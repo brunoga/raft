@@ -4,9 +4,12 @@ package raft
 type State uint8
 
 const (
-	// StateFollower is the state of a Raft instance when it is a follower. All
-	// instances start as a follower.
-	StateFollower = iota
+	// StateStopped is the state of a Raft instance when it is stopped. This is
+	// the initial state of a Raft instance.
+	StateStopped State = iota
+	// StateFollower is the state of a Raft instance when it is a follower. This
+	// can be because it just started or because there is already a leader.
+	StateFollower
 	// StateCandidate is the state of a Raft instance when it is a candidate. This
 	// means the instance is offering itself to become a leader.
 	StateCandidate
@@ -20,6 +23,8 @@ const (
 // String returns the string representation of the state.
 func (s State) String() string {
 	switch s {
+	case StateStopped:
+		return "Stopped"
 	case StateFollower:
 		return "Follower"
 	case StateCandidate:
