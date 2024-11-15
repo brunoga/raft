@@ -2,7 +2,8 @@ package raft
 
 import "fmt"
 
-// Raft is the actual Raft algorithm implementation.
+// Raft is the actual Raft algorithm implementation. There is usually a single
+// Raft instance per node (i.e. service instance).
 type Raft struct {
 	id int32 // 2,147,483,647 should be anough for anybody.
 }
