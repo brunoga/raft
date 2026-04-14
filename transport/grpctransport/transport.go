@@ -16,6 +16,7 @@ package grpctransport
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -24,6 +25,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
@@ -52,6 +54,7 @@ type Option func(*options)
 type options struct {
 	serverOpts []grpc.ServerOption
 	dialOpts   []grpc.DialOption
+	tlsCfg     *tls.Config
 }
 
 // WithServerOptions appends extra gRPC server options (e.g. TLS credentials).
@@ -64,6 +67,18 @@ func WithDialOptions(opts ...grpc.DialOption) Option {
 	return func(o *options) { o.dialOpts = append(o.dialOpts, opts...) }
 }
 
+// WithTLSConfig enables TLS on both the gRPC server and all outbound client
+// connections. For mutual TLS, include client certificates in the config passed
+// to servers and server certificates in the config passed to clients; the same
+// *tls.Config can be used for both when all nodes share a common CA.
+//
+// WithTLSConfig replaces the default insecure transport credential. It is
+// applied before WithServerOptions and WithDialOptions, so callers can still
+// append additional options on top.
+func WithTLSConfig(cfg *tls.Config) Option {
+	return func(o *options) { o.tlsCfg = cfg }
+}
+
 // Listen creates a GRPCTransport bound to addr (e.g. ":50051") and starts the
 // gRPC server. Pass functional options to customise the server or client.
 //
@@ -71,38 +86,56 @@ func WithDialOptions(opts ...grpc.DialOption) Option {
 // client connections. They can be overridden with WithServerOptions /
 // WithDialOptions.
 func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
-	o := &options{
-		// Keepalive lets either side detect a dead connection quickly even when
-		// no RPCs are in flight — important for a Raft cluster where a silent
-		// network partition should not stall elections indefinitely.
-		serverOpts: []grpc.ServerOption{
-			grpc.KeepaliveParams(keepalive.ServerParameters{
-				// Close idle connections after 15 s of no activity.
-				MaxConnectionIdle: 15 * time.Second,
-				// Recycle long-lived connections every 30 s (spreads reconnect load).
-				MaxConnectionAge: 30 * time.Second,
-				// Ping the client if silent for 5 s to check liveness.
-				Time:    5 * time.Second,
-				Timeout: 1 * time.Second, // close if no pong within 1 s
-			}),
-			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-				MinTime:             5 * time.Second, // reject pings faster than this
-				PermitWithoutStream: true,            // allow pings when idle
-			}),
-		},
-		dialOpts: []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				// Send pings every 10 s when the connection is idle.
-				Time:                10 * time.Second,
-				Timeout:             5 * time.Second, // close if no pong within 5 s
-				PermitWithoutStream: true,            // ping even when no RPCs are outstanding
-			}),
-		},
-	}
+	o := &options{}
 	for _, fn := range opts {
 		fn(o)
 	}
+
+	// Choose transport credentials based on whether TLS was configured.
+	// WithTLSConfig takes precedence; without it the transport is plaintext.
+	var serverCreds grpc.ServerOption
+	var dialCreds grpc.DialOption
+	if o.tlsCfg != nil {
+		creds := credentials.NewTLS(o.tlsCfg)
+		serverCreds = grpc.Creds(creds)
+		dialCreds = grpc.WithTransportCredentials(creds)
+	} else {
+		dialCreds = grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+
+	// Keepalive lets either side detect a dead connection quickly even when
+	// no RPCs are in flight — important for a Raft cluster where a silent
+	// network partition should not stall elections indefinitely.
+	defaultServerOpts := []grpc.ServerOption{
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			// Close idle connections after 15 s of no activity.
+			MaxConnectionIdle: 15 * time.Second,
+			// Recycle long-lived connections every 30 s (spreads reconnect load).
+			MaxConnectionAge: 30 * time.Second,
+			// Ping the client if silent for 5 s to check liveness.
+			Time:    5 * time.Second,
+			Timeout: 1 * time.Second, // close if no pong within 1 s
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second, // reject pings faster than this
+			PermitWithoutStream: true,            // allow pings when idle
+		}),
+	}
+	if serverCreds != nil {
+		defaultServerOpts = append(defaultServerOpts, serverCreds)
+	}
+	serverOpts := append(defaultServerOpts, o.serverOpts...)
+
+	defaultDialOpts := []grpc.DialOption{
+		dialCreds,
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			// Send pings every 10 s when the connection is idle.
+			Time:                10 * time.Second,
+			Timeout:             5 * time.Second, // close if no pong within 5 s
+			PermitWithoutStream: true,            // ping even when no RPCs are outstanding
+		}),
+	}
+	dialOpts := append(defaultDialOpts, o.dialOpts...)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -110,9 +143,9 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	}
 
 	t := &GRPCTransport{
-		server:   grpc.NewServer(o.serverOpts...),
+		server:   grpc.NewServer(serverOpts...),
 		listener: ln,
-		dialOpts: o.dialOpts,
+		dialOpts: dialOpts,
 		handlers: make(map[raft.NodeID]raft.Handler),
 		peers:    make(map[raft.NodeID]string),
 		clients:  make(map[string]*grpc.ClientConn),

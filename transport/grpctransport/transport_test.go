@@ -2,7 +2,16 @@ package grpctransport_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +20,50 @@ import (
 	"github.com/brunoga/raft/storage/memstore"
 	"github.com/brunoga/raft/transport/grpctransport"
 )
+
+// selfSignedTLS returns a *tls.Config usable for both server and client in a
+// test (self-signed CA, mTLS). Valid for "localhost" and "127.0.0.1".
+func selfSignedTLS(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "raft-test"},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	cert, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
+	)
+	if err != nil {
+		t.Fatalf("key pair: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ServerName:   "localhost",
+	}
+}
 
 const electionTimeout = 5 * time.Second
 
@@ -317,5 +370,110 @@ func TestGRPC_ReadIndex(t *testing.T) {
 	}
 	if idx == 0 {
 		t.Fatal("ReadIndex returned 0")
+	}
+}
+
+// TestGRPC_TLS verifies that a 3-node cluster works end-to-end with mutual TLS.
+func TestGRPC_TLS(t *testing.T) {
+	tlsCfg := selfSignedTLS(t)
+	opt := grpctransport.WithTLSConfig(tlsCfg)
+
+	ids := []raft.NodeID{"n1", "n2", "n3"}
+	transports := make([]*grpctransport.GRPCTransport, 3)
+	addrs := make([]string, 3)
+	for i := range 3 {
+		tr, err := grpctransport.Listen("127.0.0.1:0", opt)
+		if err != nil {
+			t.Fatalf("Listen node %s: %v", ids[i], err)
+		}
+		transports[i] = tr
+		addrs[i] = tr.Addr()
+	}
+	for i := range 3 {
+		for j := range 3 {
+			if i != j {
+				transports[i].AddPeer(ids[j], addrs[j])
+			}
+		}
+	}
+
+	var nodes []*raft.Node
+	var sms []*kvSM
+	for i := range 3 {
+		peers := make([]raft.NodeID, 0, 2)
+		for j, id := range ids {
+			if j != i {
+				peers = append(peers, id)
+			}
+		}
+		sm := &kvSM{data: make(map[string]string)}
+		cfg := raft.DefaultConfig()
+		cfg.ID = ids[i]
+		cfg.Peers = peers
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = sm
+		cfg.Transport = transports[i]
+		cfg.TickInterval = 10 * time.Millisecond
+		node, err := raft.New(cfg)
+		if err != nil {
+			t.Fatalf("New node %s: %v", ids[i], err)
+		}
+		transports[i].Register(ids[i], node)
+		nodes = append(nodes, node)
+		sms = append(sms, sm)
+	}
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			n.Stop()
+		}
+		for _, tr := range transports {
+			tr.Close() //nolint:errcheck
+		}
+	})
+	for _, n := range nodes {
+		n.Start()
+	}
+
+	// Wait for a leader.
+	deadline := time.Now().Add(electionTimeout)
+	var leader *raft.Node
+	for time.Now().Before(deadline) {
+		for _, n := range nodes {
+			if n.StateSnapshot() == raft.Leader {
+				leader = n
+				break
+			}
+		}
+		if leader != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if leader == nil {
+		t.Fatal("no leader elected")
+	}
+
+	// Propose a write and verify it reaches all nodes.
+	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+	defer cancel()
+	if _, err := leader.Propose(ctx, []byte("tls=ok")); err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	deadline = time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) {
+		all := true
+		for _, sm := range sms {
+			if sm.Get("tls") != "ok" {
+				all = false
+				break
+			}
+		}
+		if all {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for i, sm := range sms {
+		t.Errorf("node %d: tls=%q, want 'ok'", i+1, sm.Get("tls"))
 	}
 }
