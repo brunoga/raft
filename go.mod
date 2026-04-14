@@ -1,6 +1,6 @@
 module github.com/brunoga/raft
 
-go 1.24.1
+go 1.26.2
 
 require (
 	github.com/anishathalye/porcupine v1.1.0 // indirect

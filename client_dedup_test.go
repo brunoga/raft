@@ -28,6 +28,13 @@ func TestNotLeaderError_LeaderHint(t *testing.T) {
 	followerIdx := (leaderIdx + 1) % 3
 	follower := c.nodes[followerIdx]
 
+	// Wait for the follower to hear the leader heartbeat and update its hint.
+	deadline := time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) && follower.Leader() == "" {
+		c.Tick()
+		time.Sleep(time.Millisecond)
+	}
+
 	ctx := context.Background()
 	_, err := follower.Propose(ctx, []byte("cmd"))
 
