@@ -10,6 +10,7 @@ package raft_test
 //   - A follower that restarts catches up via AppendEntries or InstallSnapshot.
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
@@ -36,8 +37,8 @@ func (s *counterSM) Snapshot(_ context.Context) ([]byte, error) {
 	return []byte(fmt.Sprintf("%d", s.count)), nil
 }
 func (s *counterSM) Restore(_ context.Context, _ raft.SnapshotMeta, data []byte) error {
-	fmt.Sscanf(string(data), "%d", &s.count)
-	return nil
+	_, err := fmt.Sscanf(string(data), "%d", &s.count)
+	return err
 }
 
 // openFileStore opens (or creates) a filestore rooted at dir.
@@ -62,7 +63,7 @@ func newPersistentNode(t *testing.T, id raft.NodeID, peers []raft.NodeID, dir st
 	cfg.StateMachine = sm
 	cfg.Transport = tr
 	cfg.TickInterval = 0 // manual ticks
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("raft.New(%s): %v", id, err)
 	}
@@ -111,7 +112,7 @@ func TestRestart_TermPreservedAcrossRestart(t *testing.T) {
 	cfg2.StateMachine = sm2
 	cfg2.Transport = tr2
 	cfg2.TickInterval = 0
-	n2, err := raft.New(cfg2)
+	n2, err := raft.New(&cfg2)
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
@@ -180,7 +181,7 @@ func TestRestart_CommittedEntriesSurviveCrash(t *testing.T) {
 	cfg2.Transport = tr2
 	cfg2.TickInterval = 0
 
-	n2, err := raft.New(cfg2)
+	n2, err := raft.New(&cfg2)
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
@@ -236,7 +237,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 5 // snapshot every 5 applied entries
 
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("raft.New: %v", err)
 	}
@@ -257,7 +258,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	defer propCancel()
 	for i := 1; i <= 10; i++ {
 		cmd := []byte(fmt.Sprintf("key%d=val%d", i, i))
-		if _, err := n.Propose(propCtx, cmd); err != nil {
+		if _, err = n.Propose(propCtx, cmd); err != nil {
 			t.Fatalf("Propose %d: %v", i, err)
 		}
 	}
@@ -267,8 +268,8 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n.Tick()
 		time.Sleep(time.Millisecond)
-		meta, _, err := fs.LoadSnapshot(context.Background())
-		if err == nil && meta.LastIncludedIndex > 0 {
+		m, _, e := fs.LoadSnapshot(context.Background())
+		if e == nil && m.LastIncludedIndex > 0 {
 			break
 		}
 	}
@@ -292,7 +293,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	cfg2.TickInterval = 0
 	cfg2.SnapshotThreshold = 5
 
-	n2, err := raft.New(cfg2)
+	n2, err := raft.New(&cfg2)
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
@@ -368,7 +369,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 		cfg.StateMachine = sms[i]
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 0
-		n, err := raft.New(cfg)
+		n, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New %s: %v", ids[i], err)
 		}
@@ -431,7 +432,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	cfg.StateMachine = newSM
 	cfg.Transport = transports[followerIdx]
 	cfg.TickInterval = 0
-	restartedNode, err := raft.New(cfg)
+	restartedNode, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("raft.New restart follower: %v", err)
 	}
@@ -496,7 +497,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 4
 
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("raft.New: %v", err)
 	}
@@ -522,7 +523,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 
 	// Commit 4 plain entries to cross the snapshot threshold.
 	for i := 0; i < 4; i++ {
-		if _, err := n.Propose(ctx, []byte(fmt.Sprintf("plain%d", i))); err != nil {
+		if _, err = n.Propose(ctx, []byte(fmt.Sprintf("plain%d", i))); err != nil {
 			t.Fatalf("Propose %d: %v", i, err)
 		}
 	}
@@ -533,9 +534,9 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n.Tick()
 		time.Sleep(time.Millisecond)
-		meta, _, err := fs.LoadSnapshot(context.Background())
-		if err == nil && meta.LastIncludedIndex > 0 {
-			snapMeta = meta
+		m, _, e := fs.LoadSnapshot(context.Background())
+		if e == nil && m.LastIncludedIndex > 0 {
+			snapMeta = m
 			break
 		}
 	}
@@ -562,7 +563,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	cfg2.Transport = tr2
 	cfg2.Storage = fs2
 
-	n2, err := raft.New(cfg2)
+	n2, err := raft.New(&cfg2)
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
@@ -598,7 +599,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeOnce retry: %v", err)
 	}
-	if string(result2) != string(result1) {
+	if !bytes.Equal(result2, result1) {
 		t.Errorf("retry result = %q, want %q", result2, result1)
 	}
 	if sm2.count != wantCount {
@@ -648,7 +649,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.SnapshotThreshold = 5
 		cfg.SnapshotChunkSize = 4 // 4 bytes — forces many chunks
 
-		n, err := raft.New(cfg)
+		n, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New %s: %v", ids[i], err)
 		}

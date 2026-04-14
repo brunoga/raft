@@ -149,7 +149,7 @@ type recordTracer struct {
 	record func(rpcType string)
 }
 
-func (r *recordTracer) StartRPC(_ raft.NodeID, _ raft.NodeID, rpcType string) func(error) {
+func (r *recordTracer) StartRPC(_, _ raft.NodeID, rpcType string) func(error) {
 	r.record(rpcType)
 	return func(error) {}
 }
@@ -342,7 +342,6 @@ established:
 // lease should expire at sendTime+ElectionTimeoutMin, not at a later time.
 func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
 	clk := newManualClock()
-	const elMin = 150 * time.Millisecond
 	c := newClusterWith(t, 3, func(cfg *raft.Config) {
 		cfg.Clock = clk
 	})
@@ -512,7 +511,6 @@ func TestJoint_ReplaceOnePeer(t *testing.T) {
 	ids := []raft.NodeID{"n1", "n2", "n3"}
 
 	var nodes []*raft.Node
-	var sms []*kvSM
 
 	for i, id := range ids {
 		peers := make([]raft.NodeID, 0, len(ids)-1)
@@ -531,12 +529,11 @@ func TestJoint_ReplaceOnePeer(t *testing.T) {
 		cfg.StateMachine = sm
 		cfg.Transport = tr
 		cfg.TickInterval = 0
-		node, err := raft.New(cfg)
+		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New %s: %v", id, err)
 		}
 		nodes = append(nodes, node)
-		sms = append(sms, sm)
 	}
 
 	for i, id := range ids {
@@ -585,7 +582,7 @@ elected:
 	n4Cfg.StateMachine = n4SM
 	n4Cfg.Transport = n4TR
 	n4Cfg.TickInterval = 0
-	n4, err := raft.New(n4Cfg)
+	n4, err := raft.New(&n4Cfg)
 	if err != nil {
 		t.Fatalf("New n4: %v", err)
 	}
@@ -593,7 +590,6 @@ elected:
 	n4.Start()
 	t.Cleanup(n4.Stop)
 	nodes = append(nodes, n4)
-	sms = append(sms, n4SM)
 
 	// Add n4 as a known peer to the leader's transport.
 	// In grpctransport this would be AddPeer; memtransport routes by NodeID

@@ -33,7 +33,7 @@ func TestHardState(t *testing.T) {
 
 	// Round-trip.
 	want := raft.HardState{CurrentTerm: 3, VotedFor: "node2"}
-	if err := m.SaveHardState(ctx, want); err != nil {
+	if err = m.SaveHardState(ctx, want); err != nil {
 		t.Fatalf("SaveHardState: %v", err)
 	}
 	got, err := m.LoadHardState(ctx)
@@ -188,7 +188,7 @@ func TestSnapshot(t *testing.T) {
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
 	}
-	if string(gotData) != string(data) {
+	if !bytes.Equal(gotData, data) {
 		t.Fatalf("data mismatch: got %q, want %q", gotData, data)
 	}
 }

@@ -98,7 +98,7 @@ func TestDiscoveryAgent_AddsPeersOnDiscovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	// Run returns when ctx is done; we only care that the seed happened.
-	go agent.Run(ctx) //nolint:errcheck
+	go agent.Run(ctx) //nolint:errcheck // Run returns ctx.Err(); unactionable in a test goroutine.
 
 	// Give the agent a moment to complete the initial seed.
 	deadline := time.Now().Add(time.Second)
@@ -128,7 +128,7 @@ func TestDiscoveryAgent_SkipsKnownPeers(t *testing.T) {
 	defer cancel()
 
 	agent := discovery.NewAgent(discovery.Static(peers), counter, 10*time.Millisecond)
-	go agent.Run(ctx) //nolint:errcheck
+	go agent.Run(ctx) //nolint:errcheck // Run returns ctx.Err(); unactionable in a test goroutine.
 
 	time.Sleep(50 * time.Millisecond)
 	cancel()
@@ -157,7 +157,7 @@ func TestDiscoveryAgent_HandlesTransientError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	go agent.Run(ctx) //nolint:errcheck
+	go agent.Run(ctx) //nolint:errcheck // Run returns ctx.Err(); unactionable in a test goroutine.
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {

@@ -51,7 +51,7 @@ func New(logger *slog.Logger) *SlogTracer {
 
 // StartRPC implements raft.Tracer. It records the start time and returns a
 // finish func that logs the completed RPC with its duration and outcome.
-func (t *SlogTracer) StartRPC(nodeID raft.NodeID, peer raft.NodeID, rpcType string) func(err error) {
+func (t *SlogTracer) StartRPC(nodeID, peer raft.NodeID, rpcType string) func(err error) {
 	start := time.Now()
 	return func(err error) {
 		ms := time.Since(start).Milliseconds()

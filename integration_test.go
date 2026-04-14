@@ -737,7 +737,6 @@ func TestMembership_AddServer(t *testing.T) {
 	ids := []raft.NodeID{"n1", "n2"}
 
 	var nodes []*raft.Node
-	var sms []*kvSM
 	for _, id := range ids {
 		peers := make([]raft.NodeID, 0)
 		for _, other := range ids {
@@ -754,12 +753,11 @@ func TestMembership_AddServer(t *testing.T) {
 		cfg.StateMachine = sm
 		cfg.Transport = tr
 		cfg.TickInterval = 0
-		node, err := raft.New(cfg)
+		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New %s: %v", id, err)
 		}
 		nodes = append(nodes, node)
-		sms = append(sms, sm)
 	}
 	for i, node := range nodes {
 		net.Register(ids[i], node)
@@ -825,7 +823,7 @@ proposed:
 	n3cfg.StateMachine = n3SM
 	n3cfg.Transport = n3tr
 	n3cfg.TickInterval = 0
-	n3, err := raft.New(n3cfg)
+	n3, err := raft.New(&n3cfg)
 	if err != nil {
 		t.Fatalf("New n3: %v", err)
 	}
@@ -833,7 +831,6 @@ proposed:
 	n3.Start()
 	t.Cleanup(n3.Stop)
 	nodes = append(nodes, n3)
-	sms = append(sms, n3SM)
 
 	// Tell the leader to add n3.
 	addDone := make(chan error, 1)

@@ -160,8 +160,8 @@ type Node struct {
 	applyBaseIndex Index
 
 	// --- Apply-loop channels ------------------------------------------------
-	commitNotifyCh  chan Index       // event loop → apply goroutine
-	applyResultCh   chan applyResult // apply goroutine → event loop
+	commitNotifyCh chan Index       // event loop → apply goroutine
+	applyResultCh  chan applyResult // apply goroutine → event loop
 	// applyAdvancedCh is signalled (non-blocking, size-1) whenever
 	// atomicLastApplied advances. waitApplied listens on it instead of
 	// polling with time.After, eliminating busy-wait latency overhead.
@@ -215,10 +215,10 @@ type Node struct {
 	// this: the commitIndex may not yet reflect all entries committed by the
 	// previous leader (Raft §8).
 	leaderNopCommitted bool
-	readBatchGen   uint64             // incremented each time a new barrier is broadcast
-	readBatchAcks  map[NodeID]bool    // peers that ACKed the current barrier heartbeat
-	readBatchIndex Index              // commitIndex captured when the batch started
-	pendingReads   []readIndexResolver // clients waiting for read-index confirmation
+	readBatchGen       uint64              // incremented each time a new barrier is broadcast
+	readBatchAcks      map[NodeID]bool     // peers that ACKed the current barrier heartbeat
+	readBatchIndex     Index               // commitIndex captured when the batch started
+	pendingReads       []readIndexResolver // clients waiting for read-index confirmation
 	// leaseExpiry is the wall-clock time until which the leader holds a valid
 	// read lease. Zero means no lease. Set in confirmReadBatch; cleared in
 	// becomeFollower. Used by ReadIndexLease to skip the heartbeat round-trip.
@@ -251,8 +251,8 @@ type Node struct {
 	// sending the previous heartbeat, the new one is dropped (the next tick
 	// will retry). This is safe because a missed heartbeat only affects
 	// follower election-timer resets — it does not affect safety.
-	hbPumps    map[NodeID]chan *AppendEntriesRequest
-	hbStopChs  map[NodeID]chan struct{} // closed to stop the pump goroutine
+	hbPumps   map[NodeID]chan *AppendEntriesRequest
+	hbStopChs map[NodeID]chan struct{} // closed to stop the pump goroutine
 
 	// --- RNG (used only in the event-loop goroutine) ------------------------
 	rng *rand.Rand
@@ -260,7 +260,7 @@ type Node struct {
 
 // New creates a Node from cfg, loads persisted state, and caches the log
 // boundaries. It does not start any goroutines; call Start for that.
-func New(cfg Config) (*Node, error) {
+func New(cfg *Config) (*Node, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -290,7 +290,7 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:         cfg,
+		cfg:         *cfg,
 		logger:      logger,
 		currentTerm: hs.CurrentTerm,
 		votedFor:    hs.VotedFor,
@@ -298,11 +298,11 @@ func New(cfg Config) (*Node, error) {
 		log:         rl,
 		// lastApplied is volatile; seed it from the snapshot boundary so the
 		// apply loop does not re-apply already-snapshotted entries.
-		lastApplied:    rl.snapMeta.LastIncludedIndex,
-		applyBaseIndex: rl.snapMeta.LastIncludedIndex,
-		heartbeatTimeout: heartbeatTicks,
-		electionMinTicks: electionMinTicks,
-		electionMaxTicks: electionMaxTicks,
+		lastApplied:       rl.snapMeta.LastIncludedIndex,
+		applyBaseIndex:    rl.snapMeta.LastIncludedIndex,
+		heartbeatTimeout:  heartbeatTicks,
+		electionMinTicks:  electionMinTicks,
+		electionMaxTicks:  electionMaxTicks,
 		tickCh:            make(chan struct{}, 1),
 		rpcCh:             make(chan rpcEnvelope, 64),
 		proposeCh:         make(chan proposeMsg, 64),
@@ -311,15 +311,15 @@ func New(cfg Config) (*Node, error) {
 		stopCh:            make(chan struct{}),
 		doneCh:            make(chan struct{}),
 		applyDoneCh:       make(chan struct{}),
-		commitNotifyCh:  make(chan Index, 1),
-		applyResultCh:   make(chan applyResult, 256),
-		applyAdvancedCh: make(chan struct{}, 1),
+		commitNotifyCh:    make(chan Index, 1),
+		applyResultCh:     make(chan applyResult, 256),
+		applyAdvancedCh:   make(chan struct{}, 1),
 		snapshotTriggerCh: make(chan snapshotTrigger, 1),
 		snapshotResultCh:  make(chan snapshotResult, 1),
 		restoreSnapshotCh: make(chan snapshotInstall, 1),
-		pending:     make(map[Index]promise[[]byte]),
-		clientTable: newClientLRU(cfg.MaxClientTableSize),
-		rng:         rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
+		pending:           make(map[Index]promise[[]byte]),
+		clientTable:       newClientLRU(cfg.MaxClientTableSize),
+		rng:               rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
 	n.stopCtx, n.stopCancel = context.WithCancel(context.Background())
 
@@ -865,7 +865,6 @@ func (n *Node) snapshotChunkSize() int {
 	return n.cfg.SnapshotChunkSize
 }
 
-
 // startHBPumps launches one persistent heartbeat-pump goroutine per peer.
 // Called by becomeLeader; each pump reads from a size-1 channel and sends a
 // single AppendEntries RPC before posting the result to rpcCh.
@@ -943,7 +942,7 @@ func (n *Node) tickerLoop() {
 // applyRestore installs a snapshot into the state machine and resets the
 // apply goroutine's local tracking state. Called from both the priority-select
 // drain and the main select in applyLoop to avoid code duplication.
-func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, localClientTable *map[NodeID]clientEntry) {
+func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index) map[NodeID]clientEntry {
 	if err := n.cfg.StateMachine.Restore(ctx, si.meta, si.data); err != nil {
 		n.logger.Error("applyLoop: Restore", "err", err)
 	}
@@ -955,7 +954,7 @@ func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastAp
 	}
 	newTable := make(map[NodeID]clientEntry, len(si.clientTable))
 	maps.Copy(newTable, si.clientTable)
-	*localClientTable = newTable
+	return newTable
 }
 
 // applyLoop reads committed entries and feeds them to the state machine.
@@ -1010,14 +1009,14 @@ func (n *Node) applyLoop() {
 		// goroutine reads (log entries via Storage) is immutable after being written.
 		select {
 		case si := <-n.restoreSnapshotCh:
-			n.applyRestore(ctx, si, &localLastApplied, &localClientTable)
+			localClientTable = n.applyRestore(ctx, si, &localLastApplied)
 			continue
 		default:
 		}
 
 		select {
 		case si := <-n.restoreSnapshotCh:
-			n.applyRestore(ctx, si, &localLastApplied, &localClientTable)
+			localClientTable = n.applyRestore(ctx, si, &localLastApplied)
 
 		case trig := <-n.snapshotTriggerCh:
 			// Take the snapshot here in applyLoop so Snapshot() and Apply()
@@ -1069,9 +1068,10 @@ func (n *Node) applyLoop() {
 				// Config entries are handled by the Raft layer; do not forward
 				// to the user state machine.
 				var ar applyResult
-				if isConfigEntry(entry.Command) {
+				switch {
+				case isConfigEntry(entry.Command):
 					ar = applyResult{index: i, configCmd: entry.Command, cmd: entry.Command}
-				} else if isDedupCmd(entry.Command) {
+				case isDedupCmd(entry.Command):
 					// ProposeOnce command: enforce exactly-once by checking the
 					// local dedup table BEFORE calling SM.Apply. This closes the
 					// window where a retry is sent to a new leader while the
@@ -1097,7 +1097,7 @@ func (n *Node) applyLoop() {
 							localClientTable[clientID] = clientEntry{seqNum: seqNum, result: val}
 						}
 					}
-				} else {
+				default:
 					val, applyErr := n.cfg.StateMachine.Apply(ctx, entry)
 					ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
 				}
