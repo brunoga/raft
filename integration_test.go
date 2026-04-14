@@ -439,6 +439,48 @@ func TestReadIndex_FollowerForwarding(t *testing.T) {
 	}
 }
 
+// TestReadStale_FollowerServesLocally verifies that a follower can serve a
+// stale read without any RPC to the leader. After the leader applies an entry,
+// we wait for the follower to catch up (via normal replication), then confirm
+// that ReadStale returns a non-zero index and that the SM reflects the write.
+func TestReadStale_FollowerServesLocally(t *testing.T) {
+	c := newCluster(t, 3)
+	leaderIdx := c.WaitLeader(electionTimeout)
+
+	// Propose a write so followers have something to apply beyond the no-op.
+	if _, err := c.Propose(electionTimeout, []byte("flavor=vanilla")); err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+
+	followerIdx := (leaderIdx + 1) % 3
+	follower := c.nodes[followerIdx]
+	followerSM := c.sms[followerIdx]
+
+	// Wait for the follower's SM to apply the write (normal replication, no
+	// special API — just poll LastApplied so we know replication has landed).
+	deadline := time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) {
+		if followerSM.Get("flavor") == "vanilla" {
+			break
+		}
+		c.Tick()
+		time.Sleep(time.Millisecond)
+	}
+	if followerSM.Get("flavor") != "vanilla" {
+		t.Fatal("follower SM never applied the write")
+	}
+
+	// ReadStale must return a non-zero applied index with no RPC.
+	idx := follower.ReadStale()
+	if idx == 0 {
+		t.Fatal("ReadStale on follower returned 0")
+	}
+	// Sanity: the value the SM holds is the one we wrote, readable immediately.
+	if got := followerSM.Get("flavor"); got != "vanilla" {
+		t.Errorf("follower SM has flavor=%q, want 'vanilla'", got)
+	}
+}
+
 // TestReadIndex_FollowerForwarding_NoKnownLeader verifies that ReadIndex on a
 // follower that has no known leader returns NotLeaderError immediately without
 // attempting a forwarded RPC.

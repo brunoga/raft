@@ -70,6 +70,50 @@ func (t *noopTransport) Close() error                       { return nil }
 
 // --- Tests ------------------------------------------------------------------
 
+func TestReadStale_ReturnsLastApplied(t *testing.T) {
+	// Single-node cluster: become leader, propose an entry, verify ReadStale
+	// returns the applied index with no RPC.
+	n := newTestNode(t, "n1", nil)
+	n.Start()
+	defer n.Stop()
+
+	// Drive to leader.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && n.StateSnapshot() != raft.Leader {
+		tickN(n, 1)
+	}
+	if n.StateSnapshot() != raft.Leader {
+		t.Fatal("node did not become leader")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Propose and wait.
+	done := make(chan error, 1)
+	go func() { _, err := n.Propose(ctx, []byte("x")); done <- err }()
+	for time.Now().Before(deadline) {
+		tickN(n, 1)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Propose: %v", err)
+			}
+			goto proposed
+		default:
+		}
+	}
+	t.Fatal("Propose timed out")
+proposed:
+	idx := n.ReadStale()
+	if idx == 0 {
+		t.Fatal("ReadStale returned 0 after a proposal was applied")
+	}
+	if idx != n.LastApplied() {
+		t.Fatalf("ReadStale=%d != LastApplied=%d", idx, n.LastApplied())
+	}
+}
+
 func TestNode_StartsAsFollower(t *testing.T) {
 	n := newTestNode(t, "n1", nil)
 	n.Start()

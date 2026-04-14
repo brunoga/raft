@@ -23,7 +23,7 @@ the operation.
 
 ```bash
 # Build
-go build -o idprovider ./cmd/idprovider
+go build -o idprovider ./examples/idprovider
 
 # Node 1
 ./idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/idp/n1 \
@@ -68,14 +68,24 @@ curl -s -X DELETE http://localhost:8001/domains/orders
 
 Supports `X-Client-ID` / `X-Seq-Num` headers for exactly-once delivery.
 
-#### `GET /domains`
+#### `GET /domains[?consistency=stale]`
 
-Linearizable read of all domains and their current counter values. Works on any
-node — followers forward the read barrier to the leader and wait for their local
-state machine to catch up before responding.
+Returns all domains and their current counter values.
+
+- **Default** (no query param): linearizable — forwards the read barrier to the
+  leader and waits for the local state machine to catch up before responding.
+- **`?consistency=stale`**: serves directly from this node's local state machine
+  with no leader round-trip. May lag by up to one replication interval, but
+  never returns data from the future. The `X-Raft-Applied-Index` response header
+  carries the applied index the read was taken at.
 
 ```bash
+# Linearizable (default)
 curl -s http://localhost:8001/domains | jq
+
+# Stale — lower latency, no leader dependency
+curl -s 'http://localhost:8001/domains?consistency=stale' | jq
+# X-Raft-Applied-Index: 12
 # {
 #   "orders": 101,
 #   "invoices": 42
@@ -117,14 +127,22 @@ IDs `[start, start+count)` are exclusively yours.
 Both headers must be present to enable deduplication. Omitting them makes the
 allocation at-most-once (safe for non-retrying callers).
 
-#### `GET /domains/{name}/current`
+#### `GET /domains/{name}/current[?consistency=stale]`
 
-Linearizable read of the current high-water mark for a domain. All IDs ≤
-`current` have been allocated. Works on any node (same follower-forwarding
-behaviour as `GET /domains`). Returns `404` if the domain does not exist.
+Returns the current high-water mark for a domain. All IDs ≤ `current` have been
+allocated. Returns `404` if the domain does not exist.
+
+Accepts the same `?consistency=stale` parameter as `GET /domains` above, with
+identical semantics and the same `X-Raft-Applied-Index` response header.
 
 ```bash
+# Linearizable (default)
 curl -s http://localhost:8001/domains/orders/current
+# {"domain":"orders","current":101}
+
+# Stale
+curl -s 'http://localhost:8001/domains/orders/current?consistency=stale'
+# X-Raft-Applied-Index: 12
 # {"domain":"orders","current":101}
 ```
 

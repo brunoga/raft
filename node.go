@@ -568,6 +568,25 @@ func (n *Node) LastApplied() Index {
 	return Index(n.atomicLastApplied.Load())
 }
 
+// ReadStale returns the index of the last entry applied to this node's local
+// state machine. It is an atomic read with no lock and no RPC — the cheapest
+// possible read operation.
+//
+// The returned index is a fence: any value read from the local state machine
+// immediately after this call reflects at least this index. The data may be
+// behind the leader by up to one replication round-trip; callers must
+// explicitly accept this trade-off.
+//
+// Use ReadIndex or ReadIndexLease when linearizable consistency is required.
+// ReadStale is appropriate for non-critical reads, cache warming, dashboard
+// metrics, or any workload where slightly stale data is acceptable and low
+// latency / no leader dependency matters more than strict consistency.
+//
+// Safe for concurrent use.
+func (n *Node) ReadStale() Index {
+	return n.LastApplied()
+}
+
 // TransferLeadership asks this (leader) node to hand off leadership to target.
 // It returns ErrNotLeader if called on a non-leader, ErrLeadershipTransferInProgress
 // if a transfer is already underway, and ErrStopped if the node is stopped.

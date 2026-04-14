@@ -522,19 +522,19 @@ tr.AddPeer("n2", "10.0.0.2:7001")
 tr.AddPeer("n3", "10.0.0.3:7001")
 ```
 
-**TLS** via `WithServerOptions` / `WithDialOptions`:
+**TLS / mTLS** via `WithTLSConfig`:
 
 ```go
-import "google.golang.org/grpc/credentials"
-
-serverCreds := credentials.NewTLS(serverTLSConfig)
-clientCreds := credentials.NewTLS(clientTLSConfig)
-
+// tlsCfg should have Certificates, RootCAs/ClientCAs, and ClientAuth set.
 tr, err := grpctransport.Listen(":7001",
-    grpctransport.WithServerOptions(grpc.Creds(serverCreds)),
-    grpctransport.WithDialOptions(grpc.WithTransportCredentials(clientCreds)),
+    grpctransport.WithTLSConfig(tlsCfg),
 )
 ```
+
+`WithTLSConfig` applies the same `*tls.Config` to both the server listener and
+all outbound client connections. Pass separate configs to
+`WithServerOptions(grpc.Creds(...))` / `WithDialOptions(grpc.WithTransportCredentials(...))`
+if server and client configs must differ.
 
 Default keepalive settings are applied automatically; override them the same way.
 
@@ -778,7 +778,7 @@ after `Start()` has no effect.
 
 ## Reference implementation
 
-See [`cmd/idprovider`](cmd/idprovider/) for a production-ready distributed
+See [`examples/idprovider`](examples/idprovider/) for a production-ready distributed
 monotonic ID allocation service that demonstrates all major features:
 
 - **State machine**: multiple independent domains, each with a `uint64`
@@ -788,11 +788,13 @@ monotonic ID allocation service that demonstrates all major features:
 - **Exactly-once allocation**: clients supply `X-Client-ID` and `X-Seq-Num`
   headers; retrying with the same pair returns the original range.
 - **Linearizable reads**: `GET /domains/{name}/current` uses `ReadIndex`.
+- **Stale reads**: append `?consistency=stale` to any read endpoint to bypass
+  the leader round-trip and serve directly from the local state machine.
 - **Leader routing**: non-leader nodes return `503` with `X-Raft-Leader`.
 - **gRPC transport** + **filestore** + graceful shutdown.
 
 ```bash
-go build -o idprovider ./cmd/idprovider
+go build -o idprovider ./examples/idprovider
 ./idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
              --peer n2=localhost:7002 --peer n3=localhost:7003
 ```

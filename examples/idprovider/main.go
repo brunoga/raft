@@ -219,16 +219,21 @@ func buildMux(nodeID string, node *raft.Node, sm *IDSM, httpAddrMap map[raft.Nod
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	// GET /domains
+	// GET /domains[?consistency=stale]
 	//
-	// Linearizable view of all domains and their current counters.
-	// Response: JSON object mapping domain name → current counter value.
+	// Returns all domains and their current counters.
+	// Default (no query param): linearizable — waits for ReadIndex confirmation.
+	// ?consistency=stale: serves directly from this node's local state machine
+	//   with no leader round-trip; may lag by up to one replication interval.
 	mux.HandleFunc("GET /domains", func(w http.ResponseWriter, r *http.Request) {
-		if err := waitReadIndex(r.Context(), node); err != nil {
-			writeProposalError(w, r, err, httpAddrMap)
-			return
+		if r.URL.Query().Get("consistency") != "stale" {
+			if err := waitReadIndex(r.Context(), node); err != nil {
+				writeProposalError(w, r, err, httpAddrMap)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Raft-Applied-Index", fmt.Sprintf("%d", node.ReadStale()))
 		if err := json.NewEncoder(w).Encode(sm.Domains()); err != nil {
 			slog.Warn("idprovider: encode domains", "err", err)
 		}
@@ -270,16 +275,21 @@ func buildMux(nodeID string, node *raft.Node, sm *IDSM, httpAddrMap map[raft.Nod
 		}
 	})
 
-	// GET /domains/{name}/current
+	// GET /domains/{name}/current[?consistency=stale]
 	//
-	// Linearizable read of the current high-water mark for the named domain.
+	// Returns the current high-water mark for the named domain.
 	// All IDs ≤ current have been allocated to some client.
 	// Returns 404 if the domain does not exist.
+	// Default (no query param): linearizable — waits for ReadIndex confirmation.
+	// ?consistency=stale: serves directly from this node's local state machine
+	//   with no leader round-trip; may lag by up to one replication interval.
 	mux.HandleFunc("GET /domains/{name}/current", func(w http.ResponseWriter, r *http.Request) {
 		domain := r.PathValue("name")
-		if err := waitReadIndex(r.Context(), node); err != nil {
-			writeProposalError(w, r, err, httpAddrMap)
-			return
+		if r.URL.Query().Get("consistency") != "stale" {
+			if err := waitReadIndex(r.Context(), node); err != nil {
+				writeProposalError(w, r, err, httpAddrMap)
+				return
+			}
 		}
 		current, ok := sm.Current(domain)
 		if !ok {
@@ -287,6 +297,7 @@ func buildMux(nodeID string, node *raft.Node, sm *IDSM, httpAddrMap map[raft.Nod
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Raft-Applied-Index", fmt.Sprintf("%d", node.ReadStale()))
 		if err := json.NewEncoder(w).Encode(map[string]any{
 			"domain":  domain,
 			"current": current,
