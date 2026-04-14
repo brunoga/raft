@@ -418,6 +418,7 @@ cfg.Transport = tr                          // required
 | `Metrics` | `nil` | Observability hook (see [Metrics and tracing](#observability--metrics-and-tracing)). |
 | `Tracer` | `nil` | Per-RPC tracing hook. |
 | `Clock` | `time.Now` | Injectable clock for lease reads. |
+| `PreferredLeader` | `""` | NodeID that should hold leadership whenever possible. Any node that wins an election but is not the preferred node will automatically transfer leadership to it once stable. Empty means no preference. |
 
 ### Tick-based timing
 

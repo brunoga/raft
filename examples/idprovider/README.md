@@ -184,6 +184,12 @@ curl -s http://localhost:8001/status | jq
 | `--http-addr` | `:8001` | HTTP listen address for client requests |
 | `--data-dir` | required | Directory for persistent log and snapshot |
 | `--peer id=addr` | (repeatable) | Peer node: ID and its Raft gRPC address |
+| `--tls-cert` | | PEM certificate file for mTLS (must be set with `--tls-key` and `--tls-ca`) |
+| `--tls-key` | | PEM private key file for mTLS |
+| `--tls-ca` | | PEM CA certificate file for mTLS peer verification |
+
+All three TLS flags must be provided together or omitted entirely. When set,
+all peer-to-peer Raft RPCs are encrypted and mutually authenticated.
 
 ## Operational notes
 
