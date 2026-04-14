@@ -60,19 +60,38 @@ func TestNotLeaderError_LeaderHint(t *testing.T) {
 func TestLeaderMethod(t *testing.T) {
 	c := newCluster(t, 3)
 	leaderIdx := c.WaitLeader(electionTimeout)
-	leader := c.nodes[leaderIdx]
+	leaderID := c.ids[leaderIdx]
 
-	if got := leader.Leader(); got != c.ids[leaderIdx] {
-		t.Errorf("leader.Leader() = %q, want %q", got, c.ids[leaderIdx])
+	if got := c.nodes[leaderIdx].Leader(); got != leaderID {
+		t.Errorf("leader.Leader() = %q, want %q", got, leaderID)
 	}
 
-	// Followers should also know the leader after receiving a heartbeat.
+	// Keep ticking until all followers have received a heartbeat and learned
+	// the leader ID. WaitLeader only guarantees one node reached Leader state;
+	// the first AppendEntries that propagates leaderID to followers may still
+	// be in-flight.
+	deadline := time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) {
+		allKnow := true
+		for _, node := range c.nodes {
+			if node.Leader() != leaderID {
+				allKnow = false
+				break
+			}
+		}
+		if allKnow {
+			break
+		}
+		c.Tick()
+		time.Sleep(time.Millisecond)
+	}
+
 	for i, node := range c.nodes {
 		if i == leaderIdx {
 			continue
 		}
-		if got := node.Leader(); got != c.ids[leaderIdx] {
-			t.Errorf("follower %d Leader() = %q, want %q", i, got, c.ids[leaderIdx])
+		if got := node.Leader(); got != leaderID {
+			t.Errorf("follower %d Leader() = %q, want %q", i, got, leaderID)
 		}
 	}
 }
