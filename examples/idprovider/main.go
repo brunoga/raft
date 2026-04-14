@@ -40,6 +40,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -80,6 +82,9 @@ func main() {
 		raftAddr = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs")
 		httpAddr = flag.String("http-addr", ":8001", "HTTP listen address for client API")
 		dataDir  = flag.String("data-dir", "", "directory for persistent Raft state (required)")
+		tlsCert  = flag.String("tls-cert", "", "PEM certificate file for mTLS (requires --tls-key and --tls-ca)")
+		tlsKey   = flag.String("tls-key", "", "PEM private key file for mTLS")
+		tlsCA    = flag.String("tls-ca", "", "PEM CA certificate file for mTLS peer verification")
 		peers    peerFlag
 	)
 	flag.Var(&peers, "peer", "peer in the form id=raft_addr[,http_addr] (repeatable)")
@@ -88,6 +93,19 @@ func main() {
 	if *id == "" || *dataDir == "" {
 		fmt.Fprintln(os.Stderr, "idprovider: --id and --data-dir are required")
 		flag.Usage()
+		os.Exit(1)
+	}
+
+	// All three TLS flags must be provided together or not at all.
+	tlsFlags := []string{*tlsCert, *tlsKey, *tlsCA}
+	tlsCount := 0
+	for _, f := range tlsFlags {
+		if f != "" {
+			tlsCount++
+		}
+	}
+	if tlsCount != 0 && tlsCount != 3 {
+		fmt.Fprintln(os.Stderr, "idprovider: --tls-cert, --tls-key, and --tls-ca must all be provided together")
 		os.Exit(1)
 	}
 
@@ -126,8 +144,34 @@ func main() {
 	}
 	defer store.Close()
 
+	// Build TLS config when all three flags are set.
+	var trOpts []grpctransport.Option
+	if tlsCount == 3 {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "idprovider: load TLS cert/key: %v\n", err)
+			os.Exit(1)
+		}
+		caPEM, err := os.ReadFile(*tlsCA)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "idprovider: read CA cert: %v\n", err)
+			os.Exit(1)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			fmt.Fprintln(os.Stderr, "idprovider: failed to parse CA certificate")
+			os.Exit(1)
+		}
+		trOpts = append(trOpts, grpctransport.WithTLSConfig(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      pool,
+			ClientCAs:    pool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+		}))
+	}
+
 	// Set up gRPC transport.
-	tr, err := grpctransport.Listen(*raftAddr)
+	tr, err := grpctransport.Listen(*raftAddr, trOpts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "idprovider: grpctransport.Listen: %v\n", err)
 		os.Exit(1)

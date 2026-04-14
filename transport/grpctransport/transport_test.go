@@ -373,6 +373,35 @@ func TestGRPC_ReadIndex(t *testing.T) {
 	}
 }
 
+// TestGRPC_TLS_RejectsMissingClientCert verifies that a server configured with
+// mTLS (RequireAndVerifyClientCert) refuses connections from a client that
+// presents no certificate.
+func TestGRPC_TLS_RejectsMissingClientCert(t *testing.T) {
+	tlsCfg := selfSignedTLS(t)
+
+	// TLS server.
+	tlsServer, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithTLSConfig(tlsCfg))
+	if err != nil {
+		t.Fatalf("Listen TLS server: %v", err)
+	}
+	defer tlsServer.Close()
+
+	// Insecure (plaintext) client transport.
+	plainClient, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen plain client: %v", err)
+	}
+	defer plainClient.Close()
+	plainClient.AddPeer("srv", tlsServer.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = plainClient.RequestVote(ctx, "srv", &raft.RequestVoteRequest{})
+	if err == nil {
+		t.Fatal("expected TLS rejection error, got nil")
+	}
+}
+
 // TestGRPC_TLS verifies that a 3-node cluster works end-to-end with mutual TLS.
 func TestGRPC_TLS(t *testing.T) {
 	tlsCfg := selfSignedTLS(t)
