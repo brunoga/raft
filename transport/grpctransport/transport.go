@@ -44,7 +44,7 @@ type GRPCTransport struct {
 
 	mu       sync.RWMutex
 	handlers map[raft.NodeID]raft.Handler // id → registered handler
-	peers    map[raft.NodeID]string        // id → "host:port" address
+	peers    map[raft.NodeID]string       // id → "host:port" address
 	clients  map[string]*grpc.ClientConn  // address → connection (cached)
 }
 
@@ -124,7 +124,7 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	if serverCreds != nil {
 		defaultServerOpts = append(defaultServerOpts, serverCreds)
 	}
-	serverOpts := append(defaultServerOpts, o.serverOpts...)
+	defaultServerOpts = append(defaultServerOpts, o.serverOpts...)
 
 	defaultDialOpts := []grpc.DialOption{
 		dialCreds,
@@ -135,7 +135,7 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 			PermitWithoutStream: true,            // ping even when no RPCs are outstanding
 		}),
 	}
-	dialOpts := append(defaultDialOpts, o.dialOpts...)
+	defaultDialOpts = append(defaultDialOpts, o.dialOpts...)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -143,16 +143,16 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	}
 
 	t := &GRPCTransport{
-		server:   grpc.NewServer(serverOpts...),
+		server:   grpc.NewServer(defaultServerOpts...),
 		listener: ln,
-		dialOpts: dialOpts,
+		dialOpts: defaultDialOpts,
 		handlers: make(map[raft.NodeID]raft.Handler),
 		peers:    make(map[raft.NodeID]string),
 		clients:  make(map[string]*grpc.ClientConn),
 	}
 
 	pb.RegisterRaftServiceServer(t.server, &grpcServer{transport: t})
-	go t.server.Serve(ln) //nolint:errcheck
+	go t.server.Serve(ln) //nolint:errcheck // Serve always returns a non-nil error after GracefulStop; unactionable here.
 	return t, nil
 }
 
@@ -184,7 +184,7 @@ func (t *GRPCTransport) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, cc := range t.clients {
-		cc.Close() //nolint:errcheck
+		cc.Close() //nolint:errcheck // best-effort cleanup; error is unactionable during shutdown.
 	}
 	t.clients = make(map[string]*grpc.ClientConn)
 	return nil
@@ -219,7 +219,7 @@ func (t *GRPCTransport) clientFor(to raft.NodeID) (pb.RaftServiceClient, error) 
 	// Check again after acquiring write lock (another goroutine may have dialled).
 	if existing, ok := t.clients[addr]; ok {
 		t.mu.Unlock()
-		cc.Close() //nolint:errcheck
+		cc.Close() //nolint:errcheck // best-effort cleanup; error is unactionable during shutdown.
 		return pb.NewRaftServiceClient(existing), nil
 	}
 	t.clients[addr] = cc

@@ -11,15 +11,16 @@ import (
 	"github.com/brunoga/raft/storage/filestore"
 )
 
-func openFresh(t *testing.T) (*filestore.FileStore, string) {
+func openFresh(t *testing.T) (store *filestore.FileStore, dir string) {
 	t.Helper()
-	dir := t.TempDir()
-	fs, err := filestore.Open(dir)
+	dir = t.TempDir()
+	var err error
+	store, err = filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { fs.Close() })
-	return fs, dir
+	t.Cleanup(func() { _ = store.Close() })
+	return store, dir
 }
 
 func makeEntries(from, to raft.Index, term raft.Term) []raft.LogEntry {
@@ -49,7 +50,7 @@ func TestHardState_RoundTrip(t *testing.T) {
 	}
 
 	want := raft.HardState{CurrentTerm: 7, VotedFor: "peer-42"}
-	if err := fs.SaveHardState(ctx, want); err != nil {
+	if err = fs.SaveHardState(ctx, want); err != nil {
 		t.Fatalf("SaveHardState: %v", err)
 	}
 	got, err := fs.LoadHardState(ctx)
@@ -70,16 +71,16 @@ func TestHardState_PersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	want := raft.HardState{CurrentTerm: 3, VotedFor: "n1"}
-	if err := fs.SaveHardState(ctx, want); err != nil {
+	if err = fs.SaveHardState(ctx, want); err != nil {
 		t.Fatalf("SaveHardState: %v", err)
 	}
-	fs.Close()
+	_ = fs.Close()
 
 	fs2, err := filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	got, err := fs2.LoadHardState(ctx)
 	if err != nil {
@@ -127,13 +128,13 @@ func TestLog_PersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	_ = fs1.AppendLogEntries(ctx, makeEntries(1, 3, 1))
-	fs1.Close()
+	_ = fs1.Close()
 
 	fs2, err := filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	last, _ := fs2.LastIndex(ctx)
 	if last != 3 {
@@ -192,13 +193,13 @@ func TestLog_TruncateSuffix_PersistsAcrossReopen(t *testing.T) {
 	fs1, _ := filestore.Open(dir)
 	_ = fs1.AppendLogEntries(ctx, makeEntries(1, 10, 1))
 	_ = fs1.TruncateSuffix(ctx, 6)
-	fs1.Close()
+	_ = fs1.Close()
 
 	fs2, err := filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Reopen after TruncateSuffix: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	last, _ := fs2.LastIndex(ctx)
 	if last != 5 {
@@ -233,13 +234,13 @@ func TestLog_TruncatePrefix_PersistsAcrossReopen(t *testing.T) {
 	fs1, _ := filestore.Open(dir)
 	_ = fs1.AppendLogEntries(ctx, makeEntries(1, 10, 1))
 	_ = fs1.TruncatePrefix(ctx, 4)
-	fs1.Close()
+	_ = fs1.Close()
 
 	fs2, err := filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	first, _ := fs2.FirstIndex(ctx)
 	last, _ := fs2.LastIndex(ctx)
@@ -269,21 +270,21 @@ func TestRecovery_CorruptTail(t *testing.T) {
 
 	fs1, _ := filestore.Open(dir)
 	_ = fs1.AppendLogEntries(ctx, makeEntries(1, 5, 1))
-	fs1.Close()
+	_ = fs1.Close()
 
 	// Corrupt the last few bytes of the active segment log file.
 	logPath := dir + "/seg-00000.log"
 	info, _ := os.Stat(logPath)
 	f, _ := os.OpenFile(logPath, os.O_RDWR, 0o600)
-	f.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, info.Size()-4)
-	f.Close()
+	_, _ = f.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, info.Size()-4)
+	_ = f.Close()
 
 	// Open should recover to the last valid entry.
 	fs2, err := filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Open after corrupt tail: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	last, _ := fs2.LastIndex(ctx)
 	if last < 1 || last > 5 {
@@ -302,7 +303,7 @@ func openSmall(t *testing.T, dir string) *filestore.FileStore {
 	if err != nil {
 		t.Fatalf("OpenWithSegmentSize: %v", err)
 	}
-	t.Cleanup(func() { fs.Close() })
+	t.Cleanup(func() { _ = fs.Close() })
 	return fs
 }
 
@@ -397,13 +398,13 @@ func TestSegment_PersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	_ = fs1.AppendLogEntries(ctx, makeEntries(1, 10, 1))
-	fs1.Close()
+	_ = fs1.Close()
 
 	fs2, err := filestore.OpenWithSegmentSize(dir, 100)
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	first, _ := fs2.FirstIndex(ctx)
 	last, _ := fs2.LastIndex(ctx)
@@ -456,13 +457,13 @@ func TestSnapshot_PersistsAcrossReopen(t *testing.T) {
 	fs1, _ := filestore.Open(dir)
 	meta := raft.SnapshotMeta{LastIncludedIndex: 50, LastIncludedTerm: 2}
 	_ = fs1.SaveSnapshot(ctx, meta, []byte("data"))
-	fs1.Close()
+	_ = fs1.Close()
 
 	fs2, err := filestore.Open(dir)
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	gotMeta, _, err := fs2.LoadSnapshot(ctx)
 	if err != nil {
@@ -491,7 +492,7 @@ func TestPhase2Crash_BothTmps(t *testing.T) {
 	if err := fs.AppendLogEntries(ctx, makeEntries(1, 10, 1)); err != nil {
 		t.Fatalf("AppendLogEntries: %v", err)
 	}
-	fs.Close()
+	_ = fs.Close()
 
 	// Place decoy .log.tmp and .idx.tmp for seg-00000 to simulate a crash
 	// during Phase 2 before the first rename.
@@ -509,7 +510,7 @@ func TestPhase2Crash_BothTmps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after crash (both tmps): %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	last, _ := fs2.LastIndex(ctx)
 	if last != 10 {
@@ -548,14 +549,14 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read orig idx: %v", err)
 	}
-	fs.Close()
+	_ = fs.Close()
 
 	// Perform a full Phase 2 truncation (toIndex=2 lands inside seg-00000).
 	fs2, err := filestore.OpenWithSegmentSize(dir, 100)
 	if err != nil {
 		t.Fatalf("reopen for truncation: %v", err)
 	}
-	if err := fs2.TruncatePrefix(ctx, 2); err != nil {
+	if err = fs2.TruncatePrefix(ctx, 2); err != nil {
 		t.Fatalf("TruncatePrefix: %v", err)
 	}
 	// Grab the correctly-rewritten idx file content (Phase 2 produced it).
@@ -567,17 +568,17 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read new idx: %v", err)
 	}
-	fs2.Close()
+	_ = fs2.Close()
 
 	// Reconstruct crash state: log was renamed (new content), idx was NOT
 	// renamed (old content), idx.tmp has the new content.
-	if err := os.WriteFile(dir+"/seg-00000.log", newLog, 0o600); err != nil {
+	if err = os.WriteFile(dir+"/seg-00000.log", newLog, 0o600); err != nil {
 		t.Fatalf("restore log: %v", err)
 	}
-	if err := os.WriteFile(dir+"/seg-00000.idx", origIdx, 0o600); err != nil {
+	if err = os.WriteFile(dir+"/seg-00000.idx", origIdx, 0o600); err != nil {
 		t.Fatalf("restore orig idx: %v", err)
 	}
-	if err := os.WriteFile(dir+"/seg-00000.idx.tmp", newIdx, 0o600); err != nil {
+	if err = os.WriteFile(dir+"/seg-00000.idx.tmp", newIdx, 0o600); err != nil {
 		t.Fatalf("write idx.tmp: %v", err)
 	}
 	_ = origLog // suppress unused warning
@@ -587,7 +588,7 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after crash (only idx.tmp): %v", err)
 	}
-	defer fs3.Close()
+	defer func() { _ = fs3.Close() }()
 
 	// The store should be readable from index 2 onward.
 	first, _ := fs3.FirstIndex(ctx)
@@ -617,7 +618,7 @@ func TestPhase2Crash_OnlyLogTmp(t *testing.T) {
 	if err := fs.AppendLogEntries(ctx, makeEntries(1, 10, 1)); err != nil {
 		t.Fatalf("AppendLogEntries: %v", err)
 	}
-	fs.Close()
+	_ = fs.Close()
 
 	// Place only a log.tmp (no idx.tmp).
 	logTmp := dir + "/seg-00000.log.tmp"
@@ -629,7 +630,7 @@ func TestPhase2Crash_OnlyLogTmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after crash (only log.tmp): %v", err)
 	}
-	defer fs2.Close()
+	defer func() { _ = fs2.Close() }()
 
 	// Original data should be intact.
 	last, _ := fs2.LastIndex(ctx)

@@ -16,22 +16,25 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 
 	// Verify prevLog matches.
 	if req.PrevLogIndex > 0 {
-		prevTerm, err := n.log.termAt(n.stopCtx, req.PrevLogIndex)
-		if err != nil || prevTerm != req.PrevLogTerm {
-			// Send back conflict hints for fast back-tracking.
-			if err == nil {
+		prevTerm, _ := n.log.termAt(n.stopCtx, req.PrevLogIndex)
+		// prevTerm == 0 means the entry is not in our log; all valid Raft
+		// terms are ≥ 1, so 0 reliably signals "not found" and the
+		// mismatch check below handles both cases uniformly.
+		if prevTerm != req.PrevLogTerm {
+			if prevTerm == 0 {
+				// Entry not in our log — give the leader a conflict hint.
+				resp.ConflictIndex = n.log.lastLogIndex() + 1
+			} else {
+				// Term mismatch — help the leader back-track by term.
 				resp.ConflictTerm = prevTerm
-				// Find first index with that term.
 				resp.ConflictIndex = req.PrevLogIndex
 				for resp.ConflictIndex > n.log.first {
-					t, terr := n.log.termAt(n.stopCtx, resp.ConflictIndex-1)
-					if terr != nil || t != prevTerm {
+					t, _ := n.log.termAt(n.stopCtx, resp.ConflictIndex-1)
+					if t != prevTerm {
 						break
 					}
 					resp.ConflictIndex--
 				}
-			} else {
-				resp.ConflictIndex = n.log.lastLogIndex() + 1
 			}
 			return resp, nil
 		}
@@ -326,7 +329,7 @@ func hasMajorityAck(acks map[NodeID]bool, members []NodeID, includeSelf bool) bo
 	if includeSelf {
 		total++
 	}
-	return count >= total/2+1
+	return count > total/2
 }
 
 // replicatedOnMajority reports whether idx has been replicated on a majority
@@ -336,16 +339,14 @@ func hasMajorityAck(acks map[NodeID]bool, members []NodeID, includeSelf bool) bo
 // never includes the local node. includeSelf must be false when the leader is
 // removing itself and checking C_new — it is not a member of that group.
 //
-// NOTE (false positive — quorum formula is correct): for a cluster of size N
-// (includeSelf + len(members)), needed = total/2 + 1:
+// Quorum requires count > total/2 (integer division), which is a strict
+// majority for all cluster sizes:
 //
-//	N=1 (no peers, self):  needed = 1/2+1 = 1  — self alone is a majority ✓
-//	N=3 (2 peers, self):   needed = 3/2+1 = 2  — any 2 of 3 is a majority ✓
-//	N=4 (3 peers, self):   needed = 4/2+1 = 3  — strict majority of 4 ✓
-//	N=5 (4 peers, self):   needed = 5/2+1 = 3  — any 3 of 5 is a majority ✓
-//	N=2 (2 peers, no self): needed = 2/2+1 = 2  — both needed ✓
-//
-// Integer division floors, giving the correct strict majority for even sizes.
+//	N=1 (no peers, self):   total/2 = 0, count > 0 means count >= 1  ✓
+//	N=3 (2 peers, self):    total/2 = 1, count > 1 means count >= 2  ✓
+//	N=4 (3 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
+//	N=5 (4 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
+//	N=2 (2 peers, no self): total/2 = 1, count > 1 means count >= 2  ✓
 func (n *Node) replicatedOnMajority(idx Index, members []NodeID, includeSelf bool) bool {
 	count := 0
 	if includeSelf {
@@ -360,7 +361,7 @@ func (n *Node) replicatedOnMajority(idx Index, members []NodeID, includeSelf boo
 	if includeSelf {
 		total++
 	}
-	return count >= total/2+1
+	return count > total/2
 }
 
 // maybeAdvanceCommit checks whether a new index can be committed (replicated

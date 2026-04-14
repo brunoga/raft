@@ -191,7 +191,7 @@ func main() {
 	cfg.Transport = tr
 	cfg.Logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	node, err := raft.New(cfg)
+	node, err := raft.New(&cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "idprovider: raft.New: %v\n", err)
 		os.Exit(1)

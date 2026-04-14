@@ -159,7 +159,7 @@ func newGRPCCluster(t *testing.T, n int) *grpcCluster {
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 10 * time.Millisecond // real-time ticks for gRPC tests
 
-		node, err := raft.New(cfg)
+		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New node %s: %v", ids[i], err)
 		}
@@ -177,7 +177,7 @@ func newGRPCCluster(t *testing.T, n int) *grpcCluster {
 			node.Stop()
 		}
 		for _, tr := range c.transports {
-			tr.Close() //nolint:errcheck
+			tr.Close() //nolint:errcheck // best-effort cleanup in test teardown.
 		}
 	})
 
@@ -384,14 +384,14 @@ func TestGRPC_TLS_RejectsMissingClientCert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen TLS server: %v", err)
 	}
-	defer tlsServer.Close()
+	defer func() { _ = tlsServer.Close() }()
 
 	// Insecure (plaintext) client transport.
 	plainClient, err := grpctransport.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen plain client: %v", err)
 	}
-	defer plainClient.Close()
+	defer func() { _ = plainClient.Close() }()
 	plainClient.AddPeer("srv", tlsServer.Addr())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -443,7 +443,7 @@ func TestGRPC_TLS(t *testing.T) {
 		cfg.StateMachine = sm
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 10 * time.Millisecond
-		node, err := raft.New(cfg)
+		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New node %s: %v", ids[i], err)
 		}
@@ -456,7 +456,7 @@ func TestGRPC_TLS(t *testing.T) {
 			n.Stop()
 		}
 		for _, tr := range transports {
-			tr.Close() //nolint:errcheck
+			tr.Close() //nolint:errcheck // best-effort cleanup in test teardown.
 		}
 	})
 	for _, n := range nodes {

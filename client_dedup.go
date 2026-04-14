@@ -22,11 +22,11 @@ type lruItem struct {
 	ce clientEntry
 }
 
-func newClientLRU(cap int) *clientLRU {
+func newClientLRU(maxSize int) *clientLRU {
 	return &clientLRU{
 		l:   list.New(),
 		m:   make(map[NodeID]*list.Element),
-		cap: cap,
+		cap: maxSize,
 	}
 }
 
@@ -100,10 +100,14 @@ func encodeDedupCmd(clientID NodeID, seqNum uint64, payload []byte) []byte {
 	idBytes := []byte(clientID)
 	buf := make([]byte, 4+2+len(idBytes)+8+len(payload))
 	off := 0
-	copy(buf[off:], dedupMagic[:]); off += 4
-	binary.LittleEndian.PutUint16(buf[off:], uint16(len(idBytes))); off += 2
-	copy(buf[off:], idBytes); off += len(idBytes)
-	binary.LittleEndian.PutUint64(buf[off:], seqNum); off += 8
+	copy(buf[off:], dedupMagic[:])
+	off += 4
+	binary.LittleEndian.PutUint16(buf[off:], uint16(len(idBytes)))
+	off += 2
+	copy(buf[off:], idBytes)
+	off += len(idBytes)
+	binary.LittleEndian.PutUint64(buf[off:], seqNum)
+	off += 8
 	copy(buf[off:], payload)
 	return buf
 }
@@ -116,12 +120,15 @@ func decodeDedupCmd(cmd []byte) (clientID NodeID, seqNum uint64, payload []byte,
 		return "", 0, nil, fmt.Errorf("dedup cmd too short: %d bytes", len(cmd))
 	}
 	off := 4 // skip magic
-	idLen := int(binary.LittleEndian.Uint16(cmd[off:])); off += 2
+	idLen := int(binary.LittleEndian.Uint16(cmd[off:]))
+	off += 2
 	if off+idLen+8 > len(cmd) {
 		return "", 0, nil, fmt.Errorf("dedup cmd truncated at clientID")
 	}
-	clientID = NodeID(cmd[off : off+idLen]); off += idLen
-	seqNum = binary.LittleEndian.Uint64(cmd[off:]); off += 8
+	clientID = NodeID(cmd[off : off+idLen])
+	off += idLen
+	seqNum = binary.LittleEndian.Uint64(cmd[off:])
+	off += 8
 	payload = cmd[off:]
 	return clientID, seqNum, payload, nil
 }
@@ -152,9 +159,12 @@ func wrapSnapshot(table map[NodeID]clientEntry, smData []byte) []byte {
 	tableBytes := encodeClientTable(table)
 	buf := make([]byte, 8+4+len(tableBytes)+len(smData))
 	off := 0
-	binary.LittleEndian.PutUint64(buf[off:], snapFrameMagic); off += 8
-	binary.LittleEndian.PutUint32(buf[off:], uint32(len(tableBytes))); off += 4
-	copy(buf[off:], tableBytes); off += len(tableBytes)
+	binary.LittleEndian.PutUint64(buf[off:], snapFrameMagic)
+	off += 8
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(tableBytes)))
+	off += 4
+	copy(buf[off:], tableBytes)
+	off += len(tableBytes)
 	copy(buf[off:], smData)
 	return buf
 }
@@ -162,7 +172,7 @@ func wrapSnapshot(table map[NodeID]clientEntry, smData []byte) []byte {
 // unwrapSnapshot extracts the client table and SM data from a wrapped snapshot.
 // If the data is not in the wrapped format (e.g. an older snapshot), it returns
 // an empty table and the full data slice so the SM restore still succeeds.
-func unwrapSnapshot(data []byte) (map[NodeID]clientEntry, []byte) {
+func unwrapSnapshot(data []byte) (table map[NodeID]clientEntry, smData []byte) {
 	empty := make(map[NodeID]clientEntry)
 	if len(data) < 12 {
 		return empty, data
@@ -195,14 +205,20 @@ func encodeClientTable(table map[NodeID]clientEntry) []byte {
 	}
 	buf := make([]byte, size)
 	off := 0
-	binary.LittleEndian.PutUint32(buf[off:], uint32(len(table))); off += 4
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(table)))
+	off += 4
 	for id, e := range table {
 		idBytes := []byte(id)
-		binary.LittleEndian.PutUint16(buf[off:], uint16(len(idBytes))); off += 2
-		copy(buf[off:], idBytes); off += len(idBytes)
-		binary.LittleEndian.PutUint64(buf[off:], e.seqNum); off += 8
-		binary.LittleEndian.PutUint32(buf[off:], uint32(len(e.result))); off += 4
-		copy(buf[off:], e.result); off += len(e.result)
+		binary.LittleEndian.PutUint16(buf[off:], uint16(len(idBytes)))
+		off += 2
+		copy(buf[off:], idBytes)
+		off += len(idBytes)
+		binary.LittleEndian.PutUint64(buf[off:], e.seqNum)
+		off += 8
+		binary.LittleEndian.PutUint32(buf[off:], uint32(len(e.result)))
+		off += 4
+		copy(buf[off:], e.result)
+		off += len(e.result)
 	}
 	return buf[:off]
 }
@@ -211,20 +227,25 @@ func decodeClientTable(buf []byte) (map[NodeID]clientEntry, error) {
 	if len(buf) < 4 {
 		return nil, fmt.Errorf("client table: buf too short")
 	}
-	n := int(binary.LittleEndian.Uint32(buf)); buf = buf[4:]
+	n := int(binary.LittleEndian.Uint32(buf))
+	buf = buf[4:]
 	table := make(map[NodeID]clientEntry, n)
 	for i := range n {
 		if len(buf) < 2 {
 			return nil, fmt.Errorf("client table: entry %d: truncated idLen", i)
 		}
-		idLen := int(binary.LittleEndian.Uint16(buf)); buf = buf[2:]
+		idLen := int(binary.LittleEndian.Uint16(buf))
+		buf = buf[2:]
 		if len(buf) < idLen+12 {
 			return nil, fmt.Errorf("client table: entry %d: truncated id+seq+resLen", i)
 		}
 		id := NodeID(make([]byte, idLen))
-		copy([]byte(id), buf[:idLen]); buf = buf[idLen:]
-		seqNum := binary.LittleEndian.Uint64(buf); buf = buf[8:]
-		resLen := int(binary.LittleEndian.Uint32(buf)); buf = buf[4:]
+		copy([]byte(id), buf[:idLen])
+		buf = buf[idLen:]
+		seqNum := binary.LittleEndian.Uint64(buf)
+		buf = buf[8:]
+		resLen := int(binary.LittleEndian.Uint32(buf))
+		buf = buf[4:]
 		if len(buf) < resLen {
 			return nil, fmt.Errorf("client table: entry %d: truncated result", i)
 		}

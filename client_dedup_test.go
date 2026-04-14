@@ -9,6 +9,7 @@ package raft_test
 //   - Leader() returns the current leader's NodeID
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -99,7 +100,7 @@ func TestProposeOnce_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeOnce (2nd): %v", err)
 	}
-	if string(v1) != string(v2) {
+	if !bytes.Equal(v1, v2) {
 		t.Errorf("idempotent retry: first=%q second=%q, want equal", v1, v2)
 	}
 }

@@ -139,7 +139,7 @@ func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
 	}
 	rl.last = fromIndex - 1
 	if rl.last > 0 {
-		t, err := rl.storage.GetLogEntry(ctx, rl.last) //nolint:govet
+		t, err := rl.storage.GetLogEntry(ctx, rl.last)
 		if err != nil {
 			return err
 		}

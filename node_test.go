@@ -22,7 +22,7 @@ func newTestNode(t testing.TB, id raft.NodeID, peers []raft.NodeID) *raft.Node {
 	cfg.Transport = &noopTransport{}
 	cfg.TickInterval = 0 // manual ticks
 
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestNode_LoadsPersistedTerm(t *testing.T) {
 	cfg.Transport = &noopTransport{}
 	cfg.TickInterval = 0
 
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestNode_SingleNode_ProposeAndApply(t *testing.T) {
 	cfg.Transport = &noopTransport{}
 	cfg.TickInterval = 0
 
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -263,7 +263,7 @@ func (s *recordSM) Apply(_ context.Context, e raft.LogEntry) ([]byte, error) {
 	s.applied = append(s.applied, e.Command)
 	return e.Command, nil
 }
-func (s *recordSM) Snapshot(_ context.Context) ([]byte, error)               { return nil, nil }
+func (s *recordSM) Snapshot(_ context.Context) ([]byte, error) { return nil, nil }
 func (s *recordSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ []byte) error {
 	return nil
 }

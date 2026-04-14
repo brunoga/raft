@@ -3,7 +3,10 @@ package raft
 // Internal tests for clientLRU. These live in package raft (not raft_test) so
 // they can access the unexported clientLRU type directly.
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestClientLRU_GetMiss(t *testing.T) {
 	c := newClientLRU(10)
@@ -128,7 +131,7 @@ func TestClientLRU_LoadFrom(t *testing.T) {
 		if !ok {
 			t.Fatalf("loadFrom: key %q missing", id)
 		}
-		if got.seqNum != want.seqNum || string(got.result) != string(want.result) {
+		if got.seqNum != want.seqNum || !bytes.Equal(got.result, want.result) {
 			t.Fatalf("loadFrom: key %q: got %+v, want %+v", id, got, want)
 		}
 	}

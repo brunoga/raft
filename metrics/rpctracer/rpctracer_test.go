@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/brunoga/raft/metrics/rpctracer"
 	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/metrics/rpctracer"
 )
 
 func TestSlogTracer_FinishCalledOnce(t *testing.T) {
