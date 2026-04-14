@@ -782,3 +782,28 @@ func TestPendingProposals_DrainedOnStepDown(t *testing.T) {
 	}
 	t.Fatal("pending proposal was not drained after leader stepped down via CheckQuorum")
 }
+
+// ---- §22 PreferredLeader ---------------------------------------------------
+
+// TestPreferredLeader_TransfersLeadership verifies that when a node that is not
+// the preferred leader wins an election, it automatically transfers leadership
+// to the preferred node once its no-op is committed.
+func TestPreferredLeader_TransfersLeadership(t *testing.T) {
+	const preferred = raft.NodeID("n1")
+
+	// All three nodes prefer n1 as leader.
+	c := newClusterWith(t, 3, func(cfg *raft.Config) {
+		cfg.PreferredLeader = preferred
+	})
+
+	// Wait long enough for an initial election and the subsequent transfer.
+	deadline := time.Now().Add(electionTimeout * 2)
+	for time.Now().Before(deadline) {
+		c.Tick()
+		time.Sleep(time.Millisecond)
+		if idx := c.leaderIndex(); idx >= 0 && c.nodes[idx].ID() == preferred {
+			return // preferred node is the leader — success
+		}
+	}
+	t.Fatalf("preferred leader %q did not become leader within timeout", preferred)
+}

@@ -98,6 +98,23 @@ func (n *Node) tick() {
 				n.transferElapsed = 0
 			}
 		}
+		// Preferred-leader pinning: if another node is designated as the
+		// preferred leader and we are currently leading, initiate a transfer.
+		// Guard on leaderNopCommitted so we don't transfer before the cluster
+		// is in a stable state, and on transferTarget == "" so we don't start
+		// a second transfer while one is already in progress.
+		if n.cfg.PreferredLeader != "" &&
+			n.cfg.PreferredLeader != n.cfg.ID &&
+			n.transferTarget == "" &&
+			n.leaderNopCommitted {
+			respCh := make(chan error, 1)
+			n.handleLeadershipTransfer(leadershipTransferMsg{
+				target: n.cfg.PreferredLeader,
+				respCh: respCh,
+			})
+			<-respCh // always buffered; drain without blocking
+		}
+
 		// Check-quorum: step down if we have not heard from a majority of peers
 		// within the last electionTimeout ticks. This prevents a partitioned
 		// leader from continuing to reject client requests (or accepting proposals

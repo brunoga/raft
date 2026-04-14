@@ -228,6 +228,23 @@ type Config struct {
 	// Inject a fake clock in tests to make lease expiry fully deterministic
 	// without relying on wall-clock timing.
 	Clock Clock
+
+	// PreferredLeader is an optional node ID that should hold leadership
+	// whenever possible. When a node that is not the preferred leader wins an
+	// election, it will automatically initiate a leadership transfer to the
+	// preferred node once its no-op entry is committed (i.e. once it is safe
+	// to serve reads and accept proposals).
+	//
+	// Useful for heterogeneous hardware (pin leadership to the most powerful
+	// node) or geographic affinity (keep the leader co-located with clients).
+	//
+	// If the preferred node is unavailable, the transfer times out and the
+	// current leader continues normally; it will retry on the next election.
+	// Setting PreferredLeader to this node's own ID or leaving it empty both
+	// mean "no preference".
+	//
+	// Default: "" (no preference).
+	PreferredLeader NodeID
 }
 
 // DefaultConfig returns a Config populated with production-ready defaults.
