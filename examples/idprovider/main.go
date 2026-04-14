@@ -91,7 +91,7 @@ func (e *badRequestError) Error() string { return e.msg }
 // AddServer is a no-op on followers (returns NotLeaderError); the leader call
 // succeeds and the membership change propagates to the cluster.
 type raftPeerAdder struct {
-	tr   *grpctransport.GRPCTransport
+	tr   discovery.PeerAdder // typically *grpctransport.GRPCTransport
 	node *raft.Node
 }
 
