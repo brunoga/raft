@@ -11,18 +11,24 @@ import (
 
 type stubStorage struct{}
 
-func (s *stubStorage) SaveHardState(_ context.Context, _ HardState) error               { return nil }
-func (s *stubStorage) LoadHardState(_ context.Context) (HardState, error)               { return HardState{}, nil }
-func (s *stubStorage) AppendLogEntries(_ context.Context, _ []LogEntry) error           { return nil }
-func (s *stubStorage) GetLogEntry(_ context.Context, _ Index) (LogEntry, error)         { return LogEntry{}, nil }
-func (s *stubStorage) GetLogEntries(_ context.Context, _, _ Index) ([]LogEntry, error)  { return nil, nil }
-func (s *stubStorage) FirstIndex(_ context.Context) (Index, error)                      { return 0, nil }
-func (s *stubStorage) LastIndex(_ context.Context) (Index, error)                       { return 0, nil }
-func (s *stubStorage) TruncateSuffix(_ context.Context, _ Index) error                  { return nil }
-func (s *stubStorage) TruncatePrefix(_ context.Context, _ Index) error                  { return nil }
-func (s *stubStorage) SaveSnapshot(_ context.Context, _ SnapshotMeta, _ []byte) error   { return nil }
-func (s *stubStorage) LoadSnapshot(_ context.Context) (SnapshotMeta, []byte, error)     { return SnapshotMeta{}, nil, ErrNoSnapshot }
-func (s *stubStorage) Close() error                                                      { return nil }
+func (s *stubStorage) SaveHardState(_ context.Context, _ HardState) error     { return nil }
+func (s *stubStorage) LoadHardState(_ context.Context) (HardState, error)     { return HardState{}, nil }
+func (s *stubStorage) AppendLogEntries(_ context.Context, _ []LogEntry) error { return nil }
+func (s *stubStorage) GetLogEntry(_ context.Context, _ Index) (LogEntry, error) {
+	return LogEntry{}, nil
+}
+func (s *stubStorage) GetLogEntries(_ context.Context, _, _ Index) ([]LogEntry, error) {
+	return nil, nil
+}
+func (s *stubStorage) FirstIndex(_ context.Context) (Index, error)                    { return 0, nil }
+func (s *stubStorage) LastIndex(_ context.Context) (Index, error)                     { return 0, nil }
+func (s *stubStorage) TruncateSuffix(_ context.Context, _ Index) error                { return nil }
+func (s *stubStorage) TruncatePrefix(_ context.Context, _ Index) error                { return nil }
+func (s *stubStorage) SaveSnapshot(_ context.Context, _ SnapshotMeta, _ []byte) error { return nil }
+func (s *stubStorage) LoadSnapshot(_ context.Context) (SnapshotMeta, []byte, error) {
+	return SnapshotMeta{}, nil, ErrNoSnapshot
+}
+func (s *stubStorage) Close() error { return nil }
 
 type stubStateMachine struct{}
 

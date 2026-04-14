@@ -86,7 +86,7 @@ func newIDPCluster(t *testing.T, n int, opts ...func(*raft.Config)) *idpCluster 
 			opt(&cfg)
 		}
 
-		node, err := raft.New(cfg)
+		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("raft.New(%s): %v", id, err)
 		}

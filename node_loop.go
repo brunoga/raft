@@ -20,14 +20,14 @@ func (n *Node) run() {
 			for {
 				select {
 				case ar := <-n.applyResultCh:
-					n.handleApplyResult(ar)
+					n.handleApplyResult(&ar)
 				case <-n.applyDoneCh:
 					// applyLoop has fully exited; drain any final results it
 					// buffered before seeing stopCh.
 					for {
 						select {
 						case ar := <-n.applyResultCh:
-							n.handleApplyResult(ar)
+							n.handleApplyResult(&ar)
 						default:
 							return
 						}
@@ -51,7 +51,7 @@ func (n *Node) run() {
 			n.handleLeadershipTransfer(tm)
 
 		case ar := <-n.applyResultCh:
-			n.handleApplyResult(ar)
+			n.handleApplyResult(&ar)
 
 		case sr := <-n.snapshotResultCh:
 			n.handleSnapshotResult(sr)
@@ -246,7 +246,7 @@ func (n *Node) handlePropose(prop proposeMsg) {
 // handleApplyResult is called when the apply goroutine finishes applying an
 // entry. It advances lastApplied, resolves any waiting client promise, and
 // may trigger a snapshot if the log has grown past the configured threshold.
-func (n *Node) handleApplyResult(ar applyResult) {
+func (n *Node) handleApplyResult(ar *applyResult) {
 	if ar.index > n.lastApplied {
 		n.lastApplied = ar.index
 		n.atomicLastApplied.Store(uint64(ar.index))

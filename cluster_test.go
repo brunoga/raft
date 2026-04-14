@@ -19,12 +19,12 @@ import (
 
 // Cluster manages a set of Raft nodes sharing an in-memory network.
 type Cluster struct {
-	t       testing.TB
-	net     *memtransport.Network
-	nodes   []*raft.Node
-	ids     []raft.NodeID
-	stores  []*memstore.MemStore
-	sms     []*kvSM
+	t      testing.TB
+	net    *memtransport.Network
+	nodes  []*raft.Node
+	ids    []raft.NodeID
+	stores []*memstore.MemStore
+	sms    []*kvSM
 }
 
 // newCluster creates and starts a cluster of n nodes with manual ticks
@@ -70,7 +70,7 @@ func newClusterWith(t testing.TB, n int, modify func(*raft.Config)) *Cluster {
 			modify(&cfg)
 		}
 
-		node, err := raft.New(cfg)
+		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New node %s: %v", ids[i], err)
 		}

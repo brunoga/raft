@@ -19,13 +19,13 @@ import (
 
 // Metrics implements raft.Metrics using Prometheus counters and gauges.
 type Metrics struct {
-	stateGauge    *prometheus.GaugeVec   // current role (0=Follower,1=Candidate,2=Leader,3=PreCandidate)
-	termGauge     *prometheus.GaugeVec   // current term after each state change
-	transitions   *prometheus.CounterVec // total state transitions, labelled by from/to
-	commitIndex   *prometheus.GaugeVec   // latest commitIndex
-	commitsTotal  *prometheus.CounterVec // total commits advanced
+	stateGauge     *prometheus.GaugeVec   // current role (0=Follower,1=Candidate,2=Leader,3=PreCandidate)
+	termGauge      *prometheus.GaugeVec   // current term after each state change
+	transitions    *prometheus.CounterVec // total state transitions, labelled by from/to
+	commitIndex    *prometheus.GaugeVec   // latest commitIndex
+	commitsTotal   *prometheus.CounterVec // total commits advanced
 	snapshotsTotal *prometheus.CounterVec // total snapshots taken
-	snapshotBytes *prometheus.CounterVec // total snapshot bytes written
+	snapshotBytes  *prometheus.CounterVec // total snapshot bytes written
 }
 
 // New registers all Prometheus metrics with reg and returns a Metrics instance.

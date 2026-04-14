@@ -62,7 +62,7 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 // segment manages one log+index file pair. Byte offsets stored in the .idx
 // file are relative to byte 0 of that segment's .log file.
 type segment struct {
-	seqNum  int        // creation sequence (used to derive file names)
+	seqNum  int // creation sequence (used to derive file names)
 	logF    *os.File
 	idxF    *os.File
 	firstID raft.Index // raft index of the first entry; 0 = empty
@@ -272,12 +272,12 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 	}
 
 	if err := fs.loadSegments(); err != nil {
-		metaF.Close()
+		_ = metaF.Close()
 		return nil, fmt.Errorf("filestore: load segments: %w", err)
 	}
 
 	if err := fs.recoverLast(); err != nil {
-		fs.closeAll()
+		_ = fs.closeAll()
 		return nil, fmt.Errorf("filestore: recovery: %w", err)
 	}
 
@@ -372,21 +372,21 @@ func (fs *FileStore) openSegment(seqNum int) (*segment, error) {
 	}
 	idxF, err := openFile(fs.segIdxPath(seqNum))
 	if err != nil {
-		logF.Close()
+		_ = logF.Close()
 		return nil, err
 	}
 
 	logStat, err := logF.Stat()
 	if err != nil {
-		logF.Close()
-		idxF.Close()
+		_ = logF.Close()
+		_ = idxF.Close()
 		return nil, fmt.Errorf("filestore: stat seg%05d log: %w", seqNum, err)
 	}
 
 	idxStat, err := idxF.Stat()
 	if err != nil {
-		logF.Close()
-		idxF.Close()
+		_ = logF.Close()
+		_ = idxF.Close()
 		return nil, fmt.Errorf("filestore: stat seg%05d idx: %w", seqNum, err)
 	}
 
@@ -406,12 +406,12 @@ func (fs *FileStore) openSegment(seqNum int) (*segment, error) {
 	// Read first entry to get firstID.
 	firstOffset, err := s.readIdxOffsetAt(0)
 	if err != nil {
-		s.close()
+		_ = s.close()
 		return nil, err
 	}
 	first, err := s.decodeEntryAt(firstOffset)
 	if err != nil {
-		s.close()
+		_ = s.close()
 		return nil, err
 	}
 	s.firstID = first.Index
@@ -440,7 +440,7 @@ func (fs *FileStore) createSegment(seqNum int) (*segment, error) {
 	}
 	idxF, err := openFile(fs.segIdxPath(seqNum))
 	if err != nil {
-		logF.Close()
+		_ = logF.Close()
 		return nil, err
 	}
 	return &segment{seqNum: seqNum, logF: logF, idxF: idxF}, nil
@@ -472,8 +472,9 @@ func (fs *FileStore) recoverLast() error {
 
 	// Walk all entries, verify CRC; find the last valid one.
 	lastValid := int64(-1)
+	var offset int64
 	for i := int64(0); i < numEntries; i++ {
-		offset, err := s.readIdxOffsetAt(i)
+		offset, err = s.readIdxOffsetAt(i)
 		if err != nil {
 			break
 		}
@@ -483,7 +484,7 @@ func (fs *FileStore) recoverLast() error {
 		lastValid = i
 	}
 
-	if lastValid == int64(numEntries)-1 {
+	if lastValid == numEntries-1 {
 		// All entries valid. firstID/lastID are already correct from openSegment.
 		return nil
 	}
@@ -935,13 +936,13 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	}
 	keepLogSize := logStat.Size() - firstKeptOffset
 	keepLogBuf := make([]byte, keepLogSize)
-	if _, err := seg.logF.ReadAt(keepLogBuf, firstKeptOffset); err != nil {
+	if _, err = seg.logF.ReadAt(keepLogBuf, firstKeptOffset); err != nil {
 		return fmt.Errorf("filestore: read kept log in seg%05d: %w", seg.seqNum, err)
 	}
 
 	// Read and adjust the kept index entries (offsets become relative to new byte 0).
 	keepIdxBuf := make([]byte, int64(numKeep)*idxEntrySize)
-	if _, err := seg.idxF.ReadAt(keepIdxBuf, int64(numDrop)*idxEntrySize); err != nil {
+	if _, err = seg.idxF.ReadAt(keepIdxBuf, int64(numDrop)*idxEntrySize); err != nil {
 		return fmt.Errorf("filestore: read idx for prefix truncate in seg%05d: %w", seg.seqNum, err)
 	}
 	for i := range numKeep {
@@ -963,15 +964,20 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	if err != nil {
 		return fmt.Errorf("filestore: create log.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	if _, err := logTmpF.Write(keepLogBuf); err != nil {
-		logTmpF.Close(); cleanup()
+	if _, err = logTmpF.Write(keepLogBuf); err != nil {
+		_ = logTmpF.Close()
+		cleanup()
 		return fmt.Errorf("filestore: write log.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	if err := logTmpF.Sync(); err != nil {
-		logTmpF.Close(); cleanup()
+	if err = logTmpF.Sync(); err != nil {
+		_ = logTmpF.Close()
+		cleanup()
 		return fmt.Errorf("filestore: sync log.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	logTmpF.Close()
+	if err = logTmpF.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("filestore: close log.tmp in seg%05d: %w", seg.seqNum, err)
+	}
 
 	// Write adjusted index to .idx.tmp.
 	idxTmpF, err := os.OpenFile(idxTmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -979,23 +985,28 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 		cleanup()
 		return fmt.Errorf("filestore: create idx.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	if _, err := idxTmpF.Write(keepIdxBuf); err != nil {
-		idxTmpF.Close(); cleanup()
+	if _, err = idxTmpF.Write(keepIdxBuf); err != nil {
+		_ = idxTmpF.Close()
+		cleanup()
 		return fmt.Errorf("filestore: write idx.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	if err := idxTmpF.Sync(); err != nil {
-		idxTmpF.Close(); cleanup()
+	if err = idxTmpF.Sync(); err != nil {
+		_ = idxTmpF.Close()
+		cleanup()
 		return fmt.Errorf("filestore: sync idx.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	idxTmpF.Close()
+	if err = idxTmpF.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("filestore: close idx.tmp in seg%05d: %w", seg.seqNum, err)
+	}
 
 	// Close the existing open handles before renaming over the files.
-	if err := seg.logF.Close(); err != nil {
+	if err = seg.logF.Close(); err != nil {
 		cleanup()
 		return fmt.Errorf("filestore: close seg%05d log: %w", seg.seqNum, err)
 	}
 	seg.logF = nil
-	if err := seg.idxF.Close(); err != nil {
+	if err = seg.idxF.Close(); err != nil {
 		cleanup()
 		return fmt.Errorf("filestore: close seg%05d idx: %w", seg.seqNum, err)
 	}
@@ -1004,10 +1015,10 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	// Atomic rename: log first (the commit point), then idx.
 	// recoverPendingTruncations detects a crash between the two renames and
 	// completes the idx rename on the next Open.
-	if err := os.Rename(logTmpPath, fs.segLogPath(seg.seqNum)); err != nil {
+	if err = os.Rename(logTmpPath, fs.segLogPath(seg.seqNum)); err != nil {
 		return fmt.Errorf("filestore: rename log.tmp in seg%05d: %w", seg.seqNum, err)
 	}
-	if err := os.Rename(idxTmpPath, fs.segIdxPath(seg.seqNum)); err != nil {
+	if err = os.Rename(idxTmpPath, fs.segIdxPath(seg.seqNum)); err != nil {
 		// idx.tmp still exists; recoverPendingTruncations will finish this.
 		return fmt.Errorf("filestore: rename idx.tmp in seg%05d: %w", seg.seqNum, err)
 	}
@@ -1019,7 +1030,7 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	}
 	seg.idxF, err = openFile(fs.segIdxPath(seg.seqNum))
 	if err != nil {
-		seg.logF.Close()
+		_ = seg.logF.Close()
 		seg.logF = nil
 		return fmt.Errorf("filestore: reopen seg%05d idx after truncate: %w", seg.seqNum, err)
 	}
@@ -1049,21 +1060,23 @@ func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, dat
 	binary.LittleEndian.PutUint64(hdr[8:16], uint64(meta.LastIncludedTerm))
 	binary.LittleEndian.PutUint64(hdr[16:24], uint64(len(data)))
 
-	if _, err := f.Write(hdr[:]); err != nil {
-		f.Close()
+	if _, err = f.Write(hdr[:]); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("filestore: write snap header: %w", err)
 	}
 	if len(data) > 0 {
-		if _, err := f.Write(data); err != nil {
-			f.Close()
+		if _, err = f.Write(data); err != nil {
+			_ = f.Close()
 			return fmt.Errorf("filestore: write snap data: %w", err)
 		}
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("filestore: sync snap.tmp: %w", err)
 	}
-	f.Close()
+	if err = f.Close(); err != nil {
+		return fmt.Errorf("filestore: close snap.tmp: %w", err)
+	}
 
 	if err := os.Rename(tmpPath, snapPath); err != nil {
 		return fmt.Errorf("filestore: rename snap: %w", err)
@@ -1083,10 +1096,10 @@ func (fs *FileStore) LoadSnapshot(_ context.Context) (raft.SnapshotMeta, []byte,
 	if err != nil {
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: open snap: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var hdr [24]byte
-	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+	if _, err = io.ReadFull(f, hdr[:]); err != nil {
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap header: %w", err)
 	}
 	meta := raft.SnapshotMeta{
@@ -1095,7 +1108,7 @@ func (fs *FileStore) LoadSnapshot(_ context.Context) (raft.SnapshotMeta, []byte,
 	}
 	dataLen := binary.LittleEndian.Uint64(hdr[16:24])
 	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(f, data); err != nil {
+	if _, err = io.ReadFull(f, data); err != nil {
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap data: %w", err)
 	}
 	return meta, data, nil
@@ -1152,14 +1165,15 @@ func (fs *FileStore) findSegIdx(index raft.Index) int {
 	for lo <= hi {
 		mid := (lo + hi) / 2
 		s := fs.segs[mid]
-		if s.lastID != 0 && s.lastID < index {
+		switch {
+		case s.lastID != 0 && s.lastID < index:
 			lo = mid + 1
-		} else if s.firstID > index {
+		case s.firstID > index:
 			hi = mid - 1
-		} else if s.firstID == 0 {
+		case s.firstID == 0:
 			// Empty segment — shouldn't contain anything.
 			hi = mid - 1
-		} else {
+		default:
 			return mid
 		}
 	}
@@ -1191,14 +1205,14 @@ func syncDir(dir string) error {
 	if err != nil {
 		return fmt.Errorf("filestore: open dir for sync: %w", err)
 	}
-	defer d.Close()
-	return d.Sync()
+	err = d.Sync()
+	_ = d.Close()
+	return err
 }
 
 // encodeEntry serialises a LogEntry into (header, payload).
 // Wire format: crc32:4 | index:8 | term:8 | dataLen:4 | data
-func encodeEntry(e raft.LogEntry) ([entryHeaderSize]byte, []byte) {
-	var hdr [entryHeaderSize]byte
+func encodeEntry(e raft.LogEntry) (hdr [entryHeaderSize]byte, payload []byte) {
 	binary.LittleEndian.PutUint64(hdr[4:12], uint64(e.Index))
 	binary.LittleEndian.PutUint64(hdr[12:20], uint64(e.Term))
 	binary.LittleEndian.PutUint32(hdr[20:24], uint32(len(e.Command)))

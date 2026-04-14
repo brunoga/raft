@@ -54,7 +54,7 @@ func makeFollowerNode(t *testing.T, term raft.Term, votedFor raft.NodeID) *raft.
 	cfg.StateMachine = &noopSM{}
 	cfg.Transport = &noopTransport{}
 	cfg.TickInterval = 0
-	n, err := raft.New(cfg)
+	n, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestProperty_InstallSnapshot_StaleSnapshot_Ignored(t *testing.T) {
 		cfg.StateMachine = &noopSM{}
 		cfg.Transport = &noopTransport{}
 		cfg.TickInterval = 0
-		n, err := raft.New(cfg)
+		n, err := raft.New(&cfg)
 		if err != nil {
 			return true
 		}
