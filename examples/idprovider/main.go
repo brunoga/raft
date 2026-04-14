@@ -369,16 +369,14 @@ func buildMux(nodeID string, node *raft.Node, sm *IDSM, httpAddrMap map[raft.Nod
 }
 
 // waitReadIndex performs a lease read (fast path) falling back to a full
-// barrier ReadIndex, then waits for the local SM to catch up to that index.
+// barrier ReadIndex. ReadIndex/ReadIndexLease already wait for the local state
+// machine to catch up to the returned index, so no separate WaitApplied is
+// needed.
 func waitReadIndex(ctx context.Context, node *raft.Node) error {
-	idx, err := node.ReadIndexLease(ctx)
+	_, err := node.ReadIndexLease(ctx)
 	if errors.Is(err, raft.ErrLeaseExpired) {
-		idx, err = node.ReadIndex(ctx)
+		_, err = node.ReadIndex(ctx)
 	}
-	if err != nil {
-		return err
-	}
-	_, err = node.WaitApplied(ctx, idx)
 	return err
 }
 

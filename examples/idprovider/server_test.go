@@ -584,8 +584,8 @@ func TestHTTP_FollowerReadIndexForwardedToLeader(t *testing.T) {
 	do(t, http.MethodPost, leaderURL+"/domains/shared/next?count=42", nil)
 
 	// GET /domains on a follower:
-	//   ReadIndex is forwarded to the leader, WaitApplied blocks until the
-	//   follower has applied that index, then the SM read is safe.
+	//   ReadIndex is forwarded to the leader and waits for the follower's state
+	//   machine to apply up to that index, then the SM read is safe.
 	followerURL := c.FollowerURL()
 	code, body, _ := do(t, http.MethodGet, followerURL+"/domains", nil)
 	if code != http.StatusOK {

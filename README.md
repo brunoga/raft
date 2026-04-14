@@ -278,18 +278,14 @@ for {
 ### ReadIndex (always safe)
 
 ```go
-// ReadIndex performs a heartbeat round-trip to confirm leadership, then
-// returns the commit index that was current at that point.
-// WaitApplied blocks until the local state machine has applied at least
-// that index; then the read is linearizable.
-readIndex, err := node.ReadIndex(ctx)
-if err != nil {
-    // *NotLeaderError if no leader is known (follower with no leader contact).
-    // Followers forward the request to the leader via Transport.ReadIndex
-    // when a leader is known.
-    return err
-}
-if _, err := node.WaitApplied(ctx, readIndex); err != nil {
+// ReadIndex performs a heartbeat round-trip to confirm leadership, waits for
+// the local state machine to apply up to that index, then returns. After it
+// returns, the state machine reflects a linearizable snapshot.
+//
+// On a follower, the request is forwarded to the leader, and the follower
+// waits for its own state machine to catch up before returning.
+if _, err := node.ReadIndex(ctx); err != nil {
+    // *NotLeaderError if no leader is known.
     return err
 }
 // State machine is now up-to-date; serve the read.
@@ -302,17 +298,16 @@ When the leader holds a valid clock-based lease it can answer read queries
 without a heartbeat round-trip, reducing read latency to a single-node operation:
 
 ```go
-readIndex, err := node.ReadIndexLease(ctx)
-if errors.Is(err, raft.ErrLeaseExpired) {
-    // No valid lease — fall back to the safe path.
-    readIndex, err = node.ReadIndex(ctx)
+if _, err := node.ReadIndexLease(ctx); err != nil {
+    if errors.Is(err, raft.ErrLeaseExpired) {
+        // No valid lease — fall back to the safe path.
+        _, err = node.ReadIndex(ctx)
+    }
+    if err != nil {
+        return err
+    }
 }
-if err != nil {
-    return err
-}
-if _, err := node.WaitApplied(ctx, readIndex); err != nil {
-    return err
-}
+// State machine is now up-to-date; serve the read.
 ```
 
 > **§8 safety note**: a newly elected leader defers all `ReadIndex` (and

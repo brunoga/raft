@@ -163,7 +163,7 @@ type Node struct {
 	commitNotifyCh  chan Index       // event loop → apply goroutine
 	applyResultCh   chan applyResult // apply goroutine → event loop
 	// applyAdvancedCh is signalled (non-blocking, size-1) whenever
-	// atomicLastApplied advances. WaitApplied listens on it instead of
+	// atomicLastApplied advances. waitApplied listens on it instead of
 	// polling with time.After, eliminating busy-wait latency overhead.
 	applyAdvancedCh chan struct{}
 
@@ -454,10 +454,17 @@ func (n *Node) ProposeOnce(ctx context.Context, clientID NodeID, seqNum uint64, 
 	return n.Propose(ctx, encodeDedupCmd(clientID, seqNum, cmd))
 }
 
-// ReadIndex requests a linearizable read-index from the leader. It blocks
-// until this node has confirmed it is still the leader (via a heartbeat
-// quorum) or, if this node is a follower, it has successfully queried the
-// leader for the current commitIndex.
+// ReadIndex requests a linearizable read-index from the leader and waits for
+// the local state machine to apply up to that index before returning. It
+// blocks until:
+//   - (leader path) a heartbeat quorum confirms this node is still leader, and
+//     the local state machine has applied up to the commit index, or
+//   - (follower path) the leader has been queried for the current commitIndex,
+//     and the local state machine has applied up to that index.
+//
+// Because ReadIndex waits for the state machine to catch up, callers can read
+// from their local state machine immediately after ReadIndex returns and
+// observe a linearizable snapshot.
 //
 // Returns ErrStopped if the node has been stopped.
 func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
@@ -479,6 +486,9 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 		if err != nil {
 			return 0, err
 		}
+		if _, err := n.waitApplied(ctx, resp.Index); err != nil {
+			return 0, err
+		}
 		return resp.Index, nil
 	}
 
@@ -496,7 +506,13 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 	}
 	select {
 	case r := <-respCh:
-		return r.val, r.err
+		if r.err != nil {
+			return 0, r.err
+		}
+		if _, err := n.waitApplied(ctx, r.val); err != nil {
+			return 0, err
+		}
+		return r.val, nil
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
@@ -505,7 +521,9 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 }
 
 // ReadIndexLease is like ReadIndex but skips the heartbeat round-trip when the
-// leader holds a valid clock-based read lease.
+// leader holds a valid clock-based read lease. Like ReadIndex, it waits for
+// the local state machine to apply up to the returned index before returning,
+// so callers can read from their local state machine immediately.
 //
 // If called on a follower, it behaves exactly like ReadIndex (forwarding to the
 // leader), as followers do not hold read leases.
@@ -534,7 +552,13 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	}
 	select {
 	case r := <-respCh:
-		return r.val, r.err
+		if r.err != nil {
+			return 0, r.err
+		}
+		if _, err := n.waitApplied(ctx, r.val); err != nil {
+			return 0, err
+		}
+		return r.val, nil
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
@@ -542,9 +566,9 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	}
 }
 
-// WaitApplied blocks until the state machine has applied at least the given
+// waitApplied blocks until the state machine has applied at least the given
 // index. Returns the current LastApplied() once the condition is met.
-func (n *Node) WaitApplied(ctx context.Context, index Index) (Index, error) {
+func (n *Node) waitApplied(ctx context.Context, index Index) (Index, error) {
 	for {
 		last := n.LastApplied()
 		if last >= index {

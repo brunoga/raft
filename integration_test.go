@@ -417,12 +417,12 @@ func TestReadIndex_FollowerForwarding(t *testing.T) {
 	leaderIdx := c.WaitLeader(electionTimeout)
 
 	// WaitLeader returns as soon as a node enters Leader state; the no-op entry
-	// may not yet be committed. Wait for it so that the forwarded ReadIndex
-	// barrier returns commitIndex >= 1 rather than 0.
+	// may not yet be committed. Issue a ReadIndex on the leader to wait for the
+	// nop to commit and apply before testing follower forwarding.
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), electionTimeout)
 	defer waitCancel()
-	if _, err := c.nodes[leaderIdx].WaitApplied(waitCtx, 1); err != nil {
-		t.Fatalf("leader never committed no-op: %v", err)
+	if _, err := c.nodes[leaderIdx].ReadIndex(waitCtx); err != nil {
+		t.Fatalf("leader ReadIndex (nop wait): %v", err)
 	}
 
 	// Find a follower.
@@ -558,12 +558,13 @@ func TestReadIndexRPC_StaleTerm_ServesRead(t *testing.T) {
 
 	// WaitLeader returns as soon as a node enters Leader state, but the leader's
 	// no-op entry (appended on election) may not yet be committed or applied.
-	// Tick until the leader has applied at least index 1; otherwise HandleReadIndex
-	// returns commitIndex=0, which the test would incorrectly flag as the old bug.
+	// Issue a ReadIndex to wait for the nop to commit and apply; otherwise
+	// HandleReadIndex returns commitIndex=0, which the test would incorrectly
+	// flag as the old bug.
 	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
 	defer cancel()
-	if _, err := leader.WaitApplied(ctx, 1); err != nil {
-		t.Fatalf("leader never applied no-op: %v", err)
+	if _, err := leader.ReadIndex(ctx); err != nil {
+		t.Fatalf("leader ReadIndex (nop wait): %v", err)
 	}
 
 	// Call HandleReadIndex with term 0 (always < any real term) directly.

@@ -207,12 +207,12 @@ func TestReadIndexLease_FollowerForwarding(t *testing.T) {
 	leaderIdx := c.WaitLeader(electionTimeout)
 
 	// WaitLeader returns as soon as a node enters Leader state; the no-op entry
-	// may not yet be committed. Wait for it so ReadIndexLease (which falls back
-	// to ReadIndex for followers) returns commitIndex >= 1 rather than 0.
+	// may not yet be committed. Issue a ReadIndex on the leader to wait for the
+	// nop to commit and apply before testing follower forwarding.
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), electionTimeout)
 	defer waitCancel()
-	if _, err := c.nodes[leaderIdx].WaitApplied(waitCtx, 1); err != nil {
-		t.Fatalf("leader never committed no-op: %v", err)
+	if _, err := c.nodes[leaderIdx].ReadIndex(waitCtx); err != nil {
+		t.Fatalf("leader ReadIndex (nop wait): %v", err)
 	}
 
 	follower := c.nodes[(leaderIdx+1)%3]
