@@ -791,3 +791,57 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 	t.Logf("BatchHeartbeats RPCs: %d for %d groups (%.0f%% reduction)",
 		served, numGroups, 100*(1-float64(served)/float64(numGroups)))
 }
+
+// ---- TestGRPC_HeartbeatObservabilityCounters ---------------------------------
+
+// TestGRPC_HeartbeatObservabilityCounters verifies that BatchHeartbeatEntriesServed
+// and BatchHeartbeatErrors are updated correctly:
+//   - Entries counter reflects the total individual heartbeats dispatched.
+//   - Errors counter increments for unknown groups, not for successful ones.
+func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer recv.Close()
+
+	// Register groups 1 and 2; leave group 3 unknown to trigger an error counter.
+	known := map[uint64]*signalHandler{
+		1: {called: make(chan struct{}, 1)},
+		2: {called: make(chan struct{}, 1)},
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := known[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen sender: %v", err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send heartbeats to groups 1, 2 (known) and 3 (unknown) — all in one batch.
+	var wg sync.WaitGroup
+	for _, gid := range []uint64{1, 2, 3} {
+		wg.Add(1)
+		go func(g uint64) {
+			defer wg.Done()
+			//nolint:errcheck // group 3 will return success=false; that's expected
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: g, Term: 1})
+		}(gid)
+	}
+	wg.Wait()
+
+	if got := recv.BatchHeartbeatEntriesServed(); got != 3 {
+		t.Errorf("BatchHeartbeatEntriesServed = %d, want 3", got)
+	}
+	if got := recv.BatchHeartbeatErrors(); got != 1 {
+		t.Errorf("BatchHeartbeatErrors = %d, want 1 (unknown group 3)", got)
+	}
+}
