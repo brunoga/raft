@@ -1,0 +1,272 @@
+package raft_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/transport/memtransport"
+)
+
+// ---- helpers ----------------------------------------------------------------
+
+// newManagedNode builds a started *Node with the given GroupID and registers it
+// in both the Manager and the shared memtransport.Network.
+func newManagedNode(t *testing.T, mgr *raft.Manager, net *memtransport.Network,
+	groupID uint64, nodeID raft.NodeID, peers []raft.NodeID) *raft.Node {
+	t.Helper()
+	cfg := raft.DefaultConfig()
+	cfg.GroupID = groupID
+	cfg.ID = nodeID
+	cfg.Peers = peers
+	cfg.Storage = memstore.New()
+	cfg.StateMachine = &discardSM{}
+	cfg.Transport = net.NewTransport(nodeID)
+	cfg.TickInterval = 0
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New(%s): %v", nodeID, err)
+	}
+	net.Register(nodeID, node)
+	if err := mgr.Add(groupID, node); err != nil {
+		t.Fatalf("mgr.Add(%d, %s): %v", groupID, nodeID, err)
+	}
+	return node
+}
+
+// discardSM is a no-op StateMachine for manager tests.
+type discardSM struct{}
+
+func (s *discardSM) Apply(_ context.Context, _ raft.LogEntry) ([]byte, error) { return nil, nil }
+func (s *discardSM) Snapshot(_ context.Context) ([]byte, error)               { return nil, nil }
+func (s *discardSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ []byte) error {
+	return nil
+}
+
+// ---- TestManager_AddRemove --------------------------------------------------
+
+func TestManager_AddRemove(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	n1 := newManagedNode(t, mgr, net, 1, "n1", nil)
+	n1.Start()
+	defer n1.Stop()
+
+	// Get returns the node we just added.
+	got, err := mgr.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got != n1 {
+		t.Fatal("Get returned wrong node")
+	}
+
+	// Adding a duplicate GroupID fails.
+	cfg2 := raft.DefaultConfig()
+	cfg2.GroupID = 1
+	cfg2.ID = "n2"
+	cfg2.Storage = memstore.New()
+	cfg2.StateMachine = &discardSM{}
+	cfg2.Transport = net.NewTransport("n2")
+	n2, err := raft.New(&cfg2)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	if err := mgr.Add(1, n2); !errors.Is(err, raft.ErrGroupExists) {
+		t.Fatalf("duplicate Add: want ErrGroupExists, got %v", err)
+	}
+
+	// Remove stops the node and unregisters it.
+	if err := mgr.Remove(1); err != nil {
+		t.Fatalf("Remove(1): %v", err)
+	}
+	if _, err := mgr.Get(1); !errors.Is(err, raft.ErrGroupNotFound) {
+		t.Fatalf("Get after Remove: want ErrGroupNotFound, got %v", err)
+	}
+
+	// Remove a non-existent group.
+	if err := mgr.Remove(99); !errors.Is(err, raft.ErrGroupNotFound) {
+		t.Fatalf("Remove(99): want ErrGroupNotFound, got %v", err)
+	}
+}
+
+// ---- TestManager_GroupIDMismatch --------------------------------------------
+
+func TestManager_GroupIDMismatch(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	cfg := raft.DefaultConfig()
+	cfg.GroupID = 10 // node says 10
+	cfg.ID = "n1"
+	cfg.Storage = memstore.New()
+	cfg.StateMachine = &discardSM{}
+	cfg.Transport = net.NewTransport("n1")
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+
+	// Trying to register under groupID=20 while node has GroupID=10 must fail.
+	if err := mgr.Add(20, node); err == nil {
+		t.Fatal("expected error for GroupID mismatch, got nil")
+	}
+}
+
+// ---- TestManager_RoutingUnknownGroup ----------------------------------------
+
+func TestManager_RoutingUnknownGroup(t *testing.T) {
+	mgr := raft.NewManager()
+
+	// Lookup a group that was never registered.
+	_, ok := mgr.Lookup(999)
+	if ok {
+		t.Fatal("Lookup(999) should return false for unknown group")
+	}
+	if _, err := mgr.Get(999); !errors.Is(err, raft.ErrGroupNotFound) {
+		t.Fatalf("Get(999): want ErrGroupNotFound, got %v", err)
+	}
+}
+
+// ---- TestManager_StopAll ----------------------------------------------------
+
+func TestManager_StopAll(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	const numGroups = 5
+	nodes := make([]*raft.Node, numGroups)
+	for i := range numGroups {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		nodes[i] = newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+
+	mgr.StartAll()
+	mgr.StopAll()
+
+	// After StopAll all nodes should be stopped; Propose must return ErrStopped.
+	for i, n := range nodes {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		_, err := n.Propose(ctx, []byte("x"))
+		cancel()
+		if !errors.Is(err, raft.ErrStopped) {
+			t.Errorf("node %d after StopAll: want ErrStopped, got %v", i+1, err)
+		}
+	}
+}
+
+// ---- TestManager_StatusAll --------------------------------------------------
+
+func TestManager_StatusAll(t *testing.T) {
+	const timeout = 3 * time.Second
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	// Build two independent single-node groups (each elects itself leader).
+	ids := []raft.NodeID{"g1-n1", "g2-n1"}
+	nodes := make([]*raft.Node, 2)
+	for i, id := range ids {
+		nodes[i] = newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+	mgr.StartAll()
+	t.Cleanup(mgr.StopAll)
+
+	// Tick until both groups have a leader.
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		<-ticker.C
+		for _, n := range nodes {
+			n.Tick()
+		}
+		statuses := mgr.StatusAll()
+		leaders := 0
+		for _, s := range statuses {
+			if s.State == raft.Leader {
+				leaders++
+			}
+		}
+		if leaders == 2 {
+			// Both groups have leaders; verify StatusAll fields.
+			if len(statuses) != 2 {
+				t.Fatalf("StatusAll: want 2 entries, got %d", len(statuses))
+			}
+			for _, s := range statuses {
+				if s.GroupID == 0 {
+					t.Errorf("StatusAll: GroupID is 0")
+				}
+				if s.NodeID == "" {
+					t.Errorf("StatusAll: NodeID is empty")
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("timed out waiting for both groups to elect a leader")
+}
+
+// ---- TestManager_RunTicker --------------------------------------------------
+
+func TestManager_RunTicker(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	// Single-node group — it elects itself as soon as ticks fire.
+	node := newManagedNode(t, mgr, net, 1, "solo", nil)
+	node.Start()
+	t.Cleanup(node.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		mgr.RunTicker(ctx, time.Millisecond)
+		close(done)
+	}()
+
+	// Wait for the node to become leader (RunTicker is driving ticks).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if node.StateSnapshot() == raft.Leader {
+			cancel()
+			<-done
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	t.Fatal("node did not become leader with RunTicker driving ticks")
+}
+
+// ---- TestManager_LookupAfterAdd ---------------------------------------------
+
+func TestManager_LookupAfterAdd(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	node := newManagedNode(t, mgr, net, 7, "n7", nil)
+	node.Start()
+	defer node.Stop()
+
+	h, ok := mgr.Lookup(7)
+	if !ok {
+		t.Fatal("Lookup(7) returned false, want true")
+	}
+	if h == nil {
+		t.Fatal("Lookup(7) returned nil handler")
+	}
+
+	// After removal the lookup must fail.
+	if err := mgr.Remove(7); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, ok := mgr.Lookup(7); ok {
+		t.Fatal("Lookup after Remove should return false")
+	}
+}
