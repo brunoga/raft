@@ -160,6 +160,71 @@ func TestManager_StopAll(t *testing.T) {
 	}
 }
 
+// ---- TestManager_StopAll_ClearsRegistry -------------------------------------
+
+// TestManager_StopAll_ClearsRegistry verifies that after StopAll the internal
+// registry is empty: Lookup returns false, and Add succeeds for the same
+// GroupIDs (the Manager can be reused after a full restart cycle).
+func TestManager_StopAll_ClearsRegistry(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	const numGroups = 5
+	for i := range numGroups {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+
+	mgr.StartAll()
+	mgr.StopAll()
+
+	// Registry must be empty.
+	for i := range numGroups {
+		gid := uint64(i + 1)
+		if _, ok := mgr.Lookup(gid); ok {
+			t.Errorf("Lookup(%d) returned true after StopAll", gid)
+		}
+		if _, err := mgr.Get(gid); !errors.Is(err, raft.ErrGroupNotFound) {
+			t.Errorf("Get(%d) after StopAll: want ErrGroupNotFound, got %v", gid, err)
+		}
+	}
+
+	// Add must succeed for the same GroupIDs after StopAll (manager is reusable).
+	for i := range numGroups {
+		gid := uint64(i + 1)
+		id := raft.NodeID(fmt.Sprintf("n%d-2", i+1))
+		newManagedNode(t, mgr, net, gid, id, nil)
+	}
+}
+
+// ---- TestManager_StopAll_Concurrent -----------------------------------------
+
+// TestManager_StopAll_Concurrent verifies that StopAll stops many nodes
+// concurrently: stopping N=20 nodes must finish in well under N times the
+// per-node stop latency.
+func TestManager_StopAll_Concurrent(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	const numGroups = 20
+	for i := range numGroups {
+		id := raft.NodeID(fmt.Sprintf("cc%d", i+1))
+		newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+	mgr.StartAll()
+
+	start := time.Now()
+	mgr.StopAll()
+	elapsed := time.Since(start)
+
+	// A sequential stop would take numGroups × ~stop latency. We just assert
+	// the whole batch completes in a reasonable wall-clock time (1 s), which
+	// would be impossible sequentially if each Stop took ≥50 ms.
+	if elapsed > time.Second {
+		t.Errorf("StopAll took %v for %d nodes — expected concurrent execution", elapsed, numGroups)
+	}
+}
+
 // ---- TestManager_StatusAll --------------------------------------------------
 
 func TestManager_StatusAll(t *testing.T) {
