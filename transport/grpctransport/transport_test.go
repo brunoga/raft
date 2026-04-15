@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -709,6 +710,40 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 	case <-h1.called:
 		t.Fatal("group 1 handler called for a group-2 request")
 	default:
+	}
+}
+
+// ---- TestGRPC_GroupIDZeroRejectedInMultiRaftMode ----------------------------
+
+// TestGRPC_GroupIDZeroRejectedInMultiRaftMode verifies that a request with
+// GroupID==0 is rejected with InvalidArgument when SetGroupLookup is
+// installed, rather than silently falling through to NodeID-header routing.
+func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer recv.Close()
+
+	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// GroupID==0 with group lookup installed must return an error.
+	_, err = send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{GroupID: 0})
+	if err == nil {
+		t.Fatal("expected error for GroupID==0 in multi-Raft mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "GroupID must be non-zero") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
