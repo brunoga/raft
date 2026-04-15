@@ -269,16 +269,19 @@ func (t *GRPCTransport) Close() error {
 
 // clientFor returns a cached (or newly dialled) gRPC connection to the peer.
 func (t *GRPCTransport) clientFor(to raft.NodeID) (pb.RaftServiceClient, error) {
+	// Single read lock covers both the peers and clients maps, avoiding a
+	// second lock acquisition on the happy path (cached connection).
 	t.mu.RLock()
 	addr, ok := t.peers[to]
+	var cc *grpc.ClientConn
+	var cached bool
+	if ok {
+		cc, cached = t.clients[addr]
+	}
 	t.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("grpctransport: no address registered for peer %q", to)
 	}
-
-	t.mu.RLock()
-	cc, cached := t.clients[addr]
-	t.mu.RUnlock()
 	if cached {
 		return pb.NewRaftServiceClient(cc), nil
 	}
