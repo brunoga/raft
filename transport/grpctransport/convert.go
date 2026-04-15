@@ -9,6 +9,7 @@ import (
 
 func rvReqToProto(r *raft.RequestVoteRequest) *pb.RequestVoteRequest {
 	return &pb.RequestVoteRequest{
+		GroupId:      r.GroupID,
 		Term:         uint64(r.Term),
 		CandidateId:  string(r.CandidateID),
 		LastLogIndex: uint64(r.LastLogIndex),
@@ -19,6 +20,7 @@ func rvReqToProto(r *raft.RequestVoteRequest) *pb.RequestVoteRequest {
 
 func rvReqFromProto(p *pb.RequestVoteRequest) *raft.RequestVoteRequest {
 	return &raft.RequestVoteRequest{
+		GroupID:      p.GroupId,
 		Term:         raft.Term(p.Term),
 		CandidateID:  raft.NodeID(p.CandidateId),
 		LastLogIndex: raft.Index(p.LastLogIndex),
@@ -53,6 +55,7 @@ func aeReqToProto(r *raft.AppendEntriesRequest) *pb.AppendEntriesRequest {
 		}
 	}
 	return &pb.AppendEntriesRequest{
+		GroupId:      r.GroupID,
 		Term:         uint64(r.Term),
 		LeaderId:     string(r.LeaderID),
 		PrevLogIndex: uint64(r.PrevLogIndex),
@@ -73,6 +76,7 @@ func aeReqFromProto(p *pb.AppendEntriesRequest) *raft.AppendEntriesRequest {
 		}
 	}
 	return &raft.AppendEntriesRequest{
+		GroupID:      p.GroupId,
 		Term:         raft.Term(p.Term),
 		LeaderID:     raft.NodeID(p.LeaderId),
 		PrevLogIndex: raft.Index(p.PrevLogIndex),
@@ -105,6 +109,7 @@ func aeRespFromProto(p *pb.AppendEntriesResponse) *raft.AppendEntriesResponse {
 
 func isReqToProto(r *raft.InstallSnapshotRequest) *pb.InstallSnapshotRequest {
 	return &pb.InstallSnapshotRequest{
+		GroupId:           r.GroupID,
 		Term:              uint64(r.Term),
 		LeaderId:          string(r.LeaderID),
 		LastIncludedIndex: uint64(r.LastIncludedIndex),
@@ -117,6 +122,7 @@ func isReqToProto(r *raft.InstallSnapshotRequest) *pb.InstallSnapshotRequest {
 
 func isReqFromProto(p *pb.InstallSnapshotRequest) *raft.InstallSnapshotRequest {
 	return &raft.InstallSnapshotRequest{
+		GroupID:           p.GroupId,
 		Term:              raft.Term(p.Term),
 		LeaderID:          raft.NodeID(p.LeaderId),
 		LastIncludedIndex: raft.Index(p.LastIncludedIndex),
@@ -131,13 +137,15 @@ func isReqFromProto(p *pb.InstallSnapshotRequest) *raft.InstallSnapshotRequest {
 
 func riReqToProto(r *raft.ReadIndexRequest) *pb.ReadIndexRequest {
 	return &pb.ReadIndexRequest{
-		Term: uint64(r.Term),
+		GroupId: r.GroupID,
+		Term:    uint64(r.Term),
 	}
 }
 
 func riReqFromProto(p *pb.ReadIndexRequest) *raft.ReadIndexRequest {
 	return &raft.ReadIndexRequest{
-		Term: raft.Term(p.Term),
+		GroupID: p.GroupId,
+		Term:    raft.Term(p.Term),
 	}
 }
 

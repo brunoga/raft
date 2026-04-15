@@ -19,6 +19,13 @@ type Config struct {
 	// Every node in a cluster must have a distinct ID.
 	ID NodeID
 
+	// GroupID identifies the Raft group this node belongs to. It is stamped on
+	// every outbound RPC so that a shared transport (see Manager) can route
+	// incoming messages to the correct Node. A value of 0 is valid and is the
+	// default for single-group deployments where the transport serves exactly
+	// one Node.
+	GroupID uint64
+
 	// Peers is the initial set of peer node IDs, not including this node's own
 	// ID. For a fresh three-node cluster {A, B, C}, node A's Config should set
 	// Peers to []NodeID{"B", "C"}.

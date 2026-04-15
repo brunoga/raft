@@ -285,6 +285,7 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 		if chunkSize <= 0 || len(data) <= chunkSize {
 			// Single-RPC path: send everything at once.
 			req := &InstallSnapshotRequest{
+				GroupID:           n.cfg.GroupID,
 				Term:              term,
 				LeaderID:          leaderID,
 				LastIncludedIndex: m.LastIncludedIndex,
@@ -322,6 +323,7 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 			done := end == int64(len(data))
 
 			req := &InstallSnapshotRequest{
+				GroupID:           n.cfg.GroupID,
 				Term:              term,
 				LeaderID:          leaderID,
 				LastIncludedIndex: m.LastIncludedIndex,

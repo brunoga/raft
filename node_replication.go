@@ -81,6 +81,7 @@ func (n *Node) broadcastHeartbeat() {
 		prevIdx := n.nextIndex[peer] - 1
 		prevTerm, _ := n.log.termAt(n.stopCtx, prevIdx)
 		req := &AppendEntriesRequest{
+			GroupID:      n.cfg.GroupID,
 			Term:         n.currentTerm,
 			LeaderID:     n.cfg.ID,
 			PrevLogIndex: prevIdx,
@@ -150,6 +151,7 @@ func (n *Node) replicateToPeer(peer NodeID) {
 	}
 
 	req := &AppendEntriesRequest{
+		GroupID:      n.cfg.GroupID,
 		Term:         n.currentTerm,
 		LeaderID:     n.cfg.ID,
 		PrevLogIndex: prevIdx,

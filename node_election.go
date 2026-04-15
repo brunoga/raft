@@ -92,6 +92,7 @@ func (n *Node) broadcastRequestVote(preVote bool) {
 		term = n.currentTerm + 1
 	}
 	req := &RequestVoteRequest{
+		GroupID:      n.cfg.GroupID,
 		Term:         term,
 		CandidateID:  n.cfg.ID,
 		LastLogIndex: n.log.lastLogIndex(),
