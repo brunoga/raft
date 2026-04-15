@@ -718,13 +718,14 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 // pure heartbeats from G groups to the same peer are collapsed into a single
 // BatchHeartbeats RPC instead of G individual AppendEntries calls.
 //
-// Setup: two GRPCTransports (sender, receiver). The receiver has 3 groups
-// registered via SetGroupLookup. We concurrently send one pure heartbeat per
-// group from the sender and assert:
-//   - All 3 group handlers on the receiver receive a heartbeat (correctness).
-//   - BatchHeartbeatsServed() == 1 on the receiver (RPC count reduction).
+// Setup: two GRPCTransports (sender, receiver). The receiver has 10 groups
+// registered via SetGroupLookup. We use a barrier to ensure all 10 sender
+// goroutines are ready before any send fires, then assert:
+//   - All 10 group handlers on the receiver receive a heartbeat (correctness).
+//   - BatchHeartbeatsServed() == 1 on the receiver (strict O(P) assertion).
+//   - BatchHeartbeatEntriesServed() == numGroups.
 func TestGRPC_HeartbeatBatching(t *testing.T) {
-	const numGroups = 3
+	const numGroups = 10 // large enough that O(G×P) vs O(P) is unambiguous
 
 	recv, err := grpctransport.Listen("127.0.0.1:0")
 	if err != nil {
@@ -754,12 +755,16 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Concurrently send one pure heartbeat per group to the same peer.
+	// Barrier: all goroutines park here until every one is ready, so all sends
+	// hit the batcher within the same 1ms collection window.
+	ready := make(chan struct{})
+
 	var wg sync.WaitGroup
 	for g := range numGroups {
 		wg.Add(1)
 		go func(gid uint64) {
 			defer wg.Done()
+			<-ready // wait for all goroutines to be scheduled
 			if _, err := send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{
 				GroupID: gid,
 				Term:    1,
@@ -768,6 +773,7 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 			}
 		}(uint64(g + 1))
 	}
+	close(ready) // release all goroutines simultaneously
 	wg.Wait()
 
 	// Every group's handler must have been called.
@@ -779,14 +785,14 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 		}
 	}
 
-	// The 3 concurrent calls should have been batched into 1 (or at most 2 if
-	// goroutine scheduling split them). The key invariant is O(P) << O(G×P).
+	// All 10 concurrent calls must have collapsed into exactly 1 RPC.
 	served := recv.BatchHeartbeatsServed()
-	if served == 0 {
-		t.Error("BatchHeartbeats was never called on receiver")
+	if served != 1 {
+		t.Errorf("BatchHeartbeatsServed = %d, want 1 (all %d groups must batch into one RPC)",
+			served, numGroups)
 	}
-	if served >= int64(numGroups) {
-		t.Errorf("BatchHeartbeats called %d times for %d groups — batching not effective", served, numGroups)
+	if entries := recv.BatchHeartbeatEntriesServed(); entries != int64(numGroups) {
+		t.Errorf("BatchHeartbeatEntriesServed = %d, want %d", entries, numGroups)
 	}
 	t.Logf("BatchHeartbeats RPCs: %d for %d groups (%.0f%% reduction)",
 		served, numGroups, 100*(1-float64(served)/float64(numGroups)))
