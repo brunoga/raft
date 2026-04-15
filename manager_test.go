@@ -309,6 +309,52 @@ func TestManager_RunTicker(t *testing.T) {
 	t.Fatal("node did not become leader with RunTicker driving ticks")
 }
 
+// ---- TestManager_RunTicker_BoundedPool ---------------------------------------
+
+// TestManager_RunTicker_BoundedPool verifies that RunTicker ticks all groups
+// correctly even when there are many more groups than GOMAXPROCS. The pool
+// must not drop any ticks — every registered node must eventually become
+// leader (single-node groups elect themselves after a few ticks).
+func TestManager_RunTicker_BoundedPool(t *testing.T) {
+	// Use more groups than any realistic GOMAXPROCS to exercise the pool.
+	const numGroups = 32
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	nodes := make([]*raft.Node, numGroups)
+	for i := range numGroups {
+		id := raft.NodeID(fmt.Sprintf("bp%d", i+1))
+		nodes[i] = newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+	mgr.StartAll()
+	t.Cleanup(mgr.StopAll)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mgr.RunTicker(ctx, time.Millisecond)
+
+	// Every single-node group must self-elect within a reasonable deadline.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		allLeaders := true
+		for _, n := range nodes {
+			if n.StateSnapshot() != raft.Leader {
+				allLeaders = false
+				break
+			}
+		}
+		if allLeaders {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for i, n := range nodes {
+		if n.StateSnapshot() != raft.Leader {
+			t.Errorf("group %d never became leader", i+1)
+		}
+	}
+}
+
 // ---- TestManager_LookupAfterAdd ---------------------------------------------
 
 func TestManager_LookupAfterAdd(t *testing.T) {

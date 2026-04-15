@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -166,8 +167,10 @@ func (m *Manager) StatusAll() []GroupStatus {
 }
 
 // RunTicker drives Tick for all registered nodes at the given interval until
-// ctx is cancelled. It fans out ticks in parallel using a small goroutine pool
-// so that a slow node cannot delay other groups' election timers.
+// ctx is cancelled. It fans out ticks in parallel using a bounded worker pool
+// (min(G, GOMAXPROCS) workers) so that a slow node cannot delay other groups'
+// election timers, and goroutine allocation is O(GOMAXPROCS) per tick rather
+// than O(G).
 //
 // RunTicker blocks until ctx is done.
 func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
@@ -185,13 +188,28 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 			}
 			m.mu.RUnlock()
 
-			var wg sync.WaitGroup
+			if len(nodes) == 0 {
+				continue
+			}
+
+			// Bounded worker pool: cap concurrency at GOMAXPROCS so we don't
+			// spawn one goroutine per group per tick at large G.
+			workers := min(len(nodes), runtime.GOMAXPROCS(0))
+			work := make(chan *Node, len(nodes))
 			for _, n := range nodes {
+				work <- n
+			}
+			close(work)
+
+			var wg sync.WaitGroup
+			for range workers {
 				wg.Add(1)
-				go func(nd *Node) {
+				go func() {
 					defer wg.Done()
-					nd.Tick()
-				}(n)
+					for nd := range work {
+						nd.Tick()
+					}
+				}()
 			}
 			wg.Wait()
 		}
