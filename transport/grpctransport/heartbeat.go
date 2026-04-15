@@ -10,11 +10,11 @@ import (
 )
 
 const (
-	// hbWindow is the maximum time the batcher waits after the first entry
-	// arrives before flushing. One tick fires all G groups' heartbeats nearly
-	// simultaneously (RunTicker fans out in parallel goroutines), so 1 ms is
-	// enough to collect all of them before sending a single RPC.
-	hbWindow = time.Millisecond
+	// defaultHBWindow is the default collection window for the heartbeat
+	// batcher. One tick fires all G groups' heartbeats nearly simultaneously
+	// (RunTicker fans out in parallel goroutines), so 1 ms is enough to collect
+	// all of them before sending a single RPC. Tune with WithHeartbeatWindow.
+	defaultHBWindow = time.Millisecond
 
 	// hbChanSize is the per-peer channel depth. With G groups all enqueueing
 	// concurrently, the channel must absorb a full tick's worth of entries
@@ -58,7 +58,7 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 		// Collect remaining calls within hbWindow.
 		pending := make([]hbCall, 0, 16)
 		pending = append(pending, first)
-		window := time.NewTimer(hbWindow)
+		window := time.NewTimer(t.hbWindow)
 	drain:
 		for {
 			select {

@@ -51,6 +51,7 @@ type GRPCTransport struct {
 	clients     map[string]*grpc.ClientConn       // address → connection (cached)
 	groupLookup func(uint64) (raft.Handler, bool) // optional: route by GroupID
 
+	hbWindow  time.Duration    // collection window for heartbeat batching
 	hbBatcher *heartbeatBatcher // nil until SetGroupLookup is called
 
 	// Counters for BatchHeartbeats server-side processing.
@@ -81,9 +82,10 @@ func (t *GRPCTransport) heartbeatRPCTimeout() time.Duration { return 5 * time.Se
 type Option func(*options)
 
 type options struct {
-	serverOpts []grpc.ServerOption
-	dialOpts   []grpc.DialOption
-	tlsCfg     *tls.Config
+	serverOpts      []grpc.ServerOption
+	dialOpts        []grpc.DialOption
+	tlsCfg          *tls.Config
+	heartbeatWindow time.Duration
 }
 
 // WithServerOptions appends extra gRPC server options (e.g. TLS credentials).
@@ -94,6 +96,17 @@ func WithServerOptions(opts ...grpc.ServerOption) Option {
 // WithDialOptions appends extra gRPC dial options (e.g. TLS credentials).
 func WithDialOptions(opts ...grpc.DialOption) Option {
 	return func(o *options) { o.dialOpts = append(o.dialOpts, opts...) }
+}
+
+// WithHeartbeatWindow sets the collection window used by the heartbeat batcher.
+// The batcher waits up to this duration after the first heartbeat entry arrives
+// before flushing the batch to the peer. The default is 1 ms, which is
+// sufficient for same-datacenter clusters where a RunTicker tick disperses all
+// G heartbeats within microseconds. Increase this value in high-latency or
+// loaded environments where OS scheduling may spread heartbeats across several
+// milliseconds.
+func WithHeartbeatWindow(d time.Duration) Option {
+	return func(o *options) { o.heartbeatWindow = d }
 }
 
 // WithTLSConfig enables TLS on both the gRPC server and all outbound client
@@ -171,11 +184,16 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 		return nil, fmt.Errorf("grpctransport.Listen: %w", err)
 	}
 
+	hbWin := o.heartbeatWindow
+	if hbWin == 0 {
+		hbWin = defaultHBWindow
+	}
 	t := &GRPCTransport{
 		server:   grpc.NewServer(defaultServerOpts...),
 		listener: ln,
 		dialOpts: defaultDialOpts,
 		logger:   slog.Default().With("component", "grpctransport"),
+		hbWindow: hbWin,
 		handlers: make(map[raft.NodeID]raft.Handler),
 		peers:    make(map[raft.NodeID]string),
 		clients:  make(map[string]*grpc.ClientConn),
