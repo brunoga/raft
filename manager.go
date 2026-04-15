@@ -32,7 +32,18 @@ type GroupStatus struct {
 // Manager is the authoritative registry; the shared GRPCTransport delegates
 // inbound RPC routing to the Manager via a group-lookup function.
 //
-// Typical usage:
+// # Storage partitioning convention
+//
+// Every group must have its own isolated storage to avoid log and snapshot
+// collisions. The recommended layout when using filestore is:
+//
+//	<data-dir>/groups/<groupID>/
+//
+// Pass that path to filestore.Open when constructing each Node's Config.
+// The Manager itself does not enforce this convention; it is the caller's
+// responsibility to provide correctly partitioned storage.
+//
+// # Typical usage
 //
 //	mgr := raft.NewManager()
 //	mgr.Add(1, nodeA)
