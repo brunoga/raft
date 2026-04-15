@@ -886,3 +886,65 @@ func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
 		t.Errorf("BatchHeartbeatErrors = %d, want 1 (unknown group 3)", got)
 	}
 }
+
+// ---- TestGRPC_HeartbeatWindowOption -----------------------------------------
+
+// TestGRPC_HeartbeatWindowOption verifies that WithHeartbeatWindow is
+// accepted and that the batcher still coalesces concurrent heartbeats
+// (correctness smoke-test; the window value itself is an implementation
+// detail not directly observable from the outside).
+func TestGRPC_HeartbeatWindowOption(t *testing.T) {
+	const numGroups = 5
+
+	// Use a deliberately large window to confirm the option is wired through
+	// without panicking or altering correctness.
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer recv.Close()
+
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck
+		}(uint64(g + 1))
+	}
+	close(ready)
+	wg.Wait()
+
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler not called with custom window", gid)
+		}
+	}
+	if served := recv.BatchHeartbeatsServed(); served == 0 {
+		t.Error("BatchHeartbeats was never called")
+	}
+}
