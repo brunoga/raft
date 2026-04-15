@@ -280,8 +280,15 @@ func main() {
 	// Start the ongoing discovery agent when UDP discovery is enabled. It calls
 	// raftPeerAdder.AddPeer on each poll, which registers new peers with the
 	// transport and proposes adding them to the Raft membership via AddServer.
+	//
+	// The 5 s poll interval is intentionally shorter than the UDP TTL (6 s) so
+	// that a late-joining node is admitted within a few broadcast cycles. Until
+	// AddServer commits the joining node will log repeated "became pre-candidate"
+	// messages — this is normal: it cannot win an election because the existing
+	// leader rejects its pre-vote, and it settles as follower as soon as it
+	// receives the leader's first heartbeat after being added to membership.
 	if bcast != nil {
-		agent := discovery.NewAgent(bcast, &raftPeerAdder{tr: tr, node: node}, 30*time.Second)
+		agent := discovery.NewAgent(bcast, &raftPeerAdder{tr: tr, node: node}, 5*time.Second)
 		go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
 	}
 
