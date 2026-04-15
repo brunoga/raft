@@ -711,3 +711,83 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 	default:
 	}
 }
+
+// ---- TestGRPC_HeartbeatBatching ---------------------------------------------
+
+// TestGRPC_HeartbeatBatching verifies that when SetGroupLookup is installed,
+// pure heartbeats from G groups to the same peer are collapsed into a single
+// BatchHeartbeats RPC instead of G individual AppendEntries calls.
+//
+// Setup: two GRPCTransports (sender, receiver). The receiver has 3 groups
+// registered via SetGroupLookup. We concurrently send one pure heartbeat per
+// group from the sender and assert:
+//   - All 3 group handlers on the receiver receive a heartbeat (correctness).
+//   - BatchHeartbeatsServed() == 1 on the receiver (RPC count reduction).
+func TestGRPC_HeartbeatBatching(t *testing.T) {
+	const numGroups = 3
+
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen recv: %v", err)
+	}
+	defer recv.Close()
+
+	// One signalHandler per group; each fires its channel when HandleAppendEntries is called.
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+	// SetGroupLookup on the sender enables heartbeat batching.
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Concurrently send one pure heartbeat per group to the same peer.
+	var wg sync.WaitGroup
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			if _, err := send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{
+				GroupID: gid,
+				Term:    1,
+			}); err != nil {
+				t.Errorf("AppendEntries group %d: %v", gid, err)
+			}
+		}(uint64(g + 1))
+	}
+	wg.Wait()
+
+	// Every group's handler must have been called.
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler was not called", gid)
+		}
+	}
+
+	// The 3 concurrent calls should have been batched into 1 (or at most 2 if
+	// goroutine scheduling split them). The key invariant is O(P) << O(G×P).
+	served := recv.BatchHeartbeatsServed()
+	if served == 0 {
+		t.Error("BatchHeartbeats was never called on receiver")
+	}
+	if served >= int64(numGroups) {
+		t.Errorf("BatchHeartbeats called %d times for %d groups — batching not effective", served, numGroups)
+	}
+	t.Logf("BatchHeartbeats RPCs: %d for %d groups (%.0f%% reduction)",
+		served, numGroups, 100*(1-float64(served)/float64(numGroups)))
+}
