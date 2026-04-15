@@ -419,6 +419,150 @@ func TestManager_AddAndStart(t *testing.T) {
 	}
 }
 
+// ---- TestManager_RemoveGraceful ---------------------------------------------
+
+// TestManager_RemoveGraceful verifies that removing a leader node with
+// RemoveGraceful initiates a leadership transfer before stopping, so the
+// remaining nodes elect a new leader without an unnecessary election timeout
+// gap.
+//
+// Topology: one Manager per "physical node" (correct multi-Raft model).
+// mgr holds node "a"; nodes "b" and "c" are raw nodes on separate managers.
+// After "a" becomes leader, RemoveGraceful transfers leadership to "b" and
+// stops "a"; "b" or "c" must be leader afterwards.
+func TestManager_RemoveGraceful(t *testing.T) {
+	const timeout = 10 * time.Second
+	net := memtransport.NewNetwork()
+
+	peers := []raft.NodeID{"a", "b", "c"}
+	allNodes := make(map[raft.NodeID]*raft.Node, 3)
+
+	// Build three nodes (one group, three replicas) using separate managers —
+	// one manager per "physical node" — which is the canonical multi-Raft layout.
+	mgrs := make([]*raft.Manager, 3)
+	for i, id := range peers {
+		mgrs[i] = raft.NewManager()
+		others := make([]raft.NodeID, 0, 2)
+		for _, p := range peers {
+			if p != id {
+				others = append(others, p)
+			}
+		}
+		n := newManagedNode(t, mgrs[i], net, 1, id, others)
+		allNodes[id] = n
+	}
+	for _, m := range mgrs {
+		m.StartAll()
+	}
+	t.Cleanup(func() {
+		for _, m := range mgrs {
+			m.StopAll()
+		}
+	})
+
+	tickAll := func() {
+		for _, n := range allNodes {
+			n.Tick()
+		}
+	}
+
+	// Tick until a leader is elected.
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	var leaderID raft.NodeID
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		<-ticker.C
+		tickAll()
+		for _, id := range peers {
+			if allNodes[id].StateSnapshot() == raft.Leader {
+				leaderID = id
+				break
+			}
+		}
+		if leaderID != "" {
+			break
+		}
+	}
+	if leaderID == "" {
+		t.Fatal("no leader elected")
+	}
+
+	// Find the manager that owns the leader node.
+	var leaderMgr *raft.Manager
+	for i, id := range peers {
+		if id == leaderID {
+			leaderMgr = mgrs[i]
+			break
+		}
+	}
+
+	// Pick a non-leader as the transfer target.
+	var transferTo raft.NodeID
+	for _, id := range peers {
+		if id != leaderID {
+			transferTo = id
+			break
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Drive ticks in background so the transfer RPC can complete.
+	stopTick := make(chan struct{})
+	go func() {
+		tk := time.NewTicker(time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stopTick:
+				return
+			case <-tk.C:
+				for _, id := range peers {
+					if id != leaderID {
+						allNodes[id].Tick()
+					}
+				}
+			}
+		}
+	}()
+
+	if err := leaderMgr.RemoveGraceful(ctx, 1, transferTo); err != nil {
+		close(stopTick)
+		t.Fatalf("RemoveGraceful: %v", err)
+	}
+	close(stopTick)
+
+	// The removed node must no longer be in its manager.
+	if _, err := leaderMgr.Get(1); !errors.Is(err, raft.ErrGroupNotFound) {
+		t.Errorf("Get after RemoveGraceful: want ErrGroupNotFound, got %v", err)
+	}
+
+	// The remaining nodes must have a leader — either via the graceful transfer
+	// or a fresh election.
+	hasLeader := false
+	tk2 := time.NewTicker(time.Millisecond)
+	defer tk2.Stop()
+	deadline2 := time.Now().Add(timeout)
+	for time.Now().Before(deadline2) && !hasLeader {
+		<-tk2.C
+		for _, id := range peers {
+			if id != leaderID {
+				allNodes[id].Tick()
+			}
+		}
+		for _, id := range peers {
+			if id != leaderID && allNodes[id].StateSnapshot() == raft.Leader {
+				hasLeader = true
+			}
+		}
+	}
+	if !hasLeader {
+		t.Error("no leader among remaining nodes after RemoveGraceful")
+	}
+}
+
 // ---- TestManager_LookupAfterAdd ---------------------------------------------
 
 func TestManager_LookupAfterAdd(t *testing.T) {

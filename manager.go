@@ -106,6 +106,30 @@ func (m *Manager) Remove(groupID uint64) error {
 	return nil
 }
 
+// RemoveGraceful attempts a leadership transfer before stopping the node.
+// If the node for groupID is the current leader it calls TransferLeadership
+// to hand off leadership to transferTo, waiting up to the deadline in ctx.
+// Whether the transfer succeeds or not, the node is stopped and unregistered.
+// This is the preferred removal path in production: an abrupt Remove on a
+// leader forces an election and a momentary quorum gap; RemoveGraceful avoids
+// that gap when there is time to transfer first.
+//
+// Returns ErrGroupNotFound if no node is registered for groupID.
+func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo NodeID) error {
+	m.mu.RLock()
+	node, exists := m.nodes[groupID]
+	m.mu.RUnlock()
+	if !exists {
+		return ErrGroupNotFound
+	}
+	if node.StateSnapshot() == Leader {
+		// Best-effort: ignore transfer errors (e.g. no quorum) and fall through
+		// to the unconditional stop below.
+		_ = node.TransferLeadership(ctx, transferTo)
+	}
+	return m.Remove(groupID)
+}
+
 // Get returns the Node registered under groupID, or ErrGroupNotFound.
 func (m *Manager) Get(groupID uint64) (*Node, error) {
 	m.mu.RLock()
