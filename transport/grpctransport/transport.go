@@ -42,10 +42,11 @@ type GRPCTransport struct {
 	listener net.Listener
 	dialOpts []grpc.DialOption // options applied to every outbound connection
 
-	mu       sync.RWMutex
-	handlers map[raft.NodeID]raft.Handler // id → registered handler
-	peers    map[raft.NodeID]string       // id → "host:port" address
-	clients  map[string]*grpc.ClientConn  // address → connection (cached)
+	mu          sync.RWMutex
+	handlers    map[raft.NodeID]raft.Handler     // id → registered handler
+	peers       map[raft.NodeID]string           // id → "host:port" address
+	clients     map[string]*grpc.ClientConn      // address → connection (cached)
+	groupLookup func(uint64) (raft.Handler, bool) // optional: route by GroupID
 }
 
 // Option is a functional option for GRPCTransport.
@@ -177,6 +178,19 @@ func (t *GRPCTransport) Register(id raft.NodeID, h raft.Handler) {
 	t.mu.Unlock()
 }
 
+// SetGroupLookup installs a function that maps a GroupID to its Handler.
+// When set, inbound RPCs are routed by the GroupID embedded in the request
+// proto rather than by the x-raft-node-id metadata header. This is the
+// primary routing mechanism for multi-Raft deployments; single-group usage
+// does not need to call this method.
+//
+// The lookup function is typically Manager.Lookup.
+func (t *GRPCTransport) SetGroupLookup(fn func(uint64) (raft.Handler, bool)) {
+	t.mu.Lock()
+	t.groupLookup = fn
+	t.mu.Unlock()
+}
+
 // Close shuts down the server gracefully and closes all cached client
 // connections.
 func (t *GRPCTransport) Close() error {
@@ -305,6 +319,24 @@ type grpcServer struct {
 	transport *GRPCTransport
 }
 
+// handlerForGroup returns the Handler for the given groupID. If a group-lookup
+// function has been installed (multi-Raft mode), it takes priority. Otherwise
+// the call falls back to NodeID-header routing (single-group / test mode).
+func (s *grpcServer) handlerForGroup(ctx context.Context, groupID uint64) (raft.Handler, error) {
+	s.transport.mu.RLock()
+	lookup := s.transport.groupLookup
+	s.transport.mu.RUnlock()
+
+	if lookup != nil && groupID != 0 {
+		h, ok := lookup(groupID)
+		if !ok {
+			return nil, status.Errorf(codes.NotFound, "no handler for group %d", groupID)
+		}
+		return h, nil
+	}
+	return s.handler(ctx)
+}
+
 func (s *grpcServer) handler(ctx context.Context) (raft.Handler, error) {
 	s.transport.mu.RLock()
 	defer s.transport.mu.RUnlock()
@@ -327,7 +359,7 @@ func (s *grpcServer) handler(ctx context.Context) (raft.Handler, error) {
 }
 
 func (s *grpcServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	h, err := s.handler(ctx)
+	h, err := s.handlerForGroup(ctx, req.GroupId)
 	if err != nil {
 		return nil, err
 	}
@@ -339,7 +371,7 @@ func (s *grpcServer) RequestVote(ctx context.Context, req *pb.RequestVoteRequest
 }
 
 func (s *grpcServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	h, err := s.handler(ctx)
+	h, err := s.handlerForGroup(ctx, req.GroupId)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +383,7 @@ func (s *grpcServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 }
 
 func (s *grpcServer) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotRequest) (*pb.InstallSnapshotResponse, error) {
-	h, err := s.handler(ctx)
+	h, err := s.handlerForGroup(ctx, req.GroupId)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +395,7 @@ func (s *grpcServer) InstallSnapshot(ctx context.Context, req *pb.InstallSnapsho
 }
 
 func (s *grpcServer) TimeoutNow(ctx context.Context, req *pb.TimeoutNowRequest) (*pb.TimeoutNowResponse, error) {
-	h, err := s.handler(ctx)
+	h, err := s.handlerForGroup(ctx, req.GroupId)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +410,7 @@ func (s *grpcServer) TimeoutNow(ctx context.Context, req *pb.TimeoutNowRequest) 
 }
 
 func (s *grpcServer) ReadIndex(ctx context.Context, req *pb.ReadIndexRequest) (*pb.ReadIndexResponse, error) {
-	h, err := s.handler(ctx)
+	h, err := s.handlerForGroup(ctx, req.GroupId)
 	if err != nil {
 		return nil, err
 	}
