@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,7 @@ type GRPCTransport struct {
 	server   *grpc.Server
 	listener net.Listener
 	dialOpts []grpc.DialOption // options applied to every outbound connection
+	logger   *slog.Logger
 
 	mu          sync.RWMutex
 	handlers    map[raft.NodeID]raft.Handler      // id → registered handler
@@ -162,6 +164,7 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 		server:   grpc.NewServer(defaultServerOpts...),
 		listener: ln,
 		dialOpts: defaultDialOpts,
+		logger:   slog.Default().With("component", "grpctransport"),
 		handlers: make(map[raft.NodeID]raft.Handler),
 		peers:    make(map[raft.NodeID]string),
 		clients:  make(map[string]*grpc.ClientConn),
@@ -480,6 +483,13 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 	for _, entry := range req.Entries {
 		h, hErr := s.handlerForGroup(ctx, entry.GroupId)
 		if hErr != nil {
+			// Not-found is expected for late-joiners / just-removed groups;
+			// log at debug. Any other error is unexpected.
+			s.transport.logger.LogAttrs(ctx, slog.LevelDebug,
+				"BatchHeartbeats: group lookup failed",
+				slog.Uint64("group_id", entry.GroupId),
+				slog.Any("err", hErr),
+			)
 			resp.Results = append(resp.Results, &pb.HeartbeatResult{
 				GroupId: entry.GroupId,
 				Success: false,
@@ -497,6 +507,11 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 		}
 		aeResp, aeErr := h.HandleAppendEntries(ctx, aeReq)
 		if aeErr != nil {
+			s.transport.logger.LogAttrs(ctx, slog.LevelWarn,
+				"BatchHeartbeats: HandleAppendEntries failed",
+				slog.Uint64("group_id", entry.GroupId),
+				slog.Any("err", aeErr),
+			)
 			resp.Results = append(resp.Results, &pb.HeartbeatResult{
 				GroupId: entry.GroupId,
 				Success: false,
