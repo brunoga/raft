@@ -1,6 +1,6 @@
 package main
 
-// Tests for the UDP-discovery integration in idprovider:
+// Tests for the discovery integration in idprovider:
 //   - raftPeerAdder calls both the transport AddPeer and node.AddServer
 //   - calling AddPeer on a follower (AddServer returns NotLeaderError) does not panic
 //   - a late-joining node is added to Raft membership via raftPeerAdder
@@ -9,12 +9,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/discovery"
+	"github.com/brunoga/raft/discovery/dnsdiscovery"
 	"github.com/brunoga/raft/storage/memstore"
 )
 
@@ -172,6 +174,72 @@ func TestDiscoveryAgent_LateJoinerJoinsCluster(t *testing.T) {
 	go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable here.
 
 	// n3 should eventually receive heartbeats and learn the leader.
+	waitLeaderKnown(t, n3, testElectionTimeout)
+}
+
+// ---- DNS A-record discovery integration test --------------------------------
+
+// fakeResolver implements dnsdiscovery.Resolver using a fixed IP list.
+// It satisfies both LookupHost and LookupSRV so that it can be used for
+// A-record tests without requiring real DNS I/O.
+type fakeResolver struct {
+	ips []string
+}
+
+func (r *fakeResolver) LookupHost(_ context.Context, _ string) ([]string, error) {
+	return r.ips, nil
+}
+
+func (r *fakeResolver) LookupSRV(_ context.Context, _, _, _ string) (string, []*net.SRV, error) {
+	return "", nil, nil
+}
+
+// TestDNSDiscovery_ThreeNodeCluster is a 3-node end-to-end integration test for
+// DNS A-record peer discovery. A fake DNS resolver returns three IP addresses;
+// a NodeIDMapper translates each IP to the corresponding Raft node ID. A
+// DiscoveryAgent wired to a raftPeerAdder on the leader discovers the late
+// joiner and adds it to the Raft membership, after which the late joiner
+// receives heartbeats and learns who the leader is.
+func TestDNSDiscovery_ThreeNodeCluster(t *testing.T) {
+	// Start a 2-node cluster with IDs "n1" and "n2".
+	c := newIDPCluster(t, 2)
+	leaderIdx := c.LeaderIdx()
+
+	// n3 starts knowing about n1 and n2 but is not in their membership yet.
+	existingIDs := []raft.NodeID{c.nodes[0].ID(), c.nodes[1].ID()}
+	n3 := lateJoiner(t, c, "n3-dns", existingIDs)
+	defer n3.Stop()
+
+	// A fake DNS resolver returns 3 IPs. The mapper translates each IP to the
+	// corresponding node ID — mirroring what a Kubernetes operator would do when
+	// pod names are predictable (e.g. from a StatefulSet).
+	ipToID := map[string]raft.NodeID{
+		"10.0.0.1": "n1",
+		"10.0.0.2": "n2",
+		"10.0.0.3": "n3-dns",
+	}
+	resolver := &fakeResolver{ips: []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}}
+	dns := dnsdiscovery.NewARecord(
+		"idprovider-raft.default.svc.cluster.local",
+		"7001",
+		func(ip string) (raft.NodeID, bool) {
+			id, ok := ipToID[ip]
+			return id, ok
+		},
+		resolver,
+	)
+
+	// Wire a DiscoveryAgent on the leader. The transport PeerAdder is a
+	// fakePeerAdder (memtransport routes by NodeID, not address); the Raft
+	// membership addition goes through raftPeerAdder.AddPeer → node.AddServer.
+	adder := &raftPeerAdder{tr: newFakePeerAdder(), node: c.nodes[leaderIdx]}
+	agent := discovery.NewAgent(dns, adder, 20*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testElectionTimeout)
+	defer cancel()
+	go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable here.
+
+	// n3 must receive heartbeats and learn who the leader is.
 	waitLeaderKnown(t, n3, testElectionTimeout)
 }
 

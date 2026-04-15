@@ -24,8 +24,8 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 	}
 	switch op {
 	case configOpAdd:
-		if slices.Contains(n.cfg.Peers, id) {
-			return // already present
+		if id == n.cfg.ID || slices.Contains(n.cfg.Peers, id) {
+			return // self or already present
 		}
 		n.cfg.Peers = append(n.cfg.Peers, id)
 		n.storePeers()

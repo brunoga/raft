@@ -40,6 +40,80 @@ go build -o idprovider ./examples/idprovider
 
 After a leader is elected (~300 ms) any node's HTTP endpoint can be queried.
 
+## Kubernetes quick-start (DNS A-record discovery)
+
+In a Kubernetes StatefulSet backed by a headless service, each pod gets its own
+DNS A record. Use `--discover-dns` so nodes find each other automatically
+without a static `--peer` list.
+
+**Headless service** (exposes Raft gRPC on port 7001):
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: idprovider-raft
+spec:
+  clusterIP: None          # headless
+  selector:
+    app: idprovider
+  ports:
+    - name: raft
+      port: 7001
+```
+
+**StatefulSet** (three replicas):
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: idprovider
+spec:
+  replicas: 3
+  serviceName: idprovider-raft
+  selector:
+    matchLabels:
+      app: idprovider
+  template:
+    metadata:
+      labels:
+        app: idprovider
+    spec:
+      containers:
+        - name: idprovider
+          image: idprovider:latest
+          args:
+            - --id=$(POD_IP)
+            - --raft-addr=:7001
+            - --http-addr=:8001
+            - --data-dir=/data
+            - --discover-dns=idprovider-raft.default.svc.cluster.local
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+Each pod sets `--id` to its own pod IP (via the `status.podIP` downward API).
+`--discover-dns` resolves the headless service hostname to all pod IPs; each IP
+is used directly as the peer's node ID and contacted on the Raft port.
+
+> **Note**: when using `--discover-dns`, the node's `--id` must equal its
+> IP address as it appears in DNS. This is the standard pattern for Kubernetes
+> headless services. SRV-record discovery with custom node ID mapping requires
+> calling `dnsdiscovery.NewSRV` programmatically.
+
 ## HTTP API
 
 ### Domain management
@@ -184,9 +258,16 @@ curl -s http://localhost:8001/status | jq
 | `--http-addr` | `:8001` | HTTP listen address for client requests |
 | `--data-dir` | required | Directory for persistent log and snapshot |
 | `--peer id=addr` | (repeatable) | Peer node: ID and its Raft gRPC address |
+| `--udp-discovery` | `false` | Use UDP broadcast for peer discovery |
+| `--udp-broadcast-addr` | `255.255.255.255:9199` | UDP broadcast address |
+| `--udp-discovery-timeout` | `3s` | Initial UDP discovery window |
+| `--discover-dns` | | DNS hostname for A-record peer discovery (Kubernetes headless service) |
+| `--discover-dns-port` | `7001` | Raft gRPC port for DNS-discovered peers |
 | `--tls-cert` | | PEM certificate file for mTLS (must be set with `--tls-key` and `--tls-ca`) |
 | `--tls-key` | | PEM private key file for mTLS |
 | `--tls-ca` | | PEM CA certificate file for mTLS peer verification |
+
+`--peer`, `--udp-discovery`, and `--discover-dns` are mutually exclusive: choose one.
 
 All three TLS flags must be provided together or omitted entirely. When set,
 all peer-to-peer Raft RPCs are encrypted and mutually authenticated.

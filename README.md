@@ -2,7 +2,7 @@
 
 A production-grade implementation of the [Raft consensus algorithm](https://raft.github.io/) in Go.
 
-**Raft §§ implemented:** leader election, log replication, log compaction (snapshots), cluster membership changes (single-server and joint consensus), leadership transfer, pre-vote, linearizable reads (ReadIndex and clock-based lease reads), and an exactly-once client protocol.
+**Raft §§ implemented:** leader election, log replication, log compaction (snapshots), cluster membership changes (single-server and joint consensus), leadership transfer, pre-vote, linearizable reads (ReadIndex and clock-based lease reads), an exactly-once client protocol, and multi-raft (thousands of independent groups on shared infrastructure).
 
 ```
 go get github.com/brunoga/raft
@@ -29,8 +29,9 @@ Requires Go 1.22+.
 13. [Observability — metrics and tracing](#observability--metrics-and-tracing)
 14. [Testing utilities](#testing-utilities)
 15. [Advanced features](#advanced-features)
-16. [Caveats and known limitations](#caveats-and-known-limitations)
-17. [Reference implementation](#reference-implementation)
+16. [Multi-Raft — thousands of groups on shared infrastructure](#multi-raft--thousands-of-groups-on-shared-infrastructure)
+17. [Caveats and known limitations](#caveats-and-known-limitations)
+18. [Reference implementation](#reference-implementation)
 
 ---
 
@@ -104,31 +105,45 @@ func main() {
 ## Architecture overview
 
 ```
-┌────────────────────────────────────────────────────┐
-│                  Your application                  │
-│  StateMachine   Propose / ReadIndex / membership   │
-└───────────┬──────────────────┬─────────────────────┘
-            │                  │
-     ┌──────▼──────┐    ┌──────▼──────┐
-     │  raft.Node  │    │  raft.Node  │   … N nodes
-     │  event loop │    │  event loop │
-     └──────┬──────┘    └──────┬──────┘
-            │  Transport RPC   │
-     ┌──────▼──────────────────▼──────┐
-     │  memtransport  │  grpctransport│
-     └────────────────┴───────────────┘
-            │
-     ┌──────▼──────────────────────────┐
-     │  memstore (tests)               │
-     │  filestore (production)         │
-     └─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     Your application                     │
+│  StateMachine    Propose / ReadIndex / membership        │
+└────────────┬───────────────────────┬─────────────────────┘
+             │                       │
+      ┌──────▼───────────────────────▼──────┐
+      │           raft.Manager              │  ← multi-raft
+      │  GroupID → *Node routing            │
+      │  StartAll / StopAll / RunTicker     │
+      └──────┬───────────────────────┬──────┘
+             │                       │
+      ┌──────▼──────┐         ┌──────▼──────┐
+      │  raft.Node  │   ...   │  raft.Node  │  G groups per machine
+      │  event loop │         │  event loop │
+      └──────┬──────┘         └──────┬──────┘
+             │   Transport RPC       │
+      ┌──────▼───────────────────────▼──────┐
+      │  memtransport  │  grpctransport      │
+      │                │  (batched hb: O(P)) │
+      └────────────────┴─────────────────────┘
+             │
+      ┌──────▼────────────────────────────────┐
+      │  memstore (tests)                     │
+      │  filestore — groups/<id>/ per group   │
+      └───────────────────────────────────────┘
 ```
 
-Each node runs several goroutines internally:
-- **Event loop** — processes all Raft RPCs, timers, and proposals sequentially. Never blocks.
-- **Apply loop** — delivers committed entries to `StateMachine.Apply` and coordinates snapshots. Runs concurrently with the event loop but communicates only via channels.
-- **Ticker** (optional) — fires `Tick()` at `TickInterval` when `TickInterval > 0`. Absent when ticks are driven manually.
-- **Per-peer heartbeat pump** — one goroutine per peer, keeps heartbeat sends off the event loop. Uses a size-1 channel so a slow peer never stalls other peers.
+### Per-node goroutine budget
+
+Each `*Node` runs the following persistent goroutines:
+
+| Goroutine | Count | Purpose |
+|-----------|-------|---------|
+| Event loop | 1 | Processes RPCs, timers, and proposals sequentially |
+| Apply loop | 1 | Delivers committed entries to `StateMachine.Apply`, manages snapshots |
+| Ticker | 0 or 1 | Fires `Tick()` at `TickInterval`; absent when `TickInterval == 0` |
+| Heartbeat pump | P (one per peer) | Keeps heartbeat RPCs off the event loop; size-1 channel drops redundant sends |
+
+**Budget at scale**: with G groups and P peers per group, each physical node runs approximately `G × (2 + P)` persistent goroutines. At G = 1,000 and P = 3, that is ~5,000 goroutines — well within Go's scheduler capacity. `Manager.RunTicker` adds one additional goroutine to fan-out `Tick()` across all groups in parallel.
 
 ---
 
@@ -518,6 +533,18 @@ tr.AddPeer("n2", "10.0.0.2:7001")
 tr.AddPeer("n3", "10.0.0.3:7001")
 ```
 
+In multi-raft deployments, install `Manager.Lookup` as the group-lookup
+function so inbound RPCs are routed to the correct group by the `GroupID`
+field embedded in every proto message:
+
+```go
+mgr := raft.NewManager()
+// ... add nodes to mgr ...
+tr.SetGroupLookup(mgr.Lookup)
+```
+
+`SetGroupLookup` also enables **heartbeat batching** — see [Multi-Raft](#multi-raft--thousands-of-groups-on-shared-infrastructure).
+
 **TLS / mTLS** via `WithTLSConfig`:
 
 ```go
@@ -716,6 +743,104 @@ goroutine on every tick. The pump uses a size-1 channel; if the previous
 heartbeat hasn't been sent yet, the newer one replaces it (a missed heartbeat
 only delays follower timer resets — it does not affect safety). Replication
 RPCs continue to use per-goroutine sends to preserve pipelining.
+
+---
+
+## Multi-Raft — thousands of groups on shared infrastructure
+
+`raft.Manager` multiplexes independent Raft groups on a single physical node.
+The typical use-case is a sharded database where each shard is its own Raft
+group, and each machine hosts one replica per shard.
+
+```
+Physical node A          Physical node B          Physical node C
+┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+│ Manager      │         │ Manager      │         │ Manager      │
+│  group 1 (A) │◄───────►│  group 1 (B) │◄───────►│  group 1 (C) │  shard 1
+│  group 2 (A) │◄───────►│  group 2 (B) │◄───────►│  group 2 (C) │  shard 2
+│  group 3 (A) │◄───────►│  group 3 (B) │◄───────►│  group 3 (C) │  shard 3
+│  …           │         │  …           │         │  …           │
+└──────────────┘         └──────────────┘         └──────────────┘
+```
+
+### Setting up a Manager
+
+```go
+mgr := raft.NewManager()
+
+// Construct one Node per group. Every group must have a unique GroupID.
+for _, shard := range shards {
+    cfg := raft.DefaultConfig()
+    cfg.GroupID = shard.ID                          // non-zero uint64
+    cfg.ID      = myNodeID
+    cfg.Peers   = peersForShard(shard.ID)
+    cfg.Storage = filestore.Open(fmt.Sprintf("data/groups/%d", shard.ID))
+    cfg.StateMachine = newShardSM(shard)
+    cfg.Transport = tr                              // shared transport
+    node, _ := raft.New(cfg)
+    tr.Register(myNodeID, node)                     // single-group: still needed
+    mgr.Add(shard.ID, node)
+}
+
+// Install the group-lookup function so inbound RPCs route by GroupID.
+tr.SetGroupLookup(mgr.Lookup)
+
+// Start all nodes and drive their tick clocks with one shared goroutine.
+mgr.StartAll()
+defer mgr.StopAll()
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+go mgr.RunTicker(ctx, 10*time.Millisecond)
+```
+
+### Storage partitioning convention
+
+Each group must have its own storage directory to avoid log and snapshot
+collisions:
+
+```
+/var/lib/myapp/raft/
+  groups/
+    1/      ← FileStore for group 1
+    2/      ← FileStore for group 2
+    …
+```
+
+```go
+store, err := filestore.Open(fmt.Sprintf("/var/lib/myapp/raft/groups/%d", groupID))
+```
+
+### Heartbeat batching
+
+Without batching, G groups × P peers = G×P `AppendEntries` RPCs per tick
+interval. At 1,000 groups × 3 peers that is 3,000 RPCs every 10 ms — a
+significant fraction of a node's bandwidth.
+
+`GRPCTransport` automatically batches all pure heartbeats (regular + read-barrier)
+to the same peer into a single `BatchHeartbeats` RPC, reducing the cost to O(P)
+per interval. Batching is enabled by `SetGroupLookup`; single-group deployments
+are unaffected.
+
+```
+Before: 1,000 groups × 3 peers = 3,000 AppendEntries RPCs per tick
+After:                            3 BatchHeartbeats RPCs per tick
+```
+
+The batcher opens a 1 ms collection window after the first heartbeat arrives so
+that all groups' heartbeats (which fire together via `RunTicker`) are coalesced
+before the RPC is sent. `BatchHeartbeatsServed()` on the receiving transport
+returns the cumulative count for monitoring.
+
+### Observing group status
+
+```go
+statuses := mgr.StatusAll()  // []GroupStatus — point-in-time snapshot
+for _, s := range statuses {
+    fmt.Printf("group=%d node=%s state=%s term=%d lastApplied=%d\n",
+        s.GroupID, s.NodeID, s.State, s.Term, s.LastApplied)
+}
+```
 
 ---
 
