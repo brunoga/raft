@@ -33,6 +33,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -74,6 +75,10 @@ type Config struct {
 	// Peers not heard from within TTL are excluded from Discover results.
 	// Defaults to 3 × Interval.
 	TTL time.Duration
+
+	// Logger is used to log peer-discovery events (e.g. when a new peer is
+	// first heard from). Defaults to slog.Default() when nil.
+	Logger *slog.Logger
 }
 
 // announcement is the wire format for a single UDP broadcast message.
@@ -94,9 +99,10 @@ type peerEntry struct {
 // Discover returns a point-in-time snapshot of live peers (those heard from
 // within the TTL window). Both are safe for concurrent use.
 type UDPBroadcast struct {
-	cfg   Config
-	mu    sync.RWMutex
-	peers map[raft.NodeID]peerEntry
+	cfg    Config
+	logger *slog.Logger
+	mu     sync.RWMutex
+	peers  map[raft.NodeID]peerEntry
 }
 
 // New validates cfg, applies defaults, and returns a UDPBroadcast ready to run.
@@ -126,9 +132,14 @@ func New(cfg *Config) (*UDPBroadcast, error) {
 	if c.TTL <= 0 {
 		c.TTL = 3 * c.Interval
 	}
+	logger := c.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &UDPBroadcast{
-		cfg:   c,
-		peers: make(map[raft.NodeID]peerEntry),
+		cfg:    c,
+		logger: logger,
+		peers:  make(map[raft.NodeID]peerEntry),
 	}, nil
 }
 
@@ -203,8 +214,12 @@ func (u *UDPBroadcast) run(ctx context.Context, conn net.PacketConn) error {
 				continue // ignore own announcements
 			}
 			u.mu.Lock()
+			_, known := u.peers[id]
 			u.peers[id] = peerEntry{addr: ann.Addr, lastSeen: time.Now()}
 			u.mu.Unlock()
+			if !known {
+				u.logger.Info("udpbroadcast: discovered peer", "id", id, "addr", ann.Addr)
+			}
 		}
 	}()
 

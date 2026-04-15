@@ -149,6 +149,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
 	// Peer collections: populated from --peer flags or the UDP discovery window.
 	peerIDs := make([]raft.NodeID, 0, len(peers))
 	peerRaftAddrs := make(map[raft.NodeID]string)
@@ -185,6 +187,7 @@ func main() {
 			NodeID:        raft.NodeID(*id),
 			Addr:          *raftAddr,
 			BroadcastAddr: *udpBroadcastAddr,
+			Logger:        logger,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "idprovider: udpbroadcast.New: %v\n", err)
@@ -264,7 +267,7 @@ func main() {
 	cfg.Storage = store
 	cfg.StateMachine = sm
 	cfg.Transport = tr
-	cfg.Logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg.Logger = logger
 
 	node, err := raft.New(&cfg)
 	if err != nil {
