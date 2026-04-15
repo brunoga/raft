@@ -124,18 +124,27 @@ func (m *Manager) StartAll() {
 	}
 }
 
-// StopAll calls Stop on every registered node and blocks until all have
-// stopped.
+// StopAll stops every registered node concurrently and blocks until all have
+// stopped. It also removes all nodes from the Manager so that Add can be
+// called again for the same GroupIDs after a restart.
 func (m *Manager) StopAll() {
-	m.mu.RLock()
+	m.mu.Lock()
 	nodes := make([]*Node, 0, len(m.nodes))
 	for _, n := range m.nodes {
 		nodes = append(nodes, n)
 	}
-	m.mu.RUnlock()
+	m.nodes = make(map[uint64]*Node) // clear so the Manager can be reused
+	m.mu.Unlock()
+
+	var wg sync.WaitGroup
 	for _, n := range nodes {
-		n.Stop()
+		wg.Add(1)
+		go func(nd *Node) {
+			defer wg.Done()
+			nd.Stop()
+		}(n)
 	}
+	wg.Wait()
 }
 
 // StatusAll returns a point-in-time snapshot of every registered group's
