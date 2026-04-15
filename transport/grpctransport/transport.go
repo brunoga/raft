@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -43,11 +44,25 @@ type GRPCTransport struct {
 	dialOpts []grpc.DialOption // options applied to every outbound connection
 
 	mu          sync.RWMutex
-	handlers    map[raft.NodeID]raft.Handler     // id → registered handler
-	peers       map[raft.NodeID]string           // id → "host:port" address
-	clients     map[string]*grpc.ClientConn      // address → connection (cached)
+	handlers    map[raft.NodeID]raft.Handler      // id → registered handler
+	peers       map[raft.NodeID]string            // id → "host:port" address
+	clients     map[string]*grpc.ClientConn       // address → connection (cached)
 	groupLookup func(uint64) (raft.Handler, bool) // optional: route by GroupID
+
+	hbBatcher *heartbeatBatcher // nil until SetGroupLookup is called
+
+	// batchHBServed counts BatchHeartbeats RPCs handled by this transport's
+	// server. Useful for verifying batching in tests and for monitoring.
+	batchHBServed atomic.Int64
 }
+
+// BatchHeartbeatsServed returns the number of BatchHeartbeats RPCs this
+// transport has served as a receiver. Intended for testing and monitoring.
+func (t *GRPCTransport) BatchHeartbeatsServed() int64 { return t.batchHBServed.Load() }
+
+// heartbeatRPCTimeout returns the timeout for a single BatchHeartbeats call.
+// Heartbeats are best-effort, so we use a moderate fixed timeout.
+func (t *GRPCTransport) heartbeatRPCTimeout() time.Duration { return 5 * time.Second }
 
 // Option is a functional option for GRPCTransport.
 type Option func(*options)
@@ -184,16 +199,30 @@ func (t *GRPCTransport) Register(id raft.NodeID, h raft.Handler) {
 // primary routing mechanism for multi-Raft deployments; single-group usage
 // does not need to call this method.
 //
+// SetGroupLookup also enables heartbeat batching: outbound pure heartbeats
+// (AppendEntries with no entries and no ReadBarrier) are coalesced per-peer
+// into a single BatchHeartbeats RPC, reducing cost from O(G×P) to O(P) per
+// tick interval.
+//
 // The lookup function is typically Manager.Lookup.
 func (t *GRPCTransport) SetGroupLookup(fn func(uint64) (raft.Handler, bool)) {
 	t.mu.Lock()
 	t.groupLookup = fn
+	if t.hbBatcher == nil {
+		t.hbBatcher = newHeartbeatBatcher(t)
+	}
 	t.mu.Unlock()
 }
 
 // Close shuts down the server gracefully and closes all cached client
 // connections.
 func (t *GRPCTransport) Close() error {
+	t.mu.RLock()
+	batcher := t.hbBatcher
+	t.mu.RUnlock()
+	if batcher != nil {
+		batcher.stop()
+	}
 	t.server.GracefulStop()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -256,6 +285,16 @@ func (t *GRPCTransport) RequestVote(ctx context.Context, to raft.NodeID, req *ra
 }
 
 func (t *GRPCTransport) AppendEntries(ctx context.Context, to raft.NodeID, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	// In multi-Raft mode, pure heartbeats (no entries, no read barrier) are
+	// batched per-peer to reduce RPC count from O(G×P) to O(P) per tick.
+	if len(req.Entries) == 0 && req.ReadBarrier == 0 {
+		t.mu.RLock()
+		batcher := t.hbBatcher
+		t.mu.RUnlock()
+		if batcher != nil {
+			return batcher.Send(ctx, to, req)
+		}
+	}
 	c, err := t.clientFor(to)
 	if err != nil {
 		return nil, err
@@ -425,4 +464,47 @@ func (s *grpcServer) ReadIndex(ctx context.Context, req *pb.ReadIndexRequest) (*
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	return riRespToProto(resp), nil
+}
+
+// BatchHeartbeats demultiplexes a batch of heartbeats, dispatching a synthetic
+// empty AppendEntries to each registered group and collecting the responses.
+// Unknown groups are skipped with a non-success result rather than failing the
+// whole batch, so a late-joiner or just-removed group doesn't disrupt others.
+func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbeatRequest) (*pb.BatchedHeartbeatResponse, error) {
+	s.transport.batchHBServed.Add(1)
+	resp := &pb.BatchedHeartbeatResponse{
+		Results: make([]*pb.HeartbeatResult, 0, len(req.Entries)),
+	}
+	for _, entry := range req.Entries {
+		h, hErr := s.handlerForGroup(ctx, entry.GroupId)
+		if hErr != nil {
+			resp.Results = append(resp.Results, &pb.HeartbeatResult{
+				GroupId: entry.GroupId,
+				Success: false,
+			})
+			continue
+		}
+		aeReq := &raft.AppendEntriesRequest{
+			GroupID:      entry.GroupId,
+			Term:         raft.Term(entry.Term),
+			LeaderID:     raft.NodeID(entry.LeaderId),
+			PrevLogIndex: raft.Index(entry.PrevLogIndex),
+			PrevLogTerm:  raft.Term(entry.PrevLogTerm),
+			LeaderCommit: raft.Index(entry.LeaderCommit),
+		}
+		aeResp, aeErr := h.HandleAppendEntries(ctx, aeReq)
+		if aeErr != nil {
+			resp.Results = append(resp.Results, &pb.HeartbeatResult{
+				GroupId: entry.GroupId,
+				Success: false,
+			})
+			continue
+		}
+		resp.Results = append(resp.Results, &pb.HeartbeatResult{
+			GroupId: entry.GroupId,
+			Term:    uint64(aeResp.Term),
+			Success: aeResp.Success,
+		})
+	}
+	return resp, nil
 }

@@ -747,6 +747,240 @@ func (x *ReadIndexResponse) GetLeaderId() string {
 	return ""
 }
 
+// HeartbeatEntry carries the fields of an empty AppendEntries for one group.
+type HeartbeatEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GroupId       uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId      string                 `protobuf:"bytes,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	PrevLogIndex  uint64                 `protobuf:"varint,4,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
+	PrevLogTerm   uint64                 `protobuf:"varint,5,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
+	LeaderCommit  uint64                 `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatEntry) Reset() {
+	*x = HeartbeatEntry{}
+	mi := &file_raft_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatEntry) ProtoMessage() {}
+
+func (x *HeartbeatEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatEntry.ProtoReflect.Descriptor instead.
+func (*HeartbeatEntry) Descriptor() ([]byte, []int) {
+	return file_raft_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *HeartbeatEntry) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *HeartbeatEntry) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *HeartbeatEntry) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *HeartbeatEntry) GetPrevLogIndex() uint64 {
+	if x != nil {
+		return x.PrevLogIndex
+	}
+	return 0
+}
+
+func (x *HeartbeatEntry) GetPrevLogTerm() uint64 {
+	if x != nil {
+		return x.PrevLogTerm
+	}
+	return 0
+}
+
+func (x *HeartbeatEntry) GetLeaderCommit() uint64 {
+	if x != nil {
+		return x.LeaderCommit
+	}
+	return 0
+}
+
+// HeartbeatResult is the per-group response to a HeartbeatEntry.
+type HeartbeatResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GroupId       uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	Success       bool                   `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatResult) Reset() {
+	*x = HeartbeatResult{}
+	mi := &file_raft_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResult) ProtoMessage() {}
+
+func (x *HeartbeatResult) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResult.ProtoReflect.Descriptor instead.
+func (*HeartbeatResult) Descriptor() ([]byte, []int) {
+	return file_raft_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *HeartbeatResult) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *HeartbeatResult) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *HeartbeatResult) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+type BatchedHeartbeatRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entries       []*HeartbeatEntry      `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchedHeartbeatRequest) Reset() {
+	*x = BatchedHeartbeatRequest{}
+	mi := &file_raft_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchedHeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchedHeartbeatRequest) ProtoMessage() {}
+
+func (x *BatchedHeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchedHeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*BatchedHeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_raft_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *BatchedHeartbeatRequest) GetEntries() []*HeartbeatEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+type BatchedHeartbeatResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Results       []*HeartbeatResult     `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchedHeartbeatResponse) Reset() {
+	*x = BatchedHeartbeatResponse{}
+	mi := &file_raft_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchedHeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchedHeartbeatResponse) ProtoMessage() {}
+
+func (x *BatchedHeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_raft_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchedHeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*BatchedHeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_raft_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *BatchedHeartbeatResponse) GetResults() []*HeartbeatResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
+}
+
 var File_raft_proto protoreflect.FileDescriptor
 
 const file_raft_proto_rawDesc = "" +
@@ -804,14 +1038,30 @@ const file_raft_proto_rawDesc = "" +
 	"\x11ReadIndexResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x1b\n" +
-	"\tleader_id\x18\x03 \x01(\tR\bleaderId2\xea\x02\n" +
+	"\tleader_id\x18\x03 \x01(\tR\bleaderId\"\xcb\x01\n" +
+	"\x0eHeartbeatEntry\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x03 \x01(\tR\bleaderId\x12$\n" +
+	"\x0eprev_log_index\x18\x04 \x01(\x04R\fprevLogIndex\x12\"\n" +
+	"\rprev_log_term\x18\x05 \x01(\x04R\vprevLogTerm\x12#\n" +
+	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"Z\n" +
+	"\x0fHeartbeatResult\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x18\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\"I\n" +
+	"\x17BatchedHeartbeatRequest\x12.\n" +
+	"\aentries\x18\x01 \x03(\v2\x14.raft.HeartbeatEntryR\aentries\"K\n" +
+	"\x18BatchedHeartbeatResponse\x12/\n" +
+	"\aresults\x18\x01 \x03(\v2\x15.raft.HeartbeatResultR\aresults2\xbc\x03\n" +
 	"\vRaftService\x12B\n" +
 	"\vRequestVote\x12\x18.raft.RequestVoteRequest\x1a\x19.raft.RequestVoteResponse\x12H\n" +
 	"\rAppendEntries\x12\x1a.raft.AppendEntriesRequest\x1a\x1b.raft.AppendEntriesResponse\x12N\n" +
 	"\x0fInstallSnapshot\x12\x1c.raft.InstallSnapshotRequest\x1a\x1d.raft.InstallSnapshotResponse\x12?\n" +
 	"\n" +
 	"TimeoutNow\x12\x17.raft.TimeoutNowRequest\x1a\x18.raft.TimeoutNowResponse\x12<\n" +
-	"\tReadIndex\x12\x16.raft.ReadIndexRequest\x1a\x17.raft.ReadIndexResponseB8Z6github.com/brunoga/raft/transport/grpctransport/raftpbb\x06proto3"
+	"\tReadIndex\x12\x16.raft.ReadIndexRequest\x1a\x17.raft.ReadIndexResponse\x12P\n" +
+	"\x0fBatchHeartbeats\x12\x1d.raft.BatchedHeartbeatRequest\x1a\x1e.raft.BatchedHeartbeatResponseB8Z6github.com/brunoga/raft/transport/grpctransport/raftpbb\x06proto3"
 
 var (
 	file_raft_proto_rawDescOnce sync.Once
@@ -825,37 +1075,45 @@ func file_raft_proto_rawDescGZIP() []byte {
 	return file_raft_proto_rawDescData
 }
 
-var file_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_raft_proto_goTypes = []any{
-	(*RequestVoteRequest)(nil),      // 0: raft.RequestVoteRequest
-	(*RequestVoteResponse)(nil),     // 1: raft.RequestVoteResponse
-	(*LogEntry)(nil),                // 2: raft.LogEntry
-	(*AppendEntriesRequest)(nil),    // 3: raft.AppendEntriesRequest
-	(*AppendEntriesResponse)(nil),   // 4: raft.AppendEntriesResponse
-	(*InstallSnapshotRequest)(nil),  // 5: raft.InstallSnapshotRequest
-	(*InstallSnapshotResponse)(nil), // 6: raft.InstallSnapshotResponse
-	(*TimeoutNowRequest)(nil),       // 7: raft.TimeoutNowRequest
-	(*TimeoutNowResponse)(nil),      // 8: raft.TimeoutNowResponse
-	(*ReadIndexRequest)(nil),        // 9: raft.ReadIndexRequest
-	(*ReadIndexResponse)(nil),       // 10: raft.ReadIndexResponse
+	(*RequestVoteRequest)(nil),       // 0: raft.RequestVoteRequest
+	(*RequestVoteResponse)(nil),      // 1: raft.RequestVoteResponse
+	(*LogEntry)(nil),                 // 2: raft.LogEntry
+	(*AppendEntriesRequest)(nil),     // 3: raft.AppendEntriesRequest
+	(*AppendEntriesResponse)(nil),    // 4: raft.AppendEntriesResponse
+	(*InstallSnapshotRequest)(nil),   // 5: raft.InstallSnapshotRequest
+	(*InstallSnapshotResponse)(nil),  // 6: raft.InstallSnapshotResponse
+	(*TimeoutNowRequest)(nil),        // 7: raft.TimeoutNowRequest
+	(*TimeoutNowResponse)(nil),       // 8: raft.TimeoutNowResponse
+	(*ReadIndexRequest)(nil),         // 9: raft.ReadIndexRequest
+	(*ReadIndexResponse)(nil),        // 10: raft.ReadIndexResponse
+	(*HeartbeatEntry)(nil),           // 11: raft.HeartbeatEntry
+	(*HeartbeatResult)(nil),          // 12: raft.HeartbeatResult
+	(*BatchedHeartbeatRequest)(nil),  // 13: raft.BatchedHeartbeatRequest
+	(*BatchedHeartbeatResponse)(nil), // 14: raft.BatchedHeartbeatResponse
 }
 var file_raft_proto_depIdxs = []int32{
 	2,  // 0: raft.AppendEntriesRequest.entries:type_name -> raft.LogEntry
-	0,  // 1: raft.RaftService.RequestVote:input_type -> raft.RequestVoteRequest
-	3,  // 2: raft.RaftService.AppendEntries:input_type -> raft.AppendEntriesRequest
-	5,  // 3: raft.RaftService.InstallSnapshot:input_type -> raft.InstallSnapshotRequest
-	7,  // 4: raft.RaftService.TimeoutNow:input_type -> raft.TimeoutNowRequest
-	9,  // 5: raft.RaftService.ReadIndex:input_type -> raft.ReadIndexRequest
-	1,  // 6: raft.RaftService.RequestVote:output_type -> raft.RequestVoteResponse
-	4,  // 7: raft.RaftService.AppendEntries:output_type -> raft.AppendEntriesResponse
-	6,  // 8: raft.RaftService.InstallSnapshot:output_type -> raft.InstallSnapshotResponse
-	8,  // 9: raft.RaftService.TimeoutNow:output_type -> raft.TimeoutNowResponse
-	10, // 10: raft.RaftService.ReadIndex:output_type -> raft.ReadIndexResponse
-	6,  // [6:11] is the sub-list for method output_type
-	1,  // [1:6] is the sub-list for method input_type
-	1,  // [1:1] is the sub-list for extension type_name
-	1,  // [1:1] is the sub-list for extension extendee
-	0,  // [0:1] is the sub-list for field type_name
+	11, // 1: raft.BatchedHeartbeatRequest.entries:type_name -> raft.HeartbeatEntry
+	12, // 2: raft.BatchedHeartbeatResponse.results:type_name -> raft.HeartbeatResult
+	0,  // 3: raft.RaftService.RequestVote:input_type -> raft.RequestVoteRequest
+	3,  // 4: raft.RaftService.AppendEntries:input_type -> raft.AppendEntriesRequest
+	5,  // 5: raft.RaftService.InstallSnapshot:input_type -> raft.InstallSnapshotRequest
+	7,  // 6: raft.RaftService.TimeoutNow:input_type -> raft.TimeoutNowRequest
+	9,  // 7: raft.RaftService.ReadIndex:input_type -> raft.ReadIndexRequest
+	13, // 8: raft.RaftService.BatchHeartbeats:input_type -> raft.BatchedHeartbeatRequest
+	1,  // 9: raft.RaftService.RequestVote:output_type -> raft.RequestVoteResponse
+	4,  // 10: raft.RaftService.AppendEntries:output_type -> raft.AppendEntriesResponse
+	6,  // 11: raft.RaftService.InstallSnapshot:output_type -> raft.InstallSnapshotResponse
+	8,  // 12: raft.RaftService.TimeoutNow:output_type -> raft.TimeoutNowResponse
+	10, // 13: raft.RaftService.ReadIndex:output_type -> raft.ReadIndexResponse
+	14, // 14: raft.RaftService.BatchHeartbeats:output_type -> raft.BatchedHeartbeatResponse
+	9,  // [9:15] is the sub-list for method output_type
+	3,  // [3:9] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_raft_proto_init() }
@@ -869,7 +1127,7 @@ func file_raft_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_raft_proto_rawDesc), len(file_raft_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

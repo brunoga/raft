@@ -24,6 +24,7 @@ const (
 	RaftService_InstallSnapshot_FullMethodName = "/raft.RaftService/InstallSnapshot"
 	RaftService_TimeoutNow_FullMethodName      = "/raft.RaftService/TimeoutNow"
 	RaftService_ReadIndex_FullMethodName       = "/raft.RaftService/ReadIndex"
+	RaftService_BatchHeartbeats_FullMethodName = "/raft.RaftService/BatchHeartbeats"
 )
 
 // RaftServiceClient is the client API for RaftService service.
@@ -37,6 +38,7 @@ type RaftServiceClient interface {
 	InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error)
 	TimeoutNow(ctx context.Context, in *TimeoutNowRequest, opts ...grpc.CallOption) (*TimeoutNowResponse, error)
 	ReadIndex(ctx context.Context, in *ReadIndexRequest, opts ...grpc.CallOption) (*ReadIndexResponse, error)
+	BatchHeartbeats(ctx context.Context, in *BatchedHeartbeatRequest, opts ...grpc.CallOption) (*BatchedHeartbeatResponse, error)
 }
 
 type raftServiceClient struct {
@@ -97,6 +99,16 @@ func (c *raftServiceClient) ReadIndex(ctx context.Context, in *ReadIndexRequest,
 	return out, nil
 }
 
+func (c *raftServiceClient) BatchHeartbeats(ctx context.Context, in *BatchedHeartbeatRequest, opts ...grpc.CallOption) (*BatchedHeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchedHeartbeatResponse)
+	err := c.cc.Invoke(ctx, RaftService_BatchHeartbeats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServiceServer is the server API for RaftService service.
 // All implementations must embed UnimplementedRaftServiceServer
 // for forward compatibility.
@@ -108,6 +120,7 @@ type RaftServiceServer interface {
 	InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
 	TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error)
 	ReadIndex(context.Context, *ReadIndexRequest) (*ReadIndexResponse, error)
+	BatchHeartbeats(context.Context, *BatchedHeartbeatRequest) (*BatchedHeartbeatResponse, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -132,6 +145,9 @@ func (UnimplementedRaftServiceServer) TimeoutNow(context.Context, *TimeoutNowReq
 }
 func (UnimplementedRaftServiceServer) ReadIndex(context.Context, *ReadIndexRequest) (*ReadIndexResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadIndex not implemented")
+}
+func (UnimplementedRaftServiceServer) BatchHeartbeats(context.Context, *BatchedHeartbeatRequest) (*BatchedHeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchHeartbeats not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 func (UnimplementedRaftServiceServer) testEmbeddedByValue()                     {}
@@ -244,6 +260,24 @@ func _RaftService_ReadIndex_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftService_BatchHeartbeats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchedHeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).BatchHeartbeats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_BatchHeartbeats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).BatchHeartbeats(ctx, req.(*BatchedHeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -270,6 +304,10 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReadIndex",
 			Handler:    _RaftService_ReadIndex_Handler,
+		},
+		{
+			MethodName: "BatchHeartbeats",
+			Handler:    _RaftService_BatchHeartbeats_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
