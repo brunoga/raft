@@ -628,3 +628,86 @@ func (h handlerFunc) HandleAppendEntries(ctx context.Context, req *raft.AppendEn
 	}
 	return h.Handler.HandleAppendEntries(ctx, req)
 }
+
+// ---- TestGRPC_SetGroupLookup ------------------------------------------------
+
+// signalHandler is a minimal raft.Handler that fires a channel on every
+// HandleAppendEntries call. All other methods return zero-value responses.
+type signalHandler struct {
+	called chan struct{}
+}
+
+func (h *signalHandler) HandleRequestVote(_ context.Context, _ *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {
+	return &raft.RequestVoteResponse{}, nil
+}
+func (h *signalHandler) HandleAppendEntries(_ context.Context, _ *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	select {
+	case h.called <- struct{}{}:
+	default:
+	}
+	return &raft.AppendEntriesResponse{}, nil
+}
+func (h *signalHandler) HandleInstallSnapshot(_ context.Context, _ *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	return &raft.InstallSnapshotResponse{}, nil
+}
+func (h *signalHandler) HandleTimeoutNow(_ context.Context, _ *raft.TimeoutNowRequest) (*raft.TimeoutNowResponse, error) {
+	return &raft.TimeoutNowResponse{}, nil
+}
+func (h *signalHandler) HandleReadIndex(_ context.Context, _ *raft.ReadIndexRequest) (*raft.ReadIndexResponse, error) {
+	return &raft.ReadIndexResponse{}, nil
+}
+
+// TestGRPC_SetGroupLookup verifies that SetGroupLookup routes inbound RPCs to
+// the correct handler based on the GroupID carried in the request proto.
+func TestGRPC_SetGroupLookup(t *testing.T) {
+	srv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen server: %v", err)
+	}
+	defer srv.Close()
+
+	h1 := &signalHandler{called: make(chan struct{}, 1)}
+	h2 := &signalHandler{called: make(chan struct{}, 1)}
+
+	groups := map[uint64]raft.Handler{1: h1, 2: h2}
+	srv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := groups[gid]
+		return h, ok
+	})
+
+	cli, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen client: %v", err)
+	}
+	defer cli.Close()
+	cli.AddPeer("srv", srv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Request for group 1 must reach h1.
+	if _, err := cli.AppendEntries(ctx, "srv", &raft.AppendEntriesRequest{GroupID: 1, Term: 1}); err != nil {
+		t.Fatalf("AppendEntries group 1: %v", err)
+	}
+	select {
+	case <-h1.called:
+	case <-ctx.Done():
+		t.Fatal("group 1 handler not called")
+	}
+
+	// Request for group 2 must reach h2, not h1.
+	if _, err := cli.AppendEntries(ctx, "srv", &raft.AppendEntriesRequest{GroupID: 2, Term: 1}); err != nil {
+		t.Fatalf("AppendEntries group 2: %v", err)
+	}
+	select {
+	case <-h2.called:
+	case <-ctx.Done():
+		t.Fatal("group 2 handler not called")
+	}
+	// h1 must not have been called a second time.
+	select {
+	case <-h1.called:
+		t.Fatal("group 1 handler called for a group-2 request")
+	default:
+	}
+}
