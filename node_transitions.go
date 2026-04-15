@@ -77,9 +77,11 @@ func (n *Node) becomePreCandidate() {
 	n.matchIndex = nil
 	n.receivedVoteSet = make(map[NodeID]bool)
 	n.resetElectionTimeout()
-	n.logger.Info("became pre-candidate", "term", n.currentTerm)
-	if n.cfg.Metrics != nil {
-		n.cfg.Metrics.StateChange(n.cfg.ID, prev, PreCandidate, n.currentTerm)
+	if prev != PreCandidate {
+		n.logger.Info("became pre-candidate", "term", n.currentTerm)
+		if n.cfg.Metrics != nil {
+			n.cfg.Metrics.StateChange(n.cfg.ID, prev, PreCandidate, n.currentTerm)
+		}
 	}
 
 	// A single-node cluster has nothing to pre-vote on.
