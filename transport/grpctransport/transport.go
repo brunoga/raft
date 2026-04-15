@@ -382,7 +382,14 @@ func (s *grpcServer) handlerForGroup(ctx context.Context, groupID uint64) (raft.
 	lookup := s.transport.groupLookup
 	s.transport.mu.RUnlock()
 
-	if lookup != nil && groupID != 0 {
+	if lookup != nil {
+		// In multi-Raft mode every inbound RPC must carry a non-zero GroupID.
+		// GroupID==0 is only valid for single-group deployments that have not
+		// called SetGroupLookup.
+		if groupID == 0 {
+			return nil, status.Error(codes.InvalidArgument,
+				"GroupID must be non-zero when SetGroupLookup is installed")
+		}
 		h, ok := lookup(groupID)
 		if !ok {
 			return nil, status.Errorf(codes.NotFound, "no handler for group %d", groupID)
