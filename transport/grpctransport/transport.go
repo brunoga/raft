@@ -53,14 +53,25 @@ type GRPCTransport struct {
 
 	hbBatcher *heartbeatBatcher // nil until SetGroupLookup is called
 
-	// batchHBServed counts BatchHeartbeats RPCs handled by this transport's
-	// server. Useful for verifying batching in tests and for monitoring.
-	batchHBServed atomic.Int64
+	// Counters for BatchHeartbeats server-side processing.
+	batchHBServed  atomic.Int64 // number of BatchHeartbeats RPCs received
+	batchHBEntries atomic.Int64 // total heartbeat entries processed across all RPCs
+	batchHBErrors  atomic.Int64 // entries that failed (lookup or dispatch error)
 }
 
 // BatchHeartbeatsServed returns the number of BatchHeartbeats RPCs this
 // transport has served as a receiver. Intended for testing and monitoring.
 func (t *GRPCTransport) BatchHeartbeatsServed() int64 { return t.batchHBServed.Load() }
+
+// BatchHeartbeatEntriesServed returns the total number of individual heartbeat
+// entries dispatched across all BatchHeartbeats RPCs. Dividing by
+// BatchHeartbeatsServed gives the average batch size.
+func (t *GRPCTransport) BatchHeartbeatEntriesServed() int64 { return t.batchHBEntries.Load() }
+
+// BatchHeartbeatErrors returns the number of heartbeat entries that could not
+// be dispatched (group not found or HandleAppendEntries error). A non-zero
+// sustained value warrants investigation.
+func (t *GRPCTransport) BatchHeartbeatErrors() int64 { return t.batchHBErrors.Load() }
 
 // heartbeatRPCTimeout returns the timeout for a single BatchHeartbeats call.
 // Heartbeats are best-effort, so we use a moderate fixed timeout.
@@ -477,6 +488,7 @@ func (s *grpcServer) ReadIndex(ctx context.Context, req *pb.ReadIndexRequest) (*
 // whole batch, so a late-joiner or just-removed group doesn't disrupt others.
 func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbeatRequest) (*pb.BatchedHeartbeatResponse, error) {
 	s.transport.batchHBServed.Add(1)
+	s.transport.batchHBEntries.Add(int64(len(req.Entries)))
 	resp := &pb.BatchedHeartbeatResponse{
 		Results: make([]*pb.HeartbeatResult, 0, len(req.Entries)),
 	}
@@ -490,6 +502,7 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 				slog.Uint64("group_id", entry.GroupId),
 				slog.Any("err", hErr),
 			)
+			s.transport.batchHBErrors.Add(1)
 			resp.Results = append(resp.Results, &pb.HeartbeatResult{
 				GroupId: entry.GroupId,
 				Success: false,
@@ -512,6 +525,7 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 				slog.Uint64("group_id", entry.GroupId),
 				slog.Any("err", aeErr),
 			)
+			s.transport.batchHBErrors.Add(1)
 			resp.Results = append(resp.Results, &pb.HeartbeatResult{
 				GroupId: entry.GroupId,
 				Success: false,
