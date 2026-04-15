@@ -481,7 +481,7 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 		if leaderID == "" {
 			return 0, &NotLeaderError{}
 		}
-		req := &ReadIndexRequest{Term: n.Term()}
+		req := &ReadIndexRequest{GroupID: n.cfg.GroupID, Term: n.Term()}
 		resp, err := n.cfg.Transport.ReadIndex(ctx, leaderID, req)
 		if err != nil {
 			return 0, err

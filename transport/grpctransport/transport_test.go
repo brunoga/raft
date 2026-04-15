@@ -506,3 +506,125 @@ func TestGRPC_TLS(t *testing.T) {
 		t.Errorf("node %d: tls=%q, want 'ok'", i+1, sm.Get("tls"))
 	}
 }
+
+// TestGRPC_GroupIDStamped verifies that GroupID set in Config is carried on the
+// wire. A 3-node cluster is formed with GroupID=42; the test intercepts an
+// AppendEntries RPC at the handler level and checks that the GroupID field
+// equals 42. This exercises both the node-stamping (Step 2) and the
+// proto↔Go conversion (Step 1).
+func TestGRPC_GroupIDStamped(t *testing.T) {
+	const wantGroupID uint64 = 42
+
+	ids := []raft.NodeID{"g1", "g2", "g3"}
+
+	transports := make([]*grpctransport.GRPCTransport, 3)
+	addrs := make([]string, 3)
+	for i := range 3 {
+		tr, err := grpctransport.Listen(":0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		t.Cleanup(func() { tr.Close() }) //nolint:errcheck
+		transports[i] = tr
+		addrs[i] = tr.Addr()
+	}
+	for i := range 3 {
+		for j := range 3 {
+			if i != j {
+				transports[i].AddPeer(ids[j], addrs[j])
+			}
+		}
+	}
+
+	// groupIDCapture wraps a real node and records the GroupID seen on the
+	// first AppendEntries call. It forwards all RPCs to the underlying node.
+	type capture struct {
+		raft.Handler
+		once     sync.Once
+		observed chan uint64
+	}
+
+	captures := make([]*capture, 3)
+	nodes := make([]*raft.Node, 3)
+	for i := range 3 {
+		peers := make([]raft.NodeID, 0, 2)
+		for j, id := range ids {
+			if j != i {
+				peers = append(peers, id)
+			}
+		}
+		sm := &kvSM{data: make(map[string]string)}
+		cfg := raft.DefaultConfig()
+		cfg.ID = ids[i]
+		cfg.GroupID = wantGroupID
+		cfg.Peers = peers
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = sm
+		cfg.Transport = transports[i]
+		cfg.TickInterval = 10 * time.Millisecond
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		nodes[i] = node
+		captures[i] = &capture{Handler: node, observed: make(chan uint64, 1)}
+		transports[i].Register(ids[i], captures[i])
+	}
+	// Implement AppendEntries capture.
+	for _, c := range captures {
+		c := c
+		orig := c.Handler
+		c.Handler = handlerFunc{
+			handleAppendEntries: func(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+				c.once.Do(func() { c.observed <- req.GroupID })
+				return orig.HandleAppendEntries(ctx, req)
+			},
+			Handler: orig,
+		}
+	}
+
+	for _, n := range nodes {
+		n.Start()
+	}
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			n.Stop()
+		}
+	})
+
+	// Merge all observed channels into one; the leader never receives
+	// AppendEntries in normal operation so we only need one observation.
+	merged := make(chan uint64, len(captures))
+	for _, c := range captures {
+		c := c
+		go func() {
+			if v, ok := <-c.observed; ok {
+				merged <- v
+			}
+		}()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+	defer cancel()
+	select {
+	case got := <-merged:
+		if got != wantGroupID {
+			t.Errorf("AppendEntries.GroupID = %d, want %d", got, wantGroupID)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for an AppendEntries with GroupID")
+	}
+}
+
+// handlerFunc lets individual Handle* methods be overridden for testing.
+type handlerFunc struct {
+	raft.Handler
+	handleAppendEntries func(context.Context, *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error)
+}
+
+func (h handlerFunc) HandleAppendEntries(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	if h.handleAppendEntries != nil {
+		return h.handleAppendEntries(ctx, req)
+	}
+	return h.Handler.HandleAppendEntries(ctx, req)
+}
