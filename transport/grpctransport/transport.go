@@ -285,9 +285,11 @@ func (t *GRPCTransport) RequestVote(ctx context.Context, to raft.NodeID, req *ra
 }
 
 func (t *GRPCTransport) AppendEntries(ctx context.Context, to raft.NodeID, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
-	// In multi-Raft mode, pure heartbeats (no entries, no read barrier) are
-	// batched per-peer to reduce RPC count from O(G×P) to O(P) per tick.
-	if len(req.Entries) == 0 && req.ReadBarrier == 0 {
+	// In multi-Raft mode, all empty AppendEntries (regular heartbeats and
+	// read-barrier rounds alike) are batched per-peer to reduce RPC count from
+	// O(G×P) to O(P) per tick. ReadBarrier is forwarded through HeartbeatEntry
+	// so the follower's response routes back to the correct ReadIndex future.
+	if len(req.Entries) == 0 {
 		t.mu.RLock()
 		batcher := t.hbBatcher
 		t.mu.RUnlock()
@@ -491,6 +493,7 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 			PrevLogIndex: raft.Index(entry.PrevLogIndex),
 			PrevLogTerm:  raft.Term(entry.PrevLogTerm),
 			LeaderCommit: raft.Index(entry.LeaderCommit),
+			ReadBarrier:  entry.ReadBarrier,
 		}
 		aeResp, aeErr := h.HandleAppendEntries(ctx, aeReq)
 		if aeErr != nil {

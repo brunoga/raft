@@ -748,6 +748,9 @@ func (x *ReadIndexResponse) GetLeaderId() string {
 }
 
 // HeartbeatEntry carries the fields of an empty AppendEntries for one group.
+// read_barrier is non-zero for linearizable-read barrier rounds; it is
+// forwarded verbatim to HandleAppendEntries so the leader can match responses
+// to pending ReadIndex futures.
 type HeartbeatEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	GroupId       uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
@@ -756,6 +759,7 @@ type HeartbeatEntry struct {
 	PrevLogIndex  uint64                 `protobuf:"varint,4,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
 	PrevLogTerm   uint64                 `protobuf:"varint,5,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
 	LeaderCommit  uint64                 `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
+	ReadBarrier   uint64                 `protobuf:"varint,7,opt,name=read_barrier,json=readBarrier,proto3" json:"read_barrier,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -828,6 +832,13 @@ func (x *HeartbeatEntry) GetPrevLogTerm() uint64 {
 func (x *HeartbeatEntry) GetLeaderCommit() uint64 {
 	if x != nil {
 		return x.LeaderCommit
+	}
+	return 0
+}
+
+func (x *HeartbeatEntry) GetReadBarrier() uint64 {
+	if x != nil {
+		return x.ReadBarrier
 	}
 	return 0
 }
@@ -1038,14 +1049,15 @@ const file_raft_proto_rawDesc = "" +
 	"\x11ReadIndexResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x1b\n" +
-	"\tleader_id\x18\x03 \x01(\tR\bleaderId\"\xcb\x01\n" +
+	"\tleader_id\x18\x03 \x01(\tR\bleaderId\"\xee\x01\n" +
 	"\x0eHeartbeatEntry\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x1b\n" +
 	"\tleader_id\x18\x03 \x01(\tR\bleaderId\x12$\n" +
 	"\x0eprev_log_index\x18\x04 \x01(\x04R\fprevLogIndex\x12\"\n" +
 	"\rprev_log_term\x18\x05 \x01(\x04R\vprevLogTerm\x12#\n" +
-	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"Z\n" +
+	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\x12!\n" +
+	"\fread_barrier\x18\a \x01(\x04R\vreadBarrier\"Z\n" +
 	"\x0fHeartbeatResult\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x18\n" +

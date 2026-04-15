@@ -108,6 +108,9 @@ message ReadIndexResponse {
 // reducing cost to O(P) per tick.
 
 // HeartbeatEntry carries the fields of an empty AppendEntries for one group.
+// read_barrier is non-zero for linearizable-read barrier rounds; it is
+// forwarded verbatim to HandleAppendEntries so the leader can match responses
+// to pending ReadIndex futures.
 message HeartbeatEntry {
   uint64 group_id       = 1;
   uint64 term           = 2;
@@ -115,6 +118,7 @@ message HeartbeatEntry {
   uint64 prev_log_index = 4;
   uint64 prev_log_term  = 5;
   uint64 leader_commit  = 6;
+  uint64 read_barrier   = 7;
 }
 
 // HeartbeatResult is the per-group response to a HeartbeatEntry.

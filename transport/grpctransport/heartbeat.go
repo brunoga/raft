@@ -168,6 +168,7 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 		PrevLogIndex: uint64(req.PrevLogIndex),
 		PrevLogTerm:  uint64(req.PrevLogTerm),
 		LeaderCommit: uint64(req.LeaderCommit),
+		ReadBarrier:  req.ReadBarrier,
 	}
 	respCh := make(chan hbResp, 1)
 	call := hbCall{entry: entry, respCh: respCh}
