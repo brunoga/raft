@@ -355,6 +355,70 @@ func TestManager_RunTicker_BoundedPool(t *testing.T) {
 	}
 }
 
+// ---- TestManager_AddAndStart ------------------------------------------------
+
+// TestManager_AddAndStart verifies that a group added to a running Manager via
+// AddAndStart participates in consensus immediately without a separate Start()
+// call. This is the correct workflow for dynamic group creation after the
+// initial StartAll.
+func TestManager_AddAndStart(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	// Group 1 is started first via the normal path.
+	n1 := newManagedNode(t, mgr, net, 1, "g1", nil)
+	mgr.StartAll()
+	t.Cleanup(mgr.StopAll)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go mgr.RunTicker(ctx, time.Millisecond)
+
+	// Wait for group 1 to elect itself leader.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && n1.StateSnapshot() != raft.Leader {
+		time.Sleep(time.Millisecond)
+	}
+	if n1.StateSnapshot() != raft.Leader {
+		t.Fatal("group 1 did not become leader")
+	}
+
+	// Add group 2 dynamically while the Manager is running.
+	cfg2 := raft.DefaultConfig()
+	cfg2.GroupID = 2
+	cfg2.ID = "g2"
+	cfg2.Storage = memstore.New()
+	cfg2.StateMachine = &discardSM{}
+	cfg2.Transport = net.NewTransport("g2")
+	cfg2.TickInterval = 0
+	n2, err := raft.New(&cfg2)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	net.Register("g2", n2)
+
+	if err := mgr.AddAndStart(2, n2); err != nil {
+		t.Fatalf("AddAndStart: %v", err)
+	}
+
+	// Group 2 must also self-elect (single-node group); RunTicker drives its ticks.
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && n2.StateSnapshot() != raft.Leader {
+		time.Sleep(time.Millisecond)
+	}
+	if n2.StateSnapshot() != raft.Leader {
+		t.Fatal("dynamically added group 2 did not become leader")
+	}
+
+	// Both groups are still reachable via the Manager.
+	if _, err := mgr.Get(1); err != nil {
+		t.Errorf("Get(1): %v", err)
+	}
+	if _, err := mgr.Get(2); err != nil {
+		t.Errorf("Get(2): %v", err)
+	}
+}
+
 // ---- TestManager_LookupAfterAdd ---------------------------------------------
 
 func TestManager_LookupAfterAdd(t *testing.T) {

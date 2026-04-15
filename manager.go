@@ -79,6 +79,18 @@ func (m *Manager) Add(groupID uint64, node *Node) error {
 	return nil
 }
 
+// AddAndStart registers node under groupID and immediately starts it.
+// It is the correct way to add a new group to a Manager that has already
+// called StartAll: a plain Add followed by a manual node.Start() is
+// equivalent but error-prone.
+func (m *Manager) AddAndStart(groupID uint64, node *Node) error {
+	if err := m.Add(groupID, node); err != nil {
+		return err
+	}
+	node.Start()
+	return nil
+}
+
 // Remove stops the node registered under groupID and unregisters it.
 // Returns ErrGroupNotFound if no node is registered for that ID.
 func (m *Manager) Remove(groupID uint64) error {
