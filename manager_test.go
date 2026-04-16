@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -274,6 +275,62 @@ func TestManager_StatusAll(t *testing.T) {
 		}
 	}
 	t.Fatal("timed out waiting for both groups to elect a leader")
+}
+
+// ---- TestManager_StatusAll_DoesNotBlockMutations ----------------------------
+
+// TestManager_StatusAll_DoesNotBlockMutations verifies that StatusAll releases
+// the manager lock before calling Node methods, so that concurrent Add and
+// Remove calls are not serialized behind the full iteration.
+//
+// The test runs StatusAll and Remove concurrently under the race detector;
+// if the lock were held across Node method calls, the Remove would deadlock
+// (or take much longer) while StatusAll iterated over a large group set.
+func TestManager_StatusAll_DoesNotBlockMutations(t *testing.T) {
+	const groups = 50
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	nodes := make([]*raft.Node, groups)
+	for i := range groups {
+		id := raft.NodeID(fmt.Sprintf("s%d", i+1))
+		nodes[i] = newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+	mgr.StartAll()
+
+	// Run StatusAll repeatedly in one goroutine while Remove fires in another.
+	// The race detector will catch any data race; a deadlock would cause timeout.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 20 {
+			_ = mgr.StatusAll()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		// Remove half the groups while StatusAll is running.
+		for i := range groups / 2 {
+			_ = mgr.Remove(uint64(i + 1))
+		}
+	}()
+
+	close(start)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StatusAll blocked concurrent Remove — lock scope too wide")
+	}
 }
 
 // ---- TestManager_RunTicker --------------------------------------------------
