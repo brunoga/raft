@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 )
@@ -145,6 +146,21 @@ func (m *Manager) Get(groupID uint64) (*Node, error) {
 		return nil, ErrGroupNotFound
 	}
 	return n, nil
+}
+
+// GroupIDs returns the sorted list of group IDs currently registered with the
+// Manager. The slice is a snapshot; additions and removals after the call are
+// not reflected. Useful for introspection, healthchecks, and leader-balancing
+// controllers that need to enumerate groups without holding the lock.
+func (m *Manager) GroupIDs() []uint64 {
+	m.mu.RLock()
+	ids := make([]uint64, 0, len(m.nodes))
+	for id := range m.nodes {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // Lookup returns the Handler for groupID and true, or nil and false if no node
