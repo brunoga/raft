@@ -813,3 +813,70 @@ func TestManager_Close(t *testing.T) {
 		t.Errorf("GroupIDs after Close = %v, want []", ids)
 	}
 }
+
+// ---- TestManager_AddAndStart_StopAll_Race ------------------------------------
+
+// newUnregisteredNode creates a *Node with the given GroupID without adding it
+// to mgr. Used to test AddAndStart in isolation.
+func newUnregisteredNode(t *testing.T, net *memtransport.Network,
+	groupID uint64, nodeID raft.NodeID) *raft.Node {
+	t.Helper()
+	cfg := raft.DefaultConfig()
+	cfg.GroupID = groupID
+	cfg.ID = nodeID
+	cfg.Peers = nil
+	cfg.Storage = memstore.New()
+	cfg.StateMachine = &discardSM{}
+	cfg.Transport = net.NewTransport(nodeID)
+	cfg.TickInterval = 0
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New(%s): %v", nodeID, err)
+	}
+	net.Register(nodeID, node)
+	return node
+}
+
+// TestManager_AddAndStart_StopAll_Race verifies that a concurrent StopAll
+// cannot call Stop() on a node before Start() is called on it. Before the fix,
+// AddAndStart called Add (making the node visible in the map) before Start(),
+// leaving a window where StopAll could Stop() a never-started node, which
+// blocks forever in Node.Stop().
+func TestManager_AddAndStart_StopAll_Race(t *testing.T) {
+	const trials = 50
+	net := memtransport.NewNetwork()
+
+	for i := range trials {
+		mgr := raft.NewManager()
+
+		// Pre-register a started node so StopAll does real work and is more
+		// likely to overlap with AddAndStart's window.
+		warmup := newUnregisteredNode(t, net, 99, raft.NodeID(fmt.Sprintf("wu%d", i)))
+		if err := mgr.AddAndStart(99, warmup); err != nil {
+			t.Fatalf("trial %d: warmup AddAndStart: %v", i, err)
+		}
+
+		// Create a node that is NOT yet in the manager.
+		id := raft.NodeID(fmt.Sprintf("aas%d", i))
+		node := newUnregisteredNode(t, net, uint64(i+1), id)
+
+		stopDone := make(chan struct{})
+		go func() {
+			mgr.StopAll()
+			close(stopDone)
+		}()
+
+		// AddAndStart must not deadlock even when StopAll races it.
+		// Ignore ErrGroupExists (StopAll cleared then we add, or vice-versa).
+		_ = mgr.AddAndStart(uint64(i+1), node)
+
+		select {
+		case <-stopDone:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("trial %d: deadlock — StopAll blocked (Stop called on never-started node?)", i)
+		}
+		// Final cleanup: node may have been started by AddAndStart but not stopped
+		// (if StopAll ran before AddAndStart added it).
+		node.Stop()
+	}
+}
