@@ -56,7 +56,8 @@ func (s *stubTransport) ReadIndex(_ context.Context, _ NodeID, _ *ReadIndexReque
 	return nil, nil
 }
 func (s *stubTransport) Register(NodeID, Handler) {}
-func (s *stubTransport) Close() error             { return nil }
+func (s *stubTransport) Unregister(NodeID)     {}
+func (s *stubTransport) Close() error         { return nil }
 
 func validConfig() Config {
 	c := DefaultConfig()

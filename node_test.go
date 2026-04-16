@@ -3,6 +3,7 @@ package raft_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,10 +66,38 @@ func (t *noopTransport) TimeoutNow(_ context.Context, _ raft.NodeID, _ *raft.Tim
 func (t *noopTransport) ReadIndex(_ context.Context, _ raft.NodeID, _ *raft.ReadIndexRequest) (*raft.ReadIndexResponse, error) {
 	return &raft.ReadIndexResponse{}, nil
 }
-func (t *noopTransport) Register(raft.NodeID, raft.Handler) {}
-func (t *noopTransport) Close() error                       { return nil }
+func (t *noopTransport) Register(raft.NodeID, raft.Handler)   {}
+func (t *noopTransport) Unregister(raft.NodeID)               {}
+func (t *noopTransport) Close() error                         { return nil }
+
+type trackingTransport struct {
+	noopTransport
+	unregistered atomic.Bool
+}
+
+func (t *trackingTransport) Unregister(id raft.NodeID) {
+	if id == "n1" {
+		t.unregistered.Store(true)
+	}
+}
 
 // --- Tests ------------------------------------------------------------------
+
+func TestNode_Stop_UnregistersFromTransport(t *testing.T) {
+	tr := &trackingTransport{}
+	cfg := raft.DefaultConfig()
+	cfg.ID = "n1"
+	cfg.Storage = memstore.New()
+	cfg.StateMachine = &noopSM{}
+	cfg.Transport = tr
+	cfg.TickInterval = 0
+	n, _ := raft.New(&cfg)
+	n.Start()
+	n.Stop()
+	if !tr.unregistered.Load() {
+		t.Error("Node.Stop() did not call Transport.Unregister()")
+	}
+}
 
 func TestReadStale_ReturnsLastApplied(t *testing.T) {
 	// Single-node cluster: become leader, propose an entry, verify ReadStale

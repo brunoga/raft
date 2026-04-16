@@ -113,6 +113,10 @@ type Transport interface {
 	// node identified by id. Multiple nodes may share one Transport in tests.
 	Register(id NodeID, handler Handler)
 
+	// Unregister removes a handler from the transport. Use this when a node
+	// is stopped to prevent memory leaks and stop receiving RPCs.
+	Unregister(id NodeID)
+
 	// Close shuts down the transport and releases all resources.
 	Close() error
 }
