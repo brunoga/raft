@@ -84,11 +84,18 @@ func (m *Manager) Add(groupID uint64, node *Node) error {
 // It is the correct way to add a new group to a Manager that has already
 // called StartAll: a plain Add followed by a manual node.Start() is
 // equivalent but error-prone.
+//
+// The node is started before it is made visible in the registry so that a
+// concurrent StopAll cannot call Stop on a node that has never been started
+// (which would block indefinitely).
 func (m *Manager) AddAndStart(groupID uint64, node *Node) error {
+	// Start before Add: the node is visible to StopAll only after Add returns,
+	// at which point Start has already been called.
+	node.Start()
 	if err := m.Add(groupID, node); err != nil {
+		node.Stop() // roll back: undo the Start if Add fails
 		return err
 	}
-	node.Start()
 	return nil
 }
 
