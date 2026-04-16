@@ -1283,3 +1283,222 @@ func TestGRPC_RemovePeer_StopsBatcher(t *testing.T) {
 		t.Errorf("peerBatcher goroutine leaked after RemovePeer: before=%d after=%d", before, after)
 	}
 }
+
+// ---- TestGRPC_MultiRaft_ManagerWiring ----------------------------------------
+
+// TestGRPC_MultiRaft_ManagerWiring is the canonical integration test for the
+// full gRPC + Manager + multi-raft stack.  It verifies end-to-end wiring that
+// pure-transport tests and memtransport-based multi-raft tests cannot cover:
+//
+//   - SetGroupLookup(mgr.Lookup) routes inbound BatchHeartbeats entries to the
+//     correct Node via the Manager.
+//   - Every group independently elects a leader over real gRPC.
+//   - Proposals commit on all groups.
+//   - TransferLeadership succeeds (exercises the TimeoutNow GroupId fix: without
+//     it the receiver returns codes.InvalidArgument and the transfer fails).
+//   - HeartbeatSendBlocked stays zero under normal load, confirming no
+//     hbChanSize saturation with 3 groups.
+func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+
+	const (
+		numPhysical = 3
+		numGroups   = 3
+	)
+
+	// ---- Phase 1: create transports and managers ----------------------------
+
+	transports := make([]*grpctransport.GRPCTransport, numPhysical)
+	addrs := make([]string, numPhysical)
+	managers := make([]*raft.Manager, numPhysical)
+
+	for p := range numPhysical {
+		tr, err := grpctransport.Listen("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen physical %d: %v", p, err)
+		}
+		transports[p] = tr
+		addrs[p] = tr.Addr()
+		managers[p] = raft.NewManager()
+	}
+
+	// ---- Phase 2: wire AddPeer + SetGroupLookup before nodes start ----------
+	//
+	// AddPeer must be called before any tick fires an RPC; SetGroupLookup must
+	// be called before the first inbound BatchHeartbeats arrives.  Both happen
+	// before AddAndStart below.
+
+	for p := range numPhysical {
+		for g := range numGroups {
+			groupID := uint64(g + 1)
+			for pp := range numPhysical {
+				if pp == p {
+					continue
+				}
+				// Multiple group NodeIDs on the same physical peer all map to
+				// the same address; clientFor reuses the cached connection.
+				peerID := raft.NodeID(fmt.Sprintf("g%d-p%d", groupID, pp))
+				transports[p].AddPeer(peerID, addrs[pp])
+			}
+		}
+		transports[p].SetGroupLookup(managers[p].Lookup)
+	}
+
+	// ---- Phase 3: create and start nodes ------------------------------------
+
+	// nodes[g][p] is the Node for group g+1 on physical node p.
+	nodes := make([][]*raft.Node, numGroups)
+	sms := make([][]*kvSM, numGroups)
+	for g := range numGroups {
+		groupID := uint64(g + 1)
+		nodes[g] = make([]*raft.Node, numPhysical)
+		sms[g] = make([]*kvSM, numPhysical)
+
+		// Build the list of all NodeIDs in this group.
+		allIDs := make([]raft.NodeID, numPhysical)
+		for p := range numPhysical {
+			allIDs[p] = raft.NodeID(fmt.Sprintf("g%d-p%d", groupID, p))
+		}
+
+		for p := range numPhysical {
+			peers := make([]raft.NodeID, 0, numPhysical-1)
+			for _, id := range allIDs {
+				if id != allIDs[p] {
+					peers = append(peers, id)
+				}
+			}
+			sm := &kvSM{data: make(map[string]string)}
+			cfg := raft.DefaultConfig()
+			cfg.GroupID = groupID
+			cfg.ID = allIDs[p]
+			cfg.Peers = peers
+			cfg.Storage = memstore.New()
+			cfg.StateMachine = sm
+			cfg.Transport = transports[p] // all groups on one physical node share one transport
+			cfg.TickInterval = 10 * time.Millisecond
+
+			node, err := raft.New(&cfg)
+			if err != nil {
+				t.Fatalf("raft.New g=%d p=%d: %v", g+1, p, err)
+			}
+			// AddAndStart calls node.Start(), which calls transport.Register.
+			// In multi-raft mode groupLookup takes precedence over handlers,
+			// so registering multiple NodeIDs on the same transport is harmless.
+			if err := managers[p].AddAndStart(groupID, node); err != nil {
+				t.Fatalf("managers[%d].AddAndStart(g=%d): %v", p, g+1, err)
+			}
+			nodes[g][p] = node
+			sms[g][p] = sm
+		}
+	}
+
+	t.Cleanup(func() {
+		for _, mgr := range managers {
+			mgr.StopAll()
+		}
+		for _, tr := range transports {
+			tr.Close() //nolint:errcheck
+		}
+	})
+
+	// ---- Phase 4: wait for all groups to elect a leader --------------------
+
+	leaders := make([]*raft.Node, numGroups) // leaders[g] = leader node for group g+1
+	leaderPhys := make([]int, numGroups)     // physical index of leader[g]
+	deadline := time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) {
+		allFound := true
+		for g := range numGroups {
+			if leaders[g] != nil {
+				continue
+			}
+			for p, n := range nodes[g] {
+				if n.StateSnapshot() == raft.Leader {
+					leaders[g] = n
+					leaderPhys[g] = p
+					break
+				}
+			}
+			if leaders[g] == nil {
+				allFound = false
+			}
+		}
+		if allFound {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for g, l := range leaders {
+		if l == nil {
+			t.Fatalf("group %d never elected a leader within %s", g+1, electionTimeout)
+		}
+		t.Logf("group %d leader: %s (physical %d)", g+1, l.ID(), leaderPhys[g])
+	}
+
+	// ---- Phase 5: propose one entry per group --------------------------------
+
+	for g, leader := range leaders {
+		ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+		_, err := leader.Propose(ctx, []byte(fmt.Sprintf("key=g%d", g+1)))
+		cancel()
+		if err != nil {
+			t.Errorf("group %d Propose: %v", g+1, err)
+		}
+	}
+
+	// ---- Phase 6: TransferLeadership on group 1 (exercises TimeoutNow fix) --
+	//
+	// Without the TimeoutNow GroupId fix the receiver returns
+	// codes.InvalidArgument and TransferLeadership returns an error.
+
+	const transferGroup = 0 // group index (0-based) to test on
+	leaderNode := leaders[transferGroup]
+	leaderP := leaderPhys[transferGroup]
+
+	// Pick a follower as transfer target.
+	var transferTarget raft.NodeID
+	for p, n := range nodes[transferGroup] {
+		if p != leaderP {
+			transferTarget = n.ID()
+			break
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+	defer cancel()
+	if err := leaderNode.TransferLeadership(ctx, transferTarget); err != nil {
+		t.Errorf("group 1 TransferLeadership to %s: %v", transferTarget, err)
+	}
+
+	// Verify that the target (or at least some other node) became leader.
+	deadline = time.Now().Add(electionTimeout)
+	transferred := false
+	for time.Now().Before(deadline) {
+		for p, n := range nodes[transferGroup] {
+			if p != leaderP && n.StateSnapshot() == raft.Leader {
+				transferred = true
+				break
+			}
+		}
+		if transferred {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !transferred {
+		t.Errorf("group 1: leadership did not transfer away from physical %d within %s", leaderP, electionTimeout)
+	}
+
+	// ---- Phase 7: sanity-check backpressure counter -------------------------
+	//
+	// 3 groups is well under the default hbChanSize of 1024; the counter must
+	// remain zero throughout the test.
+
+	for p, tr := range transports {
+		if n := tr.HeartbeatSendBlocked(); n != 0 {
+			t.Errorf("physical %d: HeartbeatSendBlocked = %d, want 0 (hbChan saturated under light load)", p, n)
+		}
+	}
+}
