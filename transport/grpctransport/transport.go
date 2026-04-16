@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -590,10 +591,22 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 	lookup := s.transport.groupLookup
 	s.transport.mu.RUnlock()
 
+	// Bound dispatch concurrency to prevent goroutine explosion when G is large.
+	// GOMAXPROCS×4 allows enough in-flight dispatches to hide HandleAppendEntries
+	// latency (which blocks waiting for each node's event loop) without spawning
+	// O(G) goroutines per RPC. A semaphore is used rather than a persistent pool
+	// because BatchHeartbeats is called per-tick; the overhead is O(P), not O(G).
+	maxWorkers := min(n, runtime.GOMAXPROCS(0)*4)
+	sem := make(chan struct{}, maxWorkers)
+
 	resultCh := make(chan *pb.HeartbeatResult, n)
 	for _, entry := range req.Entries {
 		e := entry
-		go func() { resultCh <- s.dispatchHeartbeatEntry(ctx, e, lookup) }()
+		sem <- struct{}{} // acquire slot; blocks when maxWorkers goroutines are active
+		go func() {
+			defer func() { <-sem }() // release slot on completion
+			resultCh <- s.dispatchHeartbeatEntry(ctx, e, lookup)
+		}()
 	}
 
 	results := make([]*pb.HeartbeatResult, 0, n)

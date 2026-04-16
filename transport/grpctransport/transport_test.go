@@ -1092,6 +1092,64 @@ func TestGRPC_RemovePeer(t *testing.T) {
 	}
 }
 
+// ---- TestGRPC_BatchHeartbeatsBoundedDispatch --------------------------------
+
+// TestGRPC_BatchHeartbeatsBoundedDispatch verifies that BatchHeartbeats
+// correctly dispatches all entries and collects all responses even when the
+// batch size exceeds GOMAXPROCS (exercising the bounded-semaphore path).
+func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
+	// Use more groups than GOMAXPROCS to force the semaphore to throttle.
+	numGroups := runtime.GOMAXPROCS(0)*4 + 1
+
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recv.Close()
+
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck
+		}(uint64(g + 1))
+	}
+	close(ready)
+	wg.Wait()
+
+	// Every group handler must have been called — no entries silently dropped.
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler not called (entry dropped or dispatch blocked)", gid)
+		}
+	}
+}
+
 // ---- TestGRPC_HeartbeatBatcherStopWaits ------------------------------------
 
 // TestGRPC_HeartbeatBatcherStopWaits verifies that Close() does not return
