@@ -609,19 +609,37 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 	maxWorkers := min(n, runtime.GOMAXPROCS(0)*4)
 	sem := make(chan struct{}, maxWorkers)
 
+	// resultCh is buffered to n so that goroutines launched before a ctx
+	// cancellation can always write their result and exit without blocking,
+	// even if we return early from the collect loop below.
 	resultCh := make(chan *pb.HeartbeatResult, n)
 	for _, entry := range req.Entries {
 		e := entry
-		sem <- struct{}{} // acquire slot; blocks when maxWorkers goroutines are active
-		go func() {
-			defer func() { <-sem }() // release slot on completion
-			resultCh <- s.dispatchHeartbeatEntry(ctx, e, lookup)
-		}()
+		// Acquire a semaphore slot, but respect ctx cancellation: if the RPC
+		// context is already done we write a non-success result directly so the
+		// collect loop below always receives exactly n items.
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }() // release slot on completion
+				resultCh <- s.dispatchHeartbeatEntry(ctx, e, lookup)
+			}()
+		case <-ctx.Done():
+			resultCh <- &pb.HeartbeatResult{GroupId: e.GroupId, Success: false}
+		}
 	}
 
 	results := make([]*pb.HeartbeatResult, 0, n)
 	for range n {
-		results = append(results, <-resultCh)
+		// Escape early if the client disconnected or the RPC deadline fired.
+		// resultCh is fully buffered so goroutines still running will write their
+		// results and exit without blocking; the unread items are GC'd.
+		select {
+		case r := <-resultCh:
+			results = append(results, r)
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
 	}
 	return &pb.BatchedHeartbeatResponse{Results: results}, nil
 }
