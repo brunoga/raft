@@ -266,10 +266,12 @@ func (t *GRPCTransport) Register(id raft.NodeID, h raft.Handler) {
 // primary routing mechanism for multi-Raft deployments; single-group usage
 // does not need to call this method.
 //
-// SetGroupLookup also enables heartbeat batching: outbound pure heartbeats
-// (AppendEntries with no entries and no ReadBarrier) are coalesced per-peer
-// into a single BatchHeartbeats RPC, reducing cost from O(G×P) to O(P) per
-// tick interval.
+// SetGroupLookup also enables heartbeat batching: all outbound AppendEntries
+// with no log entries — including both regular heartbeats and read-barrier
+// rounds — are coalesced per-peer into a single BatchHeartbeats RPC, reducing
+// cost from O(G×P) to O(P) per tick interval. The ReadBarrier flag is
+// preserved through the batched entry so followers can satisfy in-flight
+// ReadIndex futures.
 //
 // The lookup function is typically Manager.Lookup.
 func (t *GRPCTransport) SetGroupLookup(fn func(uint64) (raft.Handler, bool)) {
