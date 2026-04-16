@@ -742,3 +742,46 @@ func TestManager_RemoveGraceful_TOCTOU(t *testing.T) {
 		}
 	}
 }
+
+// ---- TestManager_GroupIDs ---------------------------------------------------
+
+// TestManager_GroupIDs verifies that GroupIDs returns a sorted snapshot of
+// all registered group IDs, and reflects additions and removals.
+func TestManager_GroupIDs(t *testing.T) {
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	if ids := mgr.GroupIDs(); len(ids) != 0 {
+		t.Fatalf("empty manager: expected [], got %v", ids)
+	}
+
+	// Add groups in non-sequential order to confirm sorting.
+	for _, gid := range []uint64{5, 2, 8, 1, 4} {
+		id := raft.NodeID(fmt.Sprintf("g%d", gid))
+		newManagedNode(t, mgr, net, gid, id, nil)
+	}
+	mgr.StartAll()
+	t.Cleanup(mgr.StopAll)
+
+	ids := mgr.GroupIDs()
+	want := []uint64{1, 2, 4, 5, 8}
+	if len(ids) != len(want) {
+		t.Fatalf("GroupIDs() = %v, want %v", ids, want)
+	}
+	for i, v := range want {
+		if ids[i] != v {
+			t.Fatalf("GroupIDs()[%d] = %d, want %d", i, ids[i], v)
+		}
+	}
+
+	// Remove one group and verify the snapshot updates.
+	if err := mgr.Remove(2); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	after := mgr.GroupIDs()
+	for _, id := range after {
+		if id == 2 {
+			t.Fatal("GroupIDs() still contains removed group 2")
+		}
+	}
+}
