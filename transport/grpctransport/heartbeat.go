@@ -133,11 +133,6 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 	}
 }
 
-// respChanPool reuses buffered channels used to carry heartbeat responses back
-// to callers of Send. Reusing channels eliminates one heap allocation per
-// heartbeat send (G sends per tick × P peers = G×P allocations per tick).
-var respChanPool = sync.Pool{New: func() any { return make(chan hbResp, 1) }}
-
 // heartbeatBatcher manages one peerBatcher goroutine per remote peer.
 type heartbeatBatcher struct {
 	t      *GRPCTransport
@@ -148,16 +143,24 @@ type heartbeatBatcher struct {
 	stopped  bool                          // set true by stop(); checked by peerBatcherFor
 	batchers map[raft.NodeID]*peerBatcher
 	wg       sync.WaitGroup // tracks all live peerBatcher goroutines
+
+	// respChanPool reuses buffered channels used to carry heartbeat responses
+	// back to callers of Send. Per-instance (rather than package-level) so that
+	// pools from different transports are isolated and channels from one instance
+	// are never recycled into another.
+	respChanPool sync.Pool
 }
 
 func newHeartbeatBatcher(t *GRPCTransport) *heartbeatBatcher {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &heartbeatBatcher{
+	b := &heartbeatBatcher{
 		t:        t,
 		ctx:      ctx,
 		cancel:   cancel,
 		batchers: make(map[raft.NodeID]*peerBatcher),
 	}
+	b.respChanPool.New = func() any { return make(chan hbResp, 1) }
+	return b
 }
 
 // stop cancels the shared context and blocks until all peerBatcher goroutines
@@ -230,12 +233,12 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 	}
 
 	// Get a buffered response channel from the pool to avoid per-call allocation.
-	respCh := respChanPool.Get().(chan hbResp)
+	respCh := b.respChanPool.Get().(chan hbResp)
 	call := hbCall{entry: entry, respCh: respCh}
 
 	batcher, err := b.peerBatcherFor(to)
 	if err != nil {
-		respChanPool.Put(respCh)
+		b.respChanPool.Put(respCh)
 		return nil, err
 	}
 
@@ -252,7 +255,7 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 			// call enqueued after waiting; batcher WILL write to respCh exactly once.
 		case <-ctx.Done():
 			// call NOT enqueued; batcher will never write to respCh — safe to pool.
-			respChanPool.Put(respCh)
+			b.respChanPool.Put(respCh)
 			return nil, ctx.Err()
 		}
 	}
@@ -260,7 +263,7 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 	select {
 	case r := <-respCh:
 		// Normal path: response received; channel is now empty — safe to pool.
-		respChanPool.Put(respCh)
+		b.respChanPool.Put(respCh)
 		if r.err != nil {
 			return nil, r.err
 		}
@@ -275,7 +278,7 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 		// for the write and then recycles the channel.
 		go func() {
 			<-respCh
-			respChanPool.Put(respCh)
+			b.respChanPool.Put(respCh)
 		}()
 		return nil, ctx.Err()
 	}
