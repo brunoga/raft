@@ -983,3 +983,52 @@ func TestGRPC_HeartbeatRPCTimeoutOption(t *testing.T) {
 	}
 	t.Logf("failed in %v (timeout=50ms): %v", elapsed, err)
 }
+
+// ---- TestGRPC_RemovePeer ----------------------------------------------------
+
+// TestGRPC_RemovePeer verifies that after RemovePeer, outbound RPCs to the
+// removed node return an error (address no longer registered), and that a
+// subsequent AddPeer + RPC works again.
+func TestGRPC_RemovePeer(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen recv: %v", err)
+	}
+	defer recv.Close()
+
+	h := &signalHandler{called: make(chan struct{}, 1)}
+	recv.Register("recv", h)
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Sanity: RPC works before removal.
+	if _, err := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); err != nil {
+		t.Fatalf("RequestVote before RemovePeer: %v", err)
+	}
+
+	// Remove the peer.
+	send.RemovePeer("recv")
+
+	// RPC must now fail with "no address registered".
+	_, err = send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{})
+	if err == nil {
+		t.Fatal("expected error after RemovePeer, got nil")
+	}
+	if !strings.Contains(err.Error(), "no address registered") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Re-adding the peer must restore connectivity.
+	send.AddPeer("recv", recv.Addr())
+	if _, err := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); err != nil {
+		t.Errorf("RequestVote after re-AddPeer: %v", err)
+	}
+}
