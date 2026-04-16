@@ -849,6 +849,18 @@ func (t *delayedTransport) TimeoutNow(ctx context.Context, to raft.NodeID, req *
 	}
 }
 
+func (t *delayedTransport) Register(id raft.NodeID, h raft.Handler) {
+	t.Transport.Register(id, h)
+}
+
+func (t *delayedTransport) Unregister(id raft.NodeID) {
+	t.Transport.Unregister(id)
+}
+
+func (t *delayedTransport) Close() error {
+	return t.Transport.Close()
+}
+
 // ---- TestManager_LookupAfterAdd ---------------------------------------------
 
 func TestManager_LookupAfterAdd(t *testing.T) {

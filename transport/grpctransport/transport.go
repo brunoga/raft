@@ -306,6 +306,14 @@ func (t *GRPCTransport) Register(id raft.NodeID, h raft.Handler) {
 	t.mu.Unlock()
 }
 
+// Unregister implements raft.Transport. It removes the handler associated
+// with id.
+func (t *GRPCTransport) Unregister(id raft.NodeID) {
+	t.mu.Lock()
+	delete(t.handlers, id)
+	t.mu.Unlock()
+}
+
 // SetGroupLookup installs a function that maps a GroupID to its Handler.
 // When set, inbound RPCs are routed by the GroupID embedded in the request
 // proto rather than by the x-raft-node-id metadata header. This is the

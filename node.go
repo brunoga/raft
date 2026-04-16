@@ -377,6 +377,7 @@ func (n *Node) Stop() {
 		close(n.stopCh)
 		<-n.doneCh
 		<-n.applyDoneCh
+		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
 	})
 }
