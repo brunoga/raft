@@ -51,8 +51,9 @@ type GRPCTransport struct {
 	clients     map[string]*grpc.ClientConn       // address → connection (cached)
 	groupLookup func(uint64) (raft.Handler, bool) // optional: route by GroupID
 
-	hbWindow  time.Duration    // collection window for heartbeat batching
-	hbBatcher *heartbeatBatcher // nil until SetGroupLookup is called
+	hbWindow      time.Duration     // collection window for heartbeat batching
+	hbRPCTimeout  time.Duration     // per-RPC timeout for BatchHeartbeats
+	hbBatcher     *heartbeatBatcher // nil until SetGroupLookup is called
 
 	// Counters for BatchHeartbeats server-side processing.
 	batchHBServed  atomic.Int64 // number of BatchHeartbeats RPCs received
@@ -74,18 +75,20 @@ func (t *GRPCTransport) BatchHeartbeatEntriesServed() int64 { return t.batchHBEn
 // sustained value warrants investigation.
 func (t *GRPCTransport) BatchHeartbeatErrors() int64 { return t.batchHBErrors.Load() }
 
-// heartbeatRPCTimeout returns the timeout for a single BatchHeartbeats call.
-// Heartbeats are best-effort, so we use a moderate fixed timeout.
-func (t *GRPCTransport) heartbeatRPCTimeout() time.Duration { return 5 * time.Second }
+const defaultHeartbeatRPCTimeout = 5 * time.Second
+
+// heartbeatRPCTimeout returns the configured timeout for a single BatchHeartbeats call.
+func (t *GRPCTransport) heartbeatRPCTimeout() time.Duration { return t.hbRPCTimeout }
 
 // Option is a functional option for GRPCTransport.
 type Option func(*options)
 
 type options struct {
-	serverOpts      []grpc.ServerOption
-	dialOpts        []grpc.DialOption
-	tlsCfg          *tls.Config
-	heartbeatWindow time.Duration
+	serverOpts         []grpc.ServerOption
+	dialOpts           []grpc.DialOption
+	tlsCfg             *tls.Config
+	heartbeatWindow    time.Duration
+	heartbeatRPCTimeout time.Duration
 }
 
 // WithServerOptions appends extra gRPC server options (e.g. TLS credentials).
@@ -96,6 +99,14 @@ func WithServerOptions(opts ...grpc.ServerOption) Option {
 // WithDialOptions appends extra gRPC dial options (e.g. TLS credentials).
 func WithDialOptions(opts ...grpc.DialOption) Option {
 	return func(o *options) { o.dialOpts = append(o.dialOpts, opts...) }
+}
+
+// WithHeartbeatRPCTimeout sets the per-RPC timeout for BatchHeartbeats calls.
+// The batcher applies this timeout to each outbound BatchHeartbeats RPC. The
+// default is 5 s. Reduce this value when a fast failure response is preferable
+// to waiting for a slow or unreachable peer; increase it on high-latency links.
+func WithHeartbeatRPCTimeout(d time.Duration) Option {
+	return func(o *options) { o.heartbeatRPCTimeout = d }
 }
 
 // WithHeartbeatWindow sets the collection window used by the heartbeat batcher.
@@ -188,15 +199,20 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	if hbWin == 0 {
 		hbWin = defaultHBWindow
 	}
+	hbRPCTimeout := o.heartbeatRPCTimeout
+	if hbRPCTimeout == 0 {
+		hbRPCTimeout = defaultHeartbeatRPCTimeout
+	}
 	t := &GRPCTransport{
-		server:   grpc.NewServer(defaultServerOpts...),
-		listener: ln,
-		dialOpts: defaultDialOpts,
-		logger:   slog.Default().With("component", "grpctransport"),
-		hbWindow: hbWin,
-		handlers: make(map[raft.NodeID]raft.Handler),
-		peers:    make(map[raft.NodeID]string),
-		clients:  make(map[string]*grpc.ClientConn),
+		server:       grpc.NewServer(defaultServerOpts...),
+		listener:     ln,
+		dialOpts:     defaultDialOpts,
+		logger:       slog.Default().With("component", "grpctransport"),
+		hbWindow:     hbWin,
+		hbRPCTimeout: hbRPCTimeout,
+		handlers:     make(map[raft.NodeID]raft.Handler),
+		peers:        make(map[raft.NodeID]string),
+		clients:      make(map[string]*grpc.ClientConn),
 	}
 
 	pb.RegisterRaftServiceServer(t.server, &grpcServer{transport: t})
