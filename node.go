@@ -387,6 +387,9 @@ func (n *Node) Tick() {
 	select {
 	case n.tickCh <- struct{}{}:
 	case <-n.stopCh:
+	default:
+		// Drop tick if the event loop is already busy. This prevents a single
+		// slow node from stalling the shared Manager ticker (Raft §isolation).
 	}
 }
 

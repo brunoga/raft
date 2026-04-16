@@ -534,6 +534,59 @@ func TestManager_AddAndStart(t *testing.T) {
 	}
 }
 
+// ---- TestManager_RunTicker_Starvation ---------------------------------------
+
+// TestManager_RunTicker_Starvation verifies that a single slow node (whose
+// event loop is blocked) does not starve the ticker for other nodes.
+// Before the fix, Node.Tick() blocked if the tickCh was full, eventually
+// exhausting the RunTicker worker pool and deadlocking context cancellation.
+func TestManager_RunTicker_Starvation(t *testing.T) {
+	// We use GOMAXPROCS workers in RunTicker.
+	nWorkers := runtime.GOMAXPROCS(0)
+
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	// 1. Create nWorkers + 1 "slow" nodes that will block their event loop.
+	// We don't start them, so their tickCh (size 1) will fill up and block
+	// the worker.
+	for i := 0; i < nWorkers+1; i++ {
+		gid := uint64(i + 1)
+		id := raft.NodeID(fmt.Sprintf("slow-%d", i))
+		node := newUnregisteredNode(t, net, gid, id)
+		if err := mgr.Add(gid, node); err != nil {
+			t.Fatalf("Add(%d): %v", gid, err)
+		}
+	}
+
+	// 2. Start RunTicker.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tickerDone := make(chan struct{})
+	go func() {
+		mgr.RunTicker(ctx, 1*time.Millisecond)
+		close(tickerDone)
+	}()
+
+	// 3. Wait for workers to block.
+	// Each tick cycle, RunTicker will try to send ticks for all nodes.
+	// Since there are nWorkers+1 nodes and only nWorkers workers, and each
+	// node's Tick() blocks, eventually all workers will be stuck in Tick()
+	// and the main RunTicker loop will be stuck sending to 'work' channel.
+	time.Sleep(100 * time.Millisecond)
+
+	// 4. Try to cancel and see if it returns.
+	cancel()
+
+	select {
+	case <-tickerDone:
+		// Success: fixed RunTicker returns when context is cancelled.
+	case <-time.After(time.Second):
+		t.Fatal("RunTicker deadlocked and did not exit after context cancellation")
+	}
+}
+
 // ---- TestManager_RemoveGraceful ---------------------------------------------
 
 // TestManager_RemoveGraceful verifies that removing a leader node with
