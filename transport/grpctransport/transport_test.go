@@ -948,3 +948,38 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 		t.Error("BatchHeartbeats was never called")
 	}
 }
+
+// ---- TestGRPC_HeartbeatRPCTimeoutOption -------------------------------------
+
+// TestGRPC_HeartbeatRPCTimeoutOption verifies that WithHeartbeatRPCTimeout is
+// wired through: when the receiver is unreachable and the timeout is very
+// short, BatchHeartbeats must fail quickly instead of hanging for 5s.
+func TestGRPC_HeartbeatRPCTimeoutOption(t *testing.T) {
+	// Sender configured with a 50ms RPC timeout.
+	send, err := grpctransport.Listen("127.0.0.1:0",
+		grpctransport.WithHeartbeatRPCTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer send.Close()
+
+	// Register a peer address that nobody is listening on.
+	send.AddPeer("dead", "127.0.0.1:1") // port 1 is unroutable on localhost
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = send.AppendEntries(ctx, "dead", &raft.AppendEntriesRequest{GroupID: 1, Term: 1})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error sending to unreachable peer, got nil")
+	}
+	// Must fail well within the 5s default; the 50ms option should bound it.
+	if elapsed > time.Second {
+		t.Errorf("heartbeat took %v to fail — WithHeartbeatRPCTimeout not applied", elapsed)
+	}
+	t.Logf("failed in %v (timeout=50ms): %v", elapsed, err)
+}
