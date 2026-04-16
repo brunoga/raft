@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1030,5 +1031,60 @@ func TestGRPC_RemovePeer(t *testing.T) {
 	send.AddPeer("recv", recv.Addr())
 	if _, err := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); err != nil {
 		t.Errorf("RequestVote after re-AddPeer: %v", err)
+	}
+}
+
+// ---- TestGRPC_HeartbeatBatcherStopWaits ------------------------------------
+
+// TestGRPC_HeartbeatBatcherStopWaits verifies that Close() does not return
+// until all peerBatcher goroutines have exited. Before this fix, stop() only
+// cancelled the context, leaving goroutines running after Close() returned.
+func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recv.Close()
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enable multi-raft mode — this creates the heartbeat batcher.
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+	send.AddPeer("recv", recv.Addr())
+
+	// Trigger peerBatcher goroutine creation by sending a heartbeat (empty
+	// Entries == heartbeat path in AppendEntries).
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+	// Error is expected (recv has no handler for group 1) — we only need the
+	// peerBatcher goroutine to have been created and settled.
+
+	before := runtime.NumGoroutine()
+
+	// Close() must block until all peerBatcher goroutines exit.
+	closeDone := make(chan struct{})
+	go func() {
+		send.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not return — peerBatcher goroutines likely leaked")
+	}
+
+	// Allow goroutines to fully exit.
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	// Goroutine count must have dropped: at minimum the peerBatcher goroutine
+	// created above should have exited.
+	if after >= before {
+		t.Errorf("goroutine leak: before Close=%d, after=%d (expected drop)", before, after)
 	}
 }

@@ -128,6 +128,7 @@ type heartbeatBatcher struct {
 
 	mu       sync.Mutex
 	batchers map[raft.NodeID]*peerBatcher
+	wg       sync.WaitGroup // tracks all live peerBatcher goroutines
 }
 
 func newHeartbeatBatcher(t *GRPCTransport) *heartbeatBatcher {
@@ -140,7 +141,13 @@ func newHeartbeatBatcher(t *GRPCTransport) *heartbeatBatcher {
 	}
 }
 
-func (b *heartbeatBatcher) stop() { b.cancel() }
+// stop cancels the shared context and blocks until all peerBatcher goroutines
+// have exited. Callers (e.g. GRPCTransport.Close) must call stop before
+// releasing any resources the goroutines depend on.
+func (b *heartbeatBatcher) stop() {
+	b.cancel()
+	b.wg.Wait()
+}
 
 // peerBatcherFor lazily creates a peerBatcher for the given peer.
 func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) *peerBatcher {
@@ -154,7 +161,11 @@ func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) *peerBatcher {
 		ch:   make(chan hbCall, hbChanSize),
 	}
 	b.batchers[peer] = batcher
-	go batcher.run(b.ctx, b.t)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		batcher.run(b.ctx, b.t)
+	}()
 	return batcher
 }
 
