@@ -27,7 +27,7 @@ const (
 	hbChanSizeDefault = 1024
 )
 
-// hbCall is one pending heartbeat enqueued by a Node goroutine.
+// hbCall is one b.pending heartbeat enqueued by a Node goroutine.
 type hbCall struct {
 	entry  *pb.HeartbeatEntry
 	respCh chan hbResp // buffered(1); always written before read
@@ -45,8 +45,9 @@ type hbResp struct {
 type peerBatcher struct {
 	peer    raft.NodeID
 	ch      chan hbCall
-	cancel  context.CancelFunc               // cancels this batcher's context (used by removePeer)
-	results map[uint64]*pb.HeartbeatResult   // reused across RPC cycles; owned by run goroutine only
+	cancel  context.CancelFunc             // cancels this batcher's context (used by removePeer)
+	pending []hbCall                         // reused across flush cycles; owned by run goroutine only
+	results map[uint64]*pb.HeartbeatResult // reused across RPC cycles; owned by run goroutine only
 }
 
 // run is the batcher goroutine. It blocks until the first call arrives,
@@ -62,20 +63,21 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 			return
 		}
 
-		// Collect remaining calls within hbWindow.
-		pending := make([]hbCall, 0, 16)
-		pending = append(pending, first)
+		// Collect remaining calls within hbWindow. Reuse the slice across
+		// cycles (clear only) to avoid a per-batch heap allocation.
+		b.pending = b.pending[:0]
+		b.pending = append(b.pending, first)
 		window := time.NewTimer(t.hbWindow)
 	drain:
 		for {
 			select {
 			case c := <-b.ch:
-				pending = append(pending, c)
+				b.pending = append(b.pending, c)
 			case <-window.C:
 				break drain
 			case <-ctx.Done():
 				window.Stop()
-				for _, c := range pending {
+				for _, c := range b.pending {
 					c.respCh <- hbResp{err: ctx.Err()}
 				}
 				return
@@ -85,15 +87,15 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 
 		// Build and send the batched RPC.
 		req := &pb.BatchedHeartbeatRequest{
-			Entries: make([]*pb.HeartbeatEntry, len(pending)),
+			Entries: make([]*pb.HeartbeatEntry, len(b.pending)),
 		}
-		for i, c := range pending {
+		for i, c := range b.pending {
 			req.Entries[i] = c.entry
 		}
 
 		client, err := t.clientFor(b.peer)
 		if err != nil {
-			for _, c := range pending {
+			for _, c := range b.pending {
 				c.respCh <- hbResp{err: err}
 			}
 			continue
@@ -104,7 +106,7 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 		cancel()
 
 		if err != nil {
-			for _, c := range pending {
+			for _, c := range b.pending {
 				c.respCh <- hbResp{err: err}
 			}
 			continue
@@ -119,7 +121,7 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 		for _, r := range resp.Results {
 			b.results[r.GroupId] = r
 		}
-		for _, c := range pending {
+		for _, c := range b.pending {
 			if r, ok := b.results[c.entry.GroupId]; ok {
 				c.respCh <- hbResp{term: r.Term, success: r.Success}
 			} else {
