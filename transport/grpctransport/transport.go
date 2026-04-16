@@ -233,6 +233,25 @@ func (t *GRPCTransport) AddPeer(id raft.NodeID, addr string) {
 	t.mu.Unlock()
 }
 
+// RemovePeer unregisters a remote Raft node and closes its cached connection.
+// After this call, any outbound RPC to id will return an error until AddPeer
+// is called again. Use this when a node is permanently decommissioned to
+// prevent stale connection accumulation.
+func (t *GRPCTransport) RemovePeer(id raft.NodeID) {
+	t.mu.Lock()
+	addr, ok := t.peers[id]
+	var cc *grpc.ClientConn
+	if ok {
+		delete(t.peers, id)
+		cc = t.clients[addr] // nil if not yet dialled
+		delete(t.clients, addr)
+	}
+	t.mu.Unlock()
+	if cc != nil {
+		cc.Close() //nolint:errcheck // best-effort cleanup; error is unactionable here.
+	}
+}
+
 // Register implements raft.Transport. It associates a handler with a node ID
 // so inbound RPCs addressed to that node are dispatched correctly.
 func (t *GRPCTransport) Register(id raft.NodeID, h raft.Handler) {
