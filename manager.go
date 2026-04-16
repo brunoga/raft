@@ -216,15 +216,42 @@ func (m *Manager) StatusAll() []GroupStatus {
 }
 
 // RunTicker drives Tick for all registered nodes at the given interval until
-// ctx is cancelled. It fans out ticks in parallel using a bounded worker pool
-// (min(G, GOMAXPROCS) workers) so that a slow node cannot delay other groups'
-// election timers, and goroutine allocation is O(GOMAXPROCS) per tick rather
-// than O(G).
+// ctx is cancelled. It fans out ticks in parallel using a persistent worker
+// pool of GOMAXPROCS goroutines so that a slow node cannot delay other groups'
+// election timers. Workers are started once when RunTicker is called and
+// exit cleanly when ctx is cancelled.
 //
-// RunTicker blocks until ctx is done.
+// RunTicker blocks until ctx is done and all workers have exited.
 func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
+	type tickItem struct {
+		node *Node
+		done *sync.WaitGroup
+	}
+
+	nWorkers := runtime.GOMAXPROCS(0)
+	// Buffer allows the main goroutine to keep sending while workers process;
+	// 2× nWorkers keeps the pipeline full without large memory cost.
+	work := make(chan tickItem, nWorkers*2)
+
+	var poolWg sync.WaitGroup
+	poolWg.Add(nWorkers)
+	for range nWorkers {
+		go func() {
+			defer poolWg.Done()
+			for item := range work {
+				item.node.Tick()
+				item.done.Done()
+			}
+		}()
+	}
+
 	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	defer func() {
+		ticker.Stop()
+		close(work)  // signals workers to exit
+		poolWg.Wait() // wait for all workers to drain and exit
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -241,26 +268,12 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 				continue
 			}
 
-			// Bounded worker pool: cap concurrency at GOMAXPROCS so we don't
-			// spawn one goroutine per group per tick at large G.
-			workers := min(len(nodes), runtime.GOMAXPROCS(0))
-			work := make(chan *Node, len(nodes))
+			var tickWg sync.WaitGroup
+			tickWg.Add(len(nodes))
 			for _, n := range nodes {
-				work <- n
+				work <- tickItem{node: n, done: &tickWg}
 			}
-			close(work)
-
-			var wg sync.WaitGroup
-			for range workers {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for nd := range work {
-						nd.Tick()
-					}
-				}()
-			}
-			wg.Wait()
+			tickWg.Wait()
 		}
 	}
 }
