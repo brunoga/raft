@@ -48,8 +48,11 @@ type GroupStatus struct {
 // # Typical usage
 //
 //	mgr := raft.NewManager()
+//	cfgA := raft.DefaultConfig()
+//	cfgA.TickInterval = 0 // use Manager's central ticker
+//	nodeA, _ := raft.New(&cfgA)
 //	mgr.Add(1, nodeA)
-//	mgr.Add(2, nodeB)
+//
 //	mgr.StartAll()
 //	defer mgr.StopAll()
 //	mgr.RunTicker(ctx, 10*time.Millisecond)
@@ -274,8 +277,15 @@ func (m *Manager) StatusAll() []GroupStatus {
 var tickWgPool = sync.Pool{New: func() any { return new(sync.WaitGroup) }}
 
 // RunTicker drives Tick for all registered nodes at the given interval until
-// ctx is cancelled. It fans out ticks in parallel using a persistent worker
-// pool of GOMAXPROCS goroutines so that a slow node cannot delay other groups'
+// ctx is cancelled.
+//
+// To avoid double-ticking, RunTicker only sends ticks to nodes whose
+// TickInterval is set to 0 (manual ticking). Nodes with a positive
+// TickInterval already drive their own internal ticker and are skipped by
+// RunTicker.
+//
+// RunTicker fans out ticks in parallel using a persistent worker pool of
+// GOMAXPROCS goroutines so that a slow node cannot delay other groups'
 // election timers. Workers are started once when RunTicker is called and
 // exit cleanly when ctx is cancelled.
 //
@@ -331,7 +341,11 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 			tickWg := tickWgPool.Get().(*sync.WaitGroup)
 			tickWg.Add(len(nodes))
 			for _, n := range nodes {
-				work <- tickItem{node: n, done: tickWg}
+				if n.cfg.TickInterval == 0 {
+					work <- tickItem{node: n, done: tickWg}
+				} else {
+					tickWg.Done()
+				}
 			}
 			tickWg.Wait()
 			tickWgPool.Put(tickWg)
