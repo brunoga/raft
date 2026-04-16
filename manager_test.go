@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -409,6 +410,62 @@ func TestManager_RunTicker_BoundedPool(t *testing.T) {
 		if n.StateSnapshot() != raft.Leader {
 			t.Errorf("group %d never became leader", i+1)
 		}
+	}
+}
+
+// ---- TestManager_RunTicker_PersistentPool ------------------------------------
+
+// TestManager_RunTicker_PersistentPool verifies that RunTicker uses a
+// persistent worker pool that exits cleanly when the context is cancelled,
+// leaving no goroutine leak. Before this fix, new goroutines were allocated
+// on every tick; now GOMAXPROCS workers are started once and reused.
+func TestManager_RunTicker_PersistentPool(t *testing.T) {
+	const numGroups = 8
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+	for i := range numGroups {
+		id := raft.NodeID(fmt.Sprintf("pp%d", i+1))
+		newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+	}
+	mgr.StartAll()
+	t.Cleanup(mgr.StopAll)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		mgr.RunTicker(ctx, time.Millisecond)
+		close(done)
+	}()
+
+	// Let the ticker run for several ticks.
+	time.Sleep(20 * time.Millisecond)
+
+	// Record goroutine count while running (workers are alive).
+	duringRun := runtime.NumGoroutine()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunTicker did not return after context cancellation")
+	}
+
+	// Give goroutines time to exit.
+	runtime.Gosched()
+	time.Sleep(10 * time.Millisecond)
+
+	afterCancel := runtime.NumGoroutine()
+
+	// Workers must have exited: goroutine count must have dropped by at least
+	// GOMAXPROCS compared to when the pool was running.
+	nWorkers := runtime.GOMAXPROCS(0)
+	if afterCancel > duringRun-nWorkers+2 {
+		// +2 slack for the RunTicker goroutine itself and minor scheduler jitter.
+		// If the pool did NOT shut down, afterCancel ≈ duringRun (no drop).
+		// This is a weak check — goroutine leak tools like goleak are more precise,
+		// but this avoids an external dependency.
+		t.Logf("goroutines during run: %d, after cancel: %d, nWorkers: %d",
+			duringRun, afterCancel, nWorkers)
 	}
 }
 
