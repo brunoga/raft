@@ -7,6 +7,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -728,6 +729,123 @@ func TestManager_RemoveGraceful(t *testing.T) {
 	}
 	if !hasLeader {
 		t.Error("no leader among remaining nodes after RemoveGraceful")
+	}
+}
+
+// ---- TestManager_RemoveGraceful_Race ----------------------------------------
+
+// TestManager_RemoveGraceful_Race verifies that RemoveGraceful waits for the
+// leadership transfer to complete (node steps down) before stopping it.
+// Before the fix, RemoveGraceful stopped the node immediately after
+// TransferLeadership returned, which cancelled the background TimeoutNow RPC.
+func TestManager_RemoveGraceful_Race(t *testing.T) {
+	const timeout = 5 * time.Second
+	net := memtransport.NewNetwork()
+	mgr := raft.NewManager()
+
+	peers := []raft.NodeID{"a", "b", "c"}
+	nodes := make(map[raft.NodeID]*raft.Node)
+	transports := make(map[raft.NodeID]*delayedTransport)
+
+	for _, id := range peers {
+		others := make([]raft.NodeID, 0, 2)
+		for _, p := range peers {
+			if p != id {
+				others = append(others, p)
+			}
+		}
+		cfg := raft.DefaultConfig()
+		cfg.GroupID = 1
+		cfg.ID = id
+		cfg.Peers = others
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = &discardSM{}
+
+		dt := &delayedTransport{Transport: net.NewTransport(id)}
+		transports[id] = dt
+		cfg.Transport = dt
+
+		cfg.TickInterval = 0
+		node, _ := raft.New(&cfg)
+		nodes[id] = node
+		net.Register(id, node)
+		node.Start()
+	}
+
+	// Elect a leader.
+	deadline := time.Now().Add(timeout)
+	var leaderID raft.NodeID
+	for time.Now().Before(deadline) {
+		for _, n := range nodes {
+			n.Tick()
+		}
+		for id, n := range nodes {
+			if n.StateSnapshot() == raft.Leader {
+				leaderID = id
+				break
+			}
+		}
+		if leaderID != "" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if leaderID == "" {
+		t.Fatal("no leader elected")
+	}
+
+	// Find another node to transfer to.
+	var transferTo raft.NodeID
+	for _, id := range peers {
+		if id != leaderID {
+			transferTo = id
+			break
+		}
+	}
+
+	// Register the leader with the manager.
+	mgr.Add(1, nodes[leaderID])
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// In the fixed version, RemoveGraceful should wait for TimeoutNow.
+	if err := mgr.RemoveGraceful(ctx, 1, transferTo); err != nil {
+		t.Fatalf("RemoveGraceful: %v", err)
+	}
+
+	// Give the background goroutine a moment to finish its (delayed) work.
+	time.Sleep(200 * time.Millisecond)
+
+	errVal := transports[leaderID].timeoutNowErr.Load()
+	if errVal == nil {
+		t.Fatal("TimeoutNow was never called")
+	}
+	if err, ok := errVal.(error); ok {
+		t.Errorf("TimeoutNow failed: %v", err)
+	}
+}
+
+type delayedTransport struct {
+	raft.Transport
+	timeoutNowErr atomic.Value // stores error or struct{} for success
+}
+
+func (t *delayedTransport) TimeoutNow(ctx context.Context, to raft.NodeID, req *raft.TimeoutNowRequest) (*raft.TimeoutNowResponse, error) {
+	// Delay to ensure the race hits.
+	select {
+	case <-time.After(100 * time.Millisecond):
+		resp, rerr := t.Transport.TimeoutNow(ctx, to, req)
+		if rerr != nil {
+			t.timeoutNowErr.Store(rerr)
+		} else {
+			t.timeoutNowErr.Store(struct{}{})
+		}
+		return resp, rerr
+	case <-ctx.Done():
+		err := ctx.Err()
+		t.timeoutNowErr.Store(err)
+		return nil, err
 	}
 }
 
