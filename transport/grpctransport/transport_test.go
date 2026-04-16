@@ -1350,11 +1350,9 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 
 	// nodes[g][p] is the Node for group g+1 on physical node p.
 	nodes := make([][]*raft.Node, numGroups)
-	sms := make([][]*kvSM, numGroups)
 	for g := range numGroups {
 		groupID := uint64(g + 1)
 		nodes[g] = make([]*raft.Node, numPhysical)
-		sms[g] = make([]*kvSM, numPhysical)
 
 		// Build the list of all NodeIDs in this group.
 		allIDs := make([]raft.NodeID, numPhysical)
@@ -1390,7 +1388,6 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 				t.Fatalf("managers[%d].AddAndStart(g=%d): %v", p, g+1, err)
 			}
 			nodes[g][p] = node
-			sms[g][p] = sm
 		}
 	}
 
@@ -1491,14 +1488,20 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 		t.Errorf("group 1: leadership did not transfer away from physical %d within %s", leaderP, electionTimeout)
 	}
 
-	// ---- Phase 7: sanity-check backpressure counter -------------------------
+	// ---- Phase 7: sanity-check transport metrics ----------------------------
 	//
-	// 3 groups is well under the default hbChanSize of 1024; the counter must
-	// remain zero throughout the test.
+	// 3 groups is well under the default hbChanSize of 1024; the backpressure
+	// counter must remain zero throughout the test.
+	//
+	// BatchHeartbeatsServed must be positive on every transport to confirm that
+	// the batching code path (not just direct AppendEntries) was exercised.
 
 	for p, tr := range transports {
 		if n := tr.HeartbeatSendBlocked(); n != 0 {
 			t.Errorf("physical %d: HeartbeatSendBlocked = %d, want 0 (hbChan saturated under light load)", p, n)
+		}
+		if n := tr.BatchHeartbeatsServed(); n == 0 {
+			t.Errorf("physical %d: BatchHeartbeatsServed = 0, want >0 (batching path not exercised)", p)
 		}
 	}
 }

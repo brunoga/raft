@@ -503,6 +503,14 @@ type grpcServer struct {
 // handlerForGroup returns the Handler for the given groupID. If a group-lookup
 // function has been installed (multi-Raft mode), it takes priority. Otherwise
 // the call falls back to NodeID-header routing (single-group / test mode).
+//
+// The mu.RLock/RUnlock around the groupLookup read is intentionally lightweight:
+// groupLookup is set once at startup via SetGroupLookup and never changed
+// afterward, so the lock is released immediately after the pointer is read.
+// BatchHeartbeats skips this per-entry lock by reading groupLookup once at the
+// top of the handler — an optimization that is valid because groupLookup is
+// immutable after initialization. If dynamic re-registration ever becomes
+// necessary, both paths must be revisited.
 func (s *grpcServer) handlerForGroup(ctx context.Context, groupID uint64) (raft.Handler, error) {
 	s.transport.mu.RLock()
 	lookup := s.transport.groupLookup

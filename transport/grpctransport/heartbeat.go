@@ -27,7 +27,7 @@ const (
 	hbChanSizeDefault = 1024
 )
 
-// hbCall is one b.pending heartbeat enqueued by a Node goroutine.
+// hbCall is one pending heartbeat enqueued by a Node goroutine.
 type hbCall struct {
 	entry  *pb.HeartbeatEntry
 	respCh chan hbResp // buffered(1); always written before read
@@ -60,7 +60,17 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 		select {
 		case first = <-b.ch:
 		case <-ctx.Done():
-			return
+			// Drain any calls that arrived before shutdown so that Send's drainer
+			// goroutines (spawned when the caller ctx cancelled after enqueue) are
+			// not left waiting on respCh forever.
+			for {
+				select {
+				case c := <-b.ch:
+					c.respCh <- hbResp{err: ctx.Err()}
+				default:
+					return
+				}
+			}
 		}
 
 		// Collect remaining calls within hbWindow. Reuse the slice across
@@ -80,7 +90,16 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 				for _, c := range b.pending {
 					c.respCh <- hbResp{err: ctx.Err()}
 				}
-				return
+				// Drain calls that arrived in the channel during the window so
+				// that Send's drainer goroutines do not leak.
+				for {
+					select {
+					case c := <-b.ch:
+						c.respCh <- hbResp{err: ctx.Err()}
+					default:
+						return
+					}
+				}
 			}
 		}
 		window.Stop()
