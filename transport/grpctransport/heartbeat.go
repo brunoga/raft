@@ -2,12 +2,17 @@ package grpctransport
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/brunoga/raft"
 	pb "github.com/brunoga/raft/transport/grpctransport/raftpb"
 )
+
+// errBatcherStopped is returned by peerBatcherFor when the heartbeatBatcher
+// has already been stopped.
+var errBatcherStopped = errors.New("heartbeat batcher stopped")
 
 const (
 	// defaultHBWindow is the default collection window for the heartbeat
@@ -40,7 +45,8 @@ type hbResp struct {
 type peerBatcher struct {
 	peer    raft.NodeID
 	ch      chan hbCall
-	results map[uint64]*pb.HeartbeatResult // reused across RPC cycles; owned by run goroutine only
+	cancel  context.CancelFunc               // cancels this batcher's context (used by removePeer)
+	results map[uint64]*pb.HeartbeatResult   // reused across RPC cycles; owned by run goroutine only
 }
 
 // run is the batcher goroutine. It blocks until the first call arrives,
@@ -125,6 +131,11 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 	}
 }
 
+// respChanPool reuses buffered channels used to carry heartbeat responses back
+// to callers of Send. Reusing channels eliminates one heap allocation per
+// heartbeat send (G sends per tick × P peers = G×P allocations per tick).
+var respChanPool = sync.Pool{New: func() any { return make(chan hbResp, 1) }}
+
 // heartbeatBatcher manages one peerBatcher goroutine per remote peer.
 type heartbeatBatcher struct {
 	t      *GRPCTransport
@@ -132,6 +143,7 @@ type heartbeatBatcher struct {
 	cancel context.CancelFunc
 
 	mu       sync.Mutex
+	stopped  bool                          // set true by stop(); checked by peerBatcherFor
 	batchers map[raft.NodeID]*peerBatcher
 	wg       sync.WaitGroup // tracks all live peerBatcher goroutines
 }
@@ -150,29 +162,56 @@ func newHeartbeatBatcher(t *GRPCTransport) *heartbeatBatcher {
 // have exited. Callers (e.g. GRPCTransport.Close) must call stop before
 // releasing any resources the goroutines depend on.
 func (b *heartbeatBatcher) stop() {
+	b.mu.Lock()
+	b.stopped = true
+	b.mu.Unlock()
 	b.cancel()
 	b.wg.Wait()
 }
 
+// removePeer stops the peerBatcher goroutine for the given peer (if any) and
+// removes it from the registry. Subsequent sends to that peer will create a
+// fresh batcher. This is called from GRPCTransport.RemovePeer so that stale
+// batcher goroutines don't accumulate when peers leave the cluster.
+func (b *heartbeatBatcher) removePeer(peer raft.NodeID) {
+	b.mu.Lock()
+	batcher, ok := b.batchers[peer]
+	if ok {
+		delete(b.batchers, peer)
+	}
+	b.mu.Unlock()
+	if ok {
+		batcher.cancel()
+	}
+}
+
 // peerBatcherFor lazily creates a peerBatcher for the given peer.
-func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) *peerBatcher {
+// Returns errBatcherStopped if stop() has already been called.
+func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) (*peerBatcher, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if existing, ok := b.batchers[peer]; ok {
-		return existing
+	if b.stopped {
+		return nil, errBatcherStopped
 	}
+	if existing, ok := b.batchers[peer]; ok {
+		return existing, nil
+	}
+	// Each peerBatcher gets its own cancellable child context so that
+	// removePeer can stop just that goroutine without affecting others.
+	peerCtx, peerCancel := context.WithCancel(b.ctx)
 	batcher := &peerBatcher{
 		peer:    peer,
 		ch:      make(chan hbCall, b.t.hbChanSize),
+		cancel:  peerCancel,
 		results: make(map[uint64]*pb.HeartbeatResult),
 	}
 	b.batchers[peer] = batcher
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
-		batcher.run(b.ctx, b.t)
+		batcher.run(peerCtx, b.t)
 	}()
-	return batcher
+	return batcher, nil
 }
 
 // Send enqueues a pure-heartbeat AppendEntries call and blocks until the
@@ -187,18 +226,30 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 		LeaderCommit: uint64(req.LeaderCommit),
 		ReadBarrier:  req.ReadBarrier,
 	}
-	respCh := make(chan hbResp, 1)
+
+	// Get a buffered response channel from the pool to avoid per-call allocation.
+	respCh := respChanPool.Get().(chan hbResp)
 	call := hbCall{entry: entry, respCh: respCh}
 
-	pb := b.peerBatcherFor(to)
+	batcher, err := b.peerBatcherFor(to)
+	if err != nil {
+		respChanPool.Put(respCh)
+		return nil, err
+	}
+
 	select {
-	case pb.ch <- call:
+	case batcher.ch <- call:
+		// call enqueued; batcher WILL write to respCh exactly once.
 	case <-ctx.Done():
+		// call NOT enqueued; batcher will never write to respCh — safe to pool.
+		respChanPool.Put(respCh)
 		return nil, ctx.Err()
 	}
 
 	select {
 	case r := <-respCh:
+		// Normal path: response received; channel is now empty — safe to pool.
+		respChanPool.Put(respCh)
 		if r.err != nil {
 			return nil, r.err
 		}
@@ -207,6 +258,14 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 			Success: r.success,
 		}, nil
 	case <-ctx.Done():
+		// call was enqueued but we abandoned the wait. The batcher will still
+		// write to respCh (channel is buffered-1 so its write is non-blocking).
+		// We must not return respCh to the pool yet; a drainer goroutine waits
+		// for the write and then recycles the channel.
+		go func() {
+			<-respCh
+			respChanPool.Put(respCh)
+		}()
 		return nil, ctx.Err()
 	}
 }

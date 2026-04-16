@@ -1204,3 +1204,82 @@ func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
 		t.Errorf("goroutine leak: before Close=%d, after=%d (expected drop)", before, after)
 	}
 }
+
+// ---- TestGRPC_HeartbeatBatcherStoppedFlag -----------------------------------
+
+// TestGRPC_HeartbeatBatcherStoppedFlag verifies that Send returns an error
+// (not a panic or hang) when called after Close(). The stopped flag in
+// heartbeatBatcher must prevent peerBatcherFor from creating new goroutines
+// after stop() has been called.
+func TestGRPC_HeartbeatBatcherStoppedFlag(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recv.Close()
+	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+	send.AddPeer("recv", recv.Addr())
+
+	// Warm up a batcher goroutine.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+
+	// Close the sender — this must stop the batcher.
+	send.Close()
+
+	// Send after close must return an error quickly, not hang or panic.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel2()
+	_, err = send.AppendEntries(ctx2, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+	if err == nil {
+		t.Fatal("expected error after Close(), got nil")
+	}
+}
+
+// ---- TestGRPC_RemovePeer_StopsBatcher ---------------------------------------
+
+// TestGRPC_RemovePeer_StopsBatcher verifies that RemovePeer stops the
+// peerBatcher goroutine for the removed peer so it doesn't linger. Before
+// this fix, peerBatcher goroutines accumulated indefinitely as peers joined
+// and left the cluster.
+func TestGRPC_RemovePeer_StopsBatcher(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recv.Close()
+	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer send.Close()
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+	send.AddPeer("recv", recv.Addr())
+
+	// Trigger peerBatcher goroutine creation.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+
+	before := runtime.NumGoroutine()
+
+	send.RemovePeer("recv")
+
+	// Allow the goroutine to exit.
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	if after >= before {
+		t.Errorf("peerBatcher goroutine leaked after RemovePeer: before=%d after=%d", before, after)
+	}
+}
