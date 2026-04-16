@@ -464,8 +464,8 @@ func TestManager_RunTicker_PersistentPool(t *testing.T) {
 		// If the pool did NOT shut down, afterCancel ≈ duringRun (no drop).
 		// This is a weak check — goroutine leak tools like goleak are more precise,
 		// but this avoids an external dependency.
-		t.Logf("goroutines during run: %d, after cancel: %d, nWorkers: %d",
-			duringRun, afterCancel, nWorkers)
+		t.Errorf("goroutine leak: goroutines during run=%d, after cancel=%d, nWorkers=%d (expected drop of ~%d)",
+			duringRun, afterCancel, nWorkers, nWorkers)
 	}
 }
 
