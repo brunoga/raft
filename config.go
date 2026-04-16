@@ -86,6 +86,14 @@ type Config struct {
 	// Default: 10 000.
 	SnapshotThreshold uint64
 
+	// SnapshotSemaphore is an optional semaphore used to limit the number of
+	// concurrent snapshots across multiple Raft nodes on a single physical
+	// machine. If nil, snapshots are not throttled.
+	//
+	// Multi-raft deployments should share a single semaphore across all nodes
+	// to prevent "snapshot storms" that could starve the node's CPU and I/O.
+	SnapshotSemaphore chan struct{}
+
 	// MaxInflightRPCs is the maximum number of concurrent unacknowledged
 	// AppendEntries RPCs per follower (the per-peer send window). Higher values
 	// increase throughput under high latency by keeping the network pipe full,
