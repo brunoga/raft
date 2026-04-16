@@ -6,12 +6,19 @@
 //
 // Usage:
 //
-//	t, err := grpctransport.Listen(":50051", nil)
-//	cfg.Transport = t
-//	cfg.Transport.Register(cfg.ID, node)
-//	node, _ := raft.New(cfg)
-//	node.Start()
+//	t, err := grpctransport.Listen(":50051")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 //	defer t.Close()
+//
+//	node, err := raft.NewNode(raft.Config{
+//	    ID:        "node1",
+//	    Transport: t,
+//	    // ...
+//	})
+//	t.Register("node1", node)
+//	node.Start()
 package grpctransport
 
 import (
