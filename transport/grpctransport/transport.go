@@ -319,7 +319,27 @@ func (t *GRPCTransport) Register(id raft.NodeID, h raft.Handler) {
 // preserved through the batched entry so followers can satisfy in-flight
 // ReadIndex futures.
 //
-// The lookup function is typically Manager.Lookup.
+// The lookup function is typically Manager.Lookup. Canonical multi-Raft
+// wiring (one physical node, one transport, multiple groups):
+//
+//	mgr := raft.NewManager()
+//	t, _ := grpctransport.Listen(":50051")
+//	t.SetGroupLookup(mgr.Lookup) // must be called before nodes start sending RPCs
+//
+//	for _, cfg := range groupConfigs {
+//	    cfg.Transport = t          // all groups share the same transport
+//	    node, _ := raft.New(&cfg)
+//	    mgr.AddAndStart(cfg.GroupID, node)
+//	    // AddPeer must cover every (groupID, peerNodeID) pair so that
+//	    // clientFor can resolve outbound RPCs to physical addresses.
+//	}
+//
+//	ctx, cancel := context.WithCancel(context.Background())
+//	defer cancel()
+//	go mgr.RunTicker(ctx, 10*time.Millisecond)
+//
+// SetGroupLookup is idempotent: subsequent calls update the lookup function
+// and reuse the existing heartbeat batcher.
 func (t *GRPCTransport) SetGroupLookup(fn func(uint64) (raft.Handler, bool)) {
 	t.mu.Lock()
 	t.groupLookup = fn
