@@ -365,6 +365,7 @@ func (t *GRPCTransport) Close() error {
 		cc.Close() //nolint:errcheck // best-effort cleanup; error is unactionable during shutdown.
 	}
 	t.clients = make(map[string]*grpc.ClientConn)
+	t.hbBatcher = nil // prevent use-after-close from silently returning errBatcherStopped
 	return nil
 }
 
