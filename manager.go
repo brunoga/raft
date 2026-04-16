@@ -131,14 +131,15 @@ func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo
 		return ErrGroupNotFound
 	}
 	if node.StateSnapshot() == Leader {
-		// Best-effort: ignore transfer errors (e.g. no quorum) and fall through
-		// to the unconditional stop below.
+		// Best-effort: ignore transfer errors (e.g. no quorum, ErrStopped from a
+		// concurrent StopAll that stopped the node between our RUnlock and here)
+		// and fall through to the unconditional stop below.
 		_ = node.TransferLeadership(ctx, transferTo)
 	}
 	err := m.Remove(groupID)
 	if errors.Is(err, ErrGroupNotFound) {
-		// A concurrent Remove won the race between our initial lookup and this
-		// call. The group is already gone — that is the desired outcome.
+		// A concurrent Remove or StopAll won the race between our initial lookup
+		// and this call. The group is already gone — that is the desired outcome.
 		return nil
 	}
 	return err

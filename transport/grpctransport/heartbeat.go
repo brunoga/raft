@@ -178,6 +178,14 @@ func (b *heartbeatBatcher) stop() {
 // removes it from the registry. Subsequent sends to that peer will create a
 // fresh batcher. This is called from GRPCTransport.RemovePeer so that stale
 // batcher goroutines don't accumulate when peers leave the cluster.
+//
+// removePeer is fire-and-forget: it cancels the batcher's context and returns
+// without waiting for the goroutine to exit. The goroutine will exit promptly
+// on its next ctx.Done check, but there is a brief window where both the old
+// goroutine (draining or mid-RPC) and a new goroutine (created for the same
+// peer by a concurrent peerBatcherFor call) are alive simultaneously. This is
+// safe: the old goroutine owns only already-enqueued calls; new calls go to
+// the new goroutine.
 func (b *heartbeatBatcher) removePeer(peer raft.NodeID) {
 	b.mu.Lock()
 	batcher, ok := b.batchers[peer]
