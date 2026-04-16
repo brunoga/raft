@@ -514,57 +514,63 @@ func (s *grpcServer) ReadIndex(ctx context.Context, req *pb.ReadIndexRequest) (*
 // empty AppendEntries to each registered group and collecting the responses.
 // Unknown groups are skipped with a non-success result rather than failing the
 // whole batch, so a late-joiner or just-removed group doesn't disrupt others.
+//
+// Dispatches to all groups concurrently so that a temporarily stalled node
+// event channel cannot delay responses to the rest of the batch.
 func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbeatRequest) (*pb.BatchedHeartbeatResponse, error) {
 	s.transport.batchHBServed.Add(1)
 	s.transport.batchHBEntries.Add(int64(len(req.Entries)))
-	resp := &pb.BatchedHeartbeatResponse{
-		Results: make([]*pb.HeartbeatResult, 0, len(req.Entries)),
-	}
+
+	resultCh := make(chan *pb.HeartbeatResult, len(req.Entries))
 	for _, entry := range req.Entries {
-		h, hErr := s.handlerForGroup(ctx, entry.GroupId)
-		if hErr != nil {
-			// Not-found is expected for late-joiners / just-removed groups;
-			// log at debug. Any other error is unexpected.
-			s.transport.logger.LogAttrs(ctx, slog.LevelDebug,
-				"BatchHeartbeats: group lookup failed",
-				slog.Uint64("group_id", entry.GroupId),
-				slog.Any("err", hErr),
-			)
-			s.transport.batchHBErrors.Add(1)
-			resp.Results = append(resp.Results, &pb.HeartbeatResult{
-				GroupId: entry.GroupId,
-				Success: false,
-			})
-			continue
-		}
-		aeReq := &raft.AppendEntriesRequest{
-			GroupID:      entry.GroupId,
-			Term:         raft.Term(entry.Term),
-			LeaderID:     raft.NodeID(entry.LeaderId),
-			PrevLogIndex: raft.Index(entry.PrevLogIndex),
-			PrevLogTerm:  raft.Term(entry.PrevLogTerm),
-			LeaderCommit: raft.Index(entry.LeaderCommit),
-			ReadBarrier:  entry.ReadBarrier,
-		}
-		aeResp, aeErr := h.HandleAppendEntries(ctx, aeReq)
-		if aeErr != nil {
-			s.transport.logger.LogAttrs(ctx, slog.LevelWarn,
-				"BatchHeartbeats: HandleAppendEntries failed",
-				slog.Uint64("group_id", entry.GroupId),
-				slog.Any("err", aeErr),
-			)
-			s.transport.batchHBErrors.Add(1)
-			resp.Results = append(resp.Results, &pb.HeartbeatResult{
-				GroupId: entry.GroupId,
-				Success: false,
-			})
-			continue
-		}
-		resp.Results = append(resp.Results, &pb.HeartbeatResult{
-			GroupId: entry.GroupId,
-			Term:    uint64(aeResp.Term),
-			Success: aeResp.Success,
-		})
+		e := entry
+		go func() { resultCh <- s.dispatchHeartbeatEntry(ctx, e) }()
 	}
-	return resp, nil
+
+	results := make([]*pb.HeartbeatResult, 0, len(req.Entries))
+	for range req.Entries {
+		results = append(results, <-resultCh)
+	}
+	return &pb.BatchedHeartbeatResponse{Results: results}, nil
+}
+
+// dispatchHeartbeatEntry processes a single entry from a BatchHeartbeats
+// request and returns the result. Called concurrently from BatchHeartbeats.
+func (s *grpcServer) dispatchHeartbeatEntry(ctx context.Context, entry *pb.HeartbeatEntry) *pb.HeartbeatResult {
+	h, hErr := s.handlerForGroup(ctx, entry.GroupId)
+	if hErr != nil {
+		// Not-found is expected for late-joiners / just-removed groups;
+		// log at debug. Any other error is unexpected.
+		s.transport.logger.LogAttrs(ctx, slog.LevelDebug,
+			"BatchHeartbeats: group lookup failed",
+			slog.Uint64("group_id", entry.GroupId),
+			slog.Any("err", hErr),
+		)
+		s.transport.batchHBErrors.Add(1)
+		return &pb.HeartbeatResult{GroupId: entry.GroupId, Success: false}
+	}
+	aeReq := &raft.AppendEntriesRequest{
+		GroupID:      entry.GroupId,
+		Term:         raft.Term(entry.Term),
+		LeaderID:     raft.NodeID(entry.LeaderId),
+		PrevLogIndex: raft.Index(entry.PrevLogIndex),
+		PrevLogTerm:  raft.Term(entry.PrevLogTerm),
+		LeaderCommit: raft.Index(entry.LeaderCommit),
+		ReadBarrier:  entry.ReadBarrier,
+	}
+	aeResp, aeErr := h.HandleAppendEntries(ctx, aeReq)
+	if aeErr != nil {
+		s.transport.logger.LogAttrs(ctx, slog.LevelWarn,
+			"BatchHeartbeats: HandleAppendEntries failed",
+			slog.Uint64("group_id", entry.GroupId),
+			slog.Any("err", aeErr),
+		)
+		s.transport.batchHBErrors.Add(1)
+		return &pb.HeartbeatResult{GroupId: entry.GroupId, Success: false}
+	}
+	return &pb.HeartbeatResult{
+		GroupId: entry.GroupId,
+		Term:    uint64(aeResp.Term),
+		Success: aeResp.Success,
+	}
 }
