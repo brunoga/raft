@@ -139,7 +139,18 @@ func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo
 		// Best-effort: ignore transfer errors (e.g. no quorum, ErrStopped from a
 		// concurrent StopAll that stopped the node between our RUnlock and here)
 		// and fall through to the unconditional stop below.
-		_ = node.TransferLeadership(ctx, transferTo)
+		if err := node.TransferLeadership(ctx, transferTo); err == nil {
+			// Transfer accepted: wait for the node to actually step down before
+			// removing it. If we Remove too early, the background TimeoutNow RPC
+			// is cancelled and the transfer fails, causing a quorum gap.
+			for node.StateSnapshot() == Leader {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		}
 	}
 	err := m.Remove(groupID)
 	if errors.Is(err, ErrGroupNotFound) {
