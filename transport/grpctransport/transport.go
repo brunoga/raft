@@ -428,6 +428,7 @@ func (t *GRPCTransport) TimeoutNow(ctx context.Context, to raft.NodeID, req *raf
 		return nil, err
 	}
 	pbResp, err := c.TimeoutNow(ctx, &pb.TimeoutNowRequest{
+		GroupId:  req.GroupID,
 		Term:     uint64(req.Term),
 		LeaderId: string(req.LeaderID),
 	})
