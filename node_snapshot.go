@@ -201,10 +201,27 @@ func (n *Node) maybeSnapshot() {
 		return
 	}
 
+	// Throttling: if a shared SnapshotSemaphore is configured, acquire a
+	// permit before starting. If no permits are available, we defer the
+	// snapshot until the next applyResult. This prevents correlated
+	// "snapshot storms" in multi-raft deployments.
+	if n.cfg.SnapshotSemaphore != nil {
+		select {
+		case n.cfg.SnapshotSemaphore <- struct{}{}:
+			// Permit acquired.
+		default:
+			// No permits available; try again later.
+			return
+		}
+	}
+
 	snapAt := n.lastApplied
 	snapTerm, err := n.log.termAt(n.stopCtx, snapAt)
 	if err != nil {
 		n.logger.Error("maybeSnapshot: termAt", "index", snapAt, "err", err)
+		if n.cfg.SnapshotSemaphore != nil {
+			<-n.cfg.SnapshotSemaphore
+		}
 		return
 	}
 	n.snapshotting = true
@@ -223,7 +240,13 @@ func (n *Node) maybeSnapshot() {
 // handleSnapshotResult is called when the snapshot goroutine completes. It
 // persists the snapshot and truncates the log prefix.
 func (n *Node) handleSnapshotResult(sr snapshotResult) {
-	n.snapshotting = false
+	defer func() {
+		n.snapshotting = false
+		if n.cfg.SnapshotSemaphore != nil {
+			<-n.cfg.SnapshotSemaphore
+		}
+	}()
+
 	if sr.err != nil {
 		n.logger.Error("snapshot goroutine failed", "err", sr.err)
 		return

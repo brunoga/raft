@@ -826,6 +826,98 @@ func TestManager_RemoveGraceful_Race(t *testing.T) {
 	}
 }
 
+// ---- TestManager_SnapshotThrottling -----------------------------------------
+
+type concurrentSM struct {
+	concurrentCount atomic.Int32
+	maxConcurrent   atomic.Int32
+}
+
+func (s *concurrentSM) Apply(ctx context.Context, entry raft.LogEntry) ([]byte, error) { return nil, nil }
+func (s *concurrentSM) Snapshot(ctx context.Context) ([]byte, error) {
+	curr := s.concurrentCount.Add(1)
+	for {
+		max := s.maxConcurrent.Load()
+		if curr <= max || s.maxConcurrent.CompareAndSwap(max, curr) {
+			break
+		}
+	}
+	// Simulate some work.
+	time.Sleep(50 * time.Millisecond)
+	s.concurrentCount.Add(-1)
+	return nil, nil
+}
+func (s *concurrentSM) Restore(ctx context.Context, meta raft.SnapshotMeta, data []byte) error { return nil }
+
+// TestManager_SnapshotThrottling verifies that sharing a SnapshotSemaphore
+// across multiple groups successfully limits the number of concurrent
+// snapshots. This prevents "snapshot storms" in multi-raft deployments.
+func TestManager_SnapshotThrottling(t *testing.T) {
+	const nGroups = 4
+	const maxConcurrency = 2
+	net := memtransport.NewNetwork()
+	mgr := raft.NewManager()
+	sm := &concurrentSM{}
+
+	// Shared semaphore for all groups.
+	sem := make(chan struct{}, maxConcurrency)
+
+	nodes := make([]*raft.Node, nGroups)
+	for i := range nGroups {
+		gid := uint64(i + 1)
+		cfg := raft.DefaultConfig()
+		cfg.ID = raft.NodeID(fmt.Sprintf("n%d", i))
+		cfg.GroupID = gid
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = sm
+		cfg.Transport = net.NewTransport(cfg.ID)
+		cfg.TickInterval = 0
+		cfg.SnapshotThreshold = 1 // Snapshot after every apply
+		cfg.SnapshotSemaphore = sem
+
+		n, _ := raft.New(&cfg)
+		nodes[i] = n
+		_ = mgr.Add(gid, n)
+		n.Start()
+	}
+	defer mgr.StopAll()
+
+	// Elect leaders.
+	for i := range nGroups {
+		n := nodes[i]
+		// Become leader.
+		for range 40 {
+			n.Tick()
+			time.Sleep(time.Millisecond)
+		}
+		if n.StateSnapshot() != raft.Leader {
+			t.Fatalf("node %d did not become leader", i)
+		}
+	}
+
+	// Trigger snapshots in parallel.
+	var wg sync.WaitGroup
+	wg.Add(nGroups)
+	for i := range nGroups {
+		go func(node *raft.Node) {
+			defer wg.Done()
+			_, err := node.Propose(context.Background(), []byte("trigger"))
+			if err != nil {
+				t.Errorf("Propose: %v", err)
+			}
+		}(nodes[i])
+	}
+	wg.Wait()
+
+	// Wait for snapshots to start/complete.
+	time.Sleep(200 * time.Millisecond)
+
+	maxSeen := sm.maxConcurrent.Load()
+	if int(maxSeen) > maxConcurrency {
+		t.Errorf("expected max %d concurrent snapshots, got %d", maxConcurrency, maxSeen)
+	}
+}
+
 type delayedTransport struct {
 	raft.Transport
 	timeoutNowErr atomic.Value // stores error or struct{} for success
