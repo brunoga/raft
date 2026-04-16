@@ -252,6 +252,10 @@ func (m *Manager) StatusAll() []GroupStatus {
 	return out
 }
 
+// tickWgPool reuses WaitGroup objects across ticks to avoid per-tick heap
+// allocation. A WaitGroup is safe to reuse after Wait() has returned.
+var tickWgPool = sync.Pool{New: func() any { return new(sync.WaitGroup) }}
+
 // RunTicker drives Tick for all registered nodes at the given interval until
 // ctx is cancelled. It fans out ticks in parallel using a persistent worker
 // pool of GOMAXPROCS goroutines so that a slow node cannot delay other groups'
@@ -285,7 +289,7 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer func() {
 		ticker.Stop()
-		close(work)  // signals workers to exit
+		close(work)   // signals workers to exit
 		poolWg.Wait() // wait for all workers to drain and exit
 	}()
 
@@ -305,12 +309,15 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 				continue
 			}
 
-			var tickWg sync.WaitGroup
+			// Reuse WaitGroup from pool to avoid per-tick heap allocation caused
+			// by &tickWg escaping into the tickItem sent to workers.
+			tickWg := tickWgPool.Get().(*sync.WaitGroup)
 			tickWg.Add(len(nodes))
 			for _, n := range nodes {
-				work <- tickItem{node: n, done: &tickWg}
+				work <- tickItem{node: n, done: tickWg}
 			}
 			tickWg.Wait()
+			tickWgPool.Put(tickWg)
 		}
 	}
 }
