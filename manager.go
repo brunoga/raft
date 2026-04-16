@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 )
@@ -159,7 +159,7 @@ func (m *Manager) GroupIDs() []uint64 {
 		ids = append(ids, id)
 	}
 	m.mu.RUnlock()
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	return ids
 }
 
