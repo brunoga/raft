@@ -93,7 +93,12 @@ func (m *Manager) AddAndStart(groupID uint64, node *Node) error {
 	// at which point Start has already been called.
 	node.Start()
 	if err := m.Add(groupID, node); err != nil {
-		node.Stop() // roll back: undo the Start if Add fails
+		node.Stop() // roll back: undo the Start if Add fails.
+		// Note: transport.Register was already called by node.Start(), and
+		// there is no transport.Deregister. In practice Add fails only for
+		// duplicate GroupIDs (a programming error), so a stale handlers entry
+		// in the transport is harmless — the Manager's groupLookup path takes
+		// precedence for inbound multi-raft RPCs.
 		return err
 	}
 	return nil
