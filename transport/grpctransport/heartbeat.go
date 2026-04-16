@@ -16,10 +16,10 @@ const (
 	// all of them before sending a single RPC. Tune with WithHeartbeatWindow.
 	defaultHBWindow = time.Millisecond
 
-	// hbChanSize is the per-peer channel depth. With G groups all enqueueing
-	// concurrently, the channel must absorb a full tick's worth of entries
-	// without blocking callers.
-	hbChanSize = 1024
+	// hbChanSizeDefault is the default per-peer channel depth. With G groups all
+	// enqueueing concurrently, the channel must absorb a full tick's worth of
+	// entries without blocking callers. Tune with WithHeartbeatChannelSize.
+	hbChanSizeDefault = 1024
 )
 
 // hbCall is one pending heartbeat enqueued by a Node goroutine.
@@ -158,7 +158,7 @@ func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) *peerBatcher {
 	}
 	batcher := &peerBatcher{
 		peer: peer,
-		ch:   make(chan hbCall, hbChanSize),
+		ch:   make(chan hbCall, b.t.hbChanSize),
 	}
 	b.batchers[peer] = batcher
 	b.wg.Add(1)

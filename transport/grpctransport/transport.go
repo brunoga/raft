@@ -60,6 +60,7 @@ type GRPCTransport struct {
 
 	hbWindow      time.Duration     // collection window for heartbeat batching
 	hbRPCTimeout  time.Duration     // per-RPC timeout for BatchHeartbeats
+	hbChanSize    int               // per-peer batcher channel depth
 	hbBatcher     *heartbeatBatcher // nil until SetGroupLookup is called
 
 	// Counters for BatchHeartbeats server-side processing.
@@ -91,11 +92,12 @@ func (t *GRPCTransport) heartbeatRPCTimeout() time.Duration { return t.hbRPCTime
 type Option func(*options)
 
 type options struct {
-	serverOpts         []grpc.ServerOption
-	dialOpts           []grpc.DialOption
-	tlsCfg             *tls.Config
-	heartbeatWindow    time.Duration
+	serverOpts          []grpc.ServerOption
+	dialOpts            []grpc.DialOption
+	tlsCfg              *tls.Config
+	heartbeatWindow     time.Duration
 	heartbeatRPCTimeout time.Duration
+	heartbeatChanSize   int
 }
 
 // WithServerOptions appends extra gRPC server options (e.g. TLS credentials).
@@ -125,6 +127,16 @@ func WithHeartbeatRPCTimeout(d time.Duration) Option {
 // milliseconds.
 func WithHeartbeatWindow(d time.Duration) Option {
 	return func(o *options) { o.heartbeatWindow = d }
+}
+
+// WithHeartbeatChannelSize sets the per-peer channel buffer depth used by the
+// heartbeat batcher. Each peerBatcher goroutine drains its channel before each
+// RPC flush, so the buffer must be deep enough to absorb one full tick's worth
+// of enqueued heartbeats without blocking the RunTicker goroutines. The default
+// (1024) is sufficient for clusters with up to ~1000 groups. Increase this
+// value if you observe stalls at higher group counts.
+func WithHeartbeatChannelSize(n int) Option {
+	return func(o *options) { o.heartbeatChanSize = n }
 }
 
 // WithTLSConfig enables TLS on both the gRPC server and all outbound client
@@ -210,6 +222,10 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	if hbRPCTimeout == 0 {
 		hbRPCTimeout = defaultHeartbeatRPCTimeout
 	}
+	hbChanSize := o.heartbeatChanSize
+	if hbChanSize <= 0 {
+		hbChanSize = hbChanSizeDefault
+	}
 	t := &GRPCTransport{
 		server:       grpc.NewServer(defaultServerOpts...),
 		listener:     ln,
@@ -217,6 +233,7 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 		logger:       slog.Default().With("component", "grpctransport"),
 		hbWindow:     hbWin,
 		hbRPCTimeout: hbRPCTimeout,
+		hbChanSize:   hbChanSize,
 		handlers:     make(map[raft.NodeID]raft.Handler),
 		peers:        make(map[raft.NodeID]string),
 		clients:      make(map[string]*grpc.ClientConn),
