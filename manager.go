@@ -127,7 +127,13 @@ func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo
 		// to the unconditional stop below.
 		_ = node.TransferLeadership(ctx, transferTo)
 	}
-	return m.Remove(groupID)
+	err := m.Remove(groupID)
+	if errors.Is(err, ErrGroupNotFound) {
+		// A concurrent Remove won the race between our initial lookup and this
+		// call. The group is already gone — that is the desired outcome.
+		return nil
+	}
+	return err
 }
 
 // Get returns the Node registered under groupID, or ErrGroupNotFound.

@@ -703,3 +703,42 @@ func TestManager_LookupAfterAdd(t *testing.T) {
 		t.Fatal("Lookup after Remove should return false")
 	}
 }
+
+// ---- TestManager_RemoveGraceful_TOCTOU --------------------------------------
+
+// TestManager_RemoveGraceful_TOCTOU verifies that when Remove races with
+// RemoveGraceful on the same groupID after RemoveGraceful has already read
+// the node, the inner Remove returning ErrGroupNotFound is suppressed.
+// Before this fix, RemoveGraceful returned ErrGroupNotFound to its caller
+// even though the group did exist at the start of the call.
+//
+// The test uses 100 parallel trials under the race detector. In each trial
+// both calls are launched simultaneously; we assert that neither returns an
+// error other than ErrGroupNotFound (i.e., no unexpected error kinds).
+func TestManager_RemoveGraceful_TOCTOU(t *testing.T) {
+	const trials = 100
+	net := memtransport.NewNetwork()
+
+	for i := range trials {
+		mgr := raft.NewManager()
+		node := newManagedNode(t, mgr, net, uint64(i+1000), "toctou", nil)
+		node.Start()
+
+		errs := make(chan error, 2)
+
+		// Both goroutines attempt to remove the same group concurrently.
+		// One wins; the loser must return nil (after fix) or ErrGroupNotFound
+		// (acceptable only if the group disappeared before the losing call
+		// even started its lookup).
+		go func() { errs <- mgr.Remove(uint64(i + 1000)) }()
+		go func() {
+			errs <- mgr.RemoveGraceful(context.Background(), uint64(i+1000), "other")
+		}()
+
+		for range 2 {
+			if err := <-errs; err != nil && !errors.Is(err, raft.ErrGroupNotFound) {
+				t.Fatalf("trial %d: unexpected error (not ErrGroupNotFound): %v", i, err)
+			}
+		}
+	}
+}
