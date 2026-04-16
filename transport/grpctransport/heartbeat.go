@@ -237,13 +237,22 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 		return nil, err
 	}
 
+	// Fast path: try to enqueue without blocking. If the channel is full, fall
+	// through to the blocking path and increment the backpressure counter so
+	// operators can detect hbChanSize saturation via HeartbeatSendBlocked.
 	select {
 	case batcher.ch <- call:
-		// call enqueued; batcher WILL write to respCh exactly once.
-	case <-ctx.Done():
-		// call NOT enqueued; batcher will never write to respCh — safe to pool.
-		respChanPool.Put(respCh)
-		return nil, ctx.Err()
+		// call enqueued without blocking
+	default:
+		b.t.hbSendBlocked.Add(1)
+		select {
+		case batcher.ch <- call:
+			// call enqueued after waiting; batcher WILL write to respCh exactly once.
+		case <-ctx.Done():
+			// call NOT enqueued; batcher will never write to respCh — safe to pool.
+			respChanPool.Put(respCh)
+			return nil, ctx.Err()
+		}
 	}
 
 	select {

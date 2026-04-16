@@ -68,6 +68,12 @@ type GRPCTransport struct {
 	batchHBServed  atomic.Int64 // number of BatchHeartbeats RPCs received
 	batchHBEntries atomic.Int64 // total heartbeat entries processed across all RPCs
 	batchHBErrors  atomic.Int64 // entries that failed (lookup or dispatch error)
+
+	// hbSendBlocked counts the number of times a heartbeat Send had to wait
+	// because the per-peer batcher channel was full. A sustained non-zero value
+	// means hbChanSize is too small for the current group count. Use
+	// HeartbeatSendBlocked to observe this counter.
+	hbSendBlocked atomic.Int64
 }
 
 // BatchHeartbeatsServed returns the number of BatchHeartbeats RPCs this
@@ -83,6 +89,12 @@ func (t *GRPCTransport) BatchHeartbeatEntriesServed() int64 { return t.batchHBEn
 // be dispatched (group not found or HandleAppendEntries error). A non-zero
 // sustained value warrants investigation.
 func (t *GRPCTransport) BatchHeartbeatErrors() int64 { return t.batchHBErrors.Load() }
+
+// HeartbeatSendBlocked returns the cumulative number of times a heartbeat
+// Send had to block waiting for space in a per-peer batcher channel. A
+// sustained non-zero rate means the cluster has more groups than the channel
+// can absorb without back-pressure; increase WithHeartbeatChannelSize.
+func (t *GRPCTransport) HeartbeatSendBlocked() int64 { return t.hbSendBlocked.Load() }
 
 const defaultHeartbeatRPCTimeout = 5 * time.Second
 
