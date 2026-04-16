@@ -38,8 +38,9 @@ type hbResp struct {
 // peerBatcher collects heartbeat calls destined for one peer and periodically
 // flushes them as a single BatchHeartbeats RPC.
 type peerBatcher struct {
-	peer raft.NodeID
-	ch   chan hbCall
+	peer    raft.NodeID
+	ch      chan hbCall
+	results map[uint64]*pb.HeartbeatResult // reused across RPC cycles; owned by run goroutine only
 }
 
 // run is the batcher goroutine. It blocks until the first call arrives,
@@ -104,12 +105,16 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 		}
 
 		// Index results by group_id for O(1) lookup.
-		results := make(map[uint64]*pb.HeartbeatResult, len(resp.Results))
+		// Reuse the map across cycles: clear entries (keeps underlying memory) rather
+		// than allocating a new map on every RPC.
+		for k := range b.results {
+			delete(b.results, k)
+		}
 		for _, r := range resp.Results {
-			results[r.GroupId] = r
+			b.results[r.GroupId] = r
 		}
 		for _, c := range pending {
-			if r, ok := results[c.entry.GroupId]; ok {
+			if r, ok := b.results[c.entry.GroupId]; ok {
 				c.respCh <- hbResp{term: r.Term, success: r.Success}
 			} else {
 				// No result for this group (e.g. receiver doesn't know it yet).
@@ -157,8 +162,9 @@ func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) *peerBatcher {
 		return existing
 	}
 	batcher := &peerBatcher{
-		peer: peer,
-		ch:   make(chan hbCall, b.t.hbChanSize),
+		peer:    peer,
+		ch:      make(chan hbCall, b.t.hbChanSize),
+		results: make(map[uint64]*pb.HeartbeatResult),
 	}
 	b.batchers[peer] = batcher
 	b.wg.Add(1)
