@@ -186,17 +186,30 @@ func (m *Manager) StopAll() {
 
 // StatusAll returns a point-in-time snapshot of every registered group's
 // state. The slice order is not guaranteed.
+//
+// The manager lock is held only long enough to snapshot the node map; Node
+// methods are called after releasing the lock so that concurrent Add, Remove,
+// and StopAll calls are not blocked for the full iteration.
 func (m *Manager) StatusAll() []GroupStatus {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]GroupStatus, 0, len(m.nodes))
+	type entry struct {
+		gid uint64
+		n   *Node
+	}
+	snap := make([]entry, 0, len(m.nodes))
 	for gid, n := range m.nodes {
+		snap = append(snap, entry{gid, n})
+	}
+	m.mu.RUnlock()
+
+	out := make([]GroupStatus, 0, len(snap))
+	for _, e := range snap {
 		out = append(out, GroupStatus{
-			GroupID:     gid,
-			NodeID:      n.cfg.ID,
-			State:       n.StateSnapshot(),
-			Term:        n.Term(),
-			LastApplied: n.LastApplied(),
+			GroupID:     e.gid,
+			NodeID:      e.n.cfg.ID,
+			State:       e.n.StateSnapshot(),
+			Term:        e.n.Term(),
+			LastApplied: e.n.LastApplied(),
 		})
 	}
 	return out
