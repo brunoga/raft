@@ -206,6 +206,14 @@ func (m *Manager) StopAll() {
 	wg.Wait()
 }
 
+// Close stops all registered nodes and unregisters them. It implements
+// io.Closer so that Manager can be used with defer and shutdown managers that
+// accept io.Closer. Close is equivalent to StopAll and always returns nil.
+func (m *Manager) Close() error {
+	m.StopAll()
+	return nil
+}
+
 // StatusAll returns a point-in-time snapshot of every registered group's
 // state. The slice order is not guaranteed.
 //

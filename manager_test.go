@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"testing"
@@ -783,5 +784,32 @@ func TestManager_GroupIDs(t *testing.T) {
 		if id == 2 {
 			t.Fatal("GroupIDs() still contains removed group 2")
 		}
+	}
+}
+
+// ---- TestManager_Close -------------------------------------------------------
+
+// TestManager_Close verifies that Manager implements io.Closer, that Close()
+// stops all registered nodes and returns nil, and that it is equivalent to
+// StopAll (group registry is cleared afterward).
+func TestManager_Close(t *testing.T) {
+	// Compile-time check: Manager must satisfy io.Closer.
+	var _ io.Closer = (*raft.Manager)(nil)
+
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	for i := range 4 {
+		id := raft.NodeID(fmt.Sprintf("cl%d", i+1))
+		node := newManagedNode(t, mgr, net, uint64(i+1), id, nil)
+		node.Start()
+	}
+
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+	// After Close, the registry must be empty.
+	if ids := mgr.GroupIDs(); len(ids) != 0 {
+		t.Errorf("GroupIDs after Close = %v, want []", ids)
 	}
 }
