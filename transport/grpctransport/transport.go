@@ -580,16 +580,24 @@ func (s *grpcServer) ReadIndex(ctx context.Context, req *pb.ReadIndexRequest) (*
 // event channel cannot delay responses to the rest of the batch.
 func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbeatRequest) (*pb.BatchedHeartbeatResponse, error) {
 	s.transport.batchHBServed.Add(1)
-	s.transport.batchHBEntries.Add(int64(len(req.Entries)))
+	n := len(req.Entries)
+	s.transport.batchHBEntries.Add(int64(n))
 
-	resultCh := make(chan *pb.HeartbeatResult, len(req.Entries))
+	// Pre-fetch the lookup function once under a single RLock acquisition.
+	// Without this, each concurrently spawned dispatch goroutine would acquire
+	// and release mu.RLock independently, causing O(G) lock round-trips per RPC.
+	s.transport.mu.RLock()
+	lookup := s.transport.groupLookup
+	s.transport.mu.RUnlock()
+
+	resultCh := make(chan *pb.HeartbeatResult, n)
 	for _, entry := range req.Entries {
 		e := entry
-		go func() { resultCh <- s.dispatchHeartbeatEntry(ctx, e) }()
+		go func() { resultCh <- s.dispatchHeartbeatEntry(ctx, e, lookup) }()
 	}
 
-	results := make([]*pb.HeartbeatResult, 0, len(req.Entries))
-	for range req.Entries {
+	results := make([]*pb.HeartbeatResult, 0, n)
+	for range n {
 		results = append(results, <-resultCh)
 	}
 	return &pb.BatchedHeartbeatResponse{Results: results}, nil
@@ -597,18 +605,35 @@ func (s *grpcServer) BatchHeartbeats(ctx context.Context, req *pb.BatchedHeartbe
 
 // dispatchHeartbeatEntry processes a single entry from a BatchHeartbeats
 // request and returns the result. Called concurrently from BatchHeartbeats.
-func (s *grpcServer) dispatchHeartbeatEntry(ctx context.Context, entry *pb.HeartbeatEntry) *pb.HeartbeatResult {
-	h, hErr := s.handlerForGroup(ctx, entry.GroupId)
-	if hErr != nil {
-		// Not-found is expected for late-joiners / just-removed groups;
-		// log at debug. Any other error is unexpected.
-		s.transport.logger.LogAttrs(ctx, slog.LevelDebug,
-			"BatchHeartbeats: group lookup failed",
-			slog.Uint64("group_id", entry.GroupId),
-			slog.Any("err", hErr),
-		)
-		s.transport.batchHBErrors.Add(1)
-		return &pb.HeartbeatResult{GroupId: entry.GroupId, Success: false}
+// lookup is the group-lookup function pre-fetched by the caller; it is always
+// non-nil when reached via BatchHeartbeats (multi-Raft mode only).
+func (s *grpcServer) dispatchHeartbeatEntry(ctx context.Context, entry *pb.HeartbeatEntry, lookup func(uint64) (raft.Handler, bool)) *pb.HeartbeatResult {
+	var h raft.Handler
+	if lookup != nil {
+		if entry.GroupId == 0 {
+			s.transport.batchHBErrors.Add(1)
+			return &pb.HeartbeatResult{GroupId: 0, Success: false}
+		}
+		var ok bool
+		h, ok = lookup(entry.GroupId)
+		if !ok {
+			// Not-found is expected for late-joiners / just-removed groups.
+			s.transport.logger.LogAttrs(ctx, slog.LevelDebug,
+				"BatchHeartbeats: group lookup failed",
+				slog.Uint64("group_id", entry.GroupId),
+			)
+			s.transport.batchHBErrors.Add(1)
+			return &pb.HeartbeatResult{GroupId: entry.GroupId, Success: false}
+		}
+	} else {
+		// Defensive fallback (should not happen: BatchHeartbeats requires
+		// SetGroupLookup to be installed).
+		var hErr error
+		h, hErr = s.handlerForGroup(ctx, entry.GroupId)
+		if hErr != nil {
+			s.transport.batchHBErrors.Add(1)
+			return &pb.HeartbeatResult{GroupId: entry.GroupId, Success: false}
+		}
 	}
 	aeReq := &raft.AppendEntriesRequest{
 		GroupID:      entry.GroupId,
