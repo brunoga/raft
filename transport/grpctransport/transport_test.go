@@ -985,6 +985,64 @@ func TestGRPC_HeartbeatRPCTimeoutOption(t *testing.T) {
 	t.Logf("failed in %v (timeout=50ms): %v", elapsed, err)
 }
 
+// ---- TestGRPC_HeartbeatChannelSizeOption ------------------------------------
+
+// TestGRPC_HeartbeatChannelSizeOption verifies that WithHeartbeatChannelSize
+// is wired through: a small channel size still admits up to that many
+// concurrent heartbeats without blocking or panicking.
+func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
+	const numGroups = 4
+	const chanSize = 8 // small but larger than numGroups
+
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen recv: %v", err)
+	}
+	defer recv.Close()
+
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0",
+		grpctransport.WithHeartbeatChannelSize(chanSize))
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer send.Close()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	ready := make(chan struct{})
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck
+		}(uint64(g + 1))
+	}
+	close(ready)
+	wg.Wait()
+
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler not called", gid)
+		}
+	}
+}
+
 // ---- TestGRPC_RemovePeer ----------------------------------------------------
 
 // TestGRPC_RemovePeer verifies that after RemovePeer, outbound RPCs to the
