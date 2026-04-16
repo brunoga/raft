@@ -276,9 +276,13 @@ func (t *GRPCTransport) RemovePeer(id raft.NodeID) {
 		cc.Close() //nolint:errcheck // best-effort cleanup; error is unactionable here.
 	}
 	// Stop the peerBatcher goroutine for this peer so it doesn't accumulate
-	// after the peer leaves the cluster.
-	if t.hbBatcher != nil {
-		t.hbBatcher.removePeer(id)
+	// after the peer leaves the cluster. Read hbBatcher under RLock to avoid
+	// a data race with the concurrent SetGroupLookup write path.
+	t.mu.RLock()
+	batcher := t.hbBatcher
+	t.mu.RUnlock()
+	if batcher != nil {
+		batcher.removePeer(id)
 	}
 }
 
