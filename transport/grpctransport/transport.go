@@ -57,6 +57,7 @@ type GRPCTransport struct {
 	handlers    map[raft.NodeID]raft.Handler      // id → registered handler
 	peers       map[raft.NodeID]string            // id → "host:port" address
 	clients     map[string]*grpc.ClientConn       // address → connection (cached)
+	clientRefs  map[string]int                    // address → number of NodeIDs mapped to it
 	groupLookup func(uint64) (raft.Handler, bool) // optional: route by GroupID
 
 	hbWindow      time.Duration     // collection window for heartbeat batching
@@ -247,9 +248,10 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 		hbWindow:     hbWin,
 		hbRPCTimeout: hbRPCTimeout,
 		hbChanSize:   hbChanSize,
-		handlers:     make(map[raft.NodeID]raft.Handler),
-		peers:        make(map[raft.NodeID]string),
-		clients:      make(map[string]*grpc.ClientConn),
+		handlers:    make(map[raft.NodeID]raft.Handler),
+		peers:       make(map[raft.NodeID]string),
+		clients:     make(map[string]*grpc.ClientConn),
+		clientRefs:  make(map[string]int),
 	}
 
 	pb.RegisterRaftServiceServer(t.server, &grpcServer{transport: t})
@@ -264,13 +266,24 @@ func (t *GRPCTransport) Addr() string {
 
 // AddPeer registers the address of a remote Raft node. Must be called for
 // every peer before RPCs are sent to it.
+//
+// Multiple NodeIDs may map to the same physical address (common in multi-Raft
+// deployments where all groups on a peer share one gRPC server). The
+// underlying *grpc.ClientConn is shared and reference-counted; it is only
+// closed when the last NodeID mapped to that address calls RemovePeer.
 func (t *GRPCTransport) AddPeer(id raft.NodeID, addr string) {
 	t.mu.Lock()
 	t.peers[id] = addr
+	t.clientRefs[addr]++
 	t.mu.Unlock()
 }
 
-// RemovePeer unregisters a remote Raft node and closes its cached connection.
+// RemovePeer unregisters a remote Raft node. The underlying *grpc.ClientConn
+// is reference-counted (incremented by AddPeer, decremented here) and only
+// closed when no remaining NodeID maps to the same address. This prevents a
+// RemovePeer call for one Raft group from disrupting other groups that share
+// the same physical peer address.
+//
 // After this call, any outbound RPC to id will return an error until AddPeer
 // is called again. Use this when a node is permanently decommissioned to
 // prevent stale connection accumulation.
@@ -280,8 +293,12 @@ func (t *GRPCTransport) RemovePeer(id raft.NodeID) {
 	var cc *grpc.ClientConn
 	if ok {
 		delete(t.peers, id)
-		cc = t.clients[addr] // nil if not yet dialled
-		delete(t.clients, addr)
+		t.clientRefs[addr]--
+		if t.clientRefs[addr] <= 0 {
+			delete(t.clientRefs, addr)
+			cc = t.clients[addr] // nil if not yet dialled
+			delete(t.clients, addr)
+		}
 	}
 	t.mu.Unlock()
 	if cc != nil {
@@ -373,6 +390,7 @@ func (t *GRPCTransport) Close() error {
 		cc.Close() //nolint:errcheck // best-effort cleanup; error is unactionable during shutdown.
 	}
 	t.clients = make(map[string]*grpc.ClientConn)
+	t.clientRefs = make(map[string]int)
 	t.hbBatcher = nil // prevent use-after-close from silently returning errBatcherStopped
 	return nil
 }

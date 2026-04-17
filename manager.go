@@ -317,8 +317,18 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 		go func() {
 			defer poolWg.Done()
 			for item := range work {
-				item.node.Tick()
-				item.done.Done()
+				// Recover from panics in Tick so that a single misbehaving node
+				// cannot freeze tickWg.Wait() and stall all other groups.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("RunTicker: recovered panic in Tick",
+								"node", item.node.cfg.ID, "panic", r)
+						}
+						item.done.Done()
+					}()
+					item.node.Tick()
+				}()
 			}
 		}()
 	}

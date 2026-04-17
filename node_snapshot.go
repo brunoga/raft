@@ -1,19 +1,75 @@
 package raft
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"time"
 )
 
 // ---- Snapshotting -----------------------------------------------------------
 
-// partialSnapshot holds chunks of an in-progress multi-chunk snapshot install.
+// partialSnapshot holds state for an in-progress multi-chunk snapshot install.
+// Chunks are streamed directly to storage via a goroutine rather than buffered
+// in memory, preventing OOM when the snapshot is large.
 type partialSnapshot struct {
-	meta SnapshotMeta
-	data []byte // buffers chunks until Done=true
+	meta        SnapshotMeta
+	installCh   chan []byte         // event loop sends raw chunks; closed after final chunk
+	cancelFn    context.CancelFunc // cancels the runSnapshotInstall goroutine
+	expectedOff int64              // expected byte offset of the next incoming chunk
+}
+
+// snapInstallResult is posted by runSnapshotInstall to the event loop when the
+// streaming snapshot install from a leader completes (successfully or not).
+type snapInstallResult struct {
+	meta  SnapshotMeta
+	table map[NodeID]clientEntry
+	smR   io.ReadCloser // positioned past framing header, at SM data; nil on error
+	err   error
+}
+
+// chunkReader implements io.Reader by draining a channel of byte slices.
+// It is used by runSnapshotInstall to stream snapshot chunks directly to
+// storage without accumulating the full snapshot in memory.
+type chunkReader struct {
+	ctx context.Context
+	ch  <-chan []byte
+	buf []byte // leftover bytes from the previous partial Read
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	// Serve from the tail of the previously-received chunk first.
+	if len(r.buf) > 0 {
+		n := copy(p, r.buf)
+		r.buf = r.buf[n:]
+		return n, nil
+	}
+	select {
+	case chunk, ok := <-r.ch:
+		if !ok {
+			return 0, io.EOF
+		}
+		n := copy(p, chunk)
+		r.buf = chunk[n:]
+		return n, nil
+	case <-r.ctx.Done():
+		return 0, r.ctx.Err()
+	}
+}
+
+// drainChunks reads and discards all available items from ch until it is
+// closed or empty. Used by runSnapshotInstall to release any buffered chunks
+// after a storage error or context cancellation.
+func drainChunks(ch <-chan []byte) {
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
 }
 
 // snapshotTrigger carries snapshot-trigger metadata from the event loop
@@ -53,6 +109,9 @@ type installSnapshotResult struct {
 }
 
 // handleInstallSnapshot implements the receiver side of the InstallSnapshot RPC.
+// Each call enqueues one chunk of snapshot data to a background goroutine that
+// streams it directly to storage, preventing full-snapshot buffering in memory.
+// The goroutine posts a snapInstallResult to rpcCh when the install completes.
 func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
 	resp := &InstallSnapshotResponse{Term: n.currentTerm}
 
@@ -74,80 +133,175 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 		return resp, nil
 	}
 
-	// Mult-chunk install.
-	if n.pendingSnap == nil || n.pendingSnap.meta.LastIncludedIndex != req.LastIncludedIndex {
-		// New snapshot install starting.
-		n.pendingSnap = &partialSnapshot{
-			meta: SnapshotMeta{
-				LastIncludedIndex: req.LastIncludedIndex,
-				LastIncludedTerm:  req.LastIncludedTerm,
-			},
+	// Cancel any in-progress install that is for a different snapshot OR that
+	// the sender is restarting from chunk 0 (retry after an error).
+	if n.pendingSnap != nil {
+		sameSnap := n.pendingSnap.meta.LastIncludedIndex == req.LastIncludedIndex
+		if !sameSnap || req.Offset == 0 {
+			n.pendingSnap.cancelFn()
+			n.pendingSnap = nil
 		}
 	}
 
-	// Verify offset.
-	if int64(len(n.pendingSnap.data)) != req.Offset {
-		// Out of order chunk; return current term and wait for re-send.
+	// Start a new streaming install goroutine if needed.
+	if n.pendingSnap == nil {
+		if req.Offset != 0 {
+			// Cannot resume an install without its beginning; wait for chunk 0.
+			return resp, nil
+		}
+		meta := SnapshotMeta{
+			LastIncludedIndex: req.LastIncludedIndex,
+			LastIncludedTerm:  req.LastIncludedTerm,
+		}
+		installCtx, cancelFn := context.WithCancel(n.stopCtx)
+		installCh := make(chan []byte, 8) // small buffer; sender rate-limited by RPC round-trips
+		n.pendingSnap = &partialSnapshot{
+			meta:      meta,
+			installCh: installCh,
+			cancelFn:  cancelFn,
+		}
+		go n.runSnapshotInstall(installCtx, meta, installCh)
+	}
+
+	// Verify the expected byte offset to detect out-of-order delivery.
+	if req.Offset != n.pendingSnap.expectedOff {
 		return resp, nil
 	}
 
-	// Append chunk data.
-	n.pendingSnap.data = append(n.pendingSnap.data, req.Data...)
+	// Copy chunk data: the proto bytes backing req.Data may be reused by the
+	// gRPC framing layer after this handler returns.
+	chunk := make([]byte, len(req.Data))
+	copy(chunk, req.Data)
 
-	if !req.Done {
-		return resp, nil
-	}
-
-	// Snapshot complete.
-	fullData := n.pendingSnap.data
-	meta := n.pendingSnap.meta
-	n.pendingSnap = nil
-
-	// Save to storage.
-	if err := n.cfg.Storage.SaveSnapshot(n.stopCtx, meta, bytes.NewReader(fullData)); err != nil {
-		return resp, fmt.Errorf("installSnapshot: SaveSnapshot: %w", err)
-	}
-	table, smDataReader, err := readWrappedSnapshot(bytes.NewReader(fullData))
-	if err != nil {
-		return resp, fmt.Errorf("installSnapshot: unwrap: %w", err)
-	}
-	n.clientTable.loadFrom(table)
-
-	// Update in-memory log cache.
-	if err := n.log.truncatePrefix(n.stopCtx, meta.LastIncludedIndex+1); err != nil {
-		return resp, fmt.Errorf("installSnapshot: truncatePrefix: %w", err)
-	}
-	n.log.snapMeta = meta
-
-	// Signal applyLoop to restore state machine.
-	// Non-blocking send: if applyLoop is busy, it will catch the newest
-	// snapshot on its next priority-select.
+	// Enqueue chunk for the install goroutine. The channel has a small buffer;
+	// because the sender waits for our response before sending the next chunk,
+	// the goroutine should consume each chunk well before the next one arrives.
 	select {
-	case n.restoreSnapshotCh <- snapshotInstall{
-		meta:        meta,
-		r:           io.NopCloser(smDataReader),
-		clientTable: table,
-	}:
+	case n.pendingSnap.installCh <- chunk:
 	default:
-		// Existing pending restore. Overwrite it.
+		// Channel full: disk I/O is lagging behind the RPC rate. Drop the chunk
+		// and let the sender retry; it will restart from a suitable offset.
+		n.logger.Warn("snapshot install: chunk channel full, dropping chunk",
+			"peer", req.LeaderID, "offset", req.Offset)
+		return resp, nil
+	}
+	n.pendingSnap.expectedOff += int64(len(req.Data))
+
+	if req.Done {
+		// Closing the channel signals io.EOF to the chunkReader inside SaveSnapshot.
+		close(n.pendingSnap.installCh)
+		n.pendingSnap = nil // goroutine owns installCh from here; posts result via rpcCh
+	}
+
+	return resp, nil
+}
+
+// runSnapshotInstall is the background goroutine for a streaming snapshot
+// install. It reads chunks from chunkCh (which is closed after the final
+// chunk), writes them to storage via SaveSnapshot, then re-reads to extract
+// the client table and get a reader positioned at the state-machine data.
+// The result is posted to the event loop via rpcCh.
+func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkCh <-chan []byte) {
+	cr := &chunkReader{ctx: ctx, ch: chunkCh}
+	saveErr := n.cfg.Storage.SaveSnapshot(ctx, meta, cr)
+
+	// Drain remaining buffered chunks so no event-loop sends are left blocked.
+	drainChunks(chunkCh)
+
+	sendResult := func(r *snapInstallResult) {
+		select {
+		case n.rpcCh <- rpcEnvelope{req: r}:
+		case <-n.stopCtx.Done():
+			if r.smR != nil {
+				r.smR.Close()
+			}
+		}
+	}
+
+	if saveErr != nil {
+		if ctx.Err() != nil {
+			// Install was deliberately cancelled (node stopped or new snapshot
+			// started); silently discard without posting an error result.
+			return
+		}
+		n.logger.Error("snapshot install: SaveSnapshot failed", "err", saveErr)
+		sendResult(&snapInstallResult{meta: meta, err: saveErr})
+		return
+	}
+
+	// Re-read the freshly saved snapshot to extract the client dedup table and
+	// to obtain a reader positioned at the state-machine data for the apply
+	// goroutine. This avoids holding the full snapshot in memory after saving.
+	loadMeta, r, err := n.cfg.Storage.LoadSnapshot(ctx)
+	if err != nil {
+		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf("snapshot install: LoadSnapshot: %w", err)})
+		return
+	}
+	if loadMeta.LastIncludedIndex != meta.LastIncludedIndex {
+		r.Close()
+		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf(
+			"snapshot install: loaded snapshot index %d, want %d",
+			loadMeta.LastIncludedIndex, meta.LastIncludedIndex)})
+		return
+	}
+
+	table, _, parseErr := readWrappedSnapshot(r)
+	if parseErr != nil {
+		r.Close()
+		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf("snapshot install: unwrap: %w", parseErr)})
+		return
+	}
+	// r is now positioned past the framing header, at the SM data. The event
+	// loop forwards it to the apply goroutine for StateMachine.Restore; the
+	// apply goroutine closes r when done.
+	sendResult(&snapInstallResult{meta: meta, table: table, smR: r})
+}
+
+// handleSnapInstallResult is called when runSnapshotInstall reports completion.
+// It updates log state, the client dedup table, and signals the apply goroutine
+// to restore the state machine from the newly installed snapshot.
+func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
+	if r.err != nil {
+		n.logger.Error("snapshot install failed", "err", r.err)
+		return
+	}
+
+	// Skip stale results: a newer snapshot may have already been applied.
+	if r.meta.LastIncludedIndex <= n.lastApplied {
+		r.smR.Close()
+		return
+	}
+
+	n.clientTable.loadFrom(r.table)
+
+	if err := n.log.truncatePrefix(n.stopCtx, r.meta.LastIncludedIndex+1); err != nil {
+		n.logger.Error("snapshot install: truncatePrefix", "err", err)
+		r.smR.Close()
+		return
+	}
+	n.log.snapMeta = r.meta
+
+	// Signal applyLoop to restore the state machine.
+	install := snapshotInstall{
+		meta:        r.meta,
+		r:           r.smR,
+		clientTable: r.table,
+	}
+	select {
+	case n.restoreSnapshotCh <- install:
+	default:
+		// Existing pending restore — overwrite with the newer result.
 		select {
 		case <-n.restoreSnapshotCh:
 		default:
 		}
-		n.restoreSnapshotCh <- snapshotInstall{
-			meta:        meta,
-			r:           io.NopCloser(smDataReader),
-			clientTable: table,
-		}
+		n.restoreSnapshotCh <- install
 	}
 
-	// Commit index must be at least the snapshot index.
-	if n.commitIndex < meta.LastIncludedIndex {
-		n.setCommitIndex(meta.LastIncludedIndex)
+	// Commit index must reflect at least the snapshot index.
+	if n.commitIndex < r.meta.LastIncludedIndex {
+		n.setCommitIndex(r.meta.LastIncludedIndex)
 	}
-	// applied index is handled by applyLoop.
-
-	return resp, nil
 }
 
 // maybeSnapshot checks if the log has grown past SnapshotThreshold and, if so,
@@ -241,13 +395,12 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 	chunkSize := n.snapshotChunkSize()
 	term := n.currentTerm
 	leaderID := n.cfg.ID
+	// Per-chunk RPC timeout: snapshot chunks can be large, so use 4× the
+	// base RPC timeout (consistent with the RPCTimeout config documentation).
+	chunkTimeout := 4 * n.rpcTimeout()
 
 	go func(p NodeID, m SnapshotMeta, r io.ReadCloser) {
 		defer r.Close()
-
-		// Give each chunk a generous timeout since individual chunks may still
-		// be large and the network or disk may be slow.
-		chunkTimeout := 2 * time.Second
 
 		drop := func() {
 			select {
@@ -258,9 +411,12 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 			}
 		}
 
+		// Allocate the read buffer once and reuse it across chunks; gRPC
+		// marshals req.Data synchronously before InstallSnapshot returns so
+		// reuse is safe.
+		buf := make([]byte, chunkSize)
 		offset := int64(0)
 		for {
-			buf := make([]byte, chunkSize)
 			nRead, err := io.ReadFull(r, buf)
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 				n.logger.Error("sendSnapshotToPeer: read", "peer", p, "err", err)
@@ -268,9 +424,6 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 				return
 			}
 			done := err == io.EOF || err == io.ErrUnexpectedEOF
-			if done {
-				buf = buf[:nRead]
-			}
 
 			req := &InstallSnapshotRequest{
 				GroupID:           n.cfg.GroupID,
@@ -279,7 +432,7 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 				LastIncludedIndex: m.LastIncludedIndex,
 				LastIncludedTerm:  m.LastIncludedTerm,
 				Offset:            offset,
-				Data:              buf,
+				Data:              buf[:nRead],
 				Done:              done,
 			}
 
