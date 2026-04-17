@@ -45,15 +45,15 @@ func (n *Node) run() {
 			props := []proposeMsg{prop}
 			// Greedily drain the channel to batch proposals. This amortizes the
 			// cost of the durable storage write (fsync).
+		batchDrain:
 			for len(props) < 1024 {
 				select {
 				case p := <-n.proposeCh:
 					props = append(props, p)
 				default:
-					goto process
+					break batchDrain
 				}
 			}
-		process:
 			n.handleProposals(props)
 
 		case ri := <-n.readIndexCh:

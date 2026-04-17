@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"slices"
 	"sync"
@@ -146,10 +147,14 @@ func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo
 			// Transfer accepted: wait for the node to actually step down before
 			// removing it. If we Remove too early, the background TimeoutNow RPC
 			// is cancelled and the transfer fails, causing a quorum gap.
+			// If ctx expires we break out and fall through to the unconditional
+			// Remove — the node must always be stopped regardless of transfer
+			// outcome.
+		stepDown:
 			for node.StateSnapshot() == Leader {
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					break stepDown
 				case <-time.After(10 * time.Millisecond):
 				}
 			}
@@ -296,6 +301,11 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 		done *sync.WaitGroup
 	}
 
+	// Warn once if any registered node has TickInterval > 0; those nodes drive
+	// their own internal ticker and will be skipped by RunTicker. Operators who
+	// expect RunTicker to drive all groups should set TickInterval = 0.
+	var warnSkippedOnce sync.Once
+
 	nWorkers := runtime.GOMAXPROCS(0)
 	// Buffer allows the main goroutine to keep sending while workers process;
 	// 2× nWorkers keeps the pipeline full without large memory cost.
@@ -344,6 +354,10 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 				if n.cfg.TickInterval == 0 {
 					work <- tickItem{node: n, done: tickWg}
 				} else {
+					warnSkippedOnce.Do(func() {
+						slog.Warn("RunTicker: node has TickInterval>0 and will not be ticked by the Manager; set TickInterval=0 for Manager-driven ticking",
+							"node", n.cfg.ID, "tickInterval", n.cfg.TickInterval)
+					})
 					tickWg.Done()
 				}
 			}

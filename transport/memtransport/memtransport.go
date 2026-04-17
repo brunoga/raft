@@ -107,7 +107,12 @@ func (net *Network) dispatch(
 	net.mu.RUnlock()
 
 	if dropped {
-		return nil, fmt.Errorf("memtransport: dropped")
+		// Simulate the message being lost — block until ctx expires, as a real
+		// network partition would. Returning immediately would simulate a
+		// connection-refused, which is a different failure mode and causes tests
+		// to retry far more aggressively than production behaviour warrants.
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	if !ok {
 		return nil, fmt.Errorf("memtransport: no handler registered for %s", dst)
