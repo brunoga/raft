@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"testing"
 
@@ -434,16 +435,21 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 
 	meta := raft.SnapshotMeta{LastIncludedIndex: 100, LastIncludedTerm: 5}
 	data := []byte("snapshot-payload")
-	if err := fs.SaveSnapshot(ctx, meta, data); err != nil {
+	if err := fs.SaveSnapshot(ctx, meta, bytes.NewReader(data)); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}
 
-	gotMeta, gotData, err := fs.LoadSnapshot(ctx)
+	gotMeta, gotR, err := fs.LoadSnapshot(ctx)
 	if err != nil {
 		t.Fatalf("LoadSnapshot: %v", err)
 	}
+	defer gotR.Close()
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
+	}
+	gotData, err := io.ReadAll(gotR)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
 	}
 	if !bytes.Equal(gotData, data) {
 		t.Fatalf("data mismatch: got %q, want %q", gotData, data)
@@ -456,7 +462,7 @@ func TestSnapshot_PersistsAcrossReopen(t *testing.T) {
 
 	fs1, _ := filestore.Open(dir)
 	meta := raft.SnapshotMeta{LastIncludedIndex: 50, LastIncludedTerm: 2}
-	_ = fs1.SaveSnapshot(ctx, meta, []byte("data"))
+	_ = fs1.SaveSnapshot(ctx, meta, bytes.NewReader([]byte("data")))
 	_ = fs1.Close()
 
 	fs2, err := filestore.Open(dir)
@@ -465,10 +471,11 @@ func TestSnapshot_PersistsAcrossReopen(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	gotMeta, _, err := fs2.LoadSnapshot(ctx)
+	gotMeta, gotR, err := fs2.LoadSnapshot(ctx)
 	if err != nil {
 		t.Fatalf("LoadSnapshot after reopen: %v", err)
 	}
+	defer gotR.Close()
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
 	}

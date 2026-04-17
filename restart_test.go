@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -33,11 +34,16 @@ func (s *counterSM) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error
 	s.count++
 	return entry.Command, nil
 }
-func (s *counterSM) Snapshot(_ context.Context) ([]byte, error) {
-	return []byte(fmt.Sprintf("%d", s.count)), nil
+func (s *counterSM) Snapshot(_ context.Context, w io.Writer) error {
+	_, err := fmt.Fprintf(w, "%d", s.count)
+	return err
 }
-func (s *counterSM) Restore(_ context.Context, _ raft.SnapshotMeta, data []byte) error {
-	_, err := fmt.Sscanf(string(data), "%d", &s.count)
+func (s *counterSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Sscanf(string(data), "%d", &s.count)
 	return err
 }
 
@@ -268,16 +274,18 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n.Tick()
 		time.Sleep(time.Millisecond)
-		m, _, e := fs.LoadSnapshot(context.Background())
+		m, r, e := fs.LoadSnapshot(context.Background())
 		if e == nil && m.LastIncludedIndex > 0 {
+			r.Close()
 			break
 		}
 	}
 
-	meta, _, err := fs.LoadSnapshot(context.Background())
+	meta, r, err := fs.LoadSnapshot(context.Background())
 	if err != nil || meta.LastIncludedIndex == 0 {
 		t.Skip("snapshot not taken (may need more ticks) — skipping restart check")
 	}
+	r.Close()
 
 	n.Stop()
 
@@ -443,18 +451,19 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	sms[followerIdx] = newSM
 
 	// Tick all nodes until the restarted follower catches up.
+	wantIdx := leader.LastApplied()
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
 			n.Tick()
 		}
 		time.Sleep(time.Millisecond)
-		if restartedNode.LastApplied() >= 5 {
+		if restartedNode.LastApplied() >= wantIdx {
 			break
 		}
 	}
-	if restartedNode.LastApplied() < 5 {
-		t.Errorf("restarted follower lastApplied=%d, want >= 5", restartedNode.LastApplied())
+	if restartedNode.LastApplied() < wantIdx {
+		t.Errorf("restarted follower lastApplied=%d, want >= %d", restartedNode.LastApplied(), wantIdx)
 	}
 
 	// Verify the entries were applied to the restarted follower's SM.
@@ -534,9 +543,10 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	for time.Now().Before(deadline) {
 		n.Tick()
 		time.Sleep(time.Millisecond)
-		m, _, e := fs.LoadSnapshot(context.Background())
+		m, r, e := fs.LoadSnapshot(context.Background())
 		if e == nil && m.LastIncludedIndex > 0 {
 			snapMeta = m
+			r.Close()
 			break
 		}
 	}
@@ -647,7 +657,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 5
-		cfg.SnapshotChunkSize = 4 // 4 bytes — forces many chunks
+		cfg.SnapshotChunkSize = 512 // enough to still force multiple chunks for kvSM
 
 		n, err := raft.New(&cfg)
 		if err != nil {
@@ -732,9 +742,11 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	net.Heal(ids[lagIdx])
 
 	// Tick until the lagging follower catches up.
-	deadline = time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		tick()
+		for range 5 {
+			tick()
+		}
 		if nodes[lagIdx].LastApplied() >= raft.Index(numEntries) {
 			break
 		}

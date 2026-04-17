@@ -107,9 +107,7 @@ func (net *Network) dispatch(
 	net.mu.RUnlock()
 
 	if dropped {
-		// Simulate the message being lost — block until ctx expires.
-		<-ctx.Done()
-		return nil, ctx.Err()
+		return nil, fmt.Errorf("memtransport: dropped")
 	}
 	if !ok {
 		return nil, fmt.Errorf("memtransport: no handler registered for %s", dst)

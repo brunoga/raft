@@ -4,6 +4,7 @@ package main
 // Apply/Snapshot/Restore directly, which is sufficient to verify all SM logic.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -231,13 +232,13 @@ func TestIDSM_SnapshotRestore(t *testing.T) {
 	mustApply(t, src, domainCmd{Op: opAlloc, Domain: "a", Count: 42})
 	mustApply(t, src, domainCmd{Op: opAlloc, Domain: "b", Count: 7})
 
-	snap, err := src.Snapshot(context.Background())
-	if err != nil {
+	var buf bytes.Buffer
+	if err := src.Snapshot(context.Background(), &buf); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
 	dst := newSM()
-	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, snap); err != nil {
+	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, &buf); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -259,9 +260,10 @@ func TestIDSM_RestoreClearsExistingState(t *testing.T) {
 	// Restore from a snapshot that contains only "fresh".
 	fresh := newSM()
 	mustApply(t, fresh, domainCmd{Op: opCreate, Domain: "fresh"})
-	snap, _ := fresh.Snapshot(context.Background())
+	var buf bytes.Buffer
+	_ = fresh.Snapshot(context.Background(), &buf)
 
-	if err := sm.Restore(context.Background(), raft.SnapshotMeta{}, snap); err != nil {
+	if err := sm.Restore(context.Background(), raft.SnapshotMeta{}, &buf); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
@@ -276,11 +278,12 @@ func TestIDSM_RestoreClearsExistingState(t *testing.T) {
 func TestIDSM_RestoreEmptySnapshot(t *testing.T) {
 	// An empty SM snapshots to "{}"; restoring that should yield an empty SM.
 	sm := newSM()
-	snap, _ := sm.Snapshot(context.Background())
+	var buf bytes.Buffer
+	_ = sm.Snapshot(context.Background(), &buf)
 
 	dst := newSM()
 	mustApply(t, dst, domainCmd{Op: opCreate, Domain: "old"})
-	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, snap); err != nil {
+	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, &buf); err != nil {
 		t.Fatalf("Restore from empty: %v", err)
 	}
 	if _, ok := dst.Current("old"); ok {
