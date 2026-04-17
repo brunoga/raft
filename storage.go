@@ -1,6 +1,9 @@
 package raft
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // Storage is the persistence seam between the Raft engine and any storage
 // backend. All mutating methods must durably persist their data (fsync) before
@@ -60,14 +63,15 @@ type Storage interface {
 
 	// --- Snapshot -----------------------------------------------------------
 
-	// SaveSnapshot durably stores a snapshot and its metadata.
-	// The previous snapshot (if any) may be discarded after this returns.
-	// Must fsync before returning.
-	SaveSnapshot(ctx context.Context, meta SnapshotMeta, data []byte) error
+	// SaveSnapshot durably stores a snapshot and its metadata. The snapshot
+	// data is read from r. The previous snapshot (if any) may be discarded
+	// after this returns. Must fsync before returning.
+	SaveSnapshot(ctx context.Context, meta SnapshotMeta, r io.Reader) error
 
-	// LoadSnapshot returns the most recently saved snapshot.
-	// Returns ErrNoSnapshot if no snapshot exists yet.
-	LoadSnapshot(ctx context.Context) (SnapshotMeta, []byte, error)
+	// LoadSnapshot returns the most recently saved snapshot metadata and
+	// a reader for its data. The caller is responsible for closing the
+	// reader. Returns ErrNoSnapshot if no snapshot exists yet.
+	LoadSnapshot(ctx context.Context) (SnapshotMeta, io.ReadCloser, error)
 
 	// --- Lifecycle ----------------------------------------------------------
 

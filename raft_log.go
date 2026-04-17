@@ -15,10 +15,10 @@ type raftLog struct {
 	storage  Storage
 	snapMeta SnapshotMeta // metadata of the last installed snapshot
 
-	// snapData holds the snapshot payload loaded during initialisation.
-	// It is consumed by Node.New() to seed initialSnap and then cleared to
-	// avoid holding two copies of the snapshot data in memory.
-	snapData []byte
+	// snapClientTable holds the client dedup table loaded from the snapshot
+	// during initialisation. It is consumed by Node.New() to seed n.clientTable
+	// and then cleared.
+	snapClientTable map[NodeID]clientEntry
 
 	// cached positions; 0 means "no entries in storage"
 	first    Index
@@ -37,12 +37,16 @@ func newRaftLog(s Storage) (*raftLog, error) {
 	ctx := context.Background()
 
 	// Restore snapshot metadata (may not exist yet).
-	// Cache the payload in snapData so Node.New() can seed initialSnap without
-	// a second LoadSnapshot call.
-	meta, data, err := s.LoadSnapshot(ctx)
+	meta, r, err := s.LoadSnapshot(ctx)
 	if err == nil {
+		defer r.Close()
 		rl.snapMeta = meta
-		rl.snapData = data
+		// Read the framing header to extract the client dedup table.
+		table, _, err := readWrappedSnapshot(r)
+		if err != nil {
+			return nil, fmt.Errorf("raftLog: read snapshot framing: %w", err)
+		}
+		rl.snapClientTable = table
 	} else if err != ErrNoSnapshot {
 		return nil, fmt.Errorf("raftLog: load snapshot: %w", err)
 	}

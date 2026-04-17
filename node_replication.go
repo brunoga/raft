@@ -64,7 +64,8 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 
 	// Advance commitIndex.
 	if req.LeaderCommit > n.commitIndex {
-		n.commitIndex = min(req.LeaderCommit, n.log.lastLogIndex())
+		n.setCommitIndex(min(req.LeaderCommit, n.log.lastLogIndex()))
+
 		n.notifyApply()
 	}
 
@@ -391,7 +392,7 @@ func (n *Node) maybeAdvanceCommit() {
 				n.replicatedOnMajority(idx, n.jointNew, n.jointIncludeSelf)
 		}
 		if committed {
-			n.commitIndex = idx
+			n.setCommitIndex(idx)
 			n.notifyApply()
 			if n.cfg.Metrics != nil {
 				n.cfg.Metrics.CommitAdvanced(n.cfg.ID, idx)
