@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"math/rand/v2"
@@ -70,10 +71,11 @@ type Node struct {
 	lastApplied Index
 
 	// Atomic mirrors for safe external reads.
-	atomicState       atomic.Uint32 // mirrors state
-	atomicLeader      atomic.Value  // mirrors leaderID; stores string
-	atomicLastApplied atomic.Uint64 // mirrors lastApplied
-	atomicTerm        atomic.Uint64 // mirrors currentTerm
+	atomicState        atomic.Uint32 // mirrors state
+	atomicLeader       atomic.Value  // mirrors leaderID; stores string
+	atomicLastApplied  atomic.Uint64 // mirrors lastApplied
+	atomicCommitIndex  atomic.Uint64 // mirrors commitIndex
+	atomicTerm         atomic.Uint64 // mirrors currentTerm
 	// atomicPeers mirrors cfg.Peers as a []NodeID snapshot; updated by
 	// applyConfigChange (event-loop only). Read by ReconfigureCluster outside
 	// the event loop to avoid a data race on cfg.Peers.
@@ -304,8 +306,8 @@ func New(cfg *Config) (*Node, error) {
 		electionMinTicks:  electionMinTicks,
 		electionMaxTicks:  electionMaxTicks,
 		tickCh:            make(chan struct{}, 1),
-		rpcCh:             make(chan rpcEnvelope, 64),
-		proposeCh:         make(chan proposeMsg, 64),
+		rpcCh:             make(chan rpcEnvelope, 1024),
+		proposeCh:         make(chan proposeMsg, 1024),
 		readIndexCh:       make(chan readIndexMsg, 64),
 		transferCh:        make(chan leadershipTransferMsg, 4),
 		stopCh:            make(chan struct{}),
@@ -324,19 +326,15 @@ func New(cfg *Config) (*Node, error) {
 	n.stopCtx, n.stopCancel = context.WithCancel(context.Background())
 
 	// If a snapshot exists, seed initialSnap so applyLoop can restore the
-	// state machine on its first iteration. The payload was already loaded by
-	// newRaftLog, so no second LoadSnapshot call is needed.
-	// Unwrap the snapshot to separate the client dedup table from the SM data.
+	// state machine on its first iteration.
 	if rl.snapMeta.LastIncludedIndex > 0 {
-		table, smData := unwrapSnapshot(rl.snapData)
-		n.clientTable.loadFrom(table)
-		// Pass the same table to initialSnap so applyLoop can seed its local
-		// dedup state. Both n.clientTable and initialSnap.clientTable reference
-		// the same map; that is safe because applyLoop only reads from it once
-		// (to deep-copy into localClientTable) before the event loop could mutate
-		// n.clientTable, and Set once means no concurrent writes.
-		n.initialSnap = &snapshotInstall{meta: rl.snapMeta, data: smData, clientTable: table}
-		rl.snapData = nil // release reference; don't hold two copies
+		n.clientTable.loadFrom(rl.snapClientTable)
+		// We don't load the SM data here; applyLoop will call LoadSnapshot.
+		n.initialSnap = &snapshotInstall{
+			meta:        rl.snapMeta,
+			clientTable: rl.snapClientTable,
+		}
+		rl.snapClientTable = nil // release reference
 	}
 
 	// Initialise atomic mirrors so external readers never see a nil value.
@@ -344,6 +342,7 @@ func New(cfg *Config) (*Node, error) {
 	n.atomicLeader.Store(string(NodeID("")))
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
+	n.atomicCommitIndex.Store(uint64(n.commitIndex))
 	initPeers := make([]NodeID, len(cfg.Peers))
 	copy(initPeers, cfg.Peers)
 	n.atomicPeers.Store(initPeers)
@@ -596,6 +595,12 @@ func (n *Node) LastApplied() Index {
 	return Index(n.atomicLastApplied.Load())
 }
 
+// CommitIndex returns the index of the highest log entry known to be committed.
+// Safe for concurrent use.
+func (n *Node) CommitIndex() Index {
+	return Index(n.atomicCommitIndex.Load())
+}
+
 // ReadStale returns the index of the last entry applied to this node's local
 // state machine. It is an atomic read with no lock and no RPC — the cheapest
 // possible read operation.
@@ -740,6 +745,12 @@ func (n *Node) setState(s State) {
 func (n *Node) setLeaderID(id NodeID) {
 	n.leaderID = id
 	n.atomicLeader.Store(string(id))
+}
+
+// setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
+func (n *Node) setCommitIndex(idx Index) {
+	n.commitIndex = idx
+	n.atomicCommitIndex.Store(uint64(idx))
 }
 
 // --- Handler implementation -------------------------------------------------
@@ -974,7 +985,8 @@ func (n *Node) tickerLoop() {
 // apply goroutine's local tracking state. Called from both the priority-select
 // drain and the main select in applyLoop to avoid code duplication.
 func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index) map[NodeID]clientEntry {
-	if err := n.cfg.StateMachine.Restore(ctx, si.meta, si.data); err != nil {
+	defer si.r.Close()
+	if err := n.cfg.StateMachine.Restore(ctx, si.meta, si.r); err != nil {
 		n.logger.Error("applyLoop: Restore", "err", err)
 	}
 	*localLastApplied = si.meta.LastIncludedIndex
@@ -1020,8 +1032,20 @@ func (n *Node) applyLoop() {
 	// processing any committed entries. initialSnap is set once in New()
 	// and is only read here, so there is no data race.
 	if n.initialSnap != nil {
-		if err := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, n.initialSnap.data); err != nil {
-			n.logger.Error("applyLoop: initial snapshot restore", "err", err)
+		_, r, err := n.cfg.Storage.LoadSnapshot(ctx)
+		if err == nil {
+			// Skip the framing header (meta and table already handled in New).
+			_, smReader, rerr := readWrappedSnapshot(r)
+			if rerr == nil {
+				if err := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, smReader); err != nil {
+					n.logger.Error("applyLoop: initial snapshot restore", "err", err)
+				}
+			} else {
+				n.logger.Error("applyLoop: initial snapshot framing", "err", rerr)
+			}
+			_ = r.Close()
+		} else if err != ErrNoSnapshot {
+			n.logger.Error("applyLoop: initial snapshot load", "err", err)
 		}
 		// Seed localClientTable from the snapshot's table so that entries
 		// already covered by the snapshot are not applied again on log replay.
@@ -1052,13 +1076,26 @@ func (n *Node) applyLoop() {
 		case trig := <-n.snapshotTriggerCh:
 			// Take the snapshot here in applyLoop so Snapshot() and Apply()
 			// are never concurrent on the same state machine.
-			data, serr := n.cfg.StateMachine.Snapshot(ctx)
+			pr, pw := io.Pipe()
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
+			}()
+
+			serr := writeWrappedSnapshot(pw, trig.clientTable, func(w io.Writer) error {
+				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
+			})
+			_ = pw.Close() // signals EOF to SaveSnapshot
+
+			saveErr := <-errCh
+			if serr == nil {
+				serr = saveErr
+			}
+
 			select {
 			case n.snapshotResultCh <- snapshotResult{
-				meta:        trig.meta,
-				data:        data,
-				err:         serr,
-				clientTable: trig.clientTable,
+				meta: trig.meta,
+				err:  serr,
 			}:
 			case <-n.stopCh:
 				return

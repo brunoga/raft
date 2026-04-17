@@ -1043,7 +1043,7 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 
 // ---- Snapshot --------------------------------------------------------------
 
-func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, data []byte) error {
+func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, r io.Reader) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -1055,21 +1055,20 @@ func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, dat
 		return fmt.Errorf("filestore: create snap.tmp: %w", err)
 	}
 
-	var hdr [24]byte
+	var hdr [16]byte
 	binary.LittleEndian.PutUint64(hdr[0:8], uint64(meta.LastIncludedIndex))
 	binary.LittleEndian.PutUint64(hdr[8:16], uint64(meta.LastIncludedTerm))
-	binary.LittleEndian.PutUint64(hdr[16:24], uint64(len(data)))
 
 	if _, err = f.Write(hdr[:]); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("filestore: write snap header: %w", err)
 	}
-	if len(data) > 0 {
-		if _, err = f.Write(data); err != nil {
-			_ = f.Close()
-			return fmt.Errorf("filestore: write snap data: %w", err)
-		}
+
+	if _, err = io.Copy(f, r); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("filestore: write snap data: %w", err)
 	}
+
 	if err = f.Sync(); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("filestore: sync snap.tmp: %w", err)
@@ -1084,7 +1083,7 @@ func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, dat
 	return syncDir(fs.dir)
 }
 
-func (fs *FileStore) LoadSnapshot(_ context.Context) (raft.SnapshotMeta, []byte, error) {
+func (fs *FileStore) LoadSnapshot(_ context.Context) (raft.SnapshotMeta, io.ReadCloser, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -1096,22 +1095,18 @@ func (fs *FileStore) LoadSnapshot(_ context.Context) (raft.SnapshotMeta, []byte,
 	if err != nil {
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: open snap: %w", err)
 	}
-	defer func() { _ = f.Close() }()
 
-	var hdr [24]byte
+	var hdr [16]byte
 	if _, err = io.ReadFull(f, hdr[:]); err != nil {
+		_ = f.Close()
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap header: %w", err)
 	}
 	meta := raft.SnapshotMeta{
 		LastIncludedIndex: raft.Index(binary.LittleEndian.Uint64(hdr[0:8])),
 		LastIncludedTerm:  raft.Term(binary.LittleEndian.Uint64(hdr[8:16])),
 	}
-	dataLen := binary.LittleEndian.Uint64(hdr[16:24])
-	data := make([]byte, dataLen)
-	if _, err = io.ReadFull(f, data); err != nil {
-		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap data: %w", err)
-	}
-	return meta, data, nil
+
+	return meta, f, nil
 }
 
 // ---- Lifecycle -------------------------------------------------------------
