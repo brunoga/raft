@@ -626,7 +626,7 @@ func TestReadIndexRPC_HigherTerm_StepsDown(t *testing.T) {
 // because it must win a pre-vote round before incrementing its term.
 func TestPreVote_NodeBecomesPreCandidateFirst(t *testing.T) {
 	// Single node with fake peers so it can't win pre-vote automatically.
-	n := newTestNode(t, "n1", []raft.NodeID{"n2", "n3"})
+	n := newTestNodeWithPeers(t, "n1", []raft.NodeID{"n2", "n3"})
 	n.Start()
 	defer n.Stop()
 

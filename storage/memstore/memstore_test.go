@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/brunoga/raft"
@@ -13,16 +14,21 @@ import (
 func makeEntries(from, to raft.Index, term raft.Term) []raft.LogEntry {
 	entries := make([]raft.LogEntry, 0, int(to-from+1))
 	for i := from; i <= to; i++ {
-		entries = append(entries, raft.LogEntry{Index: i, Term: term, Command: []byte("cmd")})
+		entries = append(entries, raft.LogEntry{
+			Index:   i,
+			Term:    term,
+			Command: []byte("command"),
+		})
 	}
 	return entries
 }
 
-func TestHardState(t *testing.T) {
-	m := memstore.New()
+// --- Hard state -------------------------------------------------------------
 
+func TestHardState_RoundTrip(t *testing.T) {
+	m := memstore.New()
 	ctx := context.Background()
-	// Zero value on first load.
+
 	hs, err := m.LoadHardState(ctx)
 	if err != nil {
 		t.Fatalf("LoadHardState: %v", err)
@@ -31,8 +37,7 @@ func TestHardState(t *testing.T) {
 		t.Fatalf("expected zero HardState, got %+v", hs)
 	}
 
-	// Round-trip.
-	want := raft.HardState{CurrentTerm: 3, VotedFor: "node2"}
+	want := raft.HardState{CurrentTerm: 7, VotedFor: "peer-42"}
 	if err = m.SaveHardState(ctx, want); err != nil {
 		t.Fatalf("SaveHardState: %v", err)
 	}
@@ -44,6 +49,8 @@ func TestHardState(t *testing.T) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 }
+
+// --- Log --------------------------------------------------------------------
 
 func TestAppendAndGet(t *testing.T) {
 	m := memstore.New()
@@ -93,8 +100,8 @@ func TestGetLogEntry_OutOfRange(t *testing.T) {
 	ctx := context.Background()
 	_ = m.AppendLogEntries(ctx, makeEntries(1, 3, 1))
 
-	if _, err := m.GetLogEntry(ctx, 0); !errors.Is(err, raft.ErrCompacted) {
-		t.Fatalf("expected ErrCompacted for index 0, got %v", err)
+	if _, err := m.GetLogEntry(ctx, 0); !errors.Is(err, raft.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for index 0, got %v", err)
 	}
 	if _, err := m.GetLogEntry(ctx, 4); !errors.Is(err, raft.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for index 4, got %v", err)
@@ -144,8 +151,8 @@ func TestTruncatePrefix(t *testing.T) {
 	if first != 4 {
 		t.Fatalf("expected firstIndex=4, got %d", first)
 	}
-	if _, err := m.GetLogEntry(ctx, 3); !errors.Is(err, raft.ErrCompacted) {
-		t.Fatalf("expected ErrCompacted for compacted entry, got %v", err)
+	if _, err := m.GetLogEntry(ctx, 3); !errors.Is(err, raft.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for compacted entry, got %v", err)
 	}
 	if _, err := m.GetLogEntry(ctx, 4); err != nil {
 		t.Fatalf("GetLogEntry(4) after prefix truncate: %v", err)
@@ -166,7 +173,9 @@ func TestTruncatePrefix_All(t *testing.T) {
 	}
 }
 
-func TestSnapshot(t *testing.T) {
+// --- Snapshot ---------------------------------------------------------------
+
+func TestSnapshot_RoundTrip(t *testing.T) {
 	m := memstore.New()
 	ctx := context.Background()
 
@@ -177,17 +186,19 @@ func TestSnapshot(t *testing.T) {
 
 	meta := raft.SnapshotMeta{LastIncludedIndex: 100, LastIncludedTerm: 5}
 	data := []byte("snapshot-data")
-	if err := m.SaveSnapshot(ctx, meta, data); err != nil {
+	if err := m.SaveSnapshot(ctx, meta, bytes.NewReader(data)); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}
 
-	gotMeta, gotData, err := m.LoadSnapshot(ctx)
+	gotMeta, gotR, err := m.LoadSnapshot(ctx)
 	if err != nil {
 		t.Fatalf("LoadSnapshot: %v", err)
 	}
+	defer gotR.Close()
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
 	}
+	gotData, _ := io.ReadAll(gotR)
 	if !bytes.Equal(gotData, data) {
 		t.Fatalf("data mismatch: got %q, want %q", gotData, data)
 	}
@@ -198,17 +209,21 @@ func TestSnapshot_DataIsolated(t *testing.T) {
 	m := memstore.New()
 	ctx := context.Background()
 	data := []byte("original")
-	_ = m.SaveSnapshot(ctx, raft.SnapshotMeta{LastIncludedIndex: 1}, data)
+	_ = m.SaveSnapshot(ctx, raft.SnapshotMeta{LastIncludedIndex: 1}, bytes.NewReader(data))
 	data[0] = 'X'
 
-	_, got, _ := m.LoadSnapshot(ctx)
+	_, gotR, _ := m.LoadSnapshot(ctx)
+	got, _ := io.ReadAll(gotR)
+	gotR.Close()
 	if got[0] != 'o' {
 		t.Fatalf("SaveSnapshot should copy data; got %q", got)
 	}
 
 	// Mutating the loaded slice must not affect stored copy.
 	got[0] = 'Y'
-	_, got2, _ := m.LoadSnapshot(ctx)
+	_, gotR2, _ := m.LoadSnapshot(ctx)
+	got2, _ := io.ReadAll(gotR2)
+	gotR2.Close()
 	if got2[0] != 'o' {
 		t.Fatalf("LoadSnapshot should return a copy; got %q", got2)
 	}

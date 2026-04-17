@@ -1,17 +1,17 @@
 package grpctransport_test
 
 import (
+	"bufio"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
-	"net"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,38 +23,30 @@ import (
 	"github.com/brunoga/raft/transport/grpctransport"
 )
 
-// selfSignedTLS returns a *tls.Config usable for both server and client in a
-// test (self-signed CA, mTLS). Valid for "localhost" and "127.0.0.1".
+// ---- test helpers -----------------------------------------------------------
+
 func selfSignedTLS(t *testing.T) *tls.Config {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatalf("generate key: %v", err)
+		t.Fatal(err)
 	}
-	tmpl := &x509.Certificate{
+	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "raft-test"},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
+		Subject:      pkix.Name{Organization: []string{"Raft Test"}},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     []string{"localhost"},
 	}
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
-		t.Fatalf("create cert: %v", err)
+		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatalf("marshal key: %v", err)
-	}
-	cert, err := tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
-	)
-	if err != nil {
-		t.Fatalf("key pair: %v", err)
+	cert := tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  priv,
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
@@ -99,9 +91,33 @@ func (sm *kvSM) Get(key string) string {
 	return sm.data[key]
 }
 
-func (sm *kvSM) Snapshot(_ context.Context) ([]byte, error) { return nil, nil }
-func (sm *kvSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ []byte) error {
+func (sm *kvSM) Snapshot(_ context.Context, w io.Writer) error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for k, v := range sm.data {
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", k, v); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (sm *kvSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.data = make(map[string]string)
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) == 2 {
+			sm.data[parts[0]] = parts[1]
+		}
+	}
+	return scanner.Err()
 }
 
 // ---- cluster helpers -------------------------------------------------------

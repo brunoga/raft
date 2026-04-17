@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/brunoga/raft"
@@ -99,19 +100,19 @@ func (s *IDSM) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
 }
 
 // Snapshot serialises the domain map as JSON.
-func (s *IDSM) Snapshot(_ context.Context) ([]byte, error) {
+func (s *IDSM) Snapshot(_ context.Context, w io.Writer) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return json.Marshal(s.domains)
+	return json.NewEncoder(w).Encode(s.domains)
 }
 
 // Restore replaces the domain map from a snapshot produced by Snapshot.
-func (s *IDSM) Restore(_ context.Context, _ raft.SnapshotMeta, data []byte) error {
+func (s *IDSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var domains map[string]uint64
-	if err := json.Unmarshal(data, &domains); err != nil {
+	if err := json.NewDecoder(r).Decode(&domains); err != nil {
 		return fmt.Errorf("idprovider: restore: %w", err)
 	}
 	if domains == nil {

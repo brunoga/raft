@@ -55,7 +55,7 @@ func TestPreVote_LeaderDeniesPreVote(t *testing.T) {
 	// The original leader must still be the leader. If the pre-vote bug were
 	// present, L would grant B's pre-vote, B would win a majority (self + L),
 	// and B would escalate to a real election that bumps the term and deposes L.
-	if got := c.leaderIndex(); got != leaderIdx {
+	if got := c.LeaderIndex(); got != leaderIdx {
 		t.Fatalf("leader changed from %d to %d — leader granted a pre-vote it should have denied",
 			leaderIdx, got)
 	}
@@ -797,7 +797,7 @@ func TestPreferredLeader_TransfersLeadership(t *testing.T) {
 	for time.Now().Before(deadline) {
 		c.Tick()
 		time.Sleep(time.Millisecond)
-		if idx := c.leaderIndex(); idx >= 0 && c.nodes[idx].ID() == preferred {
+		if idx := c.LeaderIndex(); idx >= 0 && c.nodes[idx].ID() == preferred {
 			return // preferred node is the leader — success
 		}
 	}
