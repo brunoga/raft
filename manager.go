@@ -306,7 +306,17 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 	// expect RunTicker to drive all groups should set TickInterval = 0.
 	var warnSkippedOnce sync.Once
 
+	// Cap the worker pool at min(GOMAXPROCS, initialGroupCount) so that we
+	// don't spawn idle goroutines when the manager holds only a handful of
+	// groups on a many-core machine. Groups added after RunTicker starts are
+	// handled by the existing workers; the channel buffer absorbs the extra
+	// work-items without stalling the main ticker loop.
 	nWorkers := runtime.GOMAXPROCS(0)
+	m.mu.RLock()
+	if n := len(m.nodes); n > 0 && n < nWorkers {
+		nWorkers = n
+	}
+	m.mu.RUnlock()
 	// Buffer allows the main goroutine to keep sending while workers process;
 	// 2× nWorkers keeps the pipeline full without large memory cost.
 	work := make(chan tickItem, nWorkers*2)

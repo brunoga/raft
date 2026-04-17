@@ -201,6 +201,12 @@ type Node struct {
 	// by a message from a previous leader after an election.
 	pendingSnap *partialSnapshot
 
+	// snapshotInstallWg tracks all live runSnapshotInstall goroutines.
+	// Stop() waits on this WaitGroup so that those goroutines — which hold
+	// references to the storage backend and rpcCh — have fully exited before
+	// the node is considered stopped.
+	snapshotInstallWg sync.WaitGroup
+
 	// initialSnap, if non-nil, holds the snapshot loaded from storage in New().
 	// applyLoop restores the state machine from it on its first iteration and
 	// never touches it again. Set once before Start(); the event loop never
@@ -369,13 +375,17 @@ func (n *Node) Start() {
 }
 
 // Stop signals the node to shut down and waits for all goroutines to exit,
-// including the apply goroutine.
+// including the apply goroutine and any in-flight runSnapshotInstall goroutines.
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		n.stopCancel() // unblock any in-progress StateMachine operations
 		close(n.stopCh)
 		<-n.doneCh
 		<-n.applyDoneCh
+		// Wait for any snapshot-install goroutines to exit. stopCancel() already
+		// cancelled their contexts, so they exit quickly; we just need to be sure
+		// they have released all references before we return.
+		n.snapshotInstallWg.Wait()
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
 	})

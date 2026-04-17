@@ -97,6 +97,12 @@ func (t *GRPCTransport) BatchHeartbeatErrors() int64 { return t.batchHBErrors.Lo
 // can absorb without back-pressure; increase WithHeartbeatChannelSize.
 func (t *GRPCTransport) HeartbeatSendBlocked() int64 { return t.hbSendBlocked.Load() }
 
+// ResetHeartbeatSendBlocked atomically resets the HeartbeatSendBlocked counter
+// to zero and returns the previous value. This enables rate monitoring: call
+// this method once per reporting interval and treat the return value as the
+// count of blocked sends during that interval, rather than the cumulative total.
+func (t *GRPCTransport) ResetHeartbeatSendBlocked() int64 { return t.hbSendBlocked.Swap(0) }
+
 const defaultHeartbeatRPCTimeout = 5 * time.Second
 
 // heartbeatRPCTimeout returns the configured timeout for a single BatchHeartbeats call.
