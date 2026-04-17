@@ -204,6 +204,70 @@ success:
 	}
 }
 
+// ---- TestManager_RunTicker_WorkersBoundedByGroupCount ----------------------
+
+// TestManager_RunTicker_WorkersBoundedByGroupCount verifies that RunTicker
+// does not spawn more worker goroutines than there are registered groups.
+// Before the fix RunTicker always spawned GOMAXPROCS workers even for a single
+// group, wasting one goroutine per extra core. After the fix the pool is
+// capped at min(GOMAXPROCS, initialGroupCount).
+//
+// The test requires GOMAXPROCS ≥ 3 so the before/after difference is visible
+// via runtime.NumGoroutine() even with a ±1 measurement error budget.
+//
+// FAILS before the fix on machines with GOMAXPROCS ≥ 3.
+// PASSES after the fix.
+func TestManager_RunTicker_WorkersBoundedByGroupCount(t *testing.T) {
+	nProcs := runtime.GOMAXPROCS(0)
+	if nProcs < 3 {
+		t.Skipf("GOMAXPROCS=%d < 3; can't distinguish over-provisioning from noise", nProcs)
+	}
+
+	const nGroups = 1 // far fewer groups than cores
+
+	mgr := raft.NewManager()
+	net := memtransport.NewNetwork()
+
+	for i := range nGroups {
+		node := newUnregisteredNode(t, net, uint64(i+1), raft.NodeID(fmt.Sprintf("wb%d", i+1)))
+		if err := mgr.Add(uint64(i+1), node); err != nil {
+			t.Fatalf("Add(%d): %v", i+1, err)
+		}
+	}
+
+	// Snapshot goroutine count before RunTicker starts workers.
+	// Use a short runtime.Gosched() to let any inflight goroutine starts settle.
+	runtime.Gosched()
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	tickerDone := make(chan struct{})
+	go func() {
+		mgr.RunTicker(ctx, 10*time.Millisecond)
+		close(tickerDone)
+	}()
+
+	// Give the worker goroutines time to start.
+	time.Sleep(50 * time.Millisecond)
+	after := runtime.NumGoroutine()
+
+	cancel()
+	<-tickerDone
+
+	// Expected after - before:
+	//   1 goroutine running RunTicker itself
+	//   min(nProcs, nGroups) = nGroups worker goroutines (after fix)
+	//   OR nProcs worker goroutines (before fix)
+	// We allow a ±2 buffer for unrelated goroutine churn.
+	increase := after - before
+	maxExpected := nGroups + 3 // RunTicker goroutine + nGroups workers + 2 slack
+	if increase > maxExpected {
+		t.Errorf("RunTicker spawned too many goroutines: before=%d after=%d increase=%d "+
+			"(want ≤ %d; nGroups=%d nProcs=%d — before fix this would be ~%d)",
+			before, after, increase, maxExpected, nGroups, nProcs, nProcs+1)
+	}
+}
+
 // ---- TestManager_RunTicker_Starvation ---------------------------------------
 
 // TestManager_RunTicker_Starvation verifies that a single slow node (whose

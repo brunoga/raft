@@ -160,7 +160,11 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 			installCh: installCh,
 			cancelFn:  cancelFn,
 		}
-		go n.runSnapshotInstall(installCtx, meta, installCh)
+		n.snapshotInstallWg.Add(1)
+		go func() {
+			defer n.snapshotInstallWg.Done()
+			n.runSnapshotInstall(installCtx, meta, installCh)
+		}()
 	}
 
 	// Verify the expected byte offset to detect out-of-order delivery.
@@ -179,10 +183,14 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 	select {
 	case n.pendingSnap.installCh <- chunk:
 	default:
-		// Channel full: disk I/O is lagging behind the RPC rate. Drop the chunk
-		// and let the sender retry; it will restart from a suitable offset.
-		n.logger.Warn("snapshot install: chunk channel full, dropping chunk",
+		// Channel full: disk I/O is lagging behind the RPC rate.  Cancel the
+		// install goroutine so it exits cleanly (a blocked goroutine waiting
+		// for chunks that never arrive would otherwise leak until node stop).
+		// The leader will retry from Offset=0 when it detects stalled progress.
+		n.logger.Warn("snapshot install: chunk channel full; cancelling install",
 			"peer", req.LeaderID, "offset", req.Offset)
+		n.pendingSnap.cancelFn()
+		n.pendingSnap = nil
 		return resp, nil
 	}
 	n.pendingSnap.expectedOff += int64(len(req.Data))
@@ -209,9 +217,21 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 	drainChunks(chunkCh)
 
 	sendResult := func(r *snapInstallResult) {
+		// Prefer ctx.Done() (installCtx) over n.stopCtx so that a goroutine
+		// whose install was superseded by a newer one discards its result
+		// instead of posting a stale result to the event loop.
+		// installCtx is derived from stopCtx, so this also handles node stop.
+		select {
+		case <-ctx.Done():
+			if r.smR != nil {
+				r.smR.Close()
+			}
+			return
+		default:
+		}
 		select {
 		case n.rpcCh <- rpcEnvelope{req: r}:
-		case <-n.stopCtx.Done():
+		case <-ctx.Done():
 			if r.smR != nil {
 				r.smR.Close()
 			}
@@ -263,6 +283,12 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	if r.err != nil {
 		n.logger.Error("snapshot install failed", "err", r.err)
+		// Clear the stale pendingSnap reference so that any chunks arriving
+		// before the leader retries from Offset=0 are rejected immediately
+		// rather than being buffered into a channel whose consumer has exited.
+		if n.pendingSnap != nil && n.pendingSnap.meta.LastIncludedIndex == r.meta.LastIncludedIndex {
+			n.pendingSnap = nil
+		}
 		return
 	}
 
@@ -291,8 +317,12 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	case n.restoreSnapshotCh <- install:
 	default:
 		// Existing pending restore — overwrite with the newer result.
+		// Close the displaced reader to prevent an fd leak.
 		select {
-		case <-n.restoreSnapshotCh:
+		case old := <-n.restoreSnapshotCh:
+			if old.r != nil {
+				old.r.Close()
+			}
 		default:
 		}
 		n.restoreSnapshotCh <- install
