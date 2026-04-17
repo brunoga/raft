@@ -45,6 +45,7 @@ type hbResp struct {
 type peerBatcher struct {
 	peer    raft.NodeID
 	ch      chan hbCall
+	ctx     context.Context                // per-peer context; Done when removePeer cancels it
 	cancel  context.CancelFunc             // cancels this batcher's context (used by removePeer)
 	pending []hbCall                         // reused across flush cycles; owned by run goroutine only
 	results map[uint64]*pb.HeartbeatResult // reused across RPC cycles; owned by run goroutine only
@@ -234,6 +235,7 @@ func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) (*peerBatcher, error
 	batcher := &peerBatcher{
 		peer:    peer,
 		ch:      make(chan hbCall, b.t.hbChanSize),
+		ctx:     peerCtx,
 		cancel:  peerCancel,
 		results: make(map[uint64]*pb.HeartbeatResult),
 	}
@@ -268,6 +270,10 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 		b.respChanPool.Put(respCh)
 		return nil, err
 	}
+	// Capture the batcher's context before any concurrent removePeer can cancel
+	// it. Used below to detect the window where the goroutine exits after
+	// peerBatcherFor returns but before we finish waiting for the response.
+	batcherCtx := batcher.ctx
 
 	// Fast path: try to enqueue without blocking. If the channel is full, fall
 	// through to the blocking path and increment the backpressure counter so
@@ -284,6 +290,11 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 			// call NOT enqueued; batcher will never write to respCh — safe to pool.
 			b.respChanPool.Put(respCh)
 			return nil, ctx.Err()
+		case <-batcherCtx.Done():
+			// Batcher goroutine stopped while we were waiting to enqueue.
+			// The call was never enqueued so respCh will never be written.
+			b.respChanPool.Put(respCh)
+			return nil, errBatcherStopped
 		}
 	}
 
@@ -308,5 +319,17 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 			b.respChanPool.Put(respCh)
 		}()
 		return nil, ctx.Err()
+	case <-batcherCtx.Done():
+		// Batcher goroutine exited after we enqueued the call. The call was
+		// written to the channel but the goroutine may have drained it (writing
+		// to respCh) or may have exited before reading it. Drain respCh before
+		// returning it to the pool to handle the case where the batcher wrote
+		// to it in its shutdown drain loop.
+		select {
+		case <-respCh:
+		default:
+		}
+		b.respChanPool.Put(respCh)
+		return nil, errBatcherStopped
 	}
 }

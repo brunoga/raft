@@ -186,6 +186,8 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 		n.handleAppendResult(req)
 	case *installSnapshotResult:
 		n.handleInstallSnapshotResult(req)
+	case *snapInstallResult:
+		n.handleSnapInstallResult(req)
 	default:
 		resp = rpcResponse{err: fmt.Errorf("raft: unknown RPC type %T", req)}
 	}
