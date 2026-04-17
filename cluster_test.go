@@ -108,8 +108,10 @@ func (c *Cluster) TickN(n int) {
 }
 
 // WaitLeader waits for any node to become leader, up to timeout.
-// Returns the index of the leader node, or -1 if none elected.
+// Fails the test immediately if no leader is elected within timeout.
+// Returns the index of the leader node.
 func (c *Cluster) WaitLeader(timeout time.Duration) int {
+	c.t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for i, node := range c.nodes {
@@ -120,7 +122,8 @@ func (c *Cluster) WaitLeader(timeout time.Duration) int {
 		c.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	return -1
+	c.t.Fatalf("no leader elected within %s", timeout)
+	return -1 // unreachable; satisfies the compiler
 }
 
 // Leader returns the current leader node, or nil if none is elected.
