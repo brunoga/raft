@@ -889,6 +889,33 @@ func (n *Node) stopHBPumps() {
 	n.hbStopChs = nil
 }
 
+// startHBPumpFor starts a single heartbeat-pump goroutine for peer id.
+// Called by applyConfigChange when a new peer is added while this node is leader.
+// No-op if hbPumps is nil (i.e. we are not currently leader).
+func (n *Node) startHBPumpFor(id NodeID) {
+	if n.hbPumps == nil {
+		return
+	}
+	if _, exists := n.hbPumps[id]; exists {
+		return // already running
+	}
+	ch := make(chan *AppendEntriesRequest, 1)
+	stop := make(chan struct{})
+	n.hbPumps[id] = ch
+	n.hbStopChs[id] = stop
+	go n.runHBPump(id, ch, stop)
+}
+
+// stopHBPumpFor stops and removes the heartbeat-pump goroutine for peer id.
+// Called by applyConfigChange when a peer is removed while this node is leader.
+func (n *Node) stopHBPumpFor(id NodeID) {
+	if stop, ok := n.hbStopChs[id]; ok {
+		close(stop)
+		delete(n.hbStopChs, id)
+		delete(n.hbPumps, id)
+	}
+}
+
 // runHBPump is the body of one per-peer heartbeat pump goroutine.
 // It reads from ch, sends the AppendEntries RPC, and posts the result to rpcCh.
 // The goroutine exits when stop is closed or n.stopCtx is cancelled.

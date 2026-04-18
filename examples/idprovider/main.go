@@ -11,10 +11,17 @@
 // disjoint and ordered: if allocation A commits before allocation B in the same
 // domain, A.start+A.count <= B.start.
 //
-// # Usage (three-node example)
+// # Usage (three-node example with static peers)
 //
 //	idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
 //	           --peer n2=localhost:7002 --peer n3=localhost:7003
+//
+// # Usage (three-node example with UDP broadcast discovery)
+//
+//	idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
+//	           --udp-discovery
+//
+// The --udp-discovery and --peer flags are mutually exclusive.
 //
 //	# Create a domain:
 //	curl -s -X POST http://localhost:8001/domains/orders
@@ -57,6 +64,8 @@ import (
 	"time"
 
 	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/discovery"
+	"github.com/brunoga/raft/discovery/udpbroadcast"
 	"github.com/brunoga/raft/storage/filestore"
 	"github.com/brunoga/raft/transport/grpctransport"
 )
@@ -76,16 +85,36 @@ type badRequestError struct{ msg string }
 
 func (e *badRequestError) Error() string { return e.msg }
 
+// raftPeerAdder implements discovery.PeerAdder for the ongoing DiscoveryAgent.
+// When a new peer is detected it registers the peer's gRPC address with the
+// transport and proposes adding the peer to the Raft membership (AddServer).
+// AddServer is a no-op on followers (returns NotLeaderError); the leader call
+// succeeds and the membership change propagates to the cluster.
+type raftPeerAdder struct {
+	tr   discovery.PeerAdder // typically *grpctransport.GRPCTransport
+	node *raft.Node
+}
+
+func (a *raftPeerAdder) AddPeer(id raft.NodeID, addr string) {
+	a.tr.AddPeer(id, addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = a.node.AddServer(ctx, id) // best-effort; only the leader succeeds
+}
+
 func main() {
 	var (
-		id       = flag.String("id", "", "this node's unique ID (required)")
-		raftAddr = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs")
-		httpAddr = flag.String("http-addr", ":8001", "HTTP listen address for client API")
-		dataDir  = flag.String("data-dir", "", "directory for persistent Raft state (required)")
-		tlsCert  = flag.String("tls-cert", "", "PEM certificate file for mTLS (requires --tls-key and --tls-ca)")
-		tlsKey   = flag.String("tls-key", "", "PEM private key file for mTLS")
-		tlsCA    = flag.String("tls-ca", "", "PEM CA certificate file for mTLS peer verification")
-		peers    peerFlag
+		id                   = flag.String("id", "", "this node's unique ID (required)")
+		raftAddr             = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs")
+		httpAddr             = flag.String("http-addr", ":8001", "HTTP listen address for client API")
+		dataDir              = flag.String("data-dir", "", "directory for persistent Raft state (required)")
+		tlsCert              = flag.String("tls-cert", "", "PEM certificate file for mTLS (requires --tls-key and --tls-ca)")
+		tlsKey               = flag.String("tls-key", "", "PEM private key file for mTLS")
+		tlsCA                = flag.String("tls-ca", "", "PEM CA certificate file for mTLS peer verification")
+		udpDiscovery         = flag.Bool("udp-discovery", false, "use UDP broadcast for peer discovery (mutually exclusive with --peer)")
+		udpBroadcastAddr     = flag.String("udp-broadcast-addr", "255.255.255.255:9199", "UDP broadcast address for peer discovery")
+		udpDiscoveryTimeout  = flag.Duration("udp-discovery-timeout", 3*time.Second, "duration to wait for initial peer discovery window")
+		peers                peerFlag
 	)
 	flag.Var(&peers, "peer", "peer in the form id=raft_addr[,http_addr] (repeatable)")
 	flag.Parse()
@@ -109,27 +138,76 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse peers.
+	// --udp-discovery and --peer are mutually exclusive.
+	if *udpDiscovery && len(peers) > 0 {
+		fmt.Fprintln(os.Stderr, "idprovider: --udp-discovery and --peer are mutually exclusive")
+		os.Exit(1)
+	}
+
+	// Set up the shutdown context early so we can respect SIGINT/SIGTERM even
+	// during the initial discovery window.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Peer collections: populated from --peer flags or the UDP discovery window.
 	peerIDs := make([]raft.NodeID, 0, len(peers))
-	peerRaftAddrs := make(map[raft.NodeID]string, len(peers))
-	peerHTTPAddrs := make(map[raft.NodeID]string, len(peers))
-	for _, p := range peers {
-		parts := strings.SplitN(p, "=", 2)
-		if len(parts) != 2 {
-			fmt.Fprintf(os.Stderr, "idprovider: invalid --peer %q (want id=raft_addr[,http_addr])\n", p)
+	peerRaftAddrs := make(map[raft.NodeID]string)
+	peerHTTPAddrs := make(map[raft.NodeID]string)
+
+	if !*udpDiscovery {
+		// Parse static --peer flags.
+		for _, p := range peers {
+			parts := strings.SplitN(p, "=", 2)
+			if len(parts) != 2 {
+				fmt.Fprintf(os.Stderr, "idprovider: invalid --peer %q (want id=raft_addr[,http_addr])\n", p)
+				os.Exit(1)
+			}
+			pid := raft.NodeID(parts[0])
+			if pid == raft.NodeID(*id) {
+				continue
+			}
+			peerIDs = append(peerIDs, pid)
+
+			addrs := strings.SplitN(parts[1], ",", 2)
+			peerRaftAddrs[pid] = addrs[0]
+			if len(addrs) > 1 {
+				peerHTTPAddrs[pid] = addrs[1]
+			}
+		}
+	}
+
+	// UDP broadcast discovery window: broadcast our presence and collect peers
+	// for udpDiscoveryTimeout before starting the Raft node so that cfg.Peers
+	// is populated for the initial membership.
+	var bcast *udpbroadcast.UDPBroadcast
+	if *udpDiscovery {
+		b, err := udpbroadcast.New(&udpbroadcast.Config{
+			NodeID:        raft.NodeID(*id),
+			Addr:          *raftAddr,
+			BroadcastAddr: *udpBroadcastAddr,
+			Logger:        logger,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "idprovider: udpbroadcast.New: %v\n", err)
 			os.Exit(1)
 		}
-		pid := raft.NodeID(parts[0])
-		if pid == raft.NodeID(*id) {
-			continue
-		}
-		peerIDs = append(peerIDs, pid)
+		bcast = b
+		go func() { _ = b.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
 
-		addrs := strings.SplitN(parts[1], ",", 2)
-		peerRaftAddrs[pid] = addrs[0]
-		if len(addrs) > 1 {
-			peerHTTPAddrs[pid] = addrs[1]
+		slog.Info("idprovider: UDP discovery window", "timeout", *udpDiscoveryTimeout)
+		select {
+		case <-time.After(*udpDiscoveryTimeout):
+		case <-ctx.Done():
 		}
+
+		discovered, _ := b.Discover(ctx)
+		for _, p := range discovered {
+			peerIDs = append(peerIDs, p.ID)
+			peerRaftAddrs[p.ID] = p.Addr
+		}
+		slog.Info("idprovider: initial peers discovered", "count", len(peerIDs))
 	}
 
 	// Open persistent storage.
@@ -189,7 +267,7 @@ func main() {
 	cfg.Storage = store
 	cfg.StateMachine = sm
 	cfg.Transport = tr
-	cfg.Logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg.Logger = logger
 
 	node, err := raft.New(&cfg)
 	if err != nil {
@@ -199,6 +277,21 @@ func main() {
 	node.Start()
 	defer node.Stop()
 
+	// Start the ongoing discovery agent when UDP discovery is enabled. It calls
+	// raftPeerAdder.AddPeer on each poll, which registers new peers with the
+	// transport and proposes adding them to the Raft membership via AddServer.
+	//
+	// The 5 s poll interval is intentionally shorter than the UDP TTL (6 s) so
+	// that a late-joining node is admitted within a few broadcast cycles. Until
+	// AddServer commits the joining node will log repeated "became pre-candidate"
+	// messages — this is normal: it cannot win an election because the existing
+	// leader rejects its pre-vote, and it settles as follower as soon as it
+	// receives the leader's first heartbeat after being added to membership.
+	if bcast != nil {
+		agent := discovery.NewAgent(bcast, &raftPeerAdder{tr: tr, node: node}, 5*time.Second)
+		go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
+	}
+
 	srv := &http.Server{
 		Addr:         *httpAddr,
 		Handler:      buildMux(*id, node, sm, peerHTTPAddrs),
@@ -206,9 +299,6 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		slog.Info("idprovider: HTTP listening", "addr", *httpAddr)
@@ -221,7 +311,7 @@ func main() {
 	slog.Info("idprovider: shutting down")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(shutCtx)
+	srv.Shutdown(shutCtx) //nolint:errcheck // best-effort shutdown; error not actionable here
 }
 
 // buildMux constructs the HTTP handler for a single Raft node.
@@ -431,4 +521,3 @@ func writeProposalError(w http.ResponseWriter, r *http.Request, err error, httpA
 	}
 	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
-
