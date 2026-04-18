@@ -143,7 +143,9 @@ Each `*Node` runs the following persistent goroutines:
 | Ticker | 0 or 1 | Fires `Tick()` at `TickInterval`; absent when `TickInterval == 0` |
 | Heartbeat pump | P (one per peer) | Keeps heartbeat RPCs off the event loop; size-1 channel drops redundant sends |
 
-**Budget at scale**: with G groups and P peers per group, each physical node runs approximately `G × (2 + P)` persistent goroutines. At G = 1,000 and P = 3, that is ~5,000 goroutines — well within Go's scheduler capacity. `Manager.RunTicker` adds one additional goroutine to fan-out `Tick()` across all groups in parallel.
+**Budget at scale**: with G groups and P peers per group, each physical node runs approximately `G × (2 + P)` persistent goroutines. At G = 1,000 and P = 3, that is ~5,000 goroutines — well within Go's scheduler capacity. `Manager.RunTicker` adds one additional goroutine and a pool of `min(GOMAXPROCS, G)` workers to fan-out `Tick()` across all groups in parallel.
+
+**Practical ceiling**: Go's M:N scheduler handles 10,000+ goroutines without issue on modern hardware. Goroutine overhead typically becomes noticeable beyond ~1,000 groups per node (~5,000 goroutines at P=3). In practice, disk I/O — not goroutines — is the binding constraint at common group counts; see [Caveats](#caveats-and-known-limitations) for details.
 
 ---
 
@@ -832,6 +834,42 @@ that all groups' heartbeats (which fire together via `RunTicker`) are coalesced
 before the RPC is sent. `BatchHeartbeatsServed()` on the receiving transport
 returns the cumulative count for monitoring.
 
+### Industry context
+
+This pattern — multiple independent Raft groups co-located on each physical
+node, sharing a single transport — is what the distributed-systems community
+canonically refers to as **multi-raft**. The same architecture is used in:
+
+- **CockroachDB**: each *range* (16 MiB key-range shard) is a Raft group; nodes
+  host hundreds of ranges. CockroachDB coined the term *coalesced heartbeats*
+  for the same O(G×P) → O(P) optimisation implemented here as heartbeat
+  batching.
+- **TiKV** (powers TiDB): each *region* is a Raft group; TiKV's `MultiRaft`
+  component is structurally identical to `Manager`. PingCAP uses the term
+  "multi-raft" explicitly in their documentation.
+
+**Resource isolation caveat.** Co-locating groups shares CPU, disk I/O, and
+network bandwidth — a write-heavy shard can delay heartbeats or slow proposals
+in neighbouring groups on the same machine. Multi-raft addresses
+*Raft-protocol-level* interference (independent logs, independent elections,
+independent apply pipelines) but not hardware-resource contention. Production
+systems address this through per-shard I/O throttling, hot-shard detection,
+and partition migration — layers built above the Raft library. See
+[`examples/shardkv`](../examples/shardkv/) for a working end-to-end example
+and its README for a fuller discussion of the trade-offs.
+
+### Scale boundaries
+
+**Practical group counts**: at 10–200 groups per node the implementation runs comfortably within both goroutine and I/O budgets on typical SSD hardware. Beyond ~500 actively-writing groups, disk throughput becomes the binding constraint rather than CPU or goroutines.
+
+**fsync amplification (filestore)**: `filestore` issues an `fsync` after every mutating operation on each group's storage. Under write load, G simultaneously-active groups can issue G fsyncs within a single tick window. On a fast NVMe device (≈200 µs per fsync), 500 concurrent fsyncs consume roughly 100 ms of disk time — enough to trigger election timeouts in groups that are waiting on their own storage. Mitigation options:
+
+- **Stagger write load**: spread groups so that only a fraction are actively receiving proposals at any instant. Read-heavy or idle groups do not amplify fsyncs.
+- **Use a shared-WAL storage backend**: the `Storage` interface is intentionally narrow (`SaveLog`, `SaveSnapshot`, `LoadLog`, `LoadSnapshot`). A production system at very high group counts should replace `filestore` with an implementation that batches writes from multiple groups into a single shared WAL and issues one `fsync` per batch. `filestore` is the reference implementation for correctness and single-group deployments, not for a 1,000-group write-heavy cluster.
+- **Use `memstore` for recoverable groups**: groups whose data can be rebuilt from an external source of truth (e.g. a sharded RDBMS) can use `memstore` without durability concerns.
+
+**No inter-group flow control**: all groups share the same gRPC connection(s) to each peer. A group under heavy replication load (large log entries, frequent snapshot installs) can consume a disproportionate share of the shared TCP bandwidth and delay heartbeats from other groups, triggering unnecessary elections. HTTP/2 multiplexing prevents TCP head-of-line blocking, but the library does not implement application-level priority scheduling or bandwidth allocation between groups.
+
 ### Observing group status
 
 ```go
@@ -895,12 +933,28 @@ single-server change could leave the cluster without a quorum.
 `TickInterval` is read once in `New()` and converted to tick counts. Changing it
 after `Start()` has no effect.
 
+### fsync amplification with many groups
+
+When using `filestore` with many simultaneously-active groups, each group issues its own `fsync` on every log append. G concurrent writers produce up to G fsyncs per replication round. On NVMe storage this is usually acceptable up to ~100–200 concurrent writers; on network-attached or spinning storage the accumulated latency spikes will cause election timeouts well below that threshold. For write-heavy deployments above ~200 groups, use a shared-WAL `Storage` implementation that amortises fsyncs across groups. See [Scale boundaries](#scale-boundaries) in the Multi-Raft section.
+
+### No proposal-level backpressure
+
+The internal `proposeCh` has a fixed capacity of 1,024 entries. When the leader's event loop falls behind — due to a slow state machine, a long-running snapshot, or heavy replication traffic — `Propose` blocks at channel entry until space becomes available. There is no admission-control mechanism that sheds load or returns an error proactively. Applications that need to bound proposal queue depth should implement their own semaphore or token-bucket before calling `Propose`.
+
+### Leader balancing and follower reads are not yet implemented
+
+The `PreferredLeader` configuration field provides basic preferred-leader steering: a node that wins an election but is not the preferred node will immediately transfer leadership to it. Full leader-balancing (distributing Raft leaders evenly across physical nodes in a multi-raft deployment) and follower reads (serving `ReadIndex` requests directly from followers without forwarding to the leader) are not yet implemented. Both are planned for a future release.
+
 ---
 
 ## Reference implementation
 
+Two fully-worked examples are provided, each targeting a different deployment pattern.
+
+### `examples/idprovider` — single-group
+
 See [`examples/idprovider`](examples/idprovider/) for a production-ready distributed
-monotonic ID allocation service that demonstrates all major features:
+monotonic ID allocation service that demonstrates all major single-group features:
 
 - **State machine**: multiple independent domains, each with a `uint64`
   counter; each allocation atomically reserves a range `[start, start+count)`.
@@ -918,4 +972,31 @@ monotonic ID allocation service that demonstrates all major features:
 go build -o idprovider ./examples/idprovider
 ./idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
              --peer n2=localhost:7002 --peer n3=localhost:7003
+```
+
+### `examples/shardkv` — multi-group (multi-raft)
+
+See [`examples/shardkv`](examples/shardkv/) for a horizontally-sharded key-value
+store that demonstrates the canonical multi-raft pattern: N independent Raft
+groups (shards) co-located on each physical node, sharing one gRPC transport and
+one `Manager` ticker.
+
+- **Multi-raft wiring**: `Manager`, `cfg.GroupID`, `tr.SetGroupLookup`, `RunTicker`.
+- **FNV-hash routing**: keys are deterministically mapped to shards; the HTTP
+  layer resolves the correct group and redirects writes to the shard leader.
+- **Heartbeat batching**: enabled automatically by `SetGroupLookup` — O(G×P)
+  heartbeats per tick are coalesced into O(P) `BatchHeartbeats` RPCs.
+- **Independent fault domains**: stopping or partitioning one shard's nodes does
+  not affect other shards' availability or leadership.
+
+```bash
+go build -o shardkv ./examples/shardkv
+
+# Node 1 — hosts one replica of each of the 4 shards
+./shardkv --id p1 --shards 4 --raft-addr :7001 --http-addr :8001 \
+          --data-dir /tmp/sk/p1 \
+          --peer p2=localhost:7002,localhost:8002 \
+          --peer p3=localhost:7003,localhost:8003
+
+# Node 2 and 3 follow the same pattern (see examples/shardkv/README.md)
 ```
