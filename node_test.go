@@ -48,7 +48,7 @@ func newTestNodeWithPeers(t testing.TB, id raft.NodeID, peers []raft.NodeID) *ra
 type noopSM struct{}
 
 func (s *noopSM) Apply(_ context.Context, _ raft.LogEntry) ([]byte, error) { return nil, nil }
-func (s *noopSM) Snapshot(_ context.Context, _ io.Writer) error           { return nil }
+func (s *noopSM) Snapshot(_ context.Context, _ io.Writer) error            { return nil }
 func (s *noopSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ io.Reader) error {
 	return nil
 }
@@ -70,9 +70,9 @@ func (t *noopTransport) TimeoutNow(_ context.Context, _ raft.NodeID, _ *raft.Tim
 func (t *noopTransport) ReadIndex(_ context.Context, _ raft.NodeID, _ *raft.ReadIndexRequest) (*raft.ReadIndexResponse, error) {
 	return &raft.ReadIndexResponse{}, nil
 }
-func (t *noopTransport) Register(raft.NodeID, raft.Handler)   {}
-func (t *noopTransport) Unregister(raft.NodeID)               {}
-func (t *noopTransport) Close() error                         { return nil }
+func (t *noopTransport) Register(raft.NodeID, raft.Handler) {}
+func (t *noopTransport) Unregister(raft.NodeID)             {}
+func (t *noopTransport) Close() error                       { return nil }
 
 type trackingTransport struct {
 	noopTransport
@@ -211,21 +211,8 @@ func (s *slowSM) Apply(_ context.Context, _ raft.LogEntry) ([]byte, error) {
 	<-s.applyDone
 	return nil, nil
 }
-func (s *slowSM) Snapshot(_ context.Context, _ io.Writer) error           { return nil }
+func (s *slowSM) Snapshot(_ context.Context, _ io.Writer) error { return nil }
 func (s *slowSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ io.Reader) error {
-	return nil
-}
-
-type recordSM struct {
-	applied []string
-}
-
-func (s *recordSM) Apply(_ context.Context, e raft.LogEntry) ([]byte, error) {
-	s.applied = append(s.applied, string(e.Command))
-	return nil, nil
-}
-func (s *recordSM) Snapshot(_ context.Context, _ io.Writer) error { return nil }
-func (s *recordSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ io.Reader) error {
 	return nil
 }
 

@@ -169,12 +169,12 @@ func TestStop_WaitsForSnapshotInstallGoroutine(t *testing.T) {
 	ctx := context.Background()
 
 	// Elevate to term 1 so the node accepts InstallSnapshot from "leader".
-	n.HandleAppendEntries(ctx, &AppendEntriesRequest{ //nolint:errcheck
+	n.HandleAppendEntries(ctx, &AppendEntriesRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term: 1, LeaderID: "leader",
 	})
 
 	// Send chunk 0 to start the runSnapshotInstall goroutine.
-	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck
+	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term:              1,
 		LeaderID:          "leader",
 		LastIncludedIndex: 1,
@@ -269,7 +269,7 @@ func TestRunSnapshotInstall_CancelledDoesNotPostResult(t *testing.T) {
 	ctx := context.Background()
 
 	// Elevate to term 1.
-	n.HandleAppendEntries(ctx, &AppendEntriesRequest{ //nolint:errcheck
+	n.HandleAppendEntries(ctx, &AppendEntriesRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term: 1, LeaderID: "leader",
 	})
 
@@ -277,7 +277,7 @@ func TestRunSnapshotInstall_CancelledDoesNotPostResult(t *testing.T) {
 	// (We do not have direct access to rpcCh from package raft_test, but we
 	// are in package raft here, so we can read n.rpcCh.)
 	// Send the snapshot install request to start the goroutine.
-	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck
+	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term:              1,
 		LeaderID:          "leader",
 		LastIncludedIndex: 5,
@@ -298,7 +298,7 @@ func TestRunSnapshotInstall_CancelledDoesNotPostResult(t *testing.T) {
 	// event loop to cancel the first goroutine's installCtx and start a second
 	// goroutine.  The first goroutine is stuck in SaveSnapshot; it will detect
 	// ctx.Done() and discard its result rather than posting to rpcCh.
-	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck
+	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term:              1,
 		LeaderID:          "leader",
 		LastIncludedIndex: 5,
@@ -358,7 +358,7 @@ func TestInstallSnapshot_ChunkFullCancelsGoroutine(t *testing.T) {
 	ctx := context.Background()
 
 	// Elevate to term 1.
-	n.HandleAppendEntries(ctx, &AppendEntriesRequest{ //nolint:errcheck
+	n.HandleAppendEntries(ctx, &AppendEntriesRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term: 1, LeaderID: "leader",
 	})
 
@@ -366,7 +366,7 @@ func TestInstallSnapshot_ChunkFullCancelsGoroutine(t *testing.T) {
 
 	// Send chunk 0 to start the goroutine.  The goroutine immediately blocks
 	// in blockingSaveStorage.SaveSnapshot without reading from the channel.
-	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck
+	n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{ //nolint:errcheck // return value not meaningful in test context
 		Term: 1, LeaderID: "leader",
 		LastIncludedIndex: snapIdx, LastIncludedTerm: 1,
 		Offset: 0, Data: []byte("x"), Done: false,
@@ -383,13 +383,13 @@ func TestInstallSnapshot_ChunkFullCancelsGoroutine(t *testing.T) {
 	// Fill the install channel: the buffer holds 8 items.  The goroutine is
 	// not reading, so each send goes straight into the buffer.
 	for i := int64(1); i <= 7; i++ {
-		_, err := n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{
+		_, chunkErr := n.HandleInstallSnapshot(ctx, &InstallSnapshotRequest{
 			Term: 1, LeaderID: "leader",
 			LastIncludedIndex: snapIdx, LastIncludedTerm: 1,
 			Offset: i, Data: []byte("x"), Done: false,
 		})
-		if err != nil {
-			t.Fatalf("chunk %d: HandleInstallSnapshot: %v", i, err)
+		if chunkErr != nil {
+			t.Fatalf("chunk %d: HandleInstallSnapshot: %v", i, chunkErr)
 		}
 	}
 

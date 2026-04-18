@@ -180,11 +180,11 @@ func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, smSnapshot 
 // a reader for the remaining state-machine data.
 func readWrappedSnapshot(r io.Reader) (table map[NodeID]clientEntry, smDataReader io.Reader, err error) {
 	var hdr [12]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		if err == io.EOF {
+	if _, readErr := io.ReadFull(r, hdr[:]); readErr != nil {
+		if readErr == io.EOF {
 			return nil, nil, fmt.Errorf("read snap header: empty file")
 		}
-		return nil, nil, fmt.Errorf("read snap header: %w", err)
+		return nil, nil, fmt.Errorf("read snap header: %w", readErr)
 	}
 
 	if binary.LittleEndian.Uint64(hdr[:8]) != snapFrameMagic {
@@ -195,8 +195,8 @@ func readWrappedSnapshot(r io.Reader) (table map[NodeID]clientEntry, smDataReade
 
 	tableLen := int(binary.LittleEndian.Uint32(hdr[8:]))
 	tableBytes := make([]byte, tableLen)
-	if _, err := io.ReadFull(r, tableBytes); err != nil {
-		return nil, nil, fmt.Errorf("read snap table: %w", err)
+	if _, readErr := io.ReadFull(r, tableBytes); readErr != nil {
+		return nil, nil, fmt.Errorf("read snap table: %w", readErr)
 	}
 
 	table, err = decodeClientTable(tableBytes)

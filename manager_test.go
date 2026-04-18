@@ -45,7 +45,7 @@ func newManagedNode(t *testing.T, mgr *raft.Manager, net *memtransport.Network,
 type discardSM struct{}
 
 func (s *discardSM) Apply(_ context.Context, _ raft.LogEntry) ([]byte, error) { return nil, nil }
-func (s *discardSM) Snapshot(_ context.Context, _ io.Writer) error           { return nil }
+func (s *discardSM) Snapshot(_ context.Context, _ io.Writer) error            { return nil }
 func (s *discardSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ io.Reader) error {
 	return nil
 }
@@ -543,7 +543,9 @@ func TestManager_RemoveGraceful_Race(t *testing.T) {
 	}
 
 	// Register the leader with the manager.
-	mgr.Add(1, nodes[leaderID])
+	if err := mgr.Add(1, nodes[leaderID]); err != nil {
+		t.Fatalf("mgr.Add: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -572,12 +574,14 @@ type concurrentSM struct {
 	maxConcurrent   atomic.Int32
 }
 
-func (s *concurrentSM) Apply(ctx context.Context, entry raft.LogEntry) ([]byte, error) { return nil, nil }
+func (s *concurrentSM) Apply(ctx context.Context, entry raft.LogEntry) ([]byte, error) {
+	return nil, nil
+}
 func (s *concurrentSM) Snapshot(ctx context.Context, w io.Writer) error {
 	curr := s.concurrentCount.Add(1)
 	for {
-		max := s.maxConcurrent.Load()
-		if curr <= max || s.maxConcurrent.CompareAndSwap(max, curr) {
+		prev := s.maxConcurrent.Load()
+		if curr <= prev || s.maxConcurrent.CompareAndSwap(prev, curr) {
 			break
 		}
 	}

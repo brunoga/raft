@@ -60,10 +60,10 @@ type GRPCTransport struct {
 	clientRefs  map[string]int                    // address → number of NodeIDs mapped to it
 	groupLookup func(uint64) (raft.Handler, bool) // optional: route by GroupID
 
-	hbWindow      time.Duration     // collection window for heartbeat batching
-	hbRPCTimeout  time.Duration     // per-RPC timeout for BatchHeartbeats
-	hbChanSize    int               // per-peer batcher channel depth
-	hbBatcher     *heartbeatBatcher // nil until SetGroupLookup is called
+	hbWindow     time.Duration     // collection window for heartbeat batching
+	hbRPCTimeout time.Duration     // per-RPC timeout for BatchHeartbeats
+	hbChanSize   int               // per-peer batcher channel depth
+	hbBatcher    *heartbeatBatcher // nil until SetGroupLookup is called
 
 	// Counters for BatchHeartbeats server-side processing.
 	batchHBServed  atomic.Int64 // number of BatchHeartbeats RPCs received
@@ -254,10 +254,10 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 		hbWindow:     hbWin,
 		hbRPCTimeout: hbRPCTimeout,
 		hbChanSize:   hbChanSize,
-		handlers:    make(map[raft.NodeID]raft.Handler),
-		peers:       make(map[raft.NodeID]string),
-		clients:     make(map[string]*grpc.ClientConn),
-		clientRefs:  make(map[string]int),
+		handlers:     make(map[raft.NodeID]raft.Handler),
+		peers:        make(map[raft.NodeID]string),
+		clients:      make(map[string]*grpc.ClientConn),
+		clientRefs:   make(map[string]int),
 	}
 
 	pb.RegisterRaftServiceServer(t.server, &grpcServer{transport: t})

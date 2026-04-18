@@ -276,7 +276,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 		time.Sleep(time.Millisecond)
 		m, r, e := fs.LoadSnapshot(context.Background())
 		if e == nil && m.LastIncludedIndex > 0 {
-			r.Close()
+			_ = r.Close()
 			break
 		}
 	}
@@ -285,7 +285,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	if err != nil || meta.LastIncludedIndex == 0 {
 		t.Skip("snapshot not taken (may need more ticks) — skipping restart check")
 	}
-	r.Close()
+	_ = r.Close()
 
 	n.Stop()
 
@@ -546,7 +546,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 		m, r, e := fs.LoadSnapshot(context.Background())
 		if e == nil && m.LastIncludedIndex > 0 {
 			snapMeta = m
-			r.Close()
+			_ = r.Close()
 			break
 		}
 	}
@@ -658,6 +658,9 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 5
 		cfg.SnapshotChunkSize = 512 // enough to still force multiple chunks for kvSM
+		// Short RPCTimeout so any snapshot goroutine started while the follower
+		// is partitioned gives up in 4×30ms=120ms instead of 4×150ms=600ms.
+		cfg.RPCTimeout = 30 * time.Millisecond
 
 		n, err := raft.New(&cfg)
 		if err != nil {

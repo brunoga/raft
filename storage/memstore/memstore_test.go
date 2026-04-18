@@ -194,7 +194,7 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSnapshot: %v", err)
 	}
-	defer gotR.Close()
+	defer func() { _ = gotR.Close() }()
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
 	}
@@ -214,7 +214,7 @@ func TestSnapshot_DataIsolated(t *testing.T) {
 
 	_, gotR, _ := m.LoadSnapshot(ctx)
 	got, _ := io.ReadAll(gotR)
-	gotR.Close()
+	_ = gotR.Close()
 	if got[0] != 'o' {
 		t.Fatalf("SaveSnapshot should copy data; got %q", got)
 	}
@@ -223,7 +223,7 @@ func TestSnapshot_DataIsolated(t *testing.T) {
 	got[0] = 'Y'
 	_, gotR2, _ := m.LoadSnapshot(ctx)
 	got2, _ := io.ReadAll(gotR2)
-	gotR2.Close()
+	_ = gotR2.Close()
 	if got2[0] != 'o' {
 		t.Fatalf("LoadSnapshot should return a copy; got %q", got2)
 	}

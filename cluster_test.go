@@ -21,12 +21,11 @@ import (
 
 // Cluster manages a set of Raft nodes sharing an in-memory network.
 type Cluster struct {
-	t      testing.TB
-	net    *memtransport.Network
-	nodes  []*raft.Node
-	ids    []raft.NodeID
-	sms    []*kvSM
-	netIDs []raft.NodeID
+	t     testing.TB
+	net   *memtransport.Network
+	nodes []*raft.Node
+	ids   []raft.NodeID
+	sms   []*kvSM
 }
 
 // newCluster creates a new n-node cluster.

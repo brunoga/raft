@@ -47,7 +47,7 @@ type peerBatcher struct {
 	ch      chan hbCall
 	ctx     context.Context                // per-peer context; Done when removePeer cancels it
 	cancel  context.CancelFunc             // cancels this batcher's context (used by removePeer)
-	pending []hbCall                         // reused across flush cycles; owned by run goroutine only
+	pending []hbCall                       // reused across flush cycles; owned by run goroutine only
 	results map[uint64]*pb.HeartbeatResult // reused across RPC cycles; owned by run goroutine only
 }
 
@@ -160,7 +160,7 @@ type heartbeatBatcher struct {
 	cancel context.CancelFunc
 
 	mu       sync.Mutex
-	stopped  bool                          // set true by stop(); checked by peerBatcherFor
+	stopped  bool // set true by stop(); checked by peerBatcherFor
 	batchers map[raft.NodeID]*peerBatcher
 	wg       sync.WaitGroup // tracks all live peerBatcher goroutines
 

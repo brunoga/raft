@@ -37,18 +37,18 @@ func newRaftLog(s Storage) (*raftLog, error) {
 	ctx := context.Background()
 
 	// Restore snapshot metadata (may not exist yet).
-	meta, r, err := s.LoadSnapshot(ctx)
-	if err == nil {
-		defer r.Close()
+	meta, r, loadErr := s.LoadSnapshot(ctx)
+	if loadErr == nil {
+		defer func() { _ = r.Close() }()
 		rl.snapMeta = meta
 		// Read the framing header to extract the client dedup table.
-		table, _, err := readWrappedSnapshot(r)
-		if err != nil {
-			return nil, fmt.Errorf("raftLog: read snapshot framing: %w", err)
+		table, _, parseErr := readWrappedSnapshot(r)
+		if parseErr != nil {
+			return nil, fmt.Errorf("raftLog: read snapshot framing: %w", parseErr)
 		}
 		rl.snapClientTable = table
-	} else if err != ErrNoSnapshot {
-		return nil, fmt.Errorf("raftLog: load snapshot: %w", err)
+	} else if loadErr != ErrNoSnapshot {
+		return nil, fmt.Errorf("raftLog: load snapshot: %w", loadErr)
 	}
 
 	first, err := s.FirstIndex(ctx)

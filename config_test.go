@@ -23,8 +23,8 @@ func (s *stubStorage) GetLogEntry(_ context.Context, _ Index) (LogEntry, error) 
 func (s *stubStorage) GetLogEntries(_ context.Context, _, _ Index) ([]LogEntry, error) {
 	return nil, nil
 }
-func (s *stubStorage) FirstIndex(_ context.Context) (Index, error)    { return 0, nil }
-func (s *stubStorage) LastIndex(_ context.Context) (Index, error)     { return 0, nil }
+func (s *stubStorage) FirstIndex(_ context.Context) (Index, error)     { return 0, nil }
+func (s *stubStorage) LastIndex(_ context.Context) (Index, error)      { return 0, nil }
 func (s *stubStorage) TruncateSuffix(_ context.Context, _ Index) error { return nil }
 func (s *stubStorage) TruncatePrefix(_ context.Context, _ Index) error { return nil }
 func (s *stubStorage) SaveSnapshot(_ context.Context, _ SnapshotMeta, _ io.Reader) error {
@@ -38,7 +38,7 @@ func (s *stubStorage) Close() error { return nil }
 type stubStateMachine struct{}
 
 func (s *stubStateMachine) Apply(_ context.Context, _ LogEntry) ([]byte, error) { return nil, nil }
-func (s *stubStateMachine) Snapshot(_ context.Context, _ io.Writer) error         { return nil }
+func (s *stubStateMachine) Snapshot(_ context.Context, _ io.Writer) error       { return nil }
 func (s *stubStateMachine) Restore(_ context.Context, _ SnapshotMeta, _ io.Reader) error {
 	return nil
 }
@@ -61,8 +61,8 @@ func (s *stubTransport) ReadIndex(_ context.Context, _ NodeID, _ *ReadIndexReque
 	return nil, nil
 }
 func (s *stubTransport) Register(NodeID, Handler) {}
-func (s *stubTransport) Unregister(NodeID)     {}
-func (s *stubTransport) Close() error         { return nil }
+func (s *stubTransport) Unregister(NodeID)        {}
+func (s *stubTransport) Close() error             { return nil }
 
 func validConfig() Config {
 	c := DefaultConfig()

@@ -443,7 +443,7 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSnapshot: %v", err)
 	}
-	defer gotR.Close()
+	defer func() { _ = gotR.Close() }()
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
 	}
@@ -475,7 +475,7 @@ func TestSnapshot_PersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSnapshot after reopen: %v", err)
 	}
-	defer gotR.Close()
+	defer func() { _ = gotR.Close() }()
 	if gotMeta != meta {
 		t.Fatalf("meta mismatch: got %+v, want %+v", gotMeta, meta)
 	}
