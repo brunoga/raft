@@ -542,7 +542,7 @@ func TestGRPC_GroupIDStamped(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
-		t.Cleanup(func() { tr.Close() }) //nolint:errcheck
+		t.Cleanup(func() { _ = tr.Close() }) //nolint:errcheck // best-effort cleanup in test teardown.
 		transports[i] = tr
 		addrs[i] = tr.Addr()
 	}
@@ -682,7 +682,7 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	h1 := &signalHandler{called: make(chan struct{}, 1)}
 	h2 := &signalHandler{called: make(chan struct{}, 1)}
@@ -697,7 +697,7 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 	cli.AddPeer("srv", srv.Addr())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -740,7 +740,7 @@ func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
@@ -748,7 +748,7 @@ func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -783,7 +783,7 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	// One signalHandler per group; each fires its channel when HandleAppendEntries is called.
 	handlers := make(map[uint64]*signalHandler, numGroups)
@@ -799,7 +799,7 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 	// SetGroupLookup on the sender enables heartbeat batching.
 	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
@@ -861,7 +861,7 @@ func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	// Register groups 1 and 2; leave group 3 unknown to trigger an error counter.
 	known := map[uint64]*signalHandler{
@@ -877,7 +877,7 @@ func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen sender: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
@@ -919,7 +919,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	handlers := make(map[uint64]*signalHandler, numGroups)
 	for g := range numGroups {
@@ -934,7 +934,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
@@ -948,7 +948,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 		go func(gid uint64) {
 			defer wg.Done()
 			<-ready
-			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck // error not relevant to this test
 		}(uint64(g + 1))
 	}
 	close(ready)
@@ -978,7 +978,7 @@ func TestGRPC_HeartbeatRPCTimeoutOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 
 	// Register a peer address that nobody is listening on.
 	send.AddPeer("dead", "127.0.0.1:1") // port 1 is unroutable on localhost
@@ -1014,7 +1014,7 @@ func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	handlers := make(map[uint64]*signalHandler, numGroups)
 	for g := range numGroups {
@@ -1030,7 +1030,7 @@ func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
@@ -1044,7 +1044,7 @@ func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
 		go func(gid uint64) {
 			defer wg.Done()
 			<-ready
-			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck // error not relevant to this test
 		}(uint64(g + 1))
 	}
 	close(ready)
@@ -1069,7 +1069,7 @@ func TestGRPC_RemovePeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	h := &signalHandler{called: make(chan struct{}, 1)}
 	recv.Register("recv", h)
@@ -1078,15 +1078,15 @@ func TestGRPC_RemovePeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Sanity: RPC works before removal.
-	if _, err := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); err != nil {
-		t.Fatalf("RequestVote before RemovePeer: %v", err)
+	if _, rvErr := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); rvErr != nil {
+		t.Fatalf("RequestVote before RemovePeer: %v", rvErr)
 	}
 
 	// Remove the peer.
@@ -1121,7 +1121,7 @@ func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	handlers := make(map[uint64]*signalHandler, numGroups)
 	for g := range numGroups {
@@ -1136,7 +1136,7 @@ func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.AddPeer("recv", recv.Addr())
 	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
@@ -1150,7 +1150,7 @@ func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
 		go func(gid uint64) {
 			defer wg.Done()
 			<-ready
-			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck // error not relevant to this test
 		}(uint64(g + 1))
 	}
 	close(ready)
@@ -1176,7 +1176,7 @@ func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 
 	send, err := grpctransport.Listen("127.0.0.1:0")
 	if err != nil {
@@ -1200,7 +1200,7 @@ func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
 	// Close() must block until all peerBatcher goroutines exit.
 	closeDone := make(chan struct{})
 	go func() {
-		send.Close()
+		_ = send.Close()
 		close(closeDone)
 	}()
 	select {
@@ -1232,7 +1232,7 @@ func TestGRPC_HeartbeatBatcherStoppedFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
 	send, err := grpctransport.Listen("127.0.0.1:0")
@@ -1248,8 +1248,7 @@ func TestGRPC_HeartbeatBatcherStoppedFlag(t *testing.T) {
 	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
 
 	// Close the sender — this must stop the batcher.
-	send.Close()
-
+	_ = send.Close()
 	// Send after close must return an error quickly, not hang or panic.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel2()
@@ -1270,14 +1269,14 @@ func TestGRPC_RemovePeer_StopsBatcher(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recv.Close()
+	defer func() { _ = recv.Close() }()
 	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
 	send, err := grpctransport.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer send.Close()
+	defer func() { _ = send.Close() }()
 	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 	send.AddPeer("recv", recv.Addr())
 
@@ -1412,7 +1411,7 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 			mgr.StopAll()
 		}
 		for _, tr := range transports {
-			tr.Close() //nolint:errcheck
+			_ = tr.Close() //nolint:errcheck // best-effort cleanup in test teardown.
 		}
 	})
 
@@ -1534,7 +1533,7 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer t1.Close()
+	defer func() { _ = t1.Close() }()
 
 	// Initially zero.
 	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
@@ -1566,7 +1565,7 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer t2.Close()
+	defer func() { _ = t2.Close() }()
 
 	addr1 := t1.Addr()
 	addr2 := t2.Addr()

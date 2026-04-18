@@ -332,7 +332,6 @@ func TestMultiRaft_ThreeGroups_ThreeNodes(t *testing.T) {
 	deadline := time.Now().Add(electionTime)
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
-outer:
 	for time.Now().Before(deadline) {
 		<-ticker.C
 		for _, n := range all {
@@ -357,7 +356,7 @@ outer:
 			}
 		}
 		if allFound {
-			break outer
+			break
 		}
 	}
 	for g, l := range leaders {

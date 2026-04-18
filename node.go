@@ -71,11 +71,11 @@ type Node struct {
 	lastApplied Index
 
 	// Atomic mirrors for safe external reads.
-	atomicState        atomic.Uint32 // mirrors state
-	atomicLeader       atomic.Value  // mirrors leaderID; stores string
-	atomicLastApplied  atomic.Uint64 // mirrors lastApplied
-	atomicCommitIndex  atomic.Uint64 // mirrors commitIndex
-	atomicTerm         atomic.Uint64 // mirrors currentTerm
+	atomicState       atomic.Uint32 // mirrors state
+	atomicLeader      atomic.Value  // mirrors leaderID; stores string
+	atomicLastApplied atomic.Uint64 // mirrors lastApplied
+	atomicCommitIndex atomic.Uint64 // mirrors commitIndex
+	atomicTerm        atomic.Uint64 // mirrors currentTerm
 	// atomicPeers mirrors cfg.Peers as a []NodeID snapshot; updated by
 	// applyConfigChange (event-loop only). Read by ReconfigureCluster outside
 	// the event loop to avoid a data race on cfg.Peers.
@@ -995,7 +995,7 @@ func (n *Node) tickerLoop() {
 // apply goroutine's local tracking state. Called from both the priority-select
 // drain and the main select in applyLoop to avoid code duplication.
 func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index) map[NodeID]clientEntry {
-	defer si.r.Close()
+	defer func() { _ = si.r.Close() }()
 	if err := n.cfg.StateMachine.Restore(ctx, si.meta, si.r); err != nil {
 		n.logger.Error("applyLoop: Restore", "err", err)
 	}
@@ -1047,8 +1047,8 @@ func (n *Node) applyLoop() {
 			// Skip the framing header (meta and table already handled in New).
 			_, smReader, rerr := readWrappedSnapshot(r)
 			if rerr == nil {
-				if err := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, smReader); err != nil {
-					n.logger.Error("applyLoop: initial snapshot restore", "err", err)
+				if restoreErr := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, smReader); restoreErr != nil {
+					n.logger.Error("applyLoop: initial snapshot restore", "err", restoreErr)
 				}
 			} else {
 				n.logger.Error("applyLoop: initial snapshot framing", "err", rerr)

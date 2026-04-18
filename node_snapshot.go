@@ -13,7 +13,7 @@ import (
 // in memory, preventing OOM when the snapshot is large.
 type partialSnapshot struct {
 	meta        SnapshotMeta
-	installCh   chan []byte         // event loop sends raw chunks; closed after final chunk
+	installCh   chan []byte        // event loop sends raw chunks; closed after final chunk
 	cancelFn    context.CancelFunc // cancels the runSnapshotInstall goroutine
 	expectedOff int64              // expected byte offset of the next incoming chunk
 }
@@ -224,7 +224,7 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 		select {
 		case <-ctx.Done():
 			if r.smR != nil {
-				r.smR.Close()
+				_ = r.smR.Close()
 			}
 			return
 		default:
@@ -233,7 +233,7 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 		case n.rpcCh <- rpcEnvelope{req: r}:
 		case <-ctx.Done():
 			if r.smR != nil {
-				r.smR.Close()
+				_ = r.smR.Close()
 			}
 		}
 	}
@@ -258,7 +258,7 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 		return
 	}
 	if loadMeta.LastIncludedIndex != meta.LastIncludedIndex {
-		r.Close()
+		_ = r.Close()
 		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf(
 			"snapshot install: loaded snapshot index %d, want %d",
 			loadMeta.LastIncludedIndex, meta.LastIncludedIndex)})
@@ -267,7 +267,7 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 
 	table, _, parseErr := readWrappedSnapshot(r)
 	if parseErr != nil {
-		r.Close()
+		_ = r.Close()
 		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf("snapshot install: unwrap: %w", parseErr)})
 		return
 	}
@@ -294,7 +294,7 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 
 	// Skip stale results: a newer snapshot may have already been applied.
 	if r.meta.LastIncludedIndex <= n.lastApplied {
-		r.smR.Close()
+		_ = r.smR.Close()
 		return
 	}
 
@@ -302,7 +302,7 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 
 	if err := n.log.truncatePrefix(n.stopCtx, r.meta.LastIncludedIndex+1); err != nil {
 		n.logger.Error("snapshot install: truncatePrefix", "err", err)
-		r.smR.Close()
+		_ = r.smR.Close()
 		return
 	}
 	n.log.snapMeta = r.meta
@@ -321,7 +321,7 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 		select {
 		case old := <-n.restoreSnapshotCh:
 			if old.r != nil {
-				old.r.Close()
+				_ = old.r.Close()
 			}
 		default:
 		}
@@ -430,7 +430,7 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 	chunkTimeout := 4 * n.rpcTimeout()
 
 	go func(p NodeID, m SnapshotMeta, r io.ReadCloser) {
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 
 		drop := func() {
 			select {
