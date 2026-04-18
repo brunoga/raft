@@ -33,6 +33,9 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 			n.nextIndex[id] = n.log.lastLogIndex() + 1
 			n.matchIndex[id] = 0
 			// inflight and snapshotInflight are zero/false by map default.
+			// Start a heartbeat pump so the newly added peer receives ongoing
+			// heartbeats immediately, without waiting for the next proposal.
+			n.startHBPumpFor(id)
 		}
 		n.logger.Info("config change: added peer", "id", id)
 
@@ -45,6 +48,7 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 		}
 		n.storePeers()
 		if n.state == Leader {
+			n.stopHBPumpFor(id)
 			delete(n.nextIndex, id)
 			delete(n.matchIndex, id)
 			delete(n.inflight, id)
