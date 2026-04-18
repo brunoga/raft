@@ -320,6 +320,12 @@ func TestSnapshot_AutomaticTrigger(t *testing.T) {
 func TestSnapshot_LaggingFollowerReceivesSnapshot(t *testing.T) {
 	c := newClusterWith(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 3
+		// Short RPCTimeout so the snapshot goroutine that is started while
+		// the follower is partitioned gives up in 4×30ms=120ms instead of
+		// the default 4×ElectionTimeoutMin=600ms.  Without this, the blocked
+		// goroutine holds snapshotInflight for ~600ms and the 3-second
+		// catch-up deadline can expire on slow (race-detector) CI machines.
+		cfg.RPCTimeout = 30 * time.Millisecond
 	})
 	leaderIdx := c.WaitLeader(electionTimeout)
 
