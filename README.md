@@ -2,7 +2,7 @@
 
 A production-grade implementation of the [Raft consensus algorithm](https://raft.github.io/) in Go.
 
-**Raft §§ implemented:** leader election, log replication, log compaction (snapshots), cluster membership changes (single-server and joint consensus), leadership transfer, pre-vote, linearizable reads (ReadIndex and clock-based lease reads), an exactly-once client protocol, and multi-raft (thousands of independent groups on shared infrastructure).
+**Raft §§ implemented:** leader election, log replication, log compaction (snapshots), cluster membership changes (single-server and joint consensus), leadership transfer, pre-vote, linearizable reads (ReadIndex and clock-based lease reads), an exactly-once client protocol, multi-raft (thousands of independent groups on shared infrastructure), and automatic leader balancing across physical nodes.
 
 ```
 go get github.com/brunoga/raft
@@ -880,6 +880,52 @@ for _, s := range statuses {
 }
 ```
 
+### Leader balancing across physical nodes
+
+In a multi-raft deployment, Raft elections are independent per group: after a
+rolling restart or a series of failovers all leaders can pile up on the same
+machine, creating a hot node. `BalanceController` periodically collects the
+global leader distribution from every physical node and transfers leaders from
+the most-loaded node to the least-loaded until all counts differ by at most 1.
+
+**In-process** (single binary, all managers reachable directly):
+
+```go
+providers := map[raft.NodeID]raft.NodeProvider{
+    "node-A": mgrA,
+    "node-B": mgrB,
+    "node-C": mgrC,
+}
+ctrl := raft.NewBalanceController(providers, raft.LeastLeadersBalancer{}, 30*time.Second)
+go ctrl.Run(ctx)
+```
+
+**Across machines** (each node exposes `Manager.Handler()` over HTTP):
+
+```go
+// On each physical node, mount the manager's balance endpoints.
+mux.Handle("/raft/", http.StripPrefix("/raft", mgr.Handler()))
+
+// On each node, build the provider map using HTTPNodeProvider for peers
+// and the local Manager directly for self.
+providers := map[raft.NodeID]raft.NodeProvider{
+    "node-A": mgr,  // local: in-process
+    "node-B": raft.NewHTTPNodeProvider("http://node-b:8001/raft", nil),
+    "node-C": raft.NewHTTPNodeProvider("http://node-c:8001/raft", nil),
+}
+ctrl := raft.NewBalanceController(providers, raft.LeastLeadersBalancer{}, 30*time.Second)
+go ctrl.Run(ctx)
+```
+
+`Manager.Handler()` exposes two endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /status` | Returns `StatusAll()` as a JSON array of `GroupStatus` |
+| `POST /transfer` | Accepts `{"group_id": N, "to": "nodeID"}` and calls `TransferGroupLeadership` |
+
+See [`examples/shardkv`](examples/shardkv/) for a complete cross-machine wiring.
+
 ---
 
 ## Caveats and known limitations
@@ -941,10 +987,6 @@ When using `filestore` with many simultaneously-active groups, each group issues
 
 The internal `proposeCh` has a fixed capacity of 1,024 entries. When the leader's event loop falls behind — due to a slow state machine, a long-running snapshot, or heavy replication traffic — `Propose` blocks at channel entry until space becomes available. There is no admission-control mechanism that sheds load or returns an error proactively. Applications that need to bound proposal queue depth should implement their own semaphore or token-bucket before calling `Propose`.
 
-### Leader balancing and follower reads are not yet implemented
-
-The `PreferredLeader` configuration field provides basic preferred-leader steering: a node that wins an election but is not the preferred node will immediately transfer leadership to it. Full leader-balancing (distributing Raft leaders evenly across physical nodes in a multi-raft deployment) and follower reads (serving `ReadIndex` requests directly from followers without forwarding to the leader) are not yet implemented. Both are planned for a future release.
-
 ---
 
 ## Reference implementation
@@ -974,12 +1016,13 @@ go build -o idprovider ./examples/idprovider
              --peer n2=localhost:7002 --peer n3=localhost:7003
 ```
 
-### `examples/shardkv` — multi-group (multi-raft)
+### `examples/shardkv` — multi-group (multi-raft) with leader balancing
 
 See [`examples/shardkv`](examples/shardkv/) for a horizontally-sharded key-value
 store that demonstrates the canonical multi-raft pattern: N independent Raft
 groups (shards) co-located on each physical node, sharing one gRPC transport and
-one `Manager` ticker.
+one `Manager` ticker, with a `BalanceController` distributing leaders evenly
+across machines.
 
 - **Multi-raft wiring**: `Manager`, `cfg.GroupID`, `tr.SetGroupLookup`, `RunTicker`.
 - **FNV-hash routing**: keys are deterministically mapped to shards; the HTTP
@@ -988,6 +1031,9 @@ one `Manager` ticker.
   heartbeats per tick are coalesced into O(P) `BatchHeartbeats` RPCs.
 - **Independent fault domains**: stopping or partitioning one shard's nodes does
   not affect other shards' availability or leadership.
+- **Cross-machine leader balancing**: a `BalanceController` on each node uses
+  `HTTPNodeProvider` to query peers' `/raft/status` endpoints and drives
+  leadership transfers to maintain ±1 leader balance across physical nodes.
 
 ```bash
 go build -o shardkv ./examples/shardkv
