@@ -3,7 +3,6 @@ package raft
 import (
 	"context"
 	"fmt"
-	"slices"
 )
 
 // ---- Leadership transfer ----------------------------------------------------
@@ -40,9 +39,20 @@ func (n *Node) handleLeadershipTransfer(msg leadershipTransferMsg) {
 		msg.respCh <- ErrLeadershipTransferInProgress
 		return
 	}
-	// Validate target is a known peer.
-	if !slices.Contains(n.cfg.Peers, msg.target) {
+	// Validate target is a known voting peer.
+	var targetPeer *PeerConfig
+	for _, p := range n.cfg.Peers {
+		if p.ID == msg.target {
+			targetPeer = &p
+			break
+		}
+	}
+	if targetPeer == nil {
 		msg.respCh <- fmt.Errorf("raft: unknown transfer target %q", msg.target)
+		return
+	}
+	if !targetPeer.Voter {
+		msg.respCh <- fmt.Errorf("raft: cannot transfer leadership to non-voting member %q", msg.target)
 		return
 	}
 

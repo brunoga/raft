@@ -187,9 +187,9 @@ func main() {
 			os.Exit(1)
 		}
 
-		peerIDs := make([]raft.NodeID, 0, len(peerMap))
+		peerIDs := make([]raft.PeerConfig, 0, len(peerMap))
 		for peerPhysID := range peerMap {
-			peerIDs = append(peerIDs, shardNodeID(gid, peerPhysID))
+			peerIDs = append(peerIDs, raft.PeerConfig{ID: shardNodeID(gid, peerPhysID), Voter: true})
 		}
 
 		sm := &KvSM{data: make(map[string]string)}
