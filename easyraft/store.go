@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,8 +54,10 @@ type Store struct {
 
 	cfg        Config
 	cancel     context.CancelFunc
+	stopCtx    context.Context
 	httpServer *http.Server
 	transport  raft.Transport
+	storage    raft.Storage
 }
 
 // NewStore creates a new EasyRaft store that can manage multiple collections.
@@ -71,11 +74,14 @@ func NewStore(opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("easyraft: WithDataDir is required")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
 		collections:  make(map[string]map[string]json.RawMessage),
 		mutations:    make(map[string]map[string]MutationFunc),
 		waitForApply: 5 * time.Second,
 		cfg:          c,
+		cancel:       cancel,
+		stopCtx:      ctx,
 	}
 
 	if err := s.initRaft(); err != nil {
@@ -233,6 +239,7 @@ func (s *Store) initRaft() error {
 
 	tr.Register(s.cfg.ID, node)
 	s.transport = tr
+	s.storage = st
 
 	// 4. Metrics
 	if s.cfg.PromRegisterer != nil {
@@ -288,7 +295,6 @@ func (s *Store) Start() {
 func (s *Store) advertiseMetadata() {
 	// Retry until we successfully register our HTTP address with the leader.
 	// This ensures that after a few rotations, every node's URL is known.
-	ctx := context.Background()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -298,7 +304,7 @@ func (s *Store) advertiseMetadata() {
 		}
 
 		b, _ := json.Marshal(s.cfg.HTTPAddr)
-		_, err := s.propose(ctx, &command{
+		_, err := s.propose(s.stopCtx, &command{
 			Op:         opUpdate,
 			Collection: "__easyraft_metadata__",
 			Key:        string(s.cfg.ID),
@@ -307,7 +313,7 @@ func (s *Store) advertiseMetadata() {
 
 		// If key doesn't exist, try create
 		if errors.Is(err, ErrKeyNotFound) {
-			_, err = s.propose(ctx, &command{
+			_, err = s.propose(s.stopCtx, &command{
 				Op:         opCreate,
 				Collection: "__easyraft_metadata__",
 				Key:        string(s.cfg.ID),
@@ -323,21 +329,41 @@ func (s *Store) advertiseMetadata() {
 		}
 
 		select {
-		case <-s.cancelCtx().Done():
+		case <-s.stopCtx.Done():
 			return
 		case <-ticker.C:
 		}
 	}
 }
 
-func (s *Store) cancelCtx() context.Context {
-	// Helper to get a context that is cancelled when the store stops
-	// We didn't save the context in Store, only the cancel func.
-	// Let's just use Background for now or fix the struct.
-	return context.Background()
+// Ready blocks until the node has a known leader and has applied at least
+// one entry from the current term, indicating it is ready for operations.
+func (s *Store) Ready(ctx context.Context) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if s.node != nil {
+			if s.node.Leader() != "" {
+				// Once we have a leader, do a ReadIndex to ensure we are caught up.
+				_, err := s.node.ReadIndex(ctx)
+				if err == nil {
+					return nil
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopCtx.Done():
+			return errors.New("easyraft: store stopped")
+		case <-ticker.C:
+		}
+	}
 }
 
-// Stop shuts down the store.
+// Stop shuts down the store and releases all resources.
 func (s *Store) Stop() {
 	if s.cancel != nil {
 		s.cancel()
@@ -348,6 +374,11 @@ func (s *Store) Stop() {
 	if s.node != nil {
 		s.node.Stop()
 	}
+	if s.storage != nil {
+		if closer, ok := s.storage.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 }
 
 // Collection provides a type-safe view into a named collection within a Store.
@@ -357,7 +388,11 @@ type Collection[T any] struct {
 }
 
 // AddCollection adds a new typed collection to the store.
+// Collection names starting with "__" are reserved for internal use.
 func AddCollection[T any](s *Store, name string) *Collection[T] {
+	if strings.HasPrefix(name, "__") {
+		panic("easyraft: collection names starting with '__' are reserved")
+	}
 	return &Collection[T]{
 		store: s,
 		name:  name,
