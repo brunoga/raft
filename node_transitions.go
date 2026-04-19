@@ -54,9 +54,14 @@ func (n *Node) applyFollowerTransition(leaderID NodeID) {
 		n.stopHBPumps() // signal pump goroutines to exit
 	}
 	if changed {
-		// Discard any partially buffered snapshot: it came from a different
-		// leader (or a leader in a lower term) and can never be completed.
-		n.pendingSnap = nil
+		// Cancel any in-progress streaming snapshot install: it came from a
+		// different leader (or a leader in a lower term) and can never be
+		// completed. cancelFn is safe to call even after the goroutine has
+		// already exited.
+		if n.pendingSnap != nil {
+			n.pendingSnap.cancelFn()
+			n.pendingSnap = nil
+		}
 	}
 	n.resetElectionTimeout()
 	if changed {

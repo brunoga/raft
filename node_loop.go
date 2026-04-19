@@ -42,7 +42,19 @@ func (n *Node) run() {
 			n.handleRPCEnvelope(env)
 
 		case prop := <-n.proposeCh:
-			n.handlePropose(prop)
+			props := []proposeMsg{prop}
+			// Greedily drain the channel to batch proposals. This amortizes the
+			// cost of the durable storage write (fsync).
+		batchDrain:
+			for len(props) < 1024 {
+				select {
+				case p := <-n.proposeCh:
+					props = append(props, p)
+				default:
+					break batchDrain
+				}
+			}
+			n.handleProposals(props)
 
 		case ri := <-n.readIndexCh:
 			n.handleReadIndex(ri)
@@ -174,6 +186,8 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 		n.handleAppendResult(req)
 	case *installSnapshotResult:
 		n.handleInstallSnapshotResult(req)
+	case *snapInstallResult:
+		n.handleSnapInstallResult(req)
 	default:
 		resp = rpcResponse{err: fmt.Errorf("raft: unknown RPC type %T", req)}
 	}
@@ -185,60 +199,79 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 // ---- Client proposals ------------------------------------------------------
 
 // handlePropose is called when a client sends a command to the leader.
-func (n *Node) handlePropose(prop proposeMsg) {
+func (n *Node) handleProposals(props []proposeMsg) {
 	if n.state != Leader {
-		p := promise[[]byte]{ch: prop.respCh}
-		p.reject(&NotLeaderError{Leader: n.leaderID})
+		for _, prop := range props {
+			p := promise[[]byte]{ch: prop.respCh}
+			p.reject(&NotLeaderError{Leader: n.leaderID})
+		}
 		return
 	}
 	if n.transferTarget != "" {
-		p := promise[[]byte]{ch: prop.respCh}
-		p.reject(ErrLeadershipTransferInProgress)
-		return
-	}
-	if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
-		p := promise[[]byte]{ch: prop.respCh}
-		p.reject(ErrConfigChangeInProgress)
+		for _, prop := range props {
+			p := promise[[]byte]{ch: prop.respCh}
+			p.reject(ErrLeadershipTransferInProgress)
+		}
 		return
 	}
 
-	// Dedup check for ProposeOnce commands.
-	if isDedupCmd(prop.cmd) {
-		clientID, seqNum, _, err := decodeDedupCmd(prop.cmd)
-		if err == nil {
-			if cached, ok := n.clientTable.get(clientID); ok {
-				if seqNum < cached.seqNum {
-					p := promise[[]byte]{ch: prop.respCh}
-					p.reject(ErrObsoleteSeqNum)
-					return
+	entries := make([]LogEntry, 0, len(props))
+	for _, prop := range props {
+		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
+			p := promise[[]byte]{ch: prop.respCh}
+			p.reject(ErrConfigChangeInProgress)
+			continue
+		}
+
+		// Dedup check for ProposeOnce commands.
+		if isDedupCmd(prop.cmd) {
+			clientID, seqNum, _, err := decodeDedupCmd(prop.cmd)
+			if err == nil {
+				if cached, ok := n.clientTable.get(clientID); ok {
+					if seqNum < cached.seqNum {
+						p := promise[[]byte]{ch: prop.respCh}
+						p.reject(ErrObsoleteSeqNum)
+						continue
+					}
+					if seqNum == cached.seqNum {
+						// Exact duplicate — return the cached result without re-appending.
+						p := promise[[]byte]{ch: prop.respCh}
+						p.resolve(cached.result)
+						continue
+					}
+					// seqNum > cached.seqNum — new request; fall through to normal propose.
 				}
-				if seqNum == cached.seqNum {
-					// Exact duplicate — return the cached result without re-appending.
-					p := promise[[]byte]{ch: prop.respCh}
-					p.resolve(cached.result)
-					return
-				}
-				// seqNum > cached.seqNum — new request; fall through to normal propose.
 			}
+		}
+
+		idx := n.log.lastLogIndex() + Index(len(entries)) + 1
+		entry := LogEntry{Index: idx, Term: n.currentTerm, Command: prop.cmd}
+		entries = append(entries, entry)
+		n.pending[idx] = promise[[]byte]{ch: prop.respCh}
+		if isConfigEntry(prop.cmd) {
+			n.pendingConfigIndex = idx
 		}
 	}
 
-	idx := n.log.lastLogIndex() + 1
-	entry := LogEntry{Index: idx, Term: n.currentTerm, Command: prop.cmd}
-	if err := n.log.appendOne(n.stopCtx, entry); err != nil {
-		p := promise[[]byte]{ch: prop.respCh}
-		p.reject(fmt.Errorf("propose: append: %w", err))
-		return
+	if len(entries) > 0 {
+		if err := n.log.append(n.stopCtx, entries); err != nil {
+			// Fail all in-flight entries in this batch.
+			for _, entry := range entries {
+				if p, ok := n.pending[entry.Index]; ok {
+					p.reject(fmt.Errorf("propose: append: %w", err))
+					delete(n.pending, entry.Index)
+				}
+				if n.pendingConfigIndex == entry.Index {
+					n.pendingConfigIndex = 0
+				}
+			}
+			return
+		}
+		n.replicateToFollowers()
+		// For single-node clusters (no peers) the entry is immediately replicated
+		// on a majority (self), so try to advance commitIndex right away.
+		n.maybeAdvanceCommit()
 	}
-
-	n.pending[idx] = promise[[]byte]{ch: prop.respCh}
-	if isConfigEntry(prop.cmd) {
-		n.pendingConfigIndex = idx
-	}
-	n.replicateToFollowers()
-	// For single-node clusters (no peers) the entry is immediately replicated
-	// on a majority (self), so try to advance commitIndex right away.
-	n.maybeAdvanceCommit()
 }
 
 // ---- Apply results ---------------------------------------------------------

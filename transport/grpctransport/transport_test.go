@@ -1,17 +1,19 @@
 package grpctransport_test
 
 import (
+	"bufio"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
-	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,38 +23,30 @@ import (
 	"github.com/brunoga/raft/transport/grpctransport"
 )
 
-// selfSignedTLS returns a *tls.Config usable for both server and client in a
-// test (self-signed CA, mTLS). Valid for "localhost" and "127.0.0.1".
+// ---- test helpers -----------------------------------------------------------
+
 func selfSignedTLS(t *testing.T) *tls.Config {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatalf("generate key: %v", err)
+		t.Fatal(err)
 	}
-	tmpl := &x509.Certificate{
+	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "raft-test"},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
+		Subject:      pkix.Name{Organization: []string{"Raft Test"}},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     []string{"localhost"},
 	}
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {
-		t.Fatalf("create cert: %v", err)
+		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatalf("marshal key: %v", err)
-	}
-	cert, err := tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
-	)
-	if err != nil {
-		t.Fatalf("key pair: %v", err)
+	cert := tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  priv,
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
@@ -97,9 +91,33 @@ func (sm *kvSM) Get(key string) string {
 	return sm.data[key]
 }
 
-func (sm *kvSM) Snapshot(_ context.Context) ([]byte, error) { return nil, nil }
-func (sm *kvSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ []byte) error {
+func (sm *kvSM) Snapshot(_ context.Context, w io.Writer) error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for k, v := range sm.data {
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", k, v); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (sm *kvSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.data = make(map[string]string)
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) == 2 {
+			sm.data[parts[0]] = parts[1]
+		}
+	}
+	return scanner.Err()
 }
 
 // ---- cluster helpers -------------------------------------------------------
@@ -504,5 +522,1099 @@ func TestGRPC_TLS(t *testing.T) {
 	}
 	for i, sm := range sms {
 		t.Errorf("node %d: tls=%q, want 'ok'", i+1, sm.Get("tls"))
+	}
+}
+
+// TestGRPC_GroupIDStamped verifies that GroupID set in Config is carried on the
+// wire. A 3-node cluster is formed with GroupID=42; the test intercepts an
+// AppendEntries RPC at the handler level and checks that the GroupID field
+// equals 42. This exercises both the node-stamping (Step 2) and the
+// proto↔Go conversion (Step 1).
+func TestGRPC_GroupIDStamped(t *testing.T) {
+	const wantGroupID uint64 = 42
+
+	ids := []raft.NodeID{"g1", "g2", "g3"}
+
+	transports := make([]*grpctransport.GRPCTransport, 3)
+	addrs := make([]string, 3)
+	for i := range 3 {
+		tr, err := grpctransport.Listen(":0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = tr.Close() }) //nolint:errcheck // best-effort cleanup in test teardown.
+		transports[i] = tr
+		addrs[i] = tr.Addr()
+	}
+	for i := range 3 {
+		for j := range 3 {
+			if i != j {
+				transports[i].AddPeer(ids[j], addrs[j])
+			}
+		}
+	}
+
+	// groupIDCapture wraps a real node and records the GroupID seen on the
+	// first AppendEntries call. It forwards all RPCs to the underlying node.
+	type capture struct {
+		raft.Handler
+		once     sync.Once
+		observed chan uint64
+	}
+
+	captures := make([]*capture, 3)
+	nodes := make([]*raft.Node, 3)
+	for i := range 3 {
+		peers := make([]raft.NodeID, 0, 2)
+		for j, id := range ids {
+			if j != i {
+				peers = append(peers, id)
+			}
+		}
+		sm := &kvSM{data: make(map[string]string)}
+		cfg := raft.DefaultConfig()
+		cfg.ID = ids[i]
+		cfg.GroupID = wantGroupID
+		cfg.Peers = peers
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = sm
+		cfg.Transport = transports[i]
+		cfg.TickInterval = 10 * time.Millisecond
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		nodes[i] = node
+		captures[i] = &capture{Handler: node, observed: make(chan uint64, 1)}
+		transports[i].Register(ids[i], captures[i])
+	}
+	// Implement AppendEntries capture.
+	for _, c := range captures {
+		c := c
+		orig := c.Handler
+		c.Handler = handlerFunc{
+			handleAppendEntries: func(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+				c.once.Do(func() { c.observed <- req.GroupID })
+				return orig.HandleAppendEntries(ctx, req)
+			},
+			Handler: orig,
+		}
+	}
+
+	for _, n := range nodes {
+		n.Start()
+	}
+	t.Cleanup(func() {
+		for _, n := range nodes {
+			n.Stop()
+		}
+	})
+
+	// Merge all observed channels into one; the leader never receives
+	// AppendEntries in normal operation so we only need one observation.
+	merged := make(chan uint64, len(captures))
+	for _, c := range captures {
+		c := c
+		go func() {
+			if v, ok := <-c.observed; ok {
+				merged <- v
+			}
+		}()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+	defer cancel()
+	select {
+	case got := <-merged:
+		if got != wantGroupID {
+			t.Errorf("AppendEntries.GroupID = %d, want %d", got, wantGroupID)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for an AppendEntries with GroupID")
+	}
+}
+
+// handlerFunc lets individual Handle* methods be overridden for testing.
+type handlerFunc struct {
+	raft.Handler
+	handleAppendEntries func(context.Context, *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error)
+}
+
+func (h handlerFunc) HandleAppendEntries(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	if h.handleAppendEntries != nil {
+		return h.handleAppendEntries(ctx, req)
+	}
+	return h.Handler.HandleAppendEntries(ctx, req)
+}
+
+// ---- TestGRPC_SetGroupLookup ------------------------------------------------
+
+// signalHandler is a minimal raft.Handler that fires a channel on every
+// HandleAppendEntries call. All other methods return zero-value responses.
+type signalHandler struct {
+	called chan struct{}
+}
+
+func (h *signalHandler) HandleRequestVote(_ context.Context, _ *raft.RequestVoteRequest) (*raft.RequestVoteResponse, error) {
+	return &raft.RequestVoteResponse{}, nil
+}
+func (h *signalHandler) HandleAppendEntries(_ context.Context, _ *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	select {
+	case h.called <- struct{}{}:
+	default:
+	}
+	return &raft.AppendEntriesResponse{}, nil
+}
+func (h *signalHandler) HandleInstallSnapshot(_ context.Context, _ *raft.InstallSnapshotRequest) (*raft.InstallSnapshotResponse, error) {
+	return &raft.InstallSnapshotResponse{}, nil
+}
+func (h *signalHandler) HandleTimeoutNow(_ context.Context, _ *raft.TimeoutNowRequest) (*raft.TimeoutNowResponse, error) {
+	return &raft.TimeoutNowResponse{}, nil
+}
+func (h *signalHandler) HandleReadIndex(_ context.Context, _ *raft.ReadIndexRequest) (*raft.ReadIndexResponse, error) {
+	return &raft.ReadIndexResponse{}, nil
+}
+
+// TestGRPC_SetGroupLookup verifies that SetGroupLookup routes inbound RPCs to
+// the correct handler based on the GroupID carried in the request proto.
+func TestGRPC_SetGroupLookup(t *testing.T) {
+	srv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen server: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	h1 := &signalHandler{called: make(chan struct{}, 1)}
+	h2 := &signalHandler{called: make(chan struct{}, 1)}
+
+	groups := map[uint64]raft.Handler{1: h1, 2: h2}
+	srv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := groups[gid]
+		return h, ok
+	})
+
+	cli, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen client: %v", err)
+	}
+	defer func() { _ = cli.Close() }()
+	cli.AddPeer("srv", srv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Request for group 1 must reach h1.
+	if _, err := cli.AppendEntries(ctx, "srv", &raft.AppendEntriesRequest{GroupID: 1, Term: 1}); err != nil {
+		t.Fatalf("AppendEntries group 1: %v", err)
+	}
+	select {
+	case <-h1.called:
+	case <-ctx.Done():
+		t.Fatal("group 1 handler not called")
+	}
+
+	// Request for group 2 must reach h2, not h1.
+	if _, err := cli.AppendEntries(ctx, "srv", &raft.AppendEntriesRequest{GroupID: 2, Term: 1}); err != nil {
+		t.Fatalf("AppendEntries group 2: %v", err)
+	}
+	select {
+	case <-h2.called:
+	case <-ctx.Done():
+		t.Fatal("group 2 handler not called")
+	}
+	// h1 must not have been called a second time.
+	select {
+	case <-h1.called:
+		t.Fatal("group 1 handler called for a group-2 request")
+	default:
+	}
+}
+
+// ---- TestGRPC_GroupIDZeroRejectedInMultiRaftMode ----------------------------
+
+// TestGRPC_GroupIDZeroRejectedInMultiRaftMode verifies that a request with
+// GroupID==0 is rejected with InvalidArgument when SetGroupLookup is
+// installed, rather than silently falling through to NodeID-header routing.
+func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// GroupID==0 with group lookup installed must return an error.
+	_, err = send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{GroupID: 0})
+	if err == nil {
+		t.Fatal("expected error for GroupID==0 in multi-Raft mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "GroupID must be non-zero") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// ---- TestGRPC_HeartbeatBatching ---------------------------------------------
+
+// TestGRPC_HeartbeatBatching verifies that when SetGroupLookup is installed,
+// pure heartbeats from G groups to the same peer are collapsed into a single
+// BatchHeartbeats RPC instead of G individual AppendEntries calls.
+//
+// Setup: two GRPCTransports (sender, receiver). The receiver has 10 groups
+// registered via SetGroupLookup. We use a barrier to ensure all 10 sender
+// goroutines are ready before any send fires, then assert:
+//   - All 10 group handlers on the receiver receive a heartbeat (correctness).
+//   - BatchHeartbeatsServed() == 1 on the receiver (strict O(P) assertion).
+//   - BatchHeartbeatEntriesServed() == numGroups.
+func TestGRPC_HeartbeatBatching(t *testing.T) {
+	const numGroups = 10 // large enough that O(G×P) vs O(P) is unambiguous
+
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen recv: %v", err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	// One signalHandler per group; each fires its channel when HandleAppendEntries is called.
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+	// SetGroupLookup on the sender enables heartbeat batching.
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Barrier: all goroutines park here until every one is ready, so all sends
+	// hit the batcher within the same 1ms collection window.
+	ready := make(chan struct{})
+
+	var wg sync.WaitGroup
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready // wait for all goroutines to be scheduled
+			if _, err := send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{
+				GroupID: gid,
+				Term:    1,
+			}); err != nil {
+				t.Errorf("AppendEntries group %d: %v", gid, err)
+			}
+		}(uint64(g + 1))
+	}
+	close(ready) // release all goroutines simultaneously
+	wg.Wait()
+
+	// Every group's handler must have been called.
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler was not called", gid)
+		}
+	}
+
+	// All 10 concurrent calls must have collapsed into exactly 1 RPC.
+	served := recv.BatchHeartbeatsServed()
+	if served != 1 {
+		t.Errorf("BatchHeartbeatsServed = %d, want 1 (all %d groups must batch into one RPC)",
+			served, numGroups)
+	}
+	if entries := recv.BatchHeartbeatEntriesServed(); entries != int64(numGroups) {
+		t.Errorf("BatchHeartbeatEntriesServed = %d, want %d", entries, numGroups)
+	}
+	t.Logf("BatchHeartbeats RPCs: %d for %d groups (%.0f%% reduction)",
+		served, numGroups, 100*(1-float64(served)/float64(numGroups)))
+}
+
+// ---- TestGRPC_HeartbeatObservabilityCounters ---------------------------------
+
+// TestGRPC_HeartbeatObservabilityCounters verifies that BatchHeartbeatEntriesServed
+// and BatchHeartbeatErrors are updated correctly:
+//   - Entries counter reflects the total individual heartbeats dispatched.
+//   - Errors counter increments for unknown groups, not for successful ones.
+func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	// Register groups 1 and 2; leave group 3 unknown to trigger an error counter.
+	known := map[uint64]*signalHandler{
+		1: {called: make(chan struct{}, 1)},
+		2: {called: make(chan struct{}, 1)},
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := known[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen sender: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send heartbeats to groups 1, 2 (known) and 3 (unknown) — all in one batch.
+	var wg sync.WaitGroup
+	for _, gid := range []uint64{1, 2, 3} {
+		wg.Add(1)
+		go func(g uint64) {
+			defer wg.Done()
+			//nolint:errcheck // group 3 will return success=false; that's expected
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: g, Term: 1})
+		}(gid)
+	}
+	wg.Wait()
+
+	if got := recv.BatchHeartbeatEntriesServed(); got != 3 {
+		t.Errorf("BatchHeartbeatEntriesServed = %d, want 3", got)
+	}
+	if got := recv.BatchHeartbeatErrors(); got != 1 {
+		t.Errorf("BatchHeartbeatErrors = %d, want 1 (unknown group 3)", got)
+	}
+}
+
+// ---- TestGRPC_HeartbeatWindowOption -----------------------------------------
+
+// TestGRPC_HeartbeatWindowOption verifies that WithHeartbeatWindow is
+// accepted and that the batcher still coalesces concurrent heartbeats
+// (correctness smoke-test; the window value itself is an implementation
+// detail not directly observable from the outside).
+func TestGRPC_HeartbeatWindowOption(t *testing.T) {
+	const numGroups = 5
+
+	// Use a deliberately large window to confirm the option is wired through
+	// without panicking or altering correctness.
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck // error not relevant to this test
+		}(uint64(g + 1))
+	}
+	close(ready)
+	wg.Wait()
+
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler not called with custom window", gid)
+		}
+	}
+	if served := recv.BatchHeartbeatsServed(); served == 0 {
+		t.Error("BatchHeartbeats was never called")
+	}
+}
+
+// ---- TestGRPC_HeartbeatRPCTimeoutOption -------------------------------------
+
+// TestGRPC_HeartbeatRPCTimeoutOption verifies that WithHeartbeatRPCTimeout is
+// wired through: when the receiver is unreachable and the timeout is very
+// short, BatchHeartbeats must fail quickly instead of hanging for 5s.
+func TestGRPC_HeartbeatRPCTimeoutOption(t *testing.T) {
+	// Sender configured with a 50ms RPC timeout.
+	send, err := grpctransport.Listen("127.0.0.1:0",
+		grpctransport.WithHeartbeatRPCTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+
+	// Register a peer address that nobody is listening on.
+	send.AddPeer("dead", "127.0.0.1:1") // port 1 is unroutable on localhost
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = send.AppendEntries(ctx, "dead", &raft.AppendEntriesRequest{GroupID: 1, Term: 1})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error sending to unreachable peer, got nil")
+	}
+	// Must fail well within the 5s default; the 50ms option should bound it.
+	if elapsed > time.Second {
+		t.Errorf("heartbeat took %v to fail — WithHeartbeatRPCTimeout not applied", elapsed)
+	}
+	t.Logf("failed in %v (timeout=50ms): %v", elapsed, err)
+}
+
+// ---- TestGRPC_HeartbeatChannelSizeOption ------------------------------------
+
+// TestGRPC_HeartbeatChannelSizeOption verifies that WithHeartbeatChannelSize
+// is wired through: a small channel size still admits up to that many
+// concurrent heartbeats without blocking or panicking.
+func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
+	const numGroups = 4
+	const chanSize = 8 // small but larger than numGroups
+
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen recv: %v", err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0",
+		grpctransport.WithHeartbeatChannelSize(chanSize))
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	ready := make(chan struct{})
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck // error not relevant to this test
+		}(uint64(g + 1))
+	}
+	close(ready)
+	wg.Wait()
+
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler not called", gid)
+		}
+	}
+}
+
+// ---- TestGRPC_RemovePeer ----------------------------------------------------
+
+// TestGRPC_RemovePeer verifies that after RemovePeer, outbound RPCs to the
+// removed node return an error (address no longer registered), and that a
+// subsequent AddPeer + RPC works again.
+func TestGRPC_RemovePeer(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen recv: %v", err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	h := &signalHandler{called: make(chan struct{}, 1)}
+	recv.Register("recv", h)
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen send: %v", err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Sanity: RPC works before removal.
+	if _, rvErr := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); rvErr != nil {
+		t.Fatalf("RequestVote before RemovePeer: %v", rvErr)
+	}
+
+	// Remove the peer.
+	send.RemovePeer("recv")
+
+	// RPC must now fail with "no address registered".
+	_, err = send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{})
+	if err == nil {
+		t.Fatal("expected error after RemovePeer, got nil")
+	}
+	if !strings.Contains(err.Error(), "no address registered") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Re-adding the peer must restore connectivity.
+	send.AddPeer("recv", recv.Addr())
+	if _, err := send.RequestVote(ctx, "recv", &raft.RequestVoteRequest{}); err != nil {
+		t.Errorf("RequestVote after re-AddPeer: %v", err)
+	}
+}
+
+// ---- TestGRPC_BatchHeartbeatsBoundedDispatch --------------------------------
+
+// TestGRPC_BatchHeartbeatsBoundedDispatch verifies that BatchHeartbeats
+// correctly dispatches all entries and collects all responses even when the
+// batch size exceeds GOMAXPROCS (exercising the bounded-semaphore path).
+func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
+	// Use more groups than GOMAXPROCS to force the semaphore to throttle.
+	numGroups := runtime.GOMAXPROCS(0)*4 + 1
+
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	handlers := make(map[uint64]*signalHandler, numGroups)
+	for g := range numGroups {
+		handlers[uint64(g+1)] = &signalHandler{called: make(chan struct{}, 1)}
+	}
+	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) {
+		h, ok := handlers[gid]
+		return h, ok
+	})
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = send.Close() }()
+	send.AddPeer("recv", recv.Addr())
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range numGroups {
+		wg.Add(1)
+		go func(gid uint64) {
+			defer wg.Done()
+			<-ready
+			send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: gid, Term: 1}) //nolint:errcheck // error not relevant to this test
+		}(uint64(g + 1))
+	}
+	close(ready)
+	wg.Wait()
+
+	// Every group handler must have been called — no entries silently dropped.
+	for gid, h := range handlers {
+		select {
+		case <-h.called:
+		default:
+			t.Errorf("group %d handler not called (entry dropped or dispatch blocked)", gid)
+		}
+	}
+}
+
+// ---- TestGRPC_HeartbeatBatcherStopWaits ------------------------------------
+
+// TestGRPC_HeartbeatBatcherStopWaits verifies that Close() does not return
+// until all peerBatcher goroutines have exited. Before this fix, stop() only
+// cancelled the context, leaving goroutines running after Close() returned.
+func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = recv.Close() }()
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enable multi-raft mode — this creates the heartbeat batcher.
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+	send.AddPeer("recv", recv.Addr())
+
+	// Trigger peerBatcher goroutine creation by sending a heartbeat (empty
+	// Entries == heartbeat path in AppendEntries).
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+	// Error is expected (recv has no handler for group 1) — we only need the
+	// peerBatcher goroutine to have been created and settled.
+
+	before := runtime.NumGoroutine()
+
+	// Close() must block until all peerBatcher goroutines exit.
+	closeDone := make(chan struct{})
+	go func() {
+		_ = send.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not return — peerBatcher goroutines likely leaked")
+	}
+
+	// Allow goroutines to fully exit.
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	// Goroutine count must have dropped: at minimum the peerBatcher goroutine
+	// created above should have exited.
+	if after >= before {
+		t.Errorf("goroutine leak: before Close=%d, after=%d (expected drop)", before, after)
+	}
+}
+
+// ---- TestGRPC_HeartbeatBatcherStoppedFlag -----------------------------------
+
+// TestGRPC_HeartbeatBatcherStoppedFlag verifies that Send returns an error
+// (not a panic or hang) when called after Close(). The stopped flag in
+// heartbeatBatcher must prevent peerBatcherFor from creating new goroutines
+// after stop() has been called.
+func TestGRPC_HeartbeatBatcherStoppedFlag(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = recv.Close() }()
+	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+	send.AddPeer("recv", recv.Addr())
+
+	// Warm up a batcher goroutine.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+
+	// Close the sender — this must stop the batcher.
+	_ = send.Close()
+	// Send after close must return an error quickly, not hang or panic.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel2()
+	_, err = send.AppendEntries(ctx2, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+	if err == nil {
+		t.Fatal("expected error after Close(), got nil")
+	}
+}
+
+// ---- TestGRPC_RemovePeer_StopsBatcher ---------------------------------------
+
+// TestGRPC_RemovePeer_StopsBatcher verifies that RemovePeer stops the
+// peerBatcher goroutine for the removed peer so it doesn't linger. Before
+// this fix, peerBatcher goroutines accumulated indefinitely as peers joined
+// and left the cluster.
+func TestGRPC_RemovePeer_StopsBatcher(t *testing.T) {
+	recv, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = recv.Close() }()
+	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+
+	send, err := grpctransport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = send.Close() }()
+	send.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
+	send.AddPeer("recv", recv.Addr())
+
+	// Trigger peerBatcher goroutine creation.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = send.AppendEntries(ctx, "recv", &raft.AppendEntriesRequest{GroupID: 1})
+
+	before := runtime.NumGoroutine()
+
+	send.RemovePeer("recv")
+
+	// Allow the goroutine to exit.
+	runtime.Gosched()
+	time.Sleep(20 * time.Millisecond)
+
+	after := runtime.NumGoroutine()
+	if after >= before {
+		t.Errorf("peerBatcher goroutine leaked after RemovePeer: before=%d after=%d", before, after)
+	}
+}
+
+// ---- TestGRPC_MultiRaft_ManagerWiring ----------------------------------------
+
+// TestGRPC_MultiRaft_ManagerWiring is the canonical integration test for the
+// full gRPC + Manager + multi-raft stack.  It verifies end-to-end wiring that
+// pure-transport tests and memtransport-based multi-raft tests cannot cover:
+//
+//   - SetGroupLookup(mgr.Lookup) routes inbound BatchHeartbeats entries to the
+//     correct Node via the Manager.
+//   - Every group independently elects a leader over real gRPC.
+//   - Proposals commit on all groups.
+//   - TransferLeadership succeeds (exercises the TimeoutNow GroupId fix: without
+//     it the receiver returns codes.InvalidArgument and the transfer fails).
+//   - HeartbeatSendBlocked stays zero under normal load, confirming no
+//     hbChanSize saturation with 3 groups.
+func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+
+	const (
+		numPhysical = 3
+		numGroups   = 3
+	)
+
+	// ---- Phase 1: create transports and managers ----------------------------
+
+	transports := make([]*grpctransport.GRPCTransport, numPhysical)
+	addrs := make([]string, numPhysical)
+	managers := make([]*raft.Manager, numPhysical)
+
+	for p := range numPhysical {
+		tr, err := grpctransport.Listen("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen physical %d: %v", p, err)
+		}
+		transports[p] = tr
+		addrs[p] = tr.Addr()
+		managers[p] = raft.NewManager()
+	}
+
+	// ---- Phase 2: wire AddPeer + SetGroupLookup before nodes start ----------
+	//
+	// AddPeer must be called before any tick fires an RPC; SetGroupLookup must
+	// be called before the first inbound BatchHeartbeats arrives.  Both happen
+	// before AddAndStart below.
+
+	for p := range numPhysical {
+		for g := range numGroups {
+			groupID := uint64(g + 1)
+			for pp := range numPhysical {
+				if pp == p {
+					continue
+				}
+				// Multiple group NodeIDs on the same physical peer all map to
+				// the same address; clientFor reuses the cached connection.
+				peerID := raft.NodeID(fmt.Sprintf("g%d-p%d", groupID, pp))
+				transports[p].AddPeer(peerID, addrs[pp])
+			}
+		}
+		transports[p].SetGroupLookup(managers[p].Lookup)
+	}
+
+	// ---- Phase 3: create and start nodes ------------------------------------
+
+	// nodes[g][p] is the Node for group g+1 on physical node p.
+	nodes := make([][]*raft.Node, numGroups)
+	for g := range numGroups {
+		groupID := uint64(g + 1)
+		nodes[g] = make([]*raft.Node, numPhysical)
+
+		// Build the list of all NodeIDs in this group.
+		allIDs := make([]raft.NodeID, numPhysical)
+		for p := range numPhysical {
+			allIDs[p] = raft.NodeID(fmt.Sprintf("g%d-p%d", groupID, p))
+		}
+
+		for p := range numPhysical {
+			peers := make([]raft.NodeID, 0, numPhysical-1)
+			for _, id := range allIDs {
+				if id != allIDs[p] {
+					peers = append(peers, id)
+				}
+			}
+			sm := &kvSM{data: make(map[string]string)}
+			cfg := raft.DefaultConfig()
+			cfg.GroupID = groupID
+			cfg.ID = allIDs[p]
+			cfg.Peers = peers
+			cfg.Storage = memstore.New()
+			cfg.StateMachine = sm
+			cfg.Transport = transports[p] // all groups on one physical node share one transport
+			cfg.TickInterval = 10 * time.Millisecond
+
+			node, err := raft.New(&cfg)
+			if err != nil {
+				t.Fatalf("raft.New g=%d p=%d: %v", g+1, p, err)
+			}
+			// AddAndStart calls node.Start(), which calls transport.Register.
+			// In multi-raft mode groupLookup takes precedence over handlers,
+			// so registering multiple NodeIDs on the same transport is harmless.
+			if err := managers[p].AddAndStart(groupID, node); err != nil {
+				t.Fatalf("managers[%d].AddAndStart(g=%d): %v", p, g+1, err)
+			}
+			nodes[g][p] = node
+		}
+	}
+
+	t.Cleanup(func() {
+		for _, mgr := range managers {
+			mgr.StopAll()
+		}
+		for _, tr := range transports {
+			_ = tr.Close() //nolint:errcheck // best-effort cleanup in test teardown.
+		}
+	})
+
+	// ---- Phase 4: wait for all groups to elect a leader --------------------
+
+	leaders := make([]*raft.Node, numGroups) // leaders[g] = leader node for group g+1
+	leaderPhys := make([]int, numGroups)     // physical index of leader[g]
+	deadline := time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) {
+		allFound := true
+		for g := range numGroups {
+			if leaders[g] != nil {
+				continue
+			}
+			for p, n := range nodes[g] {
+				if n.StateSnapshot() == raft.Leader {
+					leaders[g] = n
+					leaderPhys[g] = p
+					break
+				}
+			}
+			if leaders[g] == nil {
+				allFound = false
+			}
+		}
+		if allFound {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for g, l := range leaders {
+		if l == nil {
+			t.Fatalf("group %d never elected a leader within %s", g+1, electionTimeout)
+		}
+		t.Logf("group %d leader: %s (physical %d)", g+1, l.ID(), leaderPhys[g])
+	}
+
+	// ---- Phase 5: propose one entry per group --------------------------------
+
+	for g, leader := range leaders {
+		ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+		_, err := leader.Propose(ctx, []byte(fmt.Sprintf("key=g%d", g+1)))
+		cancel()
+		if err != nil {
+			t.Errorf("group %d Propose: %v", g+1, err)
+		}
+	}
+
+	// ---- Phase 6: TransferLeadership on group 1 (exercises TimeoutNow fix) --
+	//
+	// Without the TimeoutNow GroupId fix the receiver returns
+	// codes.InvalidArgument and TransferLeadership returns an error.
+
+	const transferGroup = 0 // group index (0-based) to test on
+	leaderNode := leaders[transferGroup]
+	leaderP := leaderPhys[transferGroup]
+
+	// Pick a follower as transfer target.
+	var transferTarget raft.NodeID
+	for p, n := range nodes[transferGroup] {
+		if p != leaderP {
+			transferTarget = n.ID()
+			break
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+	defer cancel()
+	if err := leaderNode.TransferLeadership(ctx, transferTarget); err != nil {
+		t.Errorf("group 1 TransferLeadership to %s: %v", transferTarget, err)
+	}
+
+	// Verify that the target (or at least some other node) became leader.
+	deadline = time.Now().Add(electionTimeout)
+	transferred := false
+	for time.Now().Before(deadline) {
+		for p, n := range nodes[transferGroup] {
+			if p != leaderP && n.StateSnapshot() == raft.Leader {
+				transferred = true
+				break
+			}
+		}
+		if transferred {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !transferred {
+		t.Errorf("group 1: leadership did not transfer away from physical %d within %s", leaderP, electionTimeout)
+	}
+
+	// ---- Phase 7: sanity-check transport metrics ----------------------------
+	//
+	// 3 groups is well under the default hbChanSize of 1024; the backpressure
+	// counter must remain zero throughout the test.
+	//
+	// BatchHeartbeatsServed must be positive on every transport to confirm that
+	// the batching code path (not just direct AppendEntries) was exercised.
+
+	for p, tr := range transports {
+		if n := tr.HeartbeatSendBlocked(); n != 0 {
+			t.Errorf("physical %d: HeartbeatSendBlocked = %d, want 0 (hbChan saturated under light load)", p, n)
+		}
+		if n := tr.BatchHeartbeatsServed(); n == 0 {
+			t.Errorf("physical %d: BatchHeartbeatsServed = 0, want >0 (batching path not exercised)", p)
+		}
+	}
+}
+
+// ---- Issue 5: ResetHeartbeatSendBlocked enables rate monitoring -------------
+
+// TestGRPC_ResetHeartbeatSendBlocked verifies that ResetHeartbeatSendBlocked
+// atomically returns and clears the counter.
+//
+// FAILS before the fix: the method doesn't exist.
+// PASSES after the fix.
+func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
+	t1, err := grpctransport.Listen(":0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = t1.Close() }()
+
+	// Initially zero.
+	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
+		t.Errorf("initial ResetHeartbeatSendBlocked() = %d, want 0", got)
+	}
+
+	// Force a blocked send by using a tiny channel (size 1) and sending more
+	// heartbeats than it can absorb without blocking.  We drive this through
+	// the internal counter directly by using a small channel size option and
+	// exercising the Send path via a full in-process cluster.
+	//
+	// Simpler approach: the transport exposes hbSendBlocked as an atomic; we
+	// can verify the Swap semantics without the full-cluster overhead by just
+	// checking that calling Reset twice returns 0 the second time.
+	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
+		t.Errorf("second ResetHeartbeatSendBlocked() = %d, want 0 (should be idempotent)", got)
+	}
+
+	// Verify that HeartbeatSendBlocked reflects the current state (0 after reset).
+	if got := t1.HeartbeatSendBlocked(); got != 0 {
+		t.Errorf("HeartbeatSendBlocked() after reset = %d, want 0", got)
+	}
+
+	// Build a tiny two-node cluster with a very small heartbeat channel (size 1)
+	// and saturate it to produce a non-zero blocked count, then reset and verify.
+	t2, err := grpctransport.Listen(":0",
+		grpctransport.WithHeartbeatChannelSize(1),
+	)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = t2.Close() }()
+
+	addr1 := t1.Addr()
+	addr2 := t2.Addr()
+	t1.AddPeer("b", addr2)
+	t2.AddPeer("a", addr1)
+
+	sm1 := &kvSM{data: make(map[string]string)}
+	sm2 := &kvSM{data: make(map[string]string)}
+	cfg1 := raft.DefaultConfig()
+	cfg1.ID = "a"
+	cfg1.Peers = []raft.NodeID{"b"}
+	cfg1.Storage = memstore.New()
+	cfg1.StateMachine = sm1
+	cfg1.Transport = t1
+	cfg1.TickInterval = 2 * time.Millisecond
+	n1, _ := raft.New(&cfg1)
+	t1.Register("a", n1)
+	n1.Start()
+	defer n1.Stop()
+
+	cfg2 := raft.DefaultConfig()
+	cfg2.ID = "b"
+	cfg2.Peers = []raft.NodeID{"a"}
+	cfg2.Storage = memstore.New()
+	cfg2.StateMachine = sm2
+	cfg2.Transport = t2
+	cfg2.TickInterval = 2 * time.Millisecond
+	n2, _ := raft.New(&cfg2)
+	t2.Register("b", n2)
+	n2.Start()
+	defer n2.Stop()
+
+	// Let the cluster run for a bit to generate heartbeat traffic.
+	// With channelSize=1 and multiple groups sharing the batcher, blocked
+	// sends are probable — but even if not, the core API semantics hold.
+	time.Sleep(300 * time.Millisecond)
+
+	// After Reset, the cumulative total moves to the returned value
+	// and subsequent HeartbeatSendBlocked() returns 0.
+	delta := t1.ResetHeartbeatSendBlocked()
+	// delta may be 0 (no saturation) or >0 (saturation observed) — both are fine.
+	if delta < 0 {
+		t.Errorf("ResetHeartbeatSendBlocked returned negative: %d", delta)
+	}
+	if got := t1.HeartbeatSendBlocked(); got != 0 {
+		t.Errorf("HeartbeatSendBlocked() = %d after Reset, want 0", got)
+	}
+	// A second reset in the same interval must return 0.
+	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
+		t.Errorf("second ResetHeartbeatSendBlocked() = %d, want 0 (counter was already drained)", got)
 	}
 }

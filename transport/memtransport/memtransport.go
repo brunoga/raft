@@ -46,6 +46,13 @@ func (net *Network) Register(id raft.NodeID, handler raft.Handler) {
 	net.handlers[id] = handler
 }
 
+// Unregister removes id from the Network.
+func (net *Network) Unregister(id raft.NodeID) {
+	net.mu.Lock()
+	defer net.mu.Unlock()
+	delete(net.handlers, id)
+}
+
 // Drop causes all messages from → to to be silently discarded (one direction).
 func (net *Network) Drop(from, to raft.NodeID) {
 	net.mu.Lock()
@@ -100,7 +107,10 @@ func (net *Network) dispatch(
 	net.mu.RUnlock()
 
 	if dropped {
-		// Simulate the message being lost — block until ctx expires.
+		// Simulate the message being lost — block until ctx expires, as a real
+		// network partition would. Returning immediately would simulate a
+		// connection-refused, which is a different failure mode and causes tests
+		// to retry far more aggressively than production behaviour warrants.
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -169,6 +179,11 @@ func (t *MemTransport) ReadIndex(ctx context.Context, to raft.NodeID, req *raft.
 // Register makes id reachable in this transport's Network.
 func (t *MemTransport) Register(id raft.NodeID, handler raft.Handler) {
 	t.network.Register(id, handler)
+}
+
+// Unregister removes id from this transport's Network.
+func (t *MemTransport) Unregister(id raft.NodeID) {
+	t.network.Unregister(id)
 }
 
 func (t *MemTransport) Close() error { return nil }

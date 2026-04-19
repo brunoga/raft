@@ -1,9 +1,11 @@
 package raft
 
 import (
+	"bytes"
 	"container/list"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 // ---- LRU client table ---------------------------------------------------------
@@ -154,47 +156,55 @@ type clientEntry struct {
 
 const snapFrameMagic uint64 = 0xCAFEDEAD_BEEFD00D
 
-// wrapSnapshot prepends the client dedup table to smData.
-func wrapSnapshot(table map[NodeID]clientEntry, smData []byte) []byte {
+// writeWrappedSnapshot writes the client dedup table followed by the
+// state-machine data (via smSnapshot func) to w.
+func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, smSnapshot func(io.Writer) error) error {
 	tableBytes := encodeClientTable(table)
-	buf := make([]byte, 8+4+len(tableBytes)+len(smData))
-	off := 0
-	binary.LittleEndian.PutUint64(buf[off:], snapFrameMagic)
-	off += 8
-	binary.LittleEndian.PutUint32(buf[off:], uint32(len(tableBytes)))
-	off += 4
-	copy(buf[off:], tableBytes)
-	off += len(tableBytes)
-	copy(buf[off:], smData)
-	return buf
+	var hdr [12]byte
+	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagic)
+	binary.LittleEndian.PutUint32(hdr[8:], uint32(len(tableBytes)))
+
+	if _, err := w.Write(hdr[:]); err != nil {
+		return fmt.Errorf("write snap header: %w", err)
+	}
+	if _, err := w.Write(tableBytes); err != nil {
+		return fmt.Errorf("write snap table: %w", err)
+	}
+	if err := smSnapshot(w); err != nil {
+		return fmt.Errorf("write snap sm data: %w", err)
+	}
+	return nil
 }
 
-// unwrapSnapshot extracts the client table and SM data from a wrapped snapshot.
-// If the data is not in the wrapped format (e.g. an older snapshot), it returns
-// an empty table and the full data slice so the SM restore still succeeds.
-func unwrapSnapshot(data []byte) (table map[NodeID]clientEntry, smData []byte) {
-	empty := make(map[NodeID]clientEntry)
-	if len(data) < 12 {
-		return empty, data
+// readWrappedSnapshot reads the client table from r and returns it along with
+// a reader for the remaining state-machine data.
+func readWrappedSnapshot(r io.Reader) (table map[NodeID]clientEntry, smDataReader io.Reader, err error) {
+	var hdr [12]byte
+	if _, readErr := io.ReadFull(r, hdr[:]); readErr != nil {
+		if readErr == io.EOF {
+			return nil, nil, fmt.Errorf("read snap header: empty file")
+		}
+		return nil, nil, fmt.Errorf("read snap header: %w", readErr)
 	}
-	if binary.LittleEndian.Uint64(data) != snapFrameMagic {
-		return empty, data
+
+	if binary.LittleEndian.Uint64(hdr[:8]) != snapFrameMagic {
+		// Legacy snapshot or different format: the entire reader is SM data.
+		// We return a multi-reader that puts back the header bytes.
+		return make(map[NodeID]clientEntry), io.MultiReader(bytes.NewReader(hdr[:]), r), nil
 	}
-	tableLen := int(binary.LittleEndian.Uint32(data[8:]))
-	start := 12
-	if start+tableLen > len(data) {
-		// The framing header is present but the table is truncated — corrupt
-		// snapshot. Return the bytes after the header (skipping magic+tableLen)
-		// so the SM at least doesn't receive the raw framing bytes as its state.
-		// Both outcomes are garbage; skipping the header avoids misinterpreting
-		// the magic constant as a length or opcode in the SM protocol.
-		return empty, data[start:]
+
+	tableLen := int(binary.LittleEndian.Uint32(hdr[8:]))
+	tableBytes := make([]byte, tableLen)
+	if _, readErr := io.ReadFull(r, tableBytes); readErr != nil {
+		return nil, nil, fmt.Errorf("read snap table: %w", readErr)
 	}
-	table, err := decodeClientTable(data[start : start+tableLen])
+
+	table, err = decodeClientTable(tableBytes)
 	if err != nil {
-		return empty, data[start+tableLen:]
+		return nil, nil, fmt.Errorf("decode snap table: %w", err)
 	}
-	return table, data[start+tableLen:]
+
+	return table, r, nil
 }
 
 func encodeClientTable(table map[NodeID]clientEntry) []byte {

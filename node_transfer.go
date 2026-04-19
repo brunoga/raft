@@ -64,7 +64,7 @@ func (n *Node) handleLeadershipTransfer(msg leadershipTransferMsg) {
 // We do not need to track the response: if the target wins an election it will
 // broadcast a higher-term heartbeat and this node will step down naturally.
 func (n *Node) sendTimeoutNow(target NodeID) {
-	req := &TimeoutNowRequest{Term: n.currentTerm, LeaderID: n.cfg.ID}
+	req := &TimeoutNowRequest{GroupID: n.cfg.GroupID, Term: n.currentTerm, LeaderID: n.cfg.ID}
 	go func(p NodeID, r *TimeoutNowRequest) {
 		ctx, cancel := context.WithTimeout(n.stopCtx,
 			n.cfg.ElectionTimeoutMin)
