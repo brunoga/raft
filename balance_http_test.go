@@ -125,7 +125,7 @@ func TestManagerHTTP_Transfer_OK(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"group_id": 1, "to": "b"})
 	respCh := make(chan *http.Response, 1)
 	go func() {
-		resp, err := http.Post(srv.URL+"/transfer", "application/json", bytes.NewReader(body))
+		resp, err := http.Post(srv.URL+"/transfer", "application/json", bytes.NewReader(body)) //nolint:bodyclose // body closed by receiver after status check
 		if err != nil {
 			t.Errorf("POST /transfer: %v", err)
 			return
