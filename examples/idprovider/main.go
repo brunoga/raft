@@ -21,7 +21,16 @@
 //	idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
 //	           --udp-discovery
 //
-// The --udp-discovery and --peer flags are mutually exclusive.
+// # Usage (Kubernetes headless service / DNS A-record discovery)
+//
+//	idprovider --id $POD_IP --raft-addr :7001 --http-addr :8001 --data-dir /data \
+//	           --discover-dns raft.default.svc.cluster.local
+//
+// With DNS discovery the node's --id must be its IP address (set to $POD_IP in
+// Kubernetes). Each IP returned by the headless service is used directly as the
+// peer's NodeID and contacted on --discover-dns-port (default 7001).
+//
+// The --peer, --udp-discovery, and --discover-dns flags are mutually exclusive.
 //
 //	# Create a domain:
 //	curl -s -X POST http://localhost:8001/domains/orders
@@ -65,6 +74,7 @@ import (
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/discovery"
+	"github.com/brunoga/raft/discovery/dnsdiscovery"
 	"github.com/brunoga/raft/discovery/udpbroadcast"
 	"github.com/brunoga/raft/storage/filestore"
 	"github.com/brunoga/raft/transport/grpctransport"
@@ -97,6 +107,9 @@ type raftPeerAdder struct {
 
 func (a *raftPeerAdder) AddPeer(id raft.NodeID, addr string) {
 	a.tr.AddPeer(id, addr)
+	if id == a.node.ID() {
+		return // never propose adding self; cfg.Peers never contains self
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = a.node.AddServer(ctx, id) // best-effort; only the leader succeeds
@@ -111,9 +124,11 @@ func main() {
 		tlsCert              = flag.String("tls-cert", "", "PEM certificate file for mTLS (requires --tls-key and --tls-ca)")
 		tlsKey               = flag.String("tls-key", "", "PEM private key file for mTLS")
 		tlsCA                = flag.String("tls-ca", "", "PEM CA certificate file for mTLS peer verification")
-		udpDiscovery         = flag.Bool("udp-discovery", false, "use UDP broadcast for peer discovery (mutually exclusive with --peer)")
+		udpDiscovery         = flag.Bool("udp-discovery", false, "use UDP broadcast for peer discovery (mutually exclusive with --peer and --discover-dns)")
 		udpBroadcastAddr     = flag.String("udp-broadcast-addr", "255.255.255.255:9199", "UDP broadcast address for peer discovery")
 		udpDiscoveryTimeout  = flag.Duration("udp-discovery-timeout", 3*time.Second, "duration to wait for initial peer discovery window")
+		discoverDNS          = flag.String("discover-dns", "", "DNS hostname for A-record peer discovery (mutually exclusive with --peer and --udp-discovery)")
+		discoverDNSPort      = flag.String("discover-dns-port", "7001", "Raft gRPC port used for DNS-discovered peers")
 		peers                peerFlag
 	)
 	flag.Var(&peers, "peer", "peer in the form id=raft_addr[,http_addr] (repeatable)")
@@ -138,9 +153,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --udp-discovery and --peer are mutually exclusive.
-	if *udpDiscovery && len(peers) > 0 {
-		fmt.Fprintln(os.Stderr, "idprovider: --udp-discovery and --peer are mutually exclusive")
+	// --peer, --udp-discovery, and --discover-dns are mutually exclusive.
+	discoveryModes := 0
+	if len(peers) > 0 {
+		discoveryModes++
+	}
+	if *udpDiscovery {
+		discoveryModes++
+	}
+	if *discoverDNS != "" {
+		discoveryModes++
+	}
+	if discoveryModes > 1 {
+		fmt.Fprintln(os.Stderr, "idprovider: --peer, --udp-discovery, and --discover-dns are mutually exclusive")
 		os.Exit(1)
 	}
 
@@ -208,6 +233,32 @@ func main() {
 			peerRaftAddrs[p.ID] = p.Addr
 		}
 		slog.Info("idprovider: initial peers discovered", "count", len(peerIDs))
+	}
+
+	// DNS A-record discovery: resolve the headless-service hostname once before
+	// starting the node so cfg.Peers is populated for the initial election, then
+	// run a DiscoveryAgent for ongoing peer tracking.
+	var dnsDisc discovery.Discovery
+	if *discoverDNS != "" {
+		selfID := raft.NodeID(*id)
+		dnsDisc = dnsdiscovery.NewARecord(
+			*discoverDNS,
+			*discoverDNSPort,
+			func(ip string) (raft.NodeID, bool) { return raft.NodeID(ip), true },
+			nil, // use net.DefaultResolver
+		)
+		initialPeers, err := dnsDisc.Discover(ctx)
+		if err != nil {
+			slog.Warn("idprovider: initial DNS discovery failed, starting with empty peer list", "err", err)
+		}
+		for _, p := range initialPeers {
+			if p.ID == selfID {
+				continue // skip self
+			}
+			peerIDs = append(peerIDs, p.ID)
+			peerRaftAddrs[p.ID] = p.Addr
+		}
+		slog.Info("idprovider: DNS initial peers", "count", len(peerIDs))
 	}
 
 	// Open persistent storage.
@@ -289,6 +340,10 @@ func main() {
 	// receives the leader's first heartbeat after being added to membership.
 	if bcast != nil {
 		agent := discovery.NewAgent(bcast, &raftPeerAdder{tr: tr, node: node}, 5*time.Second)
+		go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
+	}
+	if dnsDisc != nil {
+		agent := discovery.NewAgent(dnsDisc, &raftPeerAdder{tr: tr, node: node}, 5*time.Second)
 		go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
 	}
 

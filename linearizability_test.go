@@ -320,7 +320,7 @@ func TestChaos_MessageDrops(t *testing.T) {
 	for tick := range totalTicks {
 		// Randomly disconnect/reconnect a non-leader node.
 		if rng.IntN(10) == 0 {
-			leaderIdx := c.leaderIndex()
+			leaderIdx := c.LeaderIndex()
 			candidates := make([]int, 0, 4)
 			for i := range c.nodes {
 				if i != leaderIdx {
@@ -339,7 +339,7 @@ func TestChaos_MessageDrops(t *testing.T) {
 		time.Sleep(time.Millisecond)
 
 		// Propose every 10 ticks if a leader exists.
-		if tick-lastPropose >= 10 && c.leaderIndex() >= 0 {
+		if tick-lastPropose >= 10 && c.LeaderIndex() >= 0 {
 			cmd := fmt.Appendf(nil, "drop=%d", tick)
 			if val, err := c.Propose(electionTimeout/4, cmd); err == nil {
 				proposed = append(proposed, string(val))

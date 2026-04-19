@@ -11,6 +11,7 @@ package raft_test
 // counter-example.
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"testing/quick"
@@ -266,7 +267,7 @@ func TestProperty_InstallSnapshot_StaleSnapshot_Ignored(t *testing.T) {
 			LastIncludedIndex: raft.Index(existingIdx),
 			LastIncludedTerm:  1,
 		}
-		if err := store.SaveSnapshot(context.Background(), existingMeta, []byte("snap")); err != nil {
+		if err := store.SaveSnapshot(context.Background(), existingMeta, bytes.NewReader([]byte("snap"))); err != nil {
 			return true
 		}
 		cfg := raft.DefaultConfig()

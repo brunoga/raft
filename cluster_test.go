@@ -1,8 +1,10 @@
 package raft_test
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -19,70 +21,60 @@ import (
 
 // Cluster manages a set of Raft nodes sharing an in-memory network.
 type Cluster struct {
-	t      testing.TB
-	net    *memtransport.Network
-	nodes  []*raft.Node
-	ids    []raft.NodeID
-	stores []*memstore.MemStore
-	sms    []*kvSM
+	t     testing.TB
+	net   *memtransport.Network
+	nodes []*raft.Node
+	ids   []raft.NodeID
+	sms   []*kvSM
 }
 
-// newCluster creates and starts a cluster of n nodes with manual ticks
-// (TickInterval=0). The caller drives time via cluster.Tick().
+// newCluster creates a new n-node cluster.
 func newCluster(t testing.TB, n int) *Cluster {
 	return newClusterWith(t, n, nil)
 }
 
-// newClusterWith is like newCluster but applies modify (if non-nil) to each
-// node's Config before construction. Use it to override defaults such as
-// SnapshotThreshold.
-func newClusterWith(t testing.TB, n int, modify func(*raft.Config)) *Cluster {
-	t.Helper()
-	net := memtransport.NewNetwork()
-	ids := make([]raft.NodeID, n)
-	for i := range n {
-		ids[i] = raft.NodeID(fmt.Sprintf("n%d", i+1))
+// newClusterWith creates a new n-node cluster with custom configuration.
+func newClusterWith(t testing.TB, n int, mutate func(*raft.Config)) *Cluster {
+	c := &Cluster{
+		t:   t,
+		net: memtransport.NewNetwork(),
 	}
 
-	c := &Cluster{t: t, net: net, ids: ids}
+	for i := range n {
+		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
+		c.ids = append(c.ids, id)
+	}
 
 	for i := range n {
 		peers := make([]raft.NodeID, 0, n-1)
-		for j, id := range ids {
-			if j != i {
-				peers = append(peers, id)
+		for j := range n {
+			if i == j {
+				continue
 			}
+			peers = append(peers, c.ids[j])
 		}
 
-		tr := net.NewTransport(ids[i])
-		store := memstore.New()
 		sm := &kvSM{data: make(map[string]string)}
+		c.sms = append(c.sms, sm)
 
 		cfg := raft.DefaultConfig()
-		cfg.ID = ids[i]
+		cfg.ID = c.ids[i]
 		cfg.Peers = peers
-		cfg.Storage = store
+		cfg.Storage = memstore.New()
 		cfg.StateMachine = sm
-		cfg.Transport = tr
-		cfg.TickInterval = 0 // manual ticks
+		cfg.Transport = c.net.NewTransport(cfg.ID)
+		cfg.TickInterval = 0 // Manual ticks for deterministic tests
 
-		if modify != nil {
-			modify(&cfg)
+		if mutate != nil {
+			mutate(&cfg)
 		}
 
 		node, err := raft.New(&cfg)
 		if err != nil {
-			t.Fatalf("New node %s: %v", ids[i], err)
+			t.Fatalf("raft.New(%d): %v", i+1, err)
 		}
 		c.nodes = append(c.nodes, node)
-		c.stores = append(c.stores, store)
-		c.sms = append(c.sms, sm)
-	}
-
-	// Register all handlers before starting so that the first heartbeat
-	// already reaches a live handler.
-	for i, node := range c.nodes {
-		net.Register(ids[i], node)
+		c.net.Register(cfg.ID, node)
 	}
 
 	for _, node := range c.nodes {
@@ -98,84 +90,85 @@ func newClusterWith(t testing.TB, n int, modify func(*raft.Config)) *Cluster {
 	return c
 }
 
-// Tick delivers one tick to every node.
+// Tick advances time by one unit for all nodes in the cluster.
 func (c *Cluster) Tick() {
-	for _, n := range c.nodes {
-		n.Tick()
+	for _, node := range c.nodes {
+		node.Tick()
 	}
 }
 
-// TickN delivers n ticks to every node with a brief yield between each.
+// TickN advances time by n units.
 func (c *Cluster) TickN(n int) {
 	for range n {
 		c.Tick()
+		// Small sleep to let background goroutines (apply, replication) run.
 		time.Sleep(time.Millisecond)
 	}
 }
 
-// WaitLeader blocks until exactly one leader is elected, then returns its
-// index in c.nodes. Fails the test after timeout.
+// WaitLeader waits for any node to become leader, up to timeout.
+// Fails the test immediately if no leader is elected within timeout.
+// Returns the index of the leader node.
 func (c *Cluster) WaitLeader(timeout time.Duration) int {
 	c.t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		for i, node := range c.nodes {
+			if node.StateSnapshot() == raft.Leader {
+				return i
+			}
+		}
 		c.Tick()
 		time.Sleep(time.Millisecond)
-		if idx := c.leaderIndex(); idx >= 0 {
-			return idx
-		}
 	}
 	c.t.Fatalf("no leader elected within %s", timeout)
-	return -1
+	return -1 // unreachable; satisfies the compiler
 }
 
-// leaderIndex returns the index of the current leader, or -1 if none.
-func (c *Cluster) leaderIndex() int {
-	leaders := []int{}
-	for i, n := range c.nodes {
-		if n.StateSnapshot() == raft.Leader {
-			leaders = append(leaders, i)
-		}
-	}
-	if len(leaders) == 1 {
-		return leaders[0]
-	}
-	return -1
-}
-
-// Leader returns the current leader node, failing the test if none.
+// Leader returns the current leader node, or nil if none is elected.
 func (c *Cluster) Leader(timeout time.Duration) *raft.Node {
-	c.t.Helper()
 	idx := c.WaitLeader(timeout)
+	if idx < 0 {
+		return nil
+	}
 	return c.nodes[idx]
 }
 
-// Propose submits a command to the current leader and awaits the result,
-// ticking the cluster in the background to drive progress.
+func (c *Cluster) LeaderIndex() int {
+	for i, node := range c.nodes {
+		if node.StateSnapshot() == raft.Leader {
+			return i
+		}
+	}
+	return -1
+}
+
+// Propose submits a command to the current leader.
 func (c *Cluster) Propose(timeout time.Duration, cmd []byte) ([]byte, error) {
-	c.t.Helper()
+	leader := c.Leader(timeout)
+	if leader == nil {
+		return nil, fmt.Errorf("no leader")
+	}
+
+	// We need to tick while waiting for the proposal to commit.
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	leader := c.Leader(timeout / 2)
-
-	// Run Propose in a goroutine so we can tick the manual-clock cluster while
-	// waiting for the apply pipeline to complete.
 	type result struct {
 		val []byte
 		err error
 	}
-	resultCh := make(chan result, 1)
+	resCh := make(chan result, 1)
 	go func() {
-		v, e := leader.Propose(ctx, cmd)
-		resultCh <- result{v, e}
+		v, err := leader.Propose(ctx, cmd)
+		resCh <- result{v, err}
 	}()
 
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case r := <-resultCh:
+		case r := <-resCh:
 			return r.val, r.err
 		case <-ticker.C:
 			c.Tick()
@@ -185,19 +178,29 @@ func (c *Cluster) Propose(timeout time.Duration, cmd []byte) ([]byte, error) {
 	}
 }
 
-// Disconnect partitions node i from the rest of the cluster.
+// Disconnect isolates node i from the rest of the cluster.
 func (c *Cluster) Disconnect(i int) {
-	c.net.Partition(c.ids[i])
+	for j := range c.nodes {
+		if i == j {
+			continue
+		}
+		c.net.Drop(c.ids[i], c.ids[j])
+		c.net.Drop(c.ids[j], c.ids[i])
+	}
 }
 
-// Reconnect heals all partitions for node i.
+// Reconnect restores network connectivity for node i.
 func (c *Cluster) Reconnect(i int) {
-	c.net.Heal(c.ids[i])
+	for j := range c.nodes {
+		if i == j {
+			continue
+		}
+		c.net.Restore(c.ids[i], c.ids[j])
+		c.net.Restore(c.ids[j], c.ids[i])
+	}
 }
 
-// DropLink drops messages from node from to node to (one direction only).
-// This simulates an asymmetric network failure; the reverse direction is
-// unaffected. Use RestoreLink to undo.
+// DropLink disables message delivery from node from to node to (one way).
 func (c *Cluster) DropLink(from, to int) {
 	c.net.Drop(c.ids[from], c.ids[to])
 }
@@ -244,22 +247,25 @@ func (sm *kvSM) Get(key string) string {
 }
 
 // Snapshot serialises the map as "key\tvalue\n" lines.
-func (sm *kvSM) Snapshot(_ context.Context) ([]byte, error) {
+func (sm *kvSM) Snapshot(_ context.Context, w io.Writer) error {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-	var sb strings.Builder
 	for k, v := range sm.data {
-		fmt.Fprintf(&sb, "%s\t%s\n", k, v)
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", k, v); err != nil {
+			return err
+		}
 	}
-	return []byte(sb.String()), nil
+	return nil
 }
 
 // Restore replaces the map with the snapshot contents.
-func (sm *kvSM) Restore(_ context.Context, _ raft.SnapshotMeta, data []byte) error {
+func (sm *kvSM) Restore(_ context.Context, meta raft.SnapshotMeta, r io.Reader) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.data = make(map[string]string)
-	for _, line := range strings.Split(string(data), "\n") {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
 		if line == "" {
 			continue
 		}
@@ -268,5 +274,5 @@ func (sm *kvSM) Restore(_ context.Context, _ raft.SnapshotMeta, data []byte) err
 			sm.data[parts[0]] = parts[1]
 		}
 	}
-	return nil
+	return scanner.Err()
 }

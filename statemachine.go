@@ -1,6 +1,9 @@
 package raft
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // StateMachine is the application-level state machine driven by Raft.
 // Implementations must be deterministic: applying the same sequence of
@@ -13,12 +16,13 @@ type StateMachine interface {
 	// the result that will be delivered to the client that proposed it.
 	Apply(ctx context.Context, entry LogEntry) (result []byte, err error)
 
-	// Snapshot serialises the current state machine state into a byte slice.
+	// Snapshot serialises the current state machine state into writer.
 	// The snapshot is taken at the given log index and term, which should
 	// match the last applied entry.
-	Snapshot(ctx context.Context) (data []byte, err error)
+	Snapshot(ctx context.Context, w io.Writer) error
 
-	// Restore replaces the current state machine state with the supplied
-	// snapshot. Called when installing a snapshot received from the leader.
-	Restore(ctx context.Context, meta SnapshotMeta, data []byte) error
+	// Restore replaces the current state machine state with the snapshot
+	// read from reader. Called when installing a snapshot received from
+	// the leader.
+	Restore(ctx context.Context, meta SnapshotMeta, r io.Reader) error
 }

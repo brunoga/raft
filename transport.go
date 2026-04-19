@@ -4,6 +4,7 @@ import "context"
 
 // RequestVoteRequest is sent by a Candidate to gather votes.
 type RequestVoteRequest struct {
+	GroupID      uint64
 	Term         Term
 	CandidateID  NodeID
 	LastLogIndex Index
@@ -21,6 +22,7 @@ type RequestVoteResponse struct {
 // AppendEntriesRequest is sent by the Leader to replicate log entries and as a
 // heartbeat (Entries == nil).
 type AppendEntriesRequest struct {
+	GroupID      uint64
 	Term         Term
 	LeaderID     NodeID
 	PrevLogIndex Index
@@ -47,6 +49,7 @@ type AppendEntriesResponse struct {
 // InstallSnapshotRequest is sent by the Leader to bring a lagging follower
 // up to date via a snapshot transfer.
 type InstallSnapshotRequest struct {
+	GroupID           uint64
 	Term              Term
 	LeaderID          NodeID
 	LastIncludedIndex Index
@@ -64,6 +67,7 @@ type InstallSnapshotResponse struct {
 // TimeoutNowRequest asks the target to start an election immediately
 // (used for leadership transfer).
 type TimeoutNowRequest struct {
+	GroupID  uint64
 	Term     Term
 	LeaderID NodeID
 }
@@ -76,7 +80,8 @@ type TimeoutNowResponse struct {
 // ReadIndexRequest is sent by a Follower to the Leader to get a linearizable
 // read index.
 type ReadIndexRequest struct {
-	Term Term
+	GroupID uint64
+	Term    Term
 }
 
 // ReadIndexResponse is the reply to a ReadIndex RPC.
@@ -107,6 +112,10 @@ type Transport interface {
 	// Register makes a handler available to receive inbound RPCs for the
 	// node identified by id. Multiple nodes may share one Transport in tests.
 	Register(id NodeID, handler Handler)
+
+	// Unregister removes a handler from the transport. Use this when a node
+	// is stopped to prevent memory leaks and stop receiving RPCs.
+	Unregister(id NodeID)
 
 	// Close shuts down the transport and releases all resources.
 	Close() error
