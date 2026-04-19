@@ -383,3 +383,67 @@ func TestStore_ProposeOnce(t *testing.T) {
 		t.Errorf("expected 1, got %d (idempotency failed)", v)
 	}
 }
+
+func TestManager_MultiRaft(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "mgr-multi-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	mgr, err := easyraft.NewManager(
+		easyraft.WithID("n1"),
+		easyraft.WithRaftAddr("127.0.0.1:9098"),
+		easyraft.WithHTTPAddr("127.0.0.1:8088"),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9098"}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s1, _ := mgr.AddStore(1, easyraft.WithDataDir(filepath.Join(tmpDir, "s1")))
+	s2, _ := mgr.AddStore(2, easyraft.WithDataDir(filepath.Join(tmpDir, "s2")))
+
+	if errStart := mgr.Start(); errStart != nil {
+		t.Fatal(errStart)
+	}
+	defer mgr.Stop()
+
+	// Wait for leaders
+	time.Sleep(3 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	c1 := easyraft.AddCollection[string](s1, "data")
+	c2 := easyraft.AddCollection[string](s2, "data")
+
+	if errC1 := c1.Create(ctx, "k1", "v1"); errC1 != nil {
+		t.Errorf("s1 create: %v", errC1)
+	}
+	if errC2 := c2.Create(ctx, "k1", "v2"); errC2 != nil {
+		t.Errorf("s2 create: %v", errC2)
+	}
+
+	// Verify isolation
+	v1, _ := c1.Read(ctx, "k1")
+	if v1 != "v1" {
+		t.Errorf("s1: expected v1, got %s", v1)
+	}
+	v2, _ := c2.Read(ctx, "k1")
+	if v2 != "v2" {
+		t.Errorf("s2: expected v2, got %s", v2)
+	}
+
+	// Test HTTP routing for Multi-Raft
+	resp, err := http.Get("http://127.0.0.1:8088/groups/1/data/k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP group 1: expected 200, got %d", resp.StatusCode)
+	}
+}
