@@ -1,9 +1,13 @@
 package easyraft
 
 import (
+	"crypto/tls"
 	"log/slog"
+	"time"
 
 	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/discovery"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Config holds the configuration for an EasyRaft node.
@@ -15,6 +19,11 @@ type Config struct {
 	Peers     map[raft.NodeID]string
 	Logger    *slog.Logger
 	SnapCount uint64
+
+	Discovery         discovery.Discovery
+	DiscoveryInterval time.Duration
+	TLS               *tls.Config
+	PromRegisterer    prometheus.Registerer
 }
 
 // Option configures an EasyRaft node.
@@ -56,4 +65,26 @@ func WithPeers(peers map[raft.NodeID]string) Option {
 // WithLogger sets a custom logger.
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Config) { c.Logger = logger }
+}
+
+// WithDiscovery sets a custom discovery mechanism.
+func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
+	return func(c *Config) {
+		c.Discovery = d
+		c.DiscoveryInterval = interval
+	}
+}
+
+// WithTLS sets the TLS configuration for Raft RPCs.
+func WithTLS(tlsCfg *tls.Config) Option {
+	return func(c *Config) {
+		c.TLS = tlsCfg
+	}
+}
+
+// WithPrometheus sets the Prometheus registerer.
+func WithPrometheus(reg prometheus.Registerer) Option {
+	return func(c *Config) {
+		c.PromRegisterer = reg
+	}
 }
