@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/brunoga/raft"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -268,12 +269,146 @@ func (s *Store) writeError(w http.ResponseWriter, code int, msg string) {
 	}{Error: msg})
 }
 
+func (m *Manager) serveHTTP() error {
+	if m.cfg.HTTPAddr == "" {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+
+	// Multi-Raft routing: /groups/{groupID}/{collection}/{key}
+	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", m.handleCreate)
+	mux.HandleFunc("GET /groups/{groupID}/{collection}/{key}", m.handleRead)
+	mux.HandleFunc("PUT /groups/{groupID}/{collection}/{key}", m.handleUpdate)
+	mux.HandleFunc("DELETE /groups/{groupID}/{collection}/{key}", m.handleDelete)
+	mux.HandleFunc("GET /groups/{groupID}/{collection}", m.handleList)
+	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}/mutate", m.handleMutate)
+
+	mux.HandleFunc("GET /status", m.handleStatus)
+	mux.HandleFunc("GET /health", m.handleHealth)
+	mux.Handle("GET /metrics", promhttp.Handler())
+
+	m.httpServer = &http.Server{
+		Addr:         m.cfg.HTTPAddr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	}
+
+	go func() {
+		if err := m.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if m.cfg.Logger != nil {
+				m.cfg.Logger.Error("Manager HTTP server failed", "err", err)
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (m *Manager) getStore(r *http.Request) (*Store, error) {
+	gidStr := r.PathValue("groupID")
+	var gid uint64
+	if _, err := fmt.Sscanf(gidStr, "%d", &gid); err != nil {
+		return nil, fmt.Errorf("invalid groupID: %w", err)
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.stores[gid]
+	if !ok {
+		return nil, raft.ErrGroupNotFound
+	}
+	return s, nil
+}
+
+func (m *Manager) handleCreate(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		m.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.handleCreate(w, r)
+}
+
+func (m *Manager) handleRead(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		m.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.handleRead(w, r)
+}
+
+func (m *Manager) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		m.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.handleUpdate(w, r)
+}
+
+func (m *Manager) handleDelete(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		m.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.handleDelete(w, r)
+}
+
+func (m *Manager) handleList(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		m.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.handleList(w, r)
+}
+
+func (m *Manager) handleMutate(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		m.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	s.handleMutate(w, r)
+}
+
+func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := m.mgr.StatusAll()
+	m.writeJSON(w, http.StatusOK, status)
+}
+
+func (m *Manager) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+}
+
 func (s *Store) writeJSON(w http.ResponseWriter, code int, val any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(val); err != nil {
 		if s.cfg.Logger != nil {
 			s.cfg.Logger.Error("HTTP encode failed", "err", err)
+		}
+	}
+}
+
+func (m *Manager) writeError(w http.ResponseWriter, code int, msg string) {
+	m.writeJSON(w, code, struct {
+		Error string `json:"error"`
+	}{Error: msg})
+}
+
+func (m *Manager) writeJSON(w http.ResponseWriter, code int, val any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(val); err != nil {
+		if m.cfg.Logger != nil {
+			m.cfg.Logger.Error("Manager HTTP encode failed", "err", err)
 		}
 	}
 }
