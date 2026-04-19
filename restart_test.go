@@ -724,7 +724,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		tick()
-		if leader.LastApplied() >= numEntries {
+		if leader.LastApplied() > raft.Index(numEntries) {
 			// Give the snapshot goroutine a moment to fire.
 			for j := 0; j < 20; j++ {
 				tick()
@@ -747,14 +747,16 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		for range 5 {
 			tick()
 		}
-		if nodes[lagIdx].LastApplied() >= raft.Index(numEntries) {
+		// Wait for LastApplied > numEntries because the leader's initial no-op entry takes index 1.
+		// Therefore, the 10th proposal is actually at index 11.
+		if nodes[lagIdx].LastApplied() > raft.Index(numEntries) {
 			break
 		}
 	}
 
 	lagApplied := nodes[lagIdx].LastApplied()
-	if lagApplied < raft.Index(numEntries) {
-		t.Errorf("lagging follower lastApplied=%d, want >= %d", lagApplied, numEntries)
+	if lagApplied <= raft.Index(numEntries) {
+		t.Errorf("lagging follower lastApplied=%d, want > %d", lagApplied, numEntries)
 	}
 
 	// Verify the state machine reflects the committed entries.
