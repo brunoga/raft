@@ -363,8 +363,14 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 }
 
+// Status returns the current status of the underlying Raft node.
+func (s *Store) Status() raft.GroupStatus {
+	return s.node.Status()
+}
+
 // Stop shuts down the store and releases all resources.
 func (s *Store) Stop() {
+
 	if s.cancel != nil {
 		s.cancel()
 	}

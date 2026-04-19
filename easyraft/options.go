@@ -67,6 +67,13 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(c *Config) { c.Logger = logger }
 }
 
+// WithSnapCount sets the number of log entries between snapshots.
+func WithSnapCount(count uint64) Option {
+	return func(c *Config) {
+		c.SnapCount = count
+	}
+}
+
 // WithDiscovery sets a custom discovery mechanism.
 func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
 	return func(c *Config) {
