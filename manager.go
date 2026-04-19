@@ -246,6 +246,17 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// TransferGroupLeadership asks the node managing groupID to transfer leadership
+// to the peer identified by to. Returns ErrGroupNotFound if groupID is not
+// registered. All other errors come from Node.TransferLeadership.
+func (m *Manager) TransferGroupLeadership(ctx context.Context, groupID uint64, to NodeID) error {
+	n, err := m.Get(groupID)
+	if err != nil {
+		return err
+	}
+	return n.TransferLeadership(ctx, to)
+}
+
 // StatusAll returns a point-in-time snapshot of every registered group's
 // state. The slice order is not guaranteed.
 //
