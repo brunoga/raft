@@ -56,7 +56,7 @@ func (n *Node) handleReadIndex(msg readIndexMsg) {
 	// Single-node cluster: we are the only member, so we are trivially the
 	// leader and there is no previous leader that could have committed entries
 	// we have not yet accounted for; resolve immediately.
-	if len(n.cfg.Peers) == 0 {
+	if n.isSingleVoter() {
 		msg.resolver.resolve(n.commitIndex)
 		return
 	}
@@ -132,7 +132,8 @@ func (n *Node) handleReadIndexRPC(req *ReadIndexRequest, respCh chan rpcResponse
 func (n *Node) broadcastReadBarrier() {
 	n.leaseSendTime = n.now()
 	for _, peer := range n.cfg.Peers {
-		prevIdx := n.nextIndex[peer] - 1
+		id := peer.ID
+		prevIdx := n.nextIndex[id] - 1
 		prevTerm, _ := n.log.termAt(n.stopCtx, prevIdx)
 		req := &AppendEntriesRequest{
 			GroupID:      n.cfg.GroupID,
@@ -152,18 +153,19 @@ func (n *Node) broadcastReadBarrier() {
 			if err != nil || resp == nil {
 				return
 			}
+
 			select {
 			case n.rpcCh <- rpcEnvelope{
 				req: &appendResult{
 					peer:    p,
-					term:    resp.Term,
-					success: resp.Success,
 					req:     r,
+					success: resp.Success,
+					term:    resp.Term,
 				},
 			}:
-			case <-n.stopCtx.Done():
+			case <-n.stopCh:
 			}
-		}(peer, req)
+		}(id, req)
 	}
 }
 

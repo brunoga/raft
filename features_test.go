@@ -422,7 +422,7 @@ func TestJoint_ShrinkToSingleNode(t *testing.T) {
 
 	rcDone := make(chan error, 1)
 	go func() {
-		rcDone <- leader.ReconfigureCluster(ctx, []raft.NodeID{leader.ID()})
+		rcDone <- leader.ReconfigureCluster(ctx, []raft.PeerConfig{{ID: leader.ID(), Voter: true}})
 	}()
 
 	deadline := time.Now().Add(2 * electionTimeout)
@@ -475,7 +475,10 @@ func TestJoint_ShrinkByOne(t *testing.T) {
 
 	rcDone := make(chan error, 1)
 	go func() {
-		rcDone <- leader.ReconfigureCluster(ctx, []raft.NodeID{leader.ID(), keepID})
+		rcDone <- leader.ReconfigureCluster(ctx, []raft.PeerConfig{
+			{ID: leader.ID(), Voter: true},
+			{ID: keepID, Voter: true},
+		})
 	}()
 
 	deadline := time.Now().Add(2 * electionTimeout)
@@ -513,10 +516,10 @@ func TestJoint_ReplaceOnePeer(t *testing.T) {
 	var nodes []*raft.Node
 
 	for i, id := range ids {
-		peers := make([]raft.NodeID, 0, len(ids)-1)
+		peers := make([]raft.PeerConfig, 0, len(ids)-1)
 		for j, p := range ids {
 			if j != i {
-				peers = append(peers, p)
+				peers = append(peers, raft.PeerConfig{ID: p, Voter: true})
 			}
 		}
 		tr := net.NewTransport(id)
@@ -577,7 +580,11 @@ elected:
 	n4SM := &kvSM{data: make(map[string]string)}
 	n4Cfg := raft.DefaultConfig()
 	n4Cfg.ID = n4ID
-	n4Cfg.Peers = []raft.NodeID{"n1", "n2", "n3"} // initial peers (will be updated by config entries)
+	n4Cfg.Peers = []raft.PeerConfig{
+		{ID: "n1", Voter: true},
+		{ID: "n2", Voter: true},
+		{ID: "n3", Voter: true},
+	} // initial peers (will be updated by config entries)
 	n4Cfg.Storage = n4Store
 	n4Cfg.StateMachine = n4SM
 	n4Cfg.Transport = n4TR
@@ -602,7 +609,10 @@ elected:
 
 	rcDone := make(chan error, 1)
 	go func() {
-		rcDone <- leaderNode.ReconfigureCluster(ctx, []raft.NodeID{leaderNode.ID(), n4ID})
+		rcDone <- leaderNode.ReconfigureCluster(ctx, []raft.PeerConfig{
+			{ID: leaderNode.ID(), Voter: true},
+			{ID: n4ID, Voter: true},
+		})
 	}()
 
 	deadline = time.Now().Add(3 * electionTimeout)
@@ -657,10 +667,10 @@ func TestJoint_LeaderRemoval(t *testing.T) {
 	leaderID := c.ids[leaderIdx]
 
 	// Identify the two peers that will remain.
-	var remainIDs []raft.NodeID
+	var remainIDs []raft.PeerConfig
 	for _, id := range c.ids {
 		if id != leaderID {
-			remainIDs = append(remainIDs, id)
+			remainIDs = append(remainIDs, raft.PeerConfig{ID: id, Voter: true})
 		}
 	}
 

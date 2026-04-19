@@ -55,10 +55,10 @@ func newMRCluster(t testing.TB, numGroups, numPhysical int) *mrCluster {
 
 		for p := range numPhysical {
 			id := allIDs[p]
-			peers := make([]raft.NodeID, 0, numPhysical-1)
+			peers := make([]raft.PeerConfig, 0, numPhysical-1)
 			for _, pid := range allIDs {
 				if pid != id {
-					peers = append(peers, pid)
+					peers = append(peers, raft.PeerConfig{ID: pid, Voter: true})
 				}
 			}
 			sm := &kvSM{data: make(map[string]string)}
@@ -286,10 +286,10 @@ func TestMultiRaft_ThreeGroups_ThreeNodes(t *testing.T) {
 
 		for p := range numPhysical {
 			id := allIDs[p]
-			peers := make([]raft.NodeID, 0, numPhysical-1)
+			peers := make([]raft.PeerConfig, 0, numPhysical-1)
 			for _, pid := range allIDs {
 				if pid != id {
-					peers = append(peers, pid)
+					peers = append(peers, raft.PeerConfig{ID: pid, Voter: true})
 				}
 			}
 			cfg := raft.DefaultConfig()

@@ -342,12 +342,12 @@ func TestManager_RemoveGraceful(t *testing.T) {
 	for i := range numNodes {
 		id := raft.NodeID(fmt.Sprintf("n%d", i+1))
 		ids[i] = id
-		peers := make([]raft.NodeID, 0, numNodes-1)
+		peers := make([]raft.PeerConfig, 0, numNodes-1)
 		for j := range numNodes {
 			if i == j {
 				continue
 			}
-			peers = append(peers, raft.NodeID(fmt.Sprintf("n%d", j+1)))
+			peers = append(peers, raft.PeerConfig{ID: raft.NodeID(fmt.Sprintf("n%d", j+1)), Voter: true})
 		}
 		sm := &kvSM{data: make(map[string]string)}
 		sms[i] = sm
@@ -487,12 +487,13 @@ func TestManager_RemoveGraceful_Race(t *testing.T) {
 	transports := make(map[raft.NodeID]*delayedTransport)
 
 	for _, id := range peers {
-		others := make([]raft.NodeID, 0, 2)
-		for _, p := range peers {
-			if p != id {
-				others = append(others, p)
+		others := make([]raft.PeerConfig, 0, 2)
+		for _, other := range peers {
+			if other != id {
+				others = append(others, raft.PeerConfig{ID: other, Voter: true})
 			}
 		}
+
 		cfg := raft.DefaultConfig()
 		cfg.GroupID = 1
 		cfg.ID = id

@@ -10,6 +10,9 @@ func (n *Node) handleRequestVote(req *RequestVoteRequest) (*RequestVoteResponse,
 	// we would vote.
 	if req.PreVote {
 		resp := &RequestVoteResponse{Term: n.currentTerm}
+		if !n.cfg.Voter {
+			return resp, nil
+		}
 		// Grant pre-vote if: their next-term would be higher than ours, their log
 		// is up-to-date, and we have not heard from a valid leader recently.
 		// "Recently" is defined as: we are a follower whose election timer has
@@ -32,6 +35,13 @@ func (n *Node) handleRequestVote(req *RequestVoteRequest) (*RequestVoteResponse,
 
 	// Real vote: step down if we see a higher term.
 	if req.Term > n.currentTerm {
+		if !n.cfg.Voter {
+			if err := n.saveTerm(req.Term, ""); err != nil {
+				return &RequestVoteResponse{Term: n.currentTerm}, err
+			}
+			n.applyFollowerTransition("")
+			return &RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}, nil
+		}
 		// Determine the vote decision now, before stepping down, so we can
 		// merge the term-update and vote-grant into a single fsync. When the
 		// term increases, votedFor resets to "" (new term), so alreadyVoted is
@@ -57,6 +67,9 @@ func (n *Node) handleRequestVote(req *RequestVoteRequest) (*RequestVoteResponse,
 
 	// Grant vote if we haven't voted yet (or already voted for this candidate)
 	// and the candidate's log is at least as up-to-date as ours.
+	if !n.cfg.Voter {
+		return resp, nil
+	}
 	alreadyVoted := n.votedFor != "" && n.votedFor != req.CandidateID
 	logOK := n.log.isUpToDate(req.LastLogIndex, req.LastLogTerm)
 	if !alreadyVoted && logOK {
@@ -101,6 +114,10 @@ func (n *Node) broadcastRequestVote(preVote bool) {
 	}
 
 	for _, peer := range n.cfg.Peers {
+		if !peer.Voter {
+			continue
+		}
+		p := peer.ID
 		go func(p NodeID) {
 			ctx, cancel := context.WithTimeout(n.stopCtx, n.rpcTimeout())
 			defer cancel()
@@ -118,13 +135,13 @@ func (n *Node) broadcastRequestVote(preVote bool) {
 					peerID:       p,
 					term:         resp.Term,
 					voteGranted:  resp.VoteGranted,
-					electionTerm: term,
+					electionTerm: req.Term,
 					preVote:      preVote,
 				},
 			}:
-			case <-n.stopCtx.Done():
+			case <-n.stopCh:
 			}
-		}(peer)
+		}(p)
 	}
 }
 
@@ -144,11 +161,11 @@ type voteResult struct {
 func (n *Node) electionWon() bool {
 	if n.jointOld == nil {
 		// Normal single-config: self + voted peers must reach quorum.
-		return hasMajorityAck(n.receivedVoteSet, n.cfg.Peers, true)
+		return hasMajorityAck(n.receivedVoteSet, n.cfg.Peers, true, n.cfg.Voter)
 	}
 	// Joint consensus: both C_old and C_new must independently have a majority.
-	return hasMajorityAck(n.receivedVoteSet, n.jointOld, true) &&
-		hasMajorityAck(n.receivedVoteSet, n.jointNew, n.jointIncludeSelf)
+	return hasMajorityAck(n.receivedVoteSet, n.jointOld, true, true) &&
+		hasMajorityAck(n.receivedVoteSet, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 }
 
 func (n *Node) handleVoteResult(r *voteResult) {
@@ -159,33 +176,30 @@ func (n *Node) handleVoteResult(r *voteResult) {
 			return
 		}
 		if r.term > n.currentTerm {
-			// Peer is in a higher term; step down to follower.
 			n.becomeFollower(r.term, "")
 			return
 		}
-		if !r.voteGranted {
-			return
-		}
-		n.receivedVoteSet[r.peerID] = true
-		if n.electionWon() {
-			n.becomeCandidate()
+		if r.voteGranted {
+			n.receivedVoteSet[r.peerID] = true
+			if n.electionWon() {
+				n.becomeCandidate()
+			}
 		}
 		return
 	}
 
-	// Real vote: ignore stale replies.
-	if r.electionTerm != n.currentTerm || n.state != Candidate {
-		return
-	}
+	// Real vote: step down if we see a higher term.
 	if r.term > n.currentTerm {
 		n.becomeFollower(r.term, "")
 		return
 	}
-	if !r.voteGranted {
+	if n.state != Candidate || r.term < n.currentTerm {
 		return
 	}
-	n.receivedVoteSet[r.peerID] = true
-	if n.electionWon() {
-		n.becomeLeader()
+	if r.voteGranted {
+		n.receivedVoteSet[r.peerID] = true
+		if n.electionWon() {
+			n.becomeLeader()
+		}
 	}
 }
