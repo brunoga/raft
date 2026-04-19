@@ -52,7 +52,7 @@ func TestWitness_QuorumExclusion(t *testing.T) {
 		}
 		nodes[i] = n
 		n.Start()
-		defer n.Stop()
+		t.Cleanup(n.Stop)
 	}
 
 	// Helper to drive ticks.
@@ -193,7 +193,8 @@ func TestWitness_Promotion(t *testing.T) {
 	}
 
 	// Verify n2 is replicating.
-	if _, err := n1.Propose(ctx, []byte("v1")); err != nil {
+	_, err = n1.Propose(ctx, []byte("v1"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	for range 100 {

@@ -196,13 +196,13 @@ func main() {
 		sms[gid] = sm
 
 		cfg := raft.DefaultConfig()
-		cfg.GroupID = gid                       // stamped on every outbound RPC
-		cfg.ID = shardNodeID(gid, *id)          // unique within the group
+		cfg.GroupID = gid              // stamped on every outbound RPC
+		cfg.ID = shardNodeID(gid, *id) // unique within the group
 		cfg.Peers = peerIDs
 		cfg.Storage = store
 		cfg.StateMachine = sm
-		cfg.Transport = tr                       // shared: one port for all shards
-		cfg.TickInterval = 0                     // driven by mgr.RunTicker below
+		cfg.Transport = tr   // shared: one port for all shards
+		cfg.TickInterval = 0 // driven by mgr.RunTicker below
 		cfg.Logger = logger
 
 		node, err := raft.New(&cfg)

@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	testNumPhysical    = 3
-	testNumShards      = uint64(4)
+	testNumPhysical     = 3
+	testNumShards       = uint64(4)
 	testElectionTimeout = 5 * time.Second
 )
 
