@@ -1,9 +1,11 @@
-# shardkv — sharded key-value store (multi-raft example)
+# shardkv — sharded key-value store (multi-raft + leader balancing example)
 
 `shardkv` is a horizontally-sharded key-value store built on the `raft` package.
 It is the canonical **multi-raft** example: N independent Raft groups (shards)
 run on each physical node, all sharing one gRPC transport and driven by one
-central `Manager` ticker.
+central `Manager` ticker. A `BalanceController` runs on every node and
+automatically redistributes shard leaders across physical nodes using the
+`HTTPNodeProvider` to build a cross-machine view.
 
 ## What multi-raft means here
 
@@ -47,6 +49,26 @@ cfg.Transport = tr    // same transport for all shards
 // One ticker drives all shard nodes on this machine.
 go mgr.RunTicker(ctx, 10*time.Millisecond)
 ```
+
+The leader balancing wiring:
+
+```go
+// Local node contributes its Manager directly; peers are reached via HTTP.
+providers := map[raft.NodeID]raft.NodeProvider{
+    raft.NodeID("p1"): mgr,  // in-process, no HTTP hop
+    raft.NodeID("p2"): raft.NewHTTPNodeProvider("http://peer2:8002/raft", nil),
+    raft.NodeID("p3"): raft.NewHTTPNodeProvider("http://peer3:8003/raft", nil),
+}
+
+// LeastLeadersBalancer moves leaders from the busiest node to the least-busy
+// until all physical nodes differ by at most 1 leader.
+ctrl := raft.NewBalanceController(providers, raft.LeastLeadersBalancer{}, 30*time.Second)
+go ctrl.Run(ctx)
+```
+
+The `/raft/status` and `/raft/transfer` HTTP endpoints are mounted automatically
+from `Manager.Handler()` and are the only cross-machine surface the balance
+controller needs.
 
 ### What multi-raft does and does not provide
 
@@ -126,6 +148,36 @@ curl -s http://localhost:8001/shards | jq
 ```
 
 ## HTTP API
+
+### `GET /raft/status`
+
+Returns a JSON array of `GroupStatus` objects — one per shard hosted on this
+node. Used by `HTTPNodeProvider` to build the cross-machine view for the
+`BalanceController`.
+
+```bash
+curl -s http://localhost:8001/raft/status | jq
+# [
+#   {"group_id":1,"node_id":"g1-p1","state":"Leader","term":2,"last_applied":15},
+#   {"group_id":2,"node_id":"g2-p1","state":"Follower","term":1,"last_applied":15},
+#   ...
+# ]
+```
+
+### `POST /raft/transfer`
+
+Transfers leadership of a shard to a specific node. Called by the
+`BalanceController` when it decides to move a leader.
+
+```bash
+curl -s -X POST http://localhost:8001/raft/transfer \
+     -H 'Content-Type: application/json' \
+     -d '{"group_id": 1, "to": "g1-p2"}'
+# 204 No Content
+```
+
+Returns `204 No Content` on success, `404 Not Found` when the group is not
+registered on this node, and `400 Bad Request` for malformed JSON.
 
 ### `PUT /keys/{key}`
 
@@ -217,7 +269,8 @@ curl -s http://localhost:8001/status | jq
 | `--raft-addr` | `:7001` | gRPC listen address shared by all shards on this node |
 | `--http-addr` | `:8001` | HTTP listen address for client requests |
 | `--data-dir` | required | Root directory for persistent shard state; each shard writes to `<data-dir>/shards/<id>/` |
-| `--peer physID=raftAddr[,httpAddr]` | (repeatable) | Peer physical node: ID, its Raft gRPC address, and optionally its HTTP address for write redirects |
+| `--balance-interval` | `30s` | How often the `BalanceController` checks and adjusts leader distribution; `0` disables balancing |
+| `--peer physID=raftAddr[,httpAddr]` | (repeatable) | Peer physical node: ID, its Raft gRPC address, and optionally its HTTP address for write redirects and leader-balance queries |
 
 All nodes must use the same `--shards` value and list the same peers. Nodes may
 be started in any order.
@@ -236,9 +289,12 @@ left as application-layer concerns.
 
 ## Operational notes
 
-- **Leader distribution**: each shard elects its own leader independently. On
-  a healthy cluster the four leaders will typically spread across the three nodes
-  rather than concentrating on one.
+- **Leader balancing**: the `BalanceController` runs on every node and calls
+  `GET /raft/status` on all peers every `--balance-interval` to build a
+  cross-machine view. It then uses `LeastLeadersBalancer` to move leaders from
+  the most-loaded node to the least-loaded until all nodes differ by at most 1.
+  At most one transfer per shard is in-flight at a time; failed transfers are
+  retried on the next interval. Set `--balance-interval=0` to disable.
 - **Shard failure isolation**: if one shard's nodes lose quorum (e.g. two of the
   three replicas are unreachable), that shard stops accepting writes but the
   other three shards continue normally.
