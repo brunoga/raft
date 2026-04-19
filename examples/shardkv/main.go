@@ -1,7 +1,9 @@
 // shardkv is a horizontally-sharded key-value store that demonstrates the
 // multi-Raft pattern: N independent Raft groups (shards) running on each
 // physical node, all sharing one gRPC transport and driven by one central
-// Manager ticker.
+// Manager ticker.  A BalanceController runs on every node and uses
+// HTTPNodeProvider to query all peers' leader distributions, then transfers
+// leaders to keep the count roughly equal across physical nodes.
 //
 // Each key is deterministically mapped to a shard by FNV-32a hash. Shards
 // elect independent leaders and replicate concurrently; an outage in one shard
@@ -28,6 +30,8 @@
 //	DELETE /keys/{key}      — delete key (404 when absent)
 //	GET    /shards          — live status of all shards on this node
 //	GET    /status          — this node's physical configuration
+//	GET    /raft/status     — leader-balance status (JSON array of GroupStatus)
+//	POST   /raft/transfer   — trigger a leadership transfer ({"group_id":N,"to":"nodeID"})
 //
 // Writes that land on a follower for the key's shard are redirected (307) to
 // the shard leader. Reads use ReadIndex and succeed on any replica.
@@ -85,12 +89,13 @@ func shardForKey(key string, numShards uint64) uint64 {
 
 func main() {
 	var (
-		id        = flag.String("id", "", "this physical node's unique ID (required)")
-		numShards = flag.Uint64("shards", 4, "number of Raft shard groups (same on every node)")
-		raftAddr  = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs (shared across all shards)")
-		httpAddr  = flag.String("http-addr", ":8001", "HTTP listen address for client API")
-		dataDir   = flag.String("data-dir", "", "root directory for persistent shard state (required)")
-		peers     peerFlag
+		id              = flag.String("id", "", "this physical node's unique ID (required)")
+		numShards       = flag.Uint64("shards", 4, "number of Raft shard groups (same on every node)")
+		raftAddr        = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs (shared across all shards)")
+		httpAddr        = flag.String("http-addr", ":8001", "HTTP listen address for client API")
+		dataDir         = flag.String("data-dir", "", "root directory for persistent shard state (required)")
+		balanceInterval = flag.Duration("balance-interval", 30*time.Second, "how often the leader-balance controller runs; 0 disables balancing")
+		peers           peerFlag
 	)
 	flag.Var(&peers, "peer", "peer in the form physID=raftAddr[,httpAddr] (repeatable)")
 	flag.Parse()
@@ -216,6 +221,30 @@ func main() {
 	// ticks in parallel using a worker pool sized to min(GOMAXPROCS, numShards).
 	go mgr.RunTicker(ctx, 10*time.Millisecond)
 
+	// BalanceController: keep shard leaders spread evenly across physical nodes.
+	// The local node contributes its Manager directly; remote peers are reached
+	// via HTTP using the /raft/status and /raft/transfer endpoints that
+	// Manager.Handler() exposes (mounted at /raft/ in buildMux below).
+	if *balanceInterval > 0 {
+		providers := make(map[raft.NodeID]raft.NodeProvider, 1+len(peerMap))
+		providers[raft.NodeID(*id)] = mgr // local: in-process, no HTTP hop
+		for physID, pi := range peerMap {
+			if pi.httpAddr != "" {
+				base := pi.httpAddr
+				if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+					base = "http://" + base
+				}
+				providers[raft.NodeID(physID)] = raft.NewHTTPNodeProvider(base+"/raft", nil)
+			}
+		}
+		if len(providers) > 1 {
+			ctrl := raft.NewBalanceController(providers, raft.LeastLeadersBalancer{}, *balanceInterval)
+			go ctrl.Run(ctx)
+			logger.Info("shardkv: leader balance controller started",
+				"interval", *balanceInterval, "nodes", len(providers))
+		}
+	}
+
 	srv := &http.Server{
 		Addr:         *httpAddr,
 		Handler:      buildMux(*id, *numShards, mgr, sms, nodeHTTPAddr),
@@ -253,6 +282,11 @@ func buildMux(
 	nodeHTTPAddr map[raft.NodeID]string,
 ) http.Handler {
 	mux := http.NewServeMux()
+
+	// /raft/ — leader-balance HTTP endpoints exposed by Manager.Handler().
+	// GET  /raft/status   → Manager.StatusAll() as JSON (used by HTTPNodeProvider)
+	// POST /raft/transfer → Manager.TransferGroupLeadership (used by BalanceController)
+	mux.Handle("/raft/", http.StripPrefix("/raft", mgr.Handler()))
 
 	// PUT /keys/{key}
 	//
