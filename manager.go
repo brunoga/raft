@@ -23,11 +23,11 @@ var ErrGroupExists = errors.New("raft: group already exists")
 // this physical node. It is used by Manager.StatusAll and by the leader
 // balancing controller (§22).
 type GroupStatus struct {
-	GroupID     uint64
-	NodeID      NodeID
-	State       State
-	Term        Term
-	LastApplied Index
+	GroupID     uint64 `json:"group_id"`
+	NodeID      NodeID `json:"node_id"`
+	State       State  `json:"state"`
+	Term        Term   `json:"term"`
+	LastApplied Index  `json:"last_applied"`
 }
 
 // Manager multiplexes multiple independent Raft groups on a single physical

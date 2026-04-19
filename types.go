@@ -2,7 +2,10 @@
 // algorithm implementation.
 package raft
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // NodeID uniquely identifies a node in the cluster.
 type NodeID string
@@ -36,6 +39,29 @@ func (s State) String() string {
 	default:
 		return "Unknown"
 	}
+}
+
+// MarshalText implements encoding.TextMarshaler so that State serialises as a
+// human-readable string (e.g. "Leader") in JSON and other text formats.
+func (s State) MarshalText() ([]byte, error) {
+	return []byte(s.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler, reversing MarshalText.
+func (s *State) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case "Follower":
+		*s = Follower
+	case "Candidate":
+		*s = Candidate
+	case "Leader":
+		*s = Leader
+	case "PreCandidate":
+		*s = PreCandidate
+	default:
+		return fmt.Errorf("raft: unknown State %q", string(text))
+	}
+	return nil
 }
 
 // LogEntry is a single record in the Raft log.
