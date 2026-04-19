@@ -48,7 +48,7 @@ func (f *fakePeerAdder) get(id raft.NodeID) (string, bool) {
 // lateJoiner adds a new Raft node to an existing idpCluster's in-memory
 // network WITHOUT adding it to the initial peer lists of the existing nodes.
 // It returns the new node; the caller is responsible for stopping it.
-func lateJoiner(t *testing.T, c *idpCluster, id raft.NodeID, knownPeers []raft.NodeID) *raft.Node {
+func lateJoiner(t *testing.T, c *idpCluster, id raft.NodeID, knownPeers []raft.PeerConfig) *raft.Node {
 	t.Helper()
 	sm := &IDSM{domains: make(map[string]uint64)}
 	cfg := raft.DefaultConfig()
@@ -113,7 +113,10 @@ func TestRaftPeerAdder_AddsToMembership(t *testing.T) {
 	leaderIdx := c.LeaderIdx()
 
 	// n3 starts knowing about n1+n2 but is not in their membership yet.
-	existingIDs := []raft.NodeID{c.nodes[0].ID(), c.nodes[1].ID()}
+	existingIDs := []raft.PeerConfig{
+		{ID: c.nodes[0].ID(), Voter: true},
+		{ID: c.nodes[1].ID(), Voter: true},
+	}
 	n3 := lateJoiner(t, c, "n3-member", existingIDs)
 	defer n3.Stop()
 
@@ -157,9 +160,9 @@ func TestDiscoveryAgent_LateJoinerJoinsCluster(t *testing.T) {
 	leaderIdx := c.LeaderIdx()
 
 	// n3 starts with n1+n2 as known peers but is not in their membership.
-	existingIDs := make([]raft.NodeID, len(c.nodes))
+	existingIDs := make([]raft.PeerConfig, len(c.nodes))
 	for i, nd := range c.nodes {
-		existingIDs[i] = nd.ID()
+		existingIDs[i] = raft.PeerConfig{ID: nd.ID(), Voter: true}
 	}
 	n3 := lateJoiner(t, c, "n3-late", existingIDs)
 	defer n3.Stop()
@@ -205,8 +208,12 @@ func TestDNSDiscovery_ThreeNodeCluster(t *testing.T) {
 	c := newIDPCluster(t, 2)
 	leaderIdx := c.LeaderIdx()
 
-	// n3 starts knowing about n1 and n2 but is not in their membership yet.
-	existingIDs := []raft.NodeID{c.nodes[0].ID(), c.nodes[1].ID()}
+	// n3 starts knowing about n1+n2 but is not in their membership yet.
+	existingIDs := []raft.PeerConfig{
+		{ID: c.nodes[0].ID(), Voter: true},
+		{ID: c.nodes[1].ID(), Voter: true},
+	}
+
 	n3 := lateJoiner(t, c, "n3-dns", existingIDs)
 	defer n3.Stop()
 
@@ -254,7 +261,7 @@ func TestDiscoveryAgent_MultipleNewPeers(t *testing.T) {
 	discoveryPeers := make([]discovery.PeerInfo, numLate)
 	for i := range numLate {
 		id := raft.NodeID(fmt.Sprintf("late-%d", i+1))
-		lateNodes[i] = lateJoiner(t, c, id, []raft.NodeID{c.nodes[0].ID()})
+		lateNodes[i] = lateJoiner(t, c, id, []raft.PeerConfig{{ID: c.nodes[0].ID(), Voter: true}})
 		t.Cleanup(lateNodes[i].Stop)
 		discoveryPeers[i] = discovery.PeerInfo{ID: id, Addr: "unused:0"}
 	}
