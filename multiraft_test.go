@@ -608,3 +608,107 @@ func TestChaos_MultiRaft_PhysicalNodePartition(t *testing.T) {
 		}
 	}
 }
+
+// ---- TestChaos_MultiRaft_MessageDrops ----------------------------------------
+
+// TestChaos_MultiRaft_MessageDrops simulates a flaky network by randomly
+// partitioning and healing individual (group, physical) nodes across 10 Raft
+// groups. The cluster must remain available (proposals succeed) and all replicas
+// must converge on each group's last written value after chaos ends.
+func TestChaos_MultiRaft_MessageDrops(t *testing.T) {
+	if testing.Short() {
+		t.Skip("chaos test skipped in short mode")
+	}
+
+	const (
+		numGroups   = 10
+		numPhysical = 3
+		totalTicks  = 400
+	)
+
+	c := newMRCluster(t, numGroups, numPhysical)
+	c.WaitAllLeaders(electionTimeout)
+
+	rng := rand.New(rand.NewPCG(7, 0))
+
+	// last[g] is the last value successfully written to key "drop" in group g.
+	last := make([]string, numGroups)
+	// lastTick[g] is the tick of the last successful propose to group g.
+	lastTick := make([]int, numGroups)
+	for g := range numGroups {
+		lastTick[g] = -(numGroups * 2) // allow an immediate first propose
+	}
+
+	for tick := range totalTicks {
+		// Randomly disconnect/reconnect a single (group, physical) node.
+		if rng.IntN(10) == 0 {
+			g := rng.IntN(numGroups)
+			p := rng.IntN(numPhysical)
+			c.DisconnectNode(g, p)
+			c.TickN(3)
+			c.ReconnectNode(g, p)
+		}
+
+		c.Tick()
+		time.Sleep(time.Millisecond)
+
+		// Cycle through groups in round-robin, proposing to each every ~20 ticks.
+		g := tick % numGroups
+		if tick-lastTick[g] >= numGroups*2 {
+			cmd := fmt.Appendf(nil, "drop=%d", tick)
+			if err := c.ProposeToGroup(g, electionTimeout/4, cmd); err == nil {
+				last[g] = fmt.Sprintf("%d", tick)
+				lastTick[g] = tick
+			}
+		}
+	}
+
+	// At least one group must have accepted proposals during the chaos window.
+	proposed := 0
+	for g := range numGroups {
+		if last[g] != "" {
+			proposed++
+		}
+	}
+	if proposed == 0 {
+		t.Fatal("no proposals succeeded during chaos test")
+	}
+
+	// Tick until every replica of every group has applied its group's last entry.
+	deadline := time.Now().Add(electionTimeout)
+	for time.Now().Before(deadline) {
+		c.Tick()
+		time.Sleep(time.Millisecond)
+
+		allConverged := true
+		for g := range numGroups {
+			if last[g] == "" {
+				continue
+			}
+			for p := range numPhysical {
+				if c.sms[g][p].Get("drop") != last[g] {
+					allConverged = false
+					break
+				}
+			}
+			if !allConverged {
+				break
+			}
+		}
+		if allConverged {
+			return
+		}
+	}
+
+	// Report which replicas are still behind.
+	for g := range numGroups {
+		if last[g] == "" {
+			continue
+		}
+		for p := range numPhysical {
+			if got := c.sms[g][p].Get("drop"); got != last[g] {
+				t.Errorf("group %d physical %d: drop=%q, want %q (last written)", g+1, p, got, last[g])
+			}
+		}
+	}
+}
