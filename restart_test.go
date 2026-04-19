@@ -658,9 +658,6 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 5
 		cfg.SnapshotChunkSize = 512 // enough to still force multiple chunks for kvSM
-		// Short RPCTimeout so any snapshot goroutine started while the follower
-		// is partitioned gives up in 4×30ms=120ms instead of 4×150ms=600ms.
-		cfg.RPCTimeout = 30 * time.Millisecond
 
 		n, err := raft.New(&cfg)
 		if err != nil {
