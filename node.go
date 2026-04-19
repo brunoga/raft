@@ -441,6 +441,19 @@ func (n *Node) ID() NodeID {
 	return n.cfg.ID
 }
 
+// Status returns a point-in-time snapshot of this node's state as a
+// GroupStatus. It is a convenience wrapper that performs the same atomic reads
+// as Manager.StatusAll and is useful when you hold a *Node directly.
+func (n *Node) Status() GroupStatus {
+	return GroupStatus{
+		GroupID:     n.cfg.GroupID,
+		NodeID:      n.cfg.ID,
+		State:       n.StateSnapshot(),
+		Term:        n.Term(),
+		LastApplied: n.LastApplied(),
+	}
+}
+
 // StateSnapshot returns the current role of this node. Safe for concurrent
 // use; reads from the atomic mirror that the event loop keeps in sync.
 func (n *Node) StateSnapshot() State {

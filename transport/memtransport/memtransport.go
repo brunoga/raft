@@ -22,6 +22,9 @@ type Network struct {
 	handlers map[raft.NodeID]raft.Handler
 	// dropped holds pairs [from, to] whose messages are silently discarded.
 	dropped map[[2]raft.NodeID]bool
+	// healChs holds a channel per dropped link; closed by Heal() to unblock
+	// goroutines currently waiting in dispatch for that link.
+	healChs map[[2]raft.NodeID]chan struct{}
 }
 
 // NewNetwork returns an empty Network.
@@ -29,6 +32,7 @@ func NewNetwork() *Network {
 	return &Network{
 		handlers: make(map[raft.NodeID]raft.Handler),
 		dropped:  make(map[[2]raft.NodeID]bool),
+		healChs:  make(map[[2]raft.NodeID]chan struct{}),
 	}
 }
 
@@ -57,14 +61,25 @@ func (net *Network) Unregister(id raft.NodeID) {
 func (net *Network) Drop(from, to raft.NodeID) {
 	net.mu.Lock()
 	defer net.mu.Unlock()
-	net.dropped[[2]raft.NodeID{from, to}] = true
+	link := [2]raft.NodeID{from, to}
+	net.dropped[link] = true
+	if _, ok := net.healChs[link]; !ok {
+		net.healChs[link] = make(chan struct{})
+	}
 }
 
-// Restore re-enables the link from → to.
+// Restore re-enables the link from → to and unblocks any goroutines waiting
+// in dispatch for that link.
 func (net *Network) Restore(from, to raft.NodeID) {
+	link := [2]raft.NodeID{from, to}
 	net.mu.Lock()
-	defer net.mu.Unlock()
-	delete(net.dropped, [2]raft.NodeID{from, to})
+	delete(net.dropped, link)
+	ch := net.healChs[link]
+	delete(net.healChs, link)
+	net.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
 }
 
 // Partition isolates node id from all other nodes (drops in both directions).
@@ -84,14 +99,25 @@ func (net *Network) Partition(id raft.NodeID) {
 	}
 }
 
-// Heal removes all drop rules involving id.
+// Heal removes all drop rules involving id and unblocks any goroutines
+// currently waiting in dispatch for those links.
 func (net *Network) Heal(id raft.NodeID) {
 	net.mu.Lock()
-	defer net.mu.Unlock()
+	var toClose []chan struct{}
 	for pair := range net.dropped {
 		if pair[0] == id || pair[1] == id {
 			delete(net.dropped, pair)
+			if ch, ok := net.healChs[pair]; ok {
+				toClose = append(toClose, ch)
+				delete(net.healChs, pair)
+			}
 		}
+	}
+	net.mu.Unlock()
+	// Close outside the lock so waiting goroutines don't deadlock trying to
+	// re-acquire the read lock inside dispatch.
+	for _, ch := range toClose {
+		close(ch)
 	}
 }
 
@@ -107,12 +133,25 @@ func (net *Network) dispatch(
 	net.mu.RUnlock()
 
 	if dropped {
-		// Simulate the message being lost — block until ctx expires, as a real
-		// network partition would. Returning immediately would simulate a
-		// connection-refused, which is a different failure mode and causes tests
-		// to retry far more aggressively than production behaviour warrants.
-		<-ctx.Done()
-		return nil, ctx.Err()
+		// Simulate the message being lost — block until ctx expires or the link
+		// is healed. Returning immediately would simulate connection-refused,
+		// which is a different failure mode. When Heal() is called the healCh is
+		// closed, allowing snapshot/RPC goroutines to unblock and retry promptly.
+		net.mu.RLock()
+		healCh := net.healChs[[2]raft.NodeID{src, dst}]
+		net.mu.RUnlock()
+		if healCh == nil {
+			// No heal channel — link was dropped without one (shouldn't happen
+			// with the new code, but be safe). Fall back to waiting on ctx.
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-healCh:
+			return nil, fmt.Errorf("memtransport: link healed mid-request")
+		}
 	}
 	if !ok {
 		return nil, fmt.Errorf("memtransport: no handler registered for %s", dst)
