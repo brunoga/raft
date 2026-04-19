@@ -72,10 +72,10 @@ func TestManagerHTTP_Transfer_OK(t *testing.T) {
 	ids := []raft.NodeID{"a", "b", "c"}
 	nodes := make([]*raft.Node, len(ids))
 	for i, id := range ids {
-		peers := make([]raft.NodeID, 0, len(ids)-1)
+		peers := make([]raft.PeerConfig, 0, len(ids)-1)
 		for _, p := range ids {
 			if p != id {
-				peers = append(peers, p)
+				peers = append(peers, raft.PeerConfig{ID: p, Voter: true})
 			}
 		}
 		cfg := raft.DefaultConfig()

@@ -626,7 +626,10 @@ func TestReadIndexRPC_HigherTerm_StepsDown(t *testing.T) {
 // because it must win a pre-vote round before incrementing its term.
 func TestPreVote_NodeBecomesPreCandidateFirst(t *testing.T) {
 	// Single node with fake peers so it can't win pre-vote automatically.
-	n := newTestNodeWithPeers(t, "n1", []raft.NodeID{"n2", "n3"})
+	n := newTestNodeWithPeers(t, "n1", []raft.PeerConfig{
+		{ID: "n2", Voter: true},
+		{ID: "n3", Voter: true},
+	})
 	n.Start()
 	defer n.Stop()
 
@@ -738,10 +741,10 @@ func TestMembership_AddServer(t *testing.T) {
 
 	var nodes []*raft.Node
 	for _, id := range ids {
-		peers := make([]raft.NodeID, 0)
+		peers := make([]raft.PeerConfig, 0)
 		for _, other := range ids {
 			if other != id {
-				peers = append(peers, other)
+				peers = append(peers, raft.PeerConfig{ID: other, Voter: true})
 			}
 		}
 		tr := net.NewTransport(id)
@@ -818,7 +821,10 @@ proposed:
 	n3tr := net.NewTransport("n3")
 	n3cfg := raft.DefaultConfig()
 	n3cfg.ID = "n3"
-	n3cfg.Peers = []raft.NodeID{"n1", "n2"} // knows the existing cluster
+	n3cfg.Peers = []raft.PeerConfig{
+		{ID: "n1", Voter: true},
+		{ID: "n2", Voter: true},
+	} // knows the existing cluster
 	n3cfg.Storage = memstore.New()
 	n3cfg.StateMachine = n3SM
 	n3cfg.Transport = n3tr
@@ -834,7 +840,7 @@ proposed:
 
 	// Tell the leader to add n3.
 	addDone := make(chan error, 1)
-	go func() { addDone <- leader.AddServer(ctx, "n3") }()
+	go func() { addDone <- leader.AddServer(ctx, raft.PeerConfig{ID: "n3", Voter: true}) }()
 
 	deadline = time.Now().Add(electionTimeout)
 	for time.Now().Before(deadline) {
@@ -892,12 +898,12 @@ func TestMembership_ConfigChangeInProgressBlocked(t *testing.T) {
 
 	// First AddServer — appended but never committed (followers are partitioned).
 	// Run in a goroutine since it will block until ctx expires.
-	go func() { _ = leader.AddServer(ctx, "n99") }()
+	go func() { _ = leader.AddServer(ctx, raft.PeerConfig{ID: "n99", Voter: true}) }()
 	// Give the event loop time to process the first proposal and set pendingConfigIndex.
 	time.Sleep(5 * time.Millisecond)
 
 	// Second AddServer should return ErrConfigChangeInProgress immediately.
-	err := leader.AddServer(ctx, "n100")
+	err := leader.AddServer(ctx, raft.PeerConfig{ID: "n100", Voter: true})
 	if err != raft.ErrConfigChangeInProgress {
 		t.Fatalf("expected ErrConfigChangeInProgress from second AddServer, got %v", err)
 	}

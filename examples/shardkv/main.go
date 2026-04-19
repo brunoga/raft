@@ -187,22 +187,22 @@ func main() {
 			os.Exit(1)
 		}
 
-		peerIDs := make([]raft.NodeID, 0, len(peerMap))
+		peerIDs := make([]raft.PeerConfig, 0, len(peerMap))
 		for peerPhysID := range peerMap {
-			peerIDs = append(peerIDs, shardNodeID(gid, peerPhysID))
+			peerIDs = append(peerIDs, raft.PeerConfig{ID: shardNodeID(gid, peerPhysID), Voter: true})
 		}
 
 		sm := &KvSM{data: make(map[string]string)}
 		sms[gid] = sm
 
 		cfg := raft.DefaultConfig()
-		cfg.GroupID = gid                       // stamped on every outbound RPC
-		cfg.ID = shardNodeID(gid, *id)          // unique within the group
+		cfg.GroupID = gid              // stamped on every outbound RPC
+		cfg.ID = shardNodeID(gid, *id) // unique within the group
 		cfg.Peers = peerIDs
 		cfg.Storage = store
 		cfg.StateMachine = sm
-		cfg.Transport = tr                       // shared: one port for all shards
-		cfg.TickInterval = 0                     // driven by mgr.RunTicker below
+		cfg.Transport = tr   // shared: one port for all shards
+		cfg.TickInterval = 0 // driven by mgr.RunTicker below
 		cfg.Logger = logger
 
 		node, err := raft.New(&cfg)

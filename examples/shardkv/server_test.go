@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	testNumPhysical    = 3
-	testNumShards      = uint64(4)
+	testNumPhysical     = 3
+	testNumShards       = uint64(4)
 	testElectionTimeout = 5 * time.Second
 )
 
@@ -84,10 +84,10 @@ func newShardCluster(t *testing.T, numPhysical int, numShards uint64) *shardClus
 		for i, physID := range physIDs {
 			nodeID := shardNodeID(gid, physID)
 
-			peers := make([]raft.NodeID, 0, numPhysical-1)
+			peers := make([]raft.PeerConfig, 0, numPhysical-1)
 			for _, id := range allIDs {
 				if id != nodeID {
-					peers = append(peers, id)
+					peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 				}
 			}
 
@@ -461,10 +461,10 @@ func TestHTTP_SnapshotPreservesData(t *testing.T) {
 		}
 		for i, pid := range physIDs {
 			nodeID := shardNodeID(gid, pid)
-			peers := make([]raft.NodeID, 0, len(physIDs)-1)
+			peers := make([]raft.PeerConfig, 0, len(physIDs)-1)
 			for _, id := range allIDs {
 				if id != nodeID {
-					peers = append(peers, id)
+					peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 				}
 			}
 			sm := &KvSM{data: make(map[string]string)}

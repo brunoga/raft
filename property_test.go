@@ -50,7 +50,7 @@ func makeFollowerNode(t *testing.T, term raft.Term, votedFor raft.NodeID) *raft.
 	}
 	cfg := raft.DefaultConfig()
 	cfg.ID = "follower"
-	cfg.Peers = []raft.NodeID{"other"}
+	cfg.Peers = []raft.PeerConfig{{ID: "other", Voter: true}}
 	cfg.Storage = store
 	cfg.StateMachine = &noopSM{}
 	cfg.Transport = &noopTransport{}
@@ -272,7 +272,7 @@ func TestProperty_InstallSnapshot_StaleSnapshot_Ignored(t *testing.T) {
 		}
 		cfg := raft.DefaultConfig()
 		cfg.ID = "follower"
-		cfg.Peers = []raft.NodeID{"leader"}
+		cfg.Peers = []raft.PeerConfig{{ID: "leader", Voter: true}}
 		cfg.Storage = store
 		cfg.StateMachine = &noopSM{}
 		cfg.Transport = &noopTransport{}

@@ -162,10 +162,10 @@ func newGRPCCluster(t *testing.T, n int) *grpcCluster {
 	// Phase 3: create and start nodes.
 	c := &grpcCluster{t: t, ids: ids, transports: transports}
 	for i := range n {
-		peers := make([]raft.NodeID, 0, n-1)
+		peers := make([]raft.PeerConfig, 0, n-1)
 		for j, id := range ids {
 			if j != i {
-				peers = append(peers, id)
+				peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 			}
 		}
 		sm := &kvSM{data: make(map[string]string)}
@@ -447,10 +447,10 @@ func TestGRPC_TLS(t *testing.T) {
 	var nodes []*raft.Node
 	var sms []*kvSM
 	for i := range 3 {
-		peers := make([]raft.NodeID, 0, 2)
+		peers := make([]raft.PeerConfig, 0, 2)
 		for j, id := range ids {
 			if j != i {
-				peers = append(peers, id)
+				peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 			}
 		}
 		sm := &kvSM{data: make(map[string]string)}
@@ -565,10 +565,10 @@ func TestGRPC_GroupIDStamped(t *testing.T) {
 	captures := make([]*capture, 3)
 	nodes := make([]*raft.Node, 3)
 	for i := range 3 {
-		peers := make([]raft.NodeID, 0, 2)
+		peers := make([]raft.PeerConfig, 0, 2)
 		for j, id := range ids {
 			if j != i {
-				peers = append(peers, id)
+				peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 			}
 		}
 		sm := &kvSM{data: make(map[string]string)}
@@ -1376,10 +1376,10 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 		}
 
 		for p := range numPhysical {
-			peers := make([]raft.NodeID, 0, numPhysical-1)
+			peers := make([]raft.PeerConfig, 0, numPhysical-1)
 			for _, id := range allIDs {
 				if id != allIDs[p] {
-					peers = append(peers, id)
+					peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 				}
 			}
 			sm := &kvSM{data: make(map[string]string)}
@@ -1576,7 +1576,7 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	sm2 := &kvSM{data: make(map[string]string)}
 	cfg1 := raft.DefaultConfig()
 	cfg1.ID = "a"
-	cfg1.Peers = []raft.NodeID{"b"}
+	cfg1.Peers = []raft.PeerConfig{{ID: "b", Voter: true}}
 	cfg1.Storage = memstore.New()
 	cfg1.StateMachine = sm1
 	cfg1.Transport = t1
@@ -1588,7 +1588,7 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 
 	cfg2 := raft.DefaultConfig()
 	cfg2.ID = "b"
-	cfg2.Peers = []raft.NodeID{"a"}
+	cfg2.Peers = []raft.PeerConfig{{ID: "a", Voter: true}}
 	cfg2.Storage = memstore.New()
 	cfg2.StateMachine = sm2
 	cfg2.Transport = t2

@@ -59,7 +59,7 @@ func openFileStore(t *testing.T, dir string) *filestore.FileStore {
 }
 
 // newPersistentNode creates (or reopens) a node backed by a filestore at dir.
-func newPersistentNode(t *testing.T, id raft.NodeID, peers []raft.NodeID, dir string, tr raft.Transport, sm raft.StateMachine) *raft.Node {
+func newPersistentNode(t *testing.T, id raft.NodeID, peers []raft.PeerConfig, dir string, tr raft.Transport, sm raft.StateMachine) *raft.Node {
 	t.Helper()
 	fs := openFileStore(t, dir)
 	cfg := raft.DefaultConfig()
@@ -347,11 +347,11 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	// Create 3 on-disk stores.
 	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
 	ids := []raft.NodeID{"n1", "n2", "n3"}
-	peers := func(i int) []raft.NodeID {
-		p := make([]raft.NodeID, 0, 2)
+	peers := func(i int) []raft.PeerConfig {
+		p := make([]raft.PeerConfig, 0, 2)
 		for j, id := range ids {
 			if j != i {
-				p = append(p, id)
+				p = append(p, raft.PeerConfig{ID: id, Voter: true})
 			}
 		}
 		return p
@@ -631,11 +631,11 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	net := memtransport.NewNetwork()
 
 	ids := []raft.NodeID{"n1", "n2", "n3"}
-	peers := func(i int) []raft.NodeID {
-		p := make([]raft.NodeID, 0, 2)
+	peers := func(i int) []raft.PeerConfig {
+		p := make([]raft.PeerConfig, 0, 2)
 		for j, id := range ids {
 			if j != i {
-				p = append(p, id)
+				p = append(p, raft.PeerConfig{ID: id, Voter: true})
 			}
 		}
 		return p

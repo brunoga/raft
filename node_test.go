@@ -30,7 +30,7 @@ func newTestNode(t testing.TB, id raft.NodeID, sm raft.StateMachine) *raft.Node 
 }
 
 // newTestNodeWithPeers creates a node with the given peers and a no-op state machine.
-func newTestNodeWithPeers(t testing.TB, id raft.NodeID, peers []raft.NodeID) *raft.Node {
+func newTestNodeWithPeers(t testing.TB, id raft.NodeID, peers []raft.PeerConfig) *raft.Node {
 	cfg := raft.DefaultConfig()
 	cfg.ID = id
 	cfg.Peers = peers

@@ -120,9 +120,12 @@ type Node struct {
 	// membership (encoded in the joint log entry). The finalise entry will
 	// include self iff this flag is set. This allows a leader to initiate its
 	// own removal by omitting itself from the new membership.
-	jointOld         []NodeID
-	jointNew         []NodeID
+	jointOld         []PeerConfig
+	jointNew         []PeerConfig
 	jointIncludeSelf bool
+	// jointSelfVoter is true if this node is a voter in the new configuration
+	// during joint consensus.
+	jointSelfVoter bool
 
 	// --- Check-quorum state (leader only) -----------------------------------
 	// leaderQuorumElapsed counts ticks since quorumAcks was last reset.
@@ -349,7 +352,7 @@ func New(cfg *Config) (*Node, error) {
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
-	initPeers := make([]NodeID, len(cfg.Peers))
+	initPeers := make([]PeerConfig, len(cfg.Peers))
 	copy(initPeers, cfg.Peers)
 	n.atomicPeers.Store(initPeers)
 	n.resetElectionTimeout()
@@ -439,6 +442,20 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 // Safe for concurrent use.
 func (n *Node) ID() NodeID {
 	return n.cfg.ID
+}
+
+// isSingleVoter returns true if this node is the only voting member of the
+// cluster.
+func (n *Node) isSingleVoter() bool {
+	if !n.cfg.Voter {
+		return false
+	}
+	for _, p := range n.cfg.Peers {
+		if p.Voter {
+			return false
+		}
+	}
+	return true
 }
 
 // Status returns a point-in-time snapshot of this node's state as a
@@ -687,8 +704,8 @@ func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 // call AddServer again before the first commits). For arbitrary topology
 // changes — adding and removing multiple servers simultaneously — use
 // ReconfigureCluster, which employs joint consensus.
-func (n *Node) AddServer(ctx context.Context, id NodeID) error {
-	_, err := n.Propose(ctx, encodeConfigEntry(configOpAdd, id))
+func (n *Node) AddServer(ctx context.Context, peer PeerConfig) error {
+	_, err := n.Propose(ctx, encodeConfigEntry(configOpAdd, peer))
 	return err
 }
 
@@ -701,7 +718,7 @@ func (n *Node) AddServer(ctx context.Context, id NodeID) error {
 // ReconfigureCluster (which uses joint consensus and handles leader self-removal
 // atomically), or transfer leadership first via TransferLeadership.
 func (n *Node) RemoveServer(ctx context.Context, id NodeID) error {
-	_, err := n.Propose(ctx, encodeConfigEntry(configOpRemove, id))
+	_, err := n.Propose(ctx, encodeConfigEntry(configOpRemove, PeerConfig{ID: id}))
 	return err
 }
 
@@ -718,35 +735,36 @@ func (n *Node) RemoveServer(ctx context.Context, id NodeID) error {
 //  3. ReconfigureCluster returns once the joint entry from step 1 is committed.
 //
 // newMembers is the complete new cluster membership. Include this node's own
-// ID to retain it in the cluster; omit it to remove the current leader —
-// the leader will step down automatically after the finalise entry commits.
+// ID and Voter status to retain it in the cluster; omit it to remove the
+// current leader — the leader will step down automatically after the finalise
+// entry commits.
 // newMembers may be empty only if this node is also omitted (leaving the
-// cluster with zero members is not useful; pass []NodeID{n.ID()} for a
-// single-node cluster).
+// cluster with zero members is not useful; pass []PeerConfig{{ID: n.ID(), Voter: true}}
+// for a single-node cluster).
 //
 // Returns ErrNotLeader if this node is not the leader, ErrConfigChangeInProgress
 // if another membership change is already in flight, or ErrStopped if the node
 // has been stopped.
-func (n *Node) ReconfigureCluster(ctx context.Context, newMembers []NodeID) error {
+func (n *Node) ReconfigureCluster(ctx context.Context, newMembers []PeerConfig) error {
 	// Reject duplicate entries in newMembers. Duplicates would propagate into
 	// the finalise entry and cfg.Peers, causing quorum calculations to overcount
 	// a node, which could permanently prevent the cluster from committing
 	// (liveness violation).
 	seen := make(map[NodeID]struct{}, len(newMembers))
-	for _, id := range newMembers {
-		if _, dup := seen[id]; dup {
-			return fmt.Errorf("raft: ReconfigureCluster: duplicate member %q in newMembers", id)
+	for _, p := range newMembers {
+		if _, dup := seen[p.ID]; dup {
+			return fmt.Errorf("raft: ReconfigureCluster: duplicate member %q in newMembers", p.ID)
 		}
-		seen[id] = struct{}{}
+		seen[p.ID] = struct{}{}
 	}
 
 	// Read the current peer list from the atomic mirror rather than cfg.Peers
 	// directly. cfg.Peers is mutated by applyConfigChange inside the event
 	// loop; reading it here (outside the loop) without synchronisation is a
 	// data race.
-	var oldPeers []NodeID
+	var oldPeers []PeerConfig
 	if v := n.atomicPeers.Load(); v != nil {
-		oldPeers = v.([]NodeID)
+		oldPeers = v.([]PeerConfig)
 	}
 	// newMembers is passed as-is: it may include self (self retained) or not
 	// (self removed). applyConfigChange detects self's presence by inspecting
@@ -910,11 +928,12 @@ func (n *Node) startHBPumps() {
 	n.hbPumps = make(map[NodeID]chan *AppendEntriesRequest, len(n.cfg.Peers))
 	n.hbStopChs = make(map[NodeID]chan struct{}, len(n.cfg.Peers))
 	for _, peer := range n.cfg.Peers {
+		id := peer.ID
 		ch := make(chan *AppendEntriesRequest, 1)
 		stop := make(chan struct{})
-		n.hbPumps[peer] = ch
-		n.hbStopChs[peer] = stop
-		go n.runHBPump(peer, ch, stop)
+		n.hbPumps[id] = ch
+		n.hbStopChs[id] = stop
+		go n.runHBPump(id, ch, stop)
 	}
 }
 

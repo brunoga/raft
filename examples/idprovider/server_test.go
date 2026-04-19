@@ -67,10 +67,10 @@ func newIDPCluster(t *testing.T, n int, opts ...func(*raft.Config)) *idpCluster 
 	}
 
 	for i, id := range ids {
-		peers := make([]raft.NodeID, 0, n-1)
+		peers := make([]raft.PeerConfig, 0, n-1)
 		for _, p := range ids {
 			if p != id {
-				peers = append(peers, p)
+				peers = append(peers, raft.PeerConfig{ID: p, Voter: true})
 			}
 		}
 
@@ -495,7 +495,9 @@ func TestHTTP_GetCurrentReflectsLatestAlloc(t *testing.T) {
 	}
 	// sum(1..5) = 15
 	_, body, _ := do(t, http.MethodGet, url+"/domains/live/current", nil)
-	var resp struct{ Current uint64 `json:"current"` }
+	var resp struct {
+		Current uint64 `json:"current"`
+	}
 	json.Unmarshal(body, &resp)
 	if resp.Current != 15 {
 		t.Errorf("current = %d, want 15", resp.Current)
@@ -612,7 +614,9 @@ func TestHTTP_FollowerCurrentForwardedToLeader(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("GET /domains/fwd/current on follower = %d\n%s", code, body)
 	}
-	var resp struct{ Current uint64 `json:"current"` }
+	var resp struct {
+		Current uint64 `json:"current"`
+	}
 	json.Unmarshal(body, &resp)
 	if resp.Current != 99 {
 		t.Errorf("follower current = %d, want 99", resp.Current)
@@ -630,7 +634,9 @@ func TestHTTP_MultiDomainIsolation(t *testing.T) {
 	do(t, http.MethodPost, url+"/domains/alpha/next?count=100", nil)
 	do(t, http.MethodPost, url+"/domains/beta/next?count=5", nil)
 
-	var ra, rb struct{ Current uint64 `json:"current"` }
+	var ra, rb struct {
+		Current uint64 `json:"current"`
+	}
 	_, ba, _ := do(t, http.MethodGet, url+"/domains/alpha/current", nil)
 	_, bb, _ := do(t, http.MethodGet, url+"/domains/beta/current", nil)
 	json.Unmarshal(ba, &ra)
@@ -710,7 +716,9 @@ func TestHTTP_SnapshotPreservesDomains(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("GET /domains/snap/current = %d\n%s", code, body)
 	}
-	var resp struct{ Current uint64 `json:"current"` }
+	var resp struct {
+		Current uint64 `json:"current"`
+	}
 	json.Unmarshal(body, &resp)
 	if resp.Current != want {
 		t.Errorf("after snapshots: current = %d, want %d", resp.Current, want)
