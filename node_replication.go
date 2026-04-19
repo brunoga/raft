@@ -78,8 +78,9 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 // goroutine is spawned, so there are no data races.
 func (n *Node) broadcastHeartbeat() {
 	for _, peer := range n.cfg.Peers {
+		id := peer.ID
 		// Build the request in the event-loop goroutine (safe: n is single-threaded here).
-		prevIdx := n.nextIndex[peer] - 1
+		prevIdx := n.nextIndex[id] - 1
 		prevTerm, _ := n.log.termAt(n.stopCtx, prevIdx)
 		req := &AppendEntriesRequest{
 			GroupID:      n.cfg.GroupID,
@@ -92,7 +93,7 @@ func (n *Node) broadcastHeartbeat() {
 		// Enqueue on the pump's size-1 channel. Non-blocking: if the pump is
 		// still sending the previous heartbeat, the new one overwrites it (a
 		// missed heartbeat only delays follower timer resets, not safety).
-		ch := n.hbPumps[peer]
+		ch := n.hbPumps[id]
 		select {
 		case ch <- req:
 		default:
@@ -112,7 +113,7 @@ func (n *Node) broadcastHeartbeat() {
 // replicateToFollowers sends AppendEntries with pending entries to all peers.
 func (n *Node) replicateToFollowers() {
 	for _, peer := range n.cfg.Peers {
-		n.replicateToPeer(peer)
+		n.replicateToPeer(peer.ID)
 	}
 }
 
@@ -294,10 +295,10 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		n.readBatchAcks[r.peer] = true
 		var confirmed bool
 		if n.jointOld == nil {
-			confirmed = hasMajorityAck(n.readBatchAcks, n.cfg.Peers, true)
+			confirmed = hasMajorityAck(n.readBatchAcks, n.cfg.Peers, true, n.cfg.Voter)
 		} else {
-			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true) &&
-				hasMajorityAck(n.readBatchAcks, n.jointNew, n.jointIncludeSelf)
+			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true, true) &&
+				hasMajorityAck(n.readBatchAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 		if confirmed {
 			n.confirmReadBatch()
@@ -318,18 +319,23 @@ func (n *Node) handleAppendResult(r *appendResult) {
 //
 // This is used for both election vote counting and read-barrier / check-quorum
 // tracking; the same quorum formula applies to all three.
-func hasMajorityAck(acks map[NodeID]bool, members []NodeID, includeSelf bool) bool {
+func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf bool, selfVoter bool) bool {
 	count := 0
-	if includeSelf {
+	if includeSelf && selfVoter {
 		count = 1
 	}
 	for _, m := range members {
-		if acks[m] {
+		if m.Voter && acks[m.ID] {
 			count++
 		}
 	}
-	total := len(members)
-	if includeSelf {
+	total := 0
+	for _, m := range members {
+		if m.Voter {
+			total++
+		}
+	}
+	if includeSelf && selfVoter {
 		total++
 	}
 	return count > total/2
@@ -350,18 +356,23 @@ func hasMajorityAck(acks map[NodeID]bool, members []NodeID, includeSelf bool) bo
 //	N=4 (3 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
 //	N=5 (4 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
 //	N=2 (2 peers, no self): total/2 = 1, count > 1 means count >= 2  ✓
-func (n *Node) replicatedOnMajority(idx Index, members []NodeID, includeSelf bool) bool {
+func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf bool) bool {
 	count := 0
-	if includeSelf {
+	if includeSelf && n.cfg.Voter {
 		count = 1
 	}
 	for _, p := range members {
-		if n.matchIndex[p] >= idx {
+		if p.Voter && n.matchIndex[p.ID] >= idx {
 			count++
 		}
 	}
-	total := len(members)
-	if includeSelf {
+	total := 0
+	for _, p := range members {
+		if p.Voter {
+			total++
+		}
+	}
+	if includeSelf && n.cfg.Voter {
 		total++
 	}
 	return count > total/2

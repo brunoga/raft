@@ -1,7 +1,5 @@
 package raft
 
-import "slices"
-
 // ---- Membership changes -----------------------------------------------------
 
 // storePeers snapshots the current cfg.Peers slice into atomicPeers so that
@@ -9,7 +7,7 @@ import "slices"
 // list without a data race. Must be called from the event-loop goroutine after
 // every mutation to n.cfg.Peers.
 func (n *Node) storePeers() {
-	snap := make([]NodeID, len(n.cfg.Peers))
+	snap := make([]PeerConfig, len(n.cfg.Peers))
 	copy(snap, n.cfg.Peers)
 	n.atomicPeers.Store(snap)
 }
@@ -18,30 +16,35 @@ func (n *Node) storePeers() {
 // config-change log entry is applied. It is called for every node (leader and
 // follower) once the entry is committed.
 func (n *Node) applyConfigChange(configCmd []byte) {
-	op, id, ok := decodeConfigEntry(configCmd)
+	op, peer, ok := decodeConfigEntry(configCmd)
 	if !ok {
 		return
 	}
 	switch op {
 	case configOpAdd:
-		if id == n.cfg.ID || slices.Contains(n.cfg.Peers, id) {
-			return // self or already present
+		if peer.ID == n.cfg.ID {
+			n.cfg.Voter = peer.Voter
+			return
 		}
-		n.cfg.Peers = append(n.cfg.Peers, id)
+		if containsPeer(n.cfg.Peers, peer.ID) {
+			return // already present
+		}
+		n.cfg.Peers = append(n.cfg.Peers, peer)
 		n.storePeers()
 		if n.state == Leader {
-			n.nextIndex[id] = n.log.lastLogIndex() + 1
-			n.matchIndex[id] = 0
+			n.nextIndex[peer.ID] = n.log.lastLogIndex() + 1
+			n.matchIndex[peer.ID] = 0
 			// inflight and snapshotInflight are zero/false by map default.
 			// Start a heartbeat pump so the newly added peer receives ongoing
 			// heartbeats immediately, without waiting for the next proposal.
-			n.startHBPumpFor(id)
+			n.startHBPumpFor(peer.ID)
 		}
-		n.logger.Info("config change: added peer", "id", id)
+		n.logger.Info("config change: added peer", "id", peer.ID, "voter", peer.Voter)
 
 	case configOpRemove:
+		id := peer.ID
 		for i, p := range n.cfg.Peers {
-			if p == id {
+			if p.ID == id {
 				n.cfg.Peers = append(n.cfg.Peers[:i], n.cfg.Peers[i+1:]...)
 				break
 			}
@@ -72,10 +75,12 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 		// Filter self out for peer tracking; remember the inclusion flag so
 		// appendFinaliseEntry knows whether to include self in the finalise entry.
 		n.jointIncludeSelf = false
-		newPeers := make([]NodeID, 0, len(new_))
+		n.jointSelfVoter = false
+		newPeers := make([]PeerConfig, 0, len(new_))
 		for _, m := range new_ {
-			if m == n.cfg.ID {
+			if m.ID == n.cfg.ID {
 				n.jointIncludeSelf = true
+				n.jointSelfVoter = m.Voter
 			} else {
 				newPeers = append(newPeers, m)
 			}
@@ -88,9 +93,10 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 		if n.state == Leader {
 			nextIdx := n.log.lastLogIndex() + 1
 			for _, p := range union {
-				if _, exists := n.nextIndex[p]; !exists {
-					n.nextIndex[p] = nextIdx
-					n.matchIndex[p] = 0
+				if _, exists := n.nextIndex[p.ID]; !exists {
+					n.nextIndex[p.ID] = nextIdx
+					n.matchIndex[p.ID] = 0
+					n.startHBPumpFor(p.ID)
 				}
 			}
 		}
@@ -101,7 +107,7 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 
 		// The leader auto-appends the finalise entry to drive the second phase.
 		if n.state == Leader {
-			n.appendFinaliseEntry(n.jointNew, n.jointIncludeSelf)
+			n.appendFinaliseEntry(n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 
 	case configOpFinalise:
@@ -112,37 +118,37 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 		oldPeers := n.cfg.Peers
 
 		// cfg.Peers becomes the finalised new membership, excluding self.
-		newPeers := make([]NodeID, 0, len(members))
+		newPeers := make([]PeerConfig, 0, len(members))
 		selfInNew := false
+		selfVoter := false
 		for _, m := range members {
-			if m == n.cfg.ID {
+			if m.ID == n.cfg.ID {
 				selfInNew = true
+				selfVoter = m.Voter
 			} else {
 				newPeers = append(newPeers, m)
 			}
 		}
-		// Self is always implicitly in the new config (ReconfigureCluster callers
-		// pass newMembers that exclude self, so self is always retained).
-		// If somehow self is not present, we still clean up and step down.
-		_ = selfInNew
 
 		// Clean up leader tracking for peers that are no longer in the cluster.
 		if n.state == Leader {
 			for _, p := range oldPeers {
-				if !slices.Contains(newPeers, p) {
-					delete(n.nextIndex, p)
-					delete(n.matchIndex, p)
-					delete(n.inflight, p)
-					delete(n.snapshotInflight, p)
+				if !containsPeer(newPeers, p.ID) {
+					delete(n.nextIndex, p.ID)
+					delete(n.matchIndex, p.ID)
+					delete(n.inflight, p.ID)
+					delete(n.snapshotInflight, p.ID)
 				}
 			}
 		}
 
 		n.cfg.Peers = newPeers
+		n.cfg.Voter = selfVoter
 		n.storePeers()
 		n.jointOld = nil
 		n.jointNew = nil
 		n.jointIncludeSelf = false
+		n.jointSelfVoter = false
 		n.logger.Info("config change: finalised new membership", "peers", newPeers)
 
 		if n.state == Leader {
@@ -157,6 +163,15 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 	}
 }
 
+func containsPeer(peers []PeerConfig, id NodeID) bool {
+	for _, p := range peers {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // appendFinaliseEntry appends a configOpFinalise entry that commits the new
 // cluster membership. Called by the leader after applying a joint config entry
 // to drive the second phase of joint consensus.
@@ -165,12 +180,12 @@ func (n *Node) applyConfigChange(configCmd []byte) {
 // self's ID is included in the encoded membership: true means self stays in
 // the cluster; false means self is removed and will step down when the
 // finalise entry is applied.
-func (n *Node) appendFinaliseEntry(newPeers []NodeID, includeSelf bool) {
+func (n *Node) appendFinaliseEntry(newPeers []PeerConfig, includeSelf, selfVoter bool) {
 	// Build the complete new membership.
-	var allNew []NodeID
+	var allNew []PeerConfig
 	if includeSelf {
-		allNew = make([]NodeID, 0, len(newPeers)+1)
-		allNew = append(allNew, n.cfg.ID)
+		allNew = make([]PeerConfig, 0, len(newPeers)+1)
+		allNew = append(allNew, PeerConfig{ID: n.cfg.ID, Voter: selfVoter})
 		allNew = append(allNew, newPeers...)
 	} else {
 		allNew = newPeers
@@ -197,18 +212,18 @@ func (n *Node) appendFinaliseEntry(newPeers []NodeID, includeSelf bool) {
 }
 
 // peerUnion returns the union of two peer lists, excluding the local node ID.
-func peerUnion(a, b []NodeID, self NodeID) []NodeID {
+func peerUnion(a, b []PeerConfig, self NodeID) []PeerConfig {
 	seen := make(map[NodeID]bool, len(a)+len(b))
-	result := make([]NodeID, 0, len(a)+len(b))
+	result := make([]PeerConfig, 0, len(a)+len(b))
 	for _, p := range a {
-		if p != self && !seen[p] {
-			seen[p] = true
+		if p.ID != self && !seen[p.ID] {
+			seen[p.ID] = true
 			result = append(result, p)
 		}
 	}
 	for _, p := range b {
-		if p != self && !seen[p] {
-			seen[p] = true
+		if p.ID != self && !seen[p.ID] {
+			seen[p.ID] = true
 			result = append(result, p)
 		}
 	}

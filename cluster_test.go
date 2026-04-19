@@ -46,12 +46,12 @@ func newClusterWith(t testing.TB, n int, mutate func(*raft.Config)) *Cluster {
 	}
 
 	for i := range n {
-		peers := make([]raft.NodeID, 0, n-1)
+		peers := make([]raft.PeerConfig, 0, n-1)
 		for j := range n {
 			if i == j {
 				continue
 			}
-			peers = append(peers, c.ids[j])
+			peers = append(peers, raft.PeerConfig{ID: c.ids[j], Voter: true})
 		}
 
 		sm := &kvSM{data: make(map[string]string)}

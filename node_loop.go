@@ -78,10 +78,12 @@ func (n *Node) run() {
 func (n *Node) tick() {
 	switch n.state {
 	case Follower, Candidate, PreCandidate:
-		n.electionElapsed++
-		if n.electionElapsed >= n.electionTimeout {
-			n.resetElectionTimeout()
-			n.triggerElection()
+		if n.cfg.Voter {
+			n.electionElapsed++
+			if n.electionElapsed >= n.electionTimeout {
+				n.resetElectionTimeout()
+				n.triggerElection()
+			}
 		}
 
 	case Leader:
@@ -140,10 +142,10 @@ func (n *Node) tick() {
 				// the legitimate leader for that config group.
 				var hasQuorum bool
 				if n.jointOld == nil {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true)
+					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
 				} else {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true) &&
-						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf)
+					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, true) &&
+						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 				}
 				if !hasQuorum {
 					n.logger.Warn("check-quorum: no majority of peers responded; stepping down")

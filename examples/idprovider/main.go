@@ -112,7 +112,7 @@ func (a *raftPeerAdder) AddPeer(id raft.NodeID, addr string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = a.node.AddServer(ctx, id) // best-effort; only the leader succeeds
+	_ = a.node.AddServer(ctx, raft.PeerConfig{ID: id, Voter: true}) // best-effort; only the leader succeeds
 }
 
 func main() {
@@ -177,7 +177,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	// Peer collections: populated from --peer flags or the UDP discovery window.
-	peerIDs := make([]raft.NodeID, 0, len(peers))
+	peerIDs := make([]raft.PeerConfig, 0, len(peers))
 	peerRaftAddrs := make(map[raft.NodeID]string)
 	peerHTTPAddrs := make(map[raft.NodeID]string)
 
@@ -193,7 +193,7 @@ func main() {
 			if pid == raft.NodeID(*id) {
 				continue
 			}
-			peerIDs = append(peerIDs, pid)
+			peerIDs = append(peerIDs, raft.PeerConfig{ID: pid, Voter: true})
 
 			addrs := strings.SplitN(parts[1], ",", 2)
 			peerRaftAddrs[pid] = addrs[0]
@@ -229,7 +229,7 @@ func main() {
 
 		discovered, _ := b.Discover(ctx)
 		for _, p := range discovered {
-			peerIDs = append(peerIDs, p.ID)
+			peerIDs = append(peerIDs, raft.PeerConfig{ID: p.ID, Voter: true})
 			peerRaftAddrs[p.ID] = p.Addr
 		}
 		slog.Info("idprovider: initial peers discovered", "count", len(peerIDs))
@@ -255,7 +255,7 @@ func main() {
 			if p.ID == selfID {
 				continue // skip self
 			}
-			peerIDs = append(peerIDs, p.ID)
+			peerIDs = append(peerIDs, raft.PeerConfig{ID: p.ID, Voter: true})
 			peerRaftAddrs[p.ID] = p.Addr
 		}
 		slog.Info("idprovider: DNS initial peers", "count", len(peerIDs))

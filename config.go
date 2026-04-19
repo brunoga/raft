@@ -6,6 +6,17 @@ import (
 	"time"
 )
 
+// PeerConfig describes the role of a single peer in the Raft cluster.
+type PeerConfig struct {
+	// ID is the unique identity of the peer node.
+	ID NodeID
+
+	// Voter indicates whether this peer participates in elections and counts
+	// toward the commit quorum. Witnesses (non-voting members) replicate the
+	// log and receive snapshots but do not vote or contribute to quorums.
+	Voter bool
+}
+
 // Config holds all tunables for a Raft node. Start with DefaultConfig() and
 // override only what you need.
 //
@@ -19,6 +30,12 @@ type Config struct {
 	// Every node in a cluster must have a distinct ID.
 	ID NodeID
 
+	// Voter indicates whether this node is a voting member of the cluster.
+	// Non-voters (witnesses) replicate the log and can be promoted to voters
+	// via configuration changes, but they do not vote in elections or count
+	// toward quorums.
+	Voter bool
+
 	// GroupID identifies the Raft group this node belongs to. It is stamped on
 	// every outbound RPC so that a shared transport (see Manager) can route
 	// incoming messages to the correct Node. A value of 0 is valid and is the
@@ -26,9 +43,10 @@ type Config struct {
 	// one Node.
 	GroupID uint64
 
-	// Peers is the initial set of peer node IDs, not including this node's own
-	// ID. For a fresh three-node cluster {A, B, C}, node A's Config should set
-	// Peers to []NodeID{"B", "C"}.
+	// Peers is the initial set of peer node configurations, not including this
+	// node's own configuration. For a fresh three-node cluster {A, B, C},
+	// node A's Config should set Peers to []PeerConfig{{ID: "B", Voter: true},
+	// {ID: "C", Voter: true}}.
 	//
 	// When the cluster is bootstrapped from a snapshot the membership list is
 	// restored from the snapshot; setting Peers to the last known membership
@@ -37,7 +55,7 @@ type Config struct {
 	//
 	// Peers is mutated in-place by the event loop as AddServer/RemoveServer
 	// entries are applied; callers must not touch it after Start is called.
-	Peers []NodeID
+	Peers []PeerConfig
 
 	// ElectionTimeoutMin is the lower bound of the randomised election timeout.
 	// A follower that receives no valid heartbeat for this long starts an
@@ -266,12 +284,13 @@ type Config struct {
 // The following fields still require explicit values before calling New:
 //
 //	cfg.ID           = "node-1"
-//	cfg.Peers        = []raft.NodeID{"node-2", "node-3"}
+//	cfg.Peers        = []raft.PeerConfig{{ID: "node-2", Voter: true}}
 //	cfg.Storage      = ...   // e.g. filestore.Open(dir)
 //	cfg.StateMachine = ...
 //	cfg.Transport    = ...   // e.g. grpctransport.Listen(":50051")
 func DefaultConfig() Config {
 	return Config{
+		Voter:               true,
 		ElectionTimeoutMin:  150 * time.Millisecond,
 		ElectionTimeoutMax:  300 * time.Millisecond,
 		HeartbeatInterval:   50 * time.Millisecond,

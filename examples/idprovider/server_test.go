@@ -67,10 +67,10 @@ func newIDPCluster(t *testing.T, n int, opts ...func(*raft.Config)) *idpCluster 
 	}
 
 	for i, id := range ids {
-		peers := make([]raft.NodeID, 0, n-1)
+		peers := make([]raft.PeerConfig, 0, n-1)
 		for _, p := range ids {
 			if p != id {
-				peers = append(peers, p)
+				peers = append(peers, raft.PeerConfig{ID: p, Voter: true})
 			}
 		}
 

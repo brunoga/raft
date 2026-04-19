@@ -90,7 +90,7 @@ func (n *Node) becomePreCandidate() {
 	}
 
 	// A single-node cluster has nothing to pre-vote on.
-	if len(n.cfg.Peers) == 0 {
+	if n.isSingleVoter() {
 		n.becomeCandidate()
 		return
 	}
@@ -119,7 +119,7 @@ func (n *Node) becomeCandidate() {
 	}
 
 	// A single-node cluster wins immediately.
-	if len(n.cfg.Peers) == 0 {
+	if n.isSingleVoter() {
 		n.becomeLeader()
 		return
 	}
@@ -145,8 +145,8 @@ func (n *Node) becomeLeader() {
 	n.inflight = make(map[NodeID]int, len(n.cfg.Peers))
 	n.snapshotInflight = make(map[NodeID]bool, len(n.cfg.Peers))
 	for _, peer := range n.cfg.Peers {
-		n.nextIndex[peer] = nextIdx
-		n.matchIndex[peer] = 0
+		n.nextIndex[peer.ID] = nextIdx
+		n.matchIndex[peer.ID] = 0
 	}
 
 	n.logger.Info("became leader", "term", n.currentTerm)
@@ -186,6 +186,6 @@ func (n *Node) becomeLeader() {
 	// the finalise entry yet. Re-append it to ensure the second phase
 	// completes. Duplicates are harmless — applyConfigChange is idempotent.
 	if n.jointOld != nil {
-		n.appendFinaliseEntry(n.jointNew, n.jointIncludeSelf)
+		n.appendFinaliseEntry(n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 	}
 }
