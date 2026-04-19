@@ -23,11 +23,11 @@ var ErrGroupExists = errors.New("raft: group already exists")
 // this physical node. It is used by Manager.StatusAll and by the leader
 // balancing controller (§22).
 type GroupStatus struct {
-	GroupID     uint64
-	NodeID      NodeID
-	State       State
-	Term        Term
-	LastApplied Index
+	GroupID     uint64 `json:"group_id"`
+	NodeID      NodeID `json:"node_id"`
+	State       State  `json:"state"`
+	Term        Term   `json:"term"`
+	LastApplied Index  `json:"last_applied"`
 }
 
 // Manager multiplexes multiple independent Raft groups on a single physical
@@ -244,6 +244,17 @@ func (m *Manager) StopAll() {
 func (m *Manager) Close() error {
 	m.StopAll()
 	return nil
+}
+
+// TransferGroupLeadership asks the node managing groupID to transfer leadership
+// to the peer identified by to. Returns ErrGroupNotFound if groupID is not
+// registered. All other errors come from Node.TransferLeadership.
+func (m *Manager) TransferGroupLeadership(ctx context.Context, groupID uint64, to NodeID) error {
+	n, err := m.Get(groupID)
+	if err != nil {
+		return err
+	}
+	return n.TransferLeadership(ctx, to)
 }
 
 // StatusAll returns a point-in-time snapshot of every registered group's
