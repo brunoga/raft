@@ -117,19 +117,19 @@ func (a *raftPeerAdder) AddPeer(id raft.NodeID, addr string) {
 
 func main() {
 	var (
-		id                   = flag.String("id", "", "this node's unique ID (required)")
-		raftAddr             = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs")
-		httpAddr             = flag.String("http-addr", ":8001", "HTTP listen address for client API")
-		dataDir              = flag.String("data-dir", "", "directory for persistent Raft state (required)")
-		tlsCert              = flag.String("tls-cert", "", "PEM certificate file for mTLS (requires --tls-key and --tls-ca)")
-		tlsKey               = flag.String("tls-key", "", "PEM private key file for mTLS")
-		tlsCA                = flag.String("tls-ca", "", "PEM CA certificate file for mTLS peer verification")
-		udpDiscovery         = flag.Bool("udp-discovery", false, "use UDP broadcast for peer discovery (mutually exclusive with --peer and --discover-dns)")
-		udpBroadcastAddr     = flag.String("udp-broadcast-addr", "255.255.255.255:9199", "UDP broadcast address for peer discovery")
-		udpDiscoveryTimeout  = flag.Duration("udp-discovery-timeout", 3*time.Second, "duration to wait for initial peer discovery window")
-		discoverDNS          = flag.String("discover-dns", "", "DNS hostname for A-record peer discovery (mutually exclusive with --peer and --udp-discovery)")
-		discoverDNSPort      = flag.String("discover-dns-port", "7001", "Raft gRPC port used for DNS-discovered peers")
-		peers                peerFlag
+		id                  = flag.String("id", "", "this node's unique ID (required)")
+		raftAddr            = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs")
+		httpAddr            = flag.String("http-addr", ":8001", "HTTP listen address for client API")
+		dataDir             = flag.String("data-dir", "", "directory for persistent Raft state (required)")
+		tlsCert             = flag.String("tls-cert", "", "PEM certificate file for mTLS (requires --tls-key and --tls-ca)")
+		tlsKey              = flag.String("tls-key", "", "PEM private key file for mTLS")
+		tlsCA               = flag.String("tls-ca", "", "PEM CA certificate file for mTLS peer verification")
+		udpDiscovery        = flag.Bool("udp-discovery", false, "use UDP broadcast for peer discovery (mutually exclusive with --peer and --discover-dns)")
+		udpBroadcastAddr    = flag.String("udp-broadcast-addr", "255.255.255.255:9199", "UDP broadcast address for peer discovery")
+		udpDiscoveryTimeout = flag.Duration("udp-discovery-timeout", 3*time.Second, "duration to wait for initial peer discovery window")
+		discoverDNS         = flag.String("discover-dns", "", "DNS hostname for A-record peer discovery (mutually exclusive with --peer and --udp-discovery)")
+		discoverDNSPort     = flag.String("discover-dns-port", "7001", "Raft gRPC port used for DNS-discovered peers")
+		peers               peerFlag
 	)
 	flag.Var(&peers, "peer", "peer in the form id=raft_addr[,http_addr] (repeatable)")
 	flag.Parse()

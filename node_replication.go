@@ -319,7 +319,7 @@ func (n *Node) handleAppendResult(r *appendResult) {
 //
 // This is used for both election vote counting and read-barrier / check-quorum
 // tracking; the same quorum formula applies to all three.
-func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf bool, selfVoter bool) bool {
+func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, selfVoter bool) bool {
 	count := 0
 	if includeSelf && selfVoter {
 		count = 1
