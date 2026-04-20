@@ -94,6 +94,12 @@ type command struct {
 	Batch      []command       `json:"batch,omitempty"`
 }
 
+// raftPeerInfo holds the transport-level details for one cluster member.
+type raftPeerInfo struct {
+	addr  string
+	voter bool
+}
+
 // Store is a Raft-replicated key-value store that can hold multiple typed
 // collections. Each Store owns exactly one Raft node, one gRPC transport, and
 // one persistent storage directory.
@@ -110,10 +116,11 @@ type Store struct {
 	mutations   map[string]map[string]MutationFunc
 	node        *raft.Node
 
-	// raftAddrs maps known peer IDs to their Raft gRPC addresses. Seeded from
-	// cfg.Peers at init and updated when peers join via handleJoin. Protected
-	// by mu. Used to return the peer list in join responses.
-	raftAddrs map[raft.NodeID]string
+	// raftPeers maps known peer IDs to their Raft gRPC address and voter
+	// status. Seeded from cfg.Peers at init; updated by handleJoin, discovery,
+	// AddServer, and RemoveServer. Protected by mu. Used to serve GET /members
+	// and to build join responses.
+	raftPeers map[raft.NodeID]raftPeerInfo
 
 	cfg        Config
 	cancel     context.CancelFunc
@@ -143,7 +150,7 @@ func NewStore(opts ...Option) (*Store, error) {
 	s := &Store{
 		collections: make(map[string]map[string]json.RawMessage),
 		mutations:   make(map[string]map[string]MutationFunc),
-		raftAddrs:   make(map[raft.NodeID]string),
+		raftPeers:   make(map[raft.NodeID]raftPeerInfo),
 		cfg:         c,
 		cancel:      cancel,
 		stopCtx:     ctx,
@@ -284,7 +291,7 @@ func (s *Store) initRaft() error {
 		if id != s.cfg.ID {
 			tr.AddPeer(id, addr)
 			peerConfigs = append(peerConfigs, raft.PeerConfig{ID: id, Voter: true})
-			s.raftAddrs[id] = addr
+			s.raftPeers[id] = raftPeerInfo{addr: addr, voter: true}
 		}
 	}
 
@@ -389,6 +396,9 @@ func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 					}
 				} else {
 					knownMembers[p.ID] = struct{}{}
+					s.mu.Lock()
+					s.raftPeers[p.ID] = raftPeerInfo{addr: p.Addr, voter: true}
+					s.mu.Unlock()
 				}
 				cancel()
 			}
@@ -507,7 +517,8 @@ func (s *Store) Ready(ctx context.Context) error {
 // success it registers the returned peer list with the local transport so
 // this node can route Raft RPCs to the existing members.
 func (s *Store) joinCluster(ctx context.Context) error {
-	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr}
+	voter := !s.cfg.JoinAsNonVoter
+	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr, Voter: &voter}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("easyraft: marshal join request: %w", err)
@@ -555,7 +566,7 @@ func (s *Store) joinCluster(ctx context.Context) error {
 			if p.ID == s.cfg.ID {
 				continue
 			}
-			s.raftAddrs[p.ID] = p.RaftAddr
+			s.raftPeers[p.ID] = raftPeerInfo{addr: p.RaftAddr, voter: p.Voter}
 			if hasPeerAdder {
 				pa.AddPeer(p.ID, p.RaftAddr)
 			}
@@ -582,7 +593,16 @@ func (s *Store) Status() raft.GroupStatus {
 // Stop cancels the store's context (terminating discovery goroutines), shuts
 // down the HTTP server, stops the Raft node, and closes persistent storage.
 // It is safe to call Stop more than once.
+//
+// If [WithLeaveOnStop] was set, Stop first calls RemoveServer(self) with a
+// 5-second timeout so the cluster adjusts its membership before this node
+// disappears. If the removal does not complete in time it is abandoned.
 func (s *Store) Stop() {
+	if s.cfg.LeaveOnStop && s.node != nil {
+		leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.node.RemoveServer(leaveCtx, s.cfg.ID)
+		leaveCancel()
+	}
 
 	if s.cancel != nil {
 		s.cancel()
@@ -901,7 +921,13 @@ func (s *Store) RemoveServer(ctx context.Context, id raft.NodeID) error {
 	if s.node == nil {
 		return errors.New("easyraft: node not started")
 	}
-	return s.node.RemoveServer(ctx, id)
+	if err := s.node.RemoveServer(ctx, id); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.raftPeers, id)
+	s.mu.Unlock()
+	return nil
 }
 
 // TransferLeadership gracefully hands off leadership to to. The leader waits

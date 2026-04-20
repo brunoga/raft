@@ -32,6 +32,16 @@ type Config struct {
 	// own transport. Set via [WithJoinAddr].
 	JoinAddrs []string
 
+	// JoinAsNonVoter, when true, causes the node to join as a non-voting
+	// member (learner/observer). Non-voters replicate the log but do not
+	// participate in elections or commit quorum. Set via [WithJoinAsLearner].
+	JoinAsNonVoter bool
+
+	// LeaveOnStop, when true, causes Stop to call RemoveServer(self) with a
+	// 5-second timeout before shutting down, gracefully removing this node
+	// from the cluster. Set via [WithLeaveOnStop].
+	LeaveOnStop bool
+
 	// Raft timing overrides. Zero means use the easyraft defaults
 	// (100 ms tick/heartbeat, 1–2 s election timeout).
 	TickInterval       time.Duration
@@ -117,6 +127,23 @@ func WithJoinAddr(addrs ...string) Option {
 	return func(c *Config) {
 		c.JoinAddrs = append(c.JoinAddrs, addrs...)
 	}
+}
+
+// WithJoinAsLearner causes the node to join as a non-voting member
+// (learner/observer) when [WithJoinAddr] is also set. Learners replicate the
+// log but do not vote in elections or count toward commit quorum. Useful for
+// read-replica nodes or nodes that should be promoted to voter later.
+func WithJoinAsLearner() Option {
+	return func(c *Config) { c.JoinAsNonVoter = true }
+}
+
+// WithLeaveOnStop causes [Store.Stop] to call RemoveServer(self) before
+// shutting down. This gracefully removes the node from the cluster so the
+// remaining members do not wait for it during elections or commits.
+// If the removal does not complete within 5 seconds it is abandoned and the
+// node shuts down anyway.
+func WithLeaveOnStop() Option {
+	return func(c *Config) { c.LeaveOnStop = true }
 }
 
 // WithTLS sets the TLS configuration for Raft RPCs.
