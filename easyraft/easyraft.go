@@ -2,6 +2,8 @@ package easyraft
 
 import (
 	"context"
+
+	"github.com/brunoga/raft"
 )
 
 // EasyRaft is a convenience wrapper that binds a [Store] to a single [Collection]
@@ -85,4 +87,16 @@ func (e *EasyRaft[T]) ListStale() (map[string]T, error) {
 // List returns all items in the collection with linearizable consistency.
 func (e *EasyRaft[T]) List(ctx context.Context) (map[string]T, error) {
 	return e.collection.List(ctx)
+}
+
+// RemoveServer removes id from the Raft cluster membership. Must be called on
+// the leader; returns [ErrNotLeader] otherwise.
+func (e *EasyRaft[T]) RemoveServer(ctx context.Context, id raft.NodeID) error {
+	return e.store.RemoveServer(ctx, id)
+}
+
+// TransferLeadership gracefully transfers leadership to to. Blocks until this
+// node steps down or the context expires.
+func (e *EasyRaft[T]) TransferLeadership(ctx context.Context, to raft.NodeID) error {
+	return e.store.TransferLeadership(ctx, to)
 }

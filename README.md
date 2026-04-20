@@ -31,7 +31,8 @@ Requires Go 1.22+.
 15. [Advanced features](#advanced-features)
 16. [Multi-Raft — thousands of groups on shared infrastructure](#multi-raft--thousands-of-groups-on-shared-infrastructure)
 17. [Caveats and known limitations](#caveats-and-known-limitations)
-18. [Reference implementation](#reference-implementation)
+18. [EasyRaft — high-level abstraction](#easyraft--high-level-abstraction)
+19. [Reference implementation](#reference-implementation)
 
 ---
 
@@ -989,9 +990,54 @@ The internal `proposeCh` has a fixed capacity of 1,024 entries. When the leader'
 
 ---
 
+## EasyRaft — high-level abstraction
+
+`easyraft` is a batteries-included layer on top of the core `raft` package. It handles transport (gRPC), storage (filestore), snapshotting, leader routing, peer discovery, and an HTTP REST API — so you can build a strongly-consistent replicated service by describing **what** data to store rather than how to replicate it.
+
+```go
+import "github.com/brunoga/raft/easyraft"
+
+type Counter struct{ Value int64 `json:"value"` }
+
+er, _ := easyraft.New[Counter](
+    easyraft.WithID("n1"),
+    easyraft.WithRaftAddr(":7001"),
+    easyraft.WithHTTPAddr(":8001"),
+    easyraft.WithDataDir("/data/n1"),
+    easyraft.WithPeers(map[raft.NodeID]string{
+        "n2": "host2:7001",
+        "n3": "host3:7001",
+    }),
+)
+er.Start()
+defer er.Stop()
+
+ctx := context.Background()
+er.Create(ctx, "alice", Counter{Value: 0})
+c, _ := er.Read(ctx, "alice")  // linearizable
+```
+
+Key features at a glance:
+
+- **`New[T]`** — single typed collection; **`NewStore` + `AddCollection[T]`** — multiple collections.
+- **Mutations** — atomic read-modify-write operations replicated as a single log entry.
+- **`WithJoinAddr`** — join a running cluster via an HTTP seed node; no upfront peer list required.
+- **`WithJoinAsLearner`** — join as a non-voting replica that replicates the log without participating in elections.
+- **`WithLeaveOnStop`** — gracefully remove this node from the cluster membership on shutdown.
+- **`RemoveServer` / `TransferLeadership`** — cluster management from Go or over HTTP (`DELETE /members/{id}`, `POST /transfer-leadership`).
+- **`GET /members`** — list all cluster members with voter status and leader flag.
+- **`POST /batch`** — apply multiple operations across collections atomically.
+- **Multi-Raft** via `easyraft.Manager` — multiple independent Raft groups on one process.
+- **Dynamic discovery** via `WithDiscovery`.
+- **TLS** via `WithTLS`, **Prometheus** via `WithPrometheus`.
+
+See [`easyraft/`](easyraft/) for the full documentation and API reference.
+
+---
+
 ## Reference implementation
 
-Two fully-worked examples are provided, each targeting a different deployment pattern.
+Three fully-worked examples are provided, each targeting a different deployment pattern.
 
 ### `examples/idprovider` — single-group
 
@@ -1014,6 +1060,25 @@ monotonic ID allocation service that demonstrates all major single-group feature
 go build -o idprovider ./examples/idprovider
 ./idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
              --peer n2=localhost:7002 --peer n3=localhost:7003
+```
+
+### `examples/ratelimiter` — EasyRaft with deterministic mutations
+
+See [`examples/ratelimiter`](examples/ratelimiter/) for a distributed token-bucket rate limiter built on `easyraft`. It demonstrates:
+
+- **EasyRaft `New[T]`**: single-collection setup with full REST API.
+- **Deterministic mutations**: the current timestamp is encoded into the mutation args before proposing, so the time-based refill is applied identically on every node.
+- **`WithJoinAddr`**: nodes can join a running cluster one at a time using the `-join` flag instead of configuring the full peer list upfront.
+
+```bash
+go build -o ratelimiter ./examples/ratelimiter
+
+# Node 1 — bootstrap
+./ratelimiter --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/rl/n1
+
+# Node 2 — joins node 1
+./ratelimiter --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/rl/n2 \
+              --join localhost:8001
 ```
 
 ### `examples/shardkv` — multi-group (multi-raft) with leader balancing

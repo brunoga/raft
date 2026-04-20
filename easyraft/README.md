@@ -200,6 +200,91 @@ defer mgr.Stop()
 
 ---
 
+## Joining a running cluster
+
+`WithJoinAddr` lets a new node join an existing cluster by contacting a seed node over HTTP, instead of configuring every node with the full peer list up-front. The seed calls `AddServer` on behalf of the joiner and returns the current peer list so the new node can bootstrap its transport.
+
+```go
+// Seed nodes — already running with WithHTTPAddr.
+n1, _ := easyraft.New[Counter](
+    easyraft.WithID("n1"),
+    easyraft.WithRaftAddr(":7001"),
+    easyraft.WithHTTPAddr(":8001"),
+    easyraft.WithDataDir("/data/n1"),
+)
+n1.Start()
+
+// Joining node — contacts n1 on startup.
+n2, _ := easyraft.New[Counter](
+    easyraft.WithID("n2"),
+    easyraft.WithRaftAddr(":7002"),
+    easyraft.WithDataDir("/data/n2"),
+    easyraft.WithJoinAddr("localhost:8001"),
+)
+n2.Start()
+```
+
+`WithJoinAddr` accepts one or more HTTP addresses; the joining node tries each in turn until one succeeds. If the contacted node is not the leader it responds with `307 Temporary Redirect` automatically.
+
+You can add nodes one at a time in separate terminal sessions — no reconfiguration of the existing nodes is required.
+
+---
+
+## Learner nodes (non-voters)
+
+`WithJoinAsLearner` causes a joining node to enter the cluster as a non-voting member. Learners replicate the log but do not participate in elections or count toward commit quorum. This is useful for read-replica nodes or for nodes that should be promoted to voters after they catch up.
+
+```go
+replica, _ := easyraft.New[Counter](
+    easyraft.WithID("replica1"),
+    easyraft.WithRaftAddr(":7010"),
+    easyraft.WithDataDir("/data/replica1"),
+    easyraft.WithJoinAddr("leader-host:8001"),
+    easyraft.WithJoinAsLearner(),
+)
+replica.Start()
+```
+
+Requires `WithJoinAddr` — learner mode only applies during the join flow.
+
+---
+
+## Graceful departure (WithLeaveOnStop)
+
+`WithLeaveOnStop` causes `Stop()` to call `RemoveServer(self)` before shutting down, gracefully removing this node from the cluster so remaining members do not wait for it during elections or commits.
+
+```go
+node, _ := easyraft.New[Counter](
+    easyraft.WithID("n3"),
+    easyraft.WithRaftAddr(":7003"),
+    easyraft.WithDataDir("/data/n3"),
+    easyraft.WithJoinAddr("seed:8001"),
+    easyraft.WithLeaveOnStop(),
+)
+node.Start()
+defer node.Stop() // removes self from cluster before shutting down
+```
+
+If removal does not complete within 5 seconds the node shuts down anyway. Do not use this on a bootstrap node (the first node in a brand-new cluster) — removing the sole member leaves the cluster with no voters.
+
+---
+
+## Cluster membership — Go API
+
+`RemoveServer` and `TransferLeadership` are available directly on `EasyRaft[T]` and `Store`:
+
+```go
+// Remove a node from the cluster. Must be called on the leader; if called on a
+// follower, returns ErrNotLeader.
+err := er.RemoveServer(ctx, "n3")
+
+// Gracefully hand off leadership to another node. Blocks until this node steps
+// down or the context expires.
+err := er.TransferLeadership(ctx, "n2")
+```
+
+---
+
 ## Discovery
 
 When `WithDiscovery` is configured, EasyRaft polls the discovery source periodically and:
@@ -247,10 +332,15 @@ if err := store.Ready(ctx); err != nil {
 
 When `WithHTTPAddr` is set, EasyRaft mounts a REST API automatically.
 
-### `Store` routes (`/{collection}/{key}`)
+### `Store` routes
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/join` | Join request from a new node (called by `WithJoinAddr`) |
+| `GET` | `/members` | List all cluster members with voter and leader flags |
+| `DELETE` | `/members/{id}` | Remove a member from the cluster (leader only) |
+| `POST` | `/transfer-leadership` | Transfer leadership: `{"to": "nodeID"}` |
+| `POST` | `/batch` | Atomic multi-collection batch (see below) |
 | `POST` | `/{collection}/{key}` | Create item (201 Created) |
 | `GET` | `/{collection}/{key}` | Read — linearizable |
 | `GET` | `/{collection}/{key}?consistency=stale` | Read — local, no round-trip |
@@ -265,7 +355,40 @@ When `WithHTTPAddr` is set, EasyRaft mounts a REST API automatically.
 
 ### `Manager` routes (`/groups/{groupID}/…`)
 
-Same as above, prefixed with `/groups/{groupID}`.
+Same as the `Store` routes above, prefixed with `/groups/{groupID}` (e.g. `GET /groups/1/members`).
+
+### Members response
+
+`GET /members` returns:
+
+```json
+{
+  "members": [
+    { "id": "n1", "raft_addr": "host1:7001", "voter": true, "leader": true, "self": true },
+    { "id": "n2", "raft_addr": "host2:7001", "voter": true, "leader": false, "self": false },
+    { "id": "n3", "raft_addr": "host3:7001", "voter": false, "leader": false, "self": false }
+  ]
+}
+```
+
+`voter: false` identifies a learner node. `leader: true` identifies the current Raft leader. `self: true` marks the node that served the response.
+
+### Batch request body
+
+`POST /batch` applies multiple operations atomically — they commit as a single log entry:
+
+```json
+[
+  { "op": "create", "collection": "users",   "key": "alice", "value": {"name":"Alice"} },
+  { "op": "create", "collection": "scores",  "key": "alice", "value": 100 },
+  { "op": "update", "collection": "counters","key": "total", "value": 42 },
+  { "op": "delete", "collection": "sessions","key": "old-session" },
+  { "op": "mutate", "collection": "quotas",  "key": "alice",
+    "mutate_name": "decrement", "mutate_args": 1 }
+]
+```
+
+Valid `op` values: `create`, `update`, `delete`, `mutate`.
 
 ### Leader routing
 
@@ -319,6 +442,9 @@ Prometheus metrics are exposed on `GET /metrics`. The option must be set before 
 | `WithHTTPAddr(addr)` | HTTP listen address; enables the REST API |
 | `WithDataDir(dir)` | Persistent storage directory — required |
 | `WithPeers(map[NodeID]string)` | Static initial peer list |
+| `WithJoinAddr(addrs...)` | HTTP address(es) of seed nodes to join on startup |
+| `WithJoinAsLearner()` | Join as a non-voting learner (requires `WithJoinAddr`) |
+| `WithLeaveOnStop()` | Call `RemoveServer(self)` before shutdown for graceful departure |
 | `WithDiscovery(d, interval)` | Dynamic peer discovery; wires both transport and membership |
 | `WithSnapCount(n)` | Log entries between automatic snapshots (default 1000) |
 | `WithLogger(logger)` | Custom `*slog.Logger` |
