@@ -1,3 +1,44 @@
+// Package easyraft provides a high-level abstraction over the brunoga/raft
+// package that lets you build strongly-consistent, replicated services without
+// managing Raft internals.
+//
+// # Core types
+//
+// [Store] is the primary type. It owns one Raft node, one gRPC transport, and
+// one file-backed storage directory. It implements [raft.StateMachine]
+// internally — callers never touch Apply, Snapshot, or Restore directly.
+//
+// [Collection] is a type-safe namespace within a Store. Multiple collections
+// can share a single Store (and thus a single Raft group). Each collection
+// provides Create, Read, Update, Delete, List, and Mutate operations.
+//
+// [EasyRaft] is a convenience wrapper that binds one Store to one Collection
+// named "default". Use it when your service manages a single entity type.
+//
+// [Manager] runs multiple independent Raft groups (shards) on one physical
+// node, sharing a single gRPC transport and HTTP server.
+//
+// # Determinism requirement
+//
+// Mutation functions registered with [Collection.RegisterMutation] execute
+// inside [raft.StateMachine].Apply on every replica during both normal
+// operation and log replay after a restart. They must be purely deterministic:
+// do not call time.Now, rand, or any external I/O inside a mutation. If a
+// mutation needs the current time, encode the timestamp in the args before
+// proposing — all nodes will then apply the same value.
+//
+// # Getting started
+//
+//	er, err := easyraft.New[MyType](
+//	    easyraft.WithID("n1"),
+//	    easyraft.WithRaftAddr(":7001"),
+//	    easyraft.WithDataDir("/data/n1"),
+//	    easyraft.WithPeers(map[raft.NodeID]string{"n2": "host2:7001"}),
+//	)
+//	er.Start()
+//	defer er.Stop()
+//
+// See the package README and [examples/ratelimiter] for complete examples.
 package easyraft
 
 import (
@@ -13,16 +54,24 @@ import (
 	"time"
 
 	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/discovery"
 	"github.com/brunoga/raft/metrics/prommetrics"
 	"github.com/brunoga/raft/storage/filestore"
 	"github.com/brunoga/raft/transport/grpctransport"
 )
 
 var (
+	// ErrKeyNotFound is returned by Read, Update, Delete, and Mutate when the
+	// requested key does not exist in the collection.
 	ErrKeyNotFound = errors.New("easyraft: key not found")
-	ErrKeyExists   = errors.New("easyraft: key already exists")
-	ErrNotLeader   = errors.New("easyraft: not leader")
+
+	// ErrKeyExists is returned by Create when a key already exists in the
+	// collection.
+	ErrKeyExists = errors.New("easyraft: key already exists")
+
+	// ErrNotLeader is returned by any write or linearizable-read operation when
+	// this node is not the current Raft leader. The HTTP layer translates this
+	// into a 307 redirect (if the leader's address is known) or a 503 response.
+	ErrNotLeader = errors.New("easyraft: not leader")
 )
 
 type opType string
@@ -45,12 +94,21 @@ type command struct {
 	Batch      []command       `json:"batch,omitempty"`
 }
 
+// Store is a Raft-replicated key-value store that can hold multiple typed
+// collections. Each Store owns exactly one Raft node, one gRPC transport, and
+// one persistent storage directory.
+//
+// Create a Store with [NewStore], add typed views with [AddCollection], then
+// call [Store.Start]. Writes are forwarded to the leader automatically via
+// ErrNotLeader; the HTTP layer (enabled by [WithHTTPAddr]) additionally issues
+// 307 redirects to the leader's HTTP address.
+//
+// A Store is safe to use from multiple goroutines after Start returns.
 type Store struct {
-	mu           sync.RWMutex
-	collections  map[string]map[string]json.RawMessage
-	mutations    map[string]map[string]MutationFunc
-	node         *raft.Node
-	waitForApply time.Duration
+	mu          sync.RWMutex
+	collections map[string]map[string]json.RawMessage
+	mutations   map[string]map[string]MutationFunc
+	node        *raft.Node
 
 	cfg        Config
 	cancel     context.CancelFunc
@@ -60,7 +118,9 @@ type Store struct {
 	storage    raft.Storage
 }
 
-// NewStore creates a new EasyRaft store that can manage multiple collections.
+// NewStore creates a Store that can manage multiple typed collections.
+// [WithID], [WithRaftAddr], and [WithDataDir] are required; all other options
+// are optional. Call [Store.Start] after registering collections.
 func NewStore(opts ...Option) (*Store, error) {
 	var c Config
 	for _, o := range opts {
@@ -76,12 +136,11 @@ func NewStore(opts ...Option) (*Store, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
-		collections:  make(map[string]map[string]json.RawMessage),
-		mutations:    make(map[string]map[string]MutationFunc),
-		waitForApply: 5 * time.Second,
-		cfg:          c,
-		cancel:       cancel,
-		stopCtx:      ctx,
+		collections: make(map[string]map[string]json.RawMessage),
+		mutations:   make(map[string]map[string]MutationFunc),
+		cfg:         c,
+		cancel:      cancel,
+		stopCtx:     ctx,
 	}
 
 	if err := s.initRaft(); err != nil {
@@ -91,7 +150,8 @@ func NewStore(opts ...Option) (*Store, error) {
 	return s, nil
 }
 
-// Txn provides an atomic, cross-collection transaction.
+// Txn accumulates operations across multiple collections to be committed as a
+// single atomic log entry. Build one via [Store.Txn]; do not construct directly.
 type Txn struct {
 	store *Store
 	cmds  []command
@@ -156,7 +216,13 @@ func (t *Txn) Mutate(collection, key, name string, args any) error {
 	return nil
 }
 
-// Txn executes a function within an atomic transaction.
+// Txn calls fn to build a batch of operations and then proposes the entire
+// batch as a single Raft log entry. Either all operations succeed or the whole
+// entry fails — there is no partial application.
+//
+// The returned slice has one json.RawMessage per operation in the order they
+// were added; mutation results are included, CRUD results are null.
+// An empty transaction (no operations added) returns nil, nil.
 func (s *Store) Txn(ctx context.Context, fn func(tx *Txn) error) ([]json.RawMessage, error) {
 	tx := &Txn{store: s}
 	if err := fn(tx); err != nil {
@@ -223,13 +289,18 @@ func (s *Store) initRaft() error {
 	rCfg.Storage = st
 	rCfg.StateMachine = s
 	rCfg.Logger = s.cfg.Logger
-	rCfg.TickInterval = 100 * time.Millisecond
-	rCfg.ElectionTimeoutMin = 1 * time.Second
-	rCfg.ElectionTimeoutMax = 2 * time.Second
-	rCfg.HeartbeatInterval = 100 * time.Millisecond
+	rCfg.TickInterval = s.raftTickInterval()
+	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
+	rCfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
+	rCfg.HeartbeatInterval = s.raftHeartbeatInterval()
 	rCfg.SnapshotThreshold = s.cfg.SnapCount
 	if rCfg.SnapshotThreshold == 0 {
 		rCfg.SnapshotThreshold = 1000
+	}
+
+	// 4. Metrics — must be set before raft.New so the node is constructed with metrics wired in.
+	if s.cfg.PromRegisterer != nil {
+		rCfg.Metrics = prommetrics.New(s.cfg.PromRegisterer)
 	}
 
 	node, err := raft.New(&rCfg)
@@ -241,42 +312,92 @@ func (s *Store) initRaft() error {
 	s.transport = tr
 	s.storage = st
 
-	// 4. Metrics
-	if s.cfg.PromRegisterer != nil {
-		rCfg.Metrics = prommetrics.New(s.cfg.PromRegisterer)
-	}
-
-	// 5. Discovery
+	// 5. Discovery: wire both transport-level connectivity and Raft membership.
+	// We run our own polling loop rather than using DiscoveryAgent so we can
+	// call node.AddServer for each newly seen peer (not just tr.AddPeer).
 	if s.cfg.Discovery != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		s.cancel = cancel
-		agent := discovery.NewAgent(s.cfg.Discovery, tr, s.cfg.DiscoveryInterval)
-		go func() {
-			if err := agent.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				if s.cfg.Logger != nil {
-					s.cfg.Logger.Error("discovery agent failed", "err", err)
-				}
-			}
-		}()
-
-		if runner, ok := s.cfg.Discovery.(interface {
-			Run(context.Context) error
-		}); ok {
-			go func() {
-				if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-					if s.cfg.Logger != nil {
-						s.cfg.Logger.Error("discovery runner failed", "err", err)
-					}
-				}
-			}()
-		}
+		s.startDiscovery(node, tr)
 	}
 
 	s.node = node
 	return nil
 }
 
-// Start launches the Raft event loop and HTTP server.
+// peerAdder is the subset of Transport that can register peer addresses.
+// grpctransport.GRPCTransport satisfies this interface.
+type peerAdder interface {
+	AddPeer(raft.NodeID, string)
+}
+
+// startDiscovery launches the background goroutines that keep the transport
+// peer table and Raft membership in sync with the discovery output.
+// It uses s.stopCtx so everything is torn down cleanly on Store.Stop.
+func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
+	// Some Discovery implementations (e.g. udpbroadcast) need their own Run loop
+	// to receive incoming peer announcements.
+	if runner, ok := s.cfg.Discovery.(interface{ Run(context.Context) error }); ok {
+		go func() {
+			if err := runner.Run(s.stopCtx); err != nil && !errors.Is(err, context.Canceled) {
+				if s.cfg.Logger != nil {
+					s.cfg.Logger.Error("discovery runner failed", "err", err)
+				}
+			}
+		}()
+	}
+
+	interval := s.cfg.DiscoveryInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		// knownMembers tracks peers that have been successfully added to the Raft
+		// cluster via AddServer.  Pre-populate with statically configured peers so
+		// we never issue a redundant membership-change RPC for them.
+		knownMembers := make(map[raft.NodeID]struct{})
+		for id := range s.cfg.Peers {
+			knownMembers[id] = struct{}{}
+		}
+
+		for {
+			peers, err := s.cfg.Discovery.Discover(s.stopCtx)
+			if err != nil && !errors.Is(err, context.Canceled) && s.cfg.Logger != nil {
+				s.cfg.Logger.Warn("discovery: Discover failed", "err", err)
+			}
+			for _, p := range peers {
+				if p.ID == s.cfg.ID {
+					continue
+				}
+				tr.AddPeer(p.ID, p.Addr)
+				if _, seen := knownMembers[p.ID]; seen {
+					continue
+				}
+				addCtx, cancel := context.WithTimeout(s.stopCtx, 5*time.Second)
+				if err := node.AddServer(addCtx, raft.PeerConfig{ID: p.ID, Voter: true}); err != nil {
+					if s.cfg.Logger != nil {
+						s.cfg.Logger.Warn("discovery: AddServer failed (will retry)", "peer", p.ID, "err", err)
+					}
+				} else {
+					knownMembers[p.ID] = struct{}{}
+				}
+				cancel()
+			}
+
+			select {
+			case <-s.stopCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+// Start launches the Raft event loop, begins advertising this node's HTTP
+// address to the cluster (if WithHTTPAddr was set), and starts the HTTP server.
+// Register all collections and mutations before calling Start.
 func (s *Store) Start() {
 	if s.node != nil {
 		s.node.Start()
@@ -294,7 +415,7 @@ func (s *Store) Start() {
 
 func (s *Store) advertiseMetadata() {
 	// Retry until we successfully register our HTTP address with the leader.
-	// This ensures that after a few rotations, every node's URL is known.
+	// This ensures that after a leadership rotation, every node's URL is known.
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -304,21 +425,19 @@ func (s *Store) advertiseMetadata() {
 		}
 
 		b, _ := json.Marshal(s.cfg.HTTPAddr)
-		_, err := s.propose(s.stopCtx, &command{
-			Op:         opUpdate,
+		cmd := &command{
 			Collection: "__easyraft_metadata__",
 			Key:        string(s.cfg.ID),
 			Value:      b,
-		})
+		}
 
-		// If key doesn't exist, try create
-		if errors.Is(err, ErrKeyNotFound) {
-			_, err = s.propose(s.stopCtx, &command{
-				Op:         opCreate,
-				Collection: "__easyraft_metadata__",
-				Key:        string(s.cfg.ID),
-				Value:      b,
-			})
+		// Try create first: succeeds on fresh start (one round-trip).
+		cmd.Op = opCreate
+		_, err := s.propose(s.stopCtx, cmd)
+		if errors.Is(err, ErrKeyExists) {
+			// Key already exists — update our address in-place.
+			cmd.Op = opUpdate
+			_, err = s.propose(s.stopCtx, cmd)
 		}
 
 		if err == nil {
@@ -336,8 +455,11 @@ func (s *Store) advertiseMetadata() {
 	}
 }
 
-// Ready blocks until the node has a known leader and has applied at least
-// one entry from the current term, indicating it is ready for operations.
+// Ready blocks until this node has a known leader and has applied at least one
+// entry in the current term, confirming the local state machine is caught up.
+// Call it after Start before issuing your first writes to avoid spurious
+// ErrNotLeader errors during leader election.
+// Returns ctx.Err() if the context expires, or an error if the store is stopped.
 func (s *Store) Ready(ctx context.Context) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -368,7 +490,9 @@ func (s *Store) Status() raft.GroupStatus {
 	return s.node.Status()
 }
 
-// Stop shuts down the store and releases all resources.
+// Stop cancels the store's context (terminating discovery goroutines), shuts
+// down the HTTP server, stops the Raft node, and closes persistent storage.
+// It is safe to call Stop more than once.
 func (s *Store) Stop() {
 
 	if s.cancel != nil {
@@ -387,14 +511,22 @@ func (s *Store) Stop() {
 	}
 }
 
-// Collection provides a type-safe view into a named collection within a Store.
+// Collection is a type-safe view into a named namespace within a [Store].
+// All keys within a collection are independent of keys in other collections.
+// T must be JSON-serialisable.
+//
+// A Collection is a lightweight handle — it is safe to create multiple
+// Collection values pointing at the same name and store.
 type Collection[T any] struct {
 	store *Store
 	name  string
 }
 
-// AddCollection adds a new typed collection to the store.
-// Collection names starting with "__" are reserved for internal use.
+// AddCollection returns a typed Collection handle for the given name within s.
+// It can be called at any time — before or after Start — and is idempotent for
+// the same name and type.
+// Collection names starting with "__" are reserved for internal use and will
+// panic if used.
 func AddCollection[T any](s *Store, name string) *Collection[T] {
 	if strings.HasPrefix(name, "__") {
 		panic("easyraft: collection names starting with '__' are reserved")
@@ -405,7 +537,23 @@ func AddCollection[T any](s *Store, name string) *Collection[T] {
 	}
 }
 
-// RegisterMutation defines a named mutation for a specific collection.
+// RegisterMutation registers a named read-modify-write function for this
+// collection. Mutations are the correct way to update a value based on its
+// current state — a Read followed by Update is not atomic.
+//
+// fn is called inside [raft.StateMachine].Apply, which runs on every replica
+// during both normal operation and log replay after a restart or snapshot
+// restore. fn MUST be purely deterministic: do not call time.Now, rand, or
+// any external I/O inside fn. If different replicas produce different results
+// for the same log entry, the cluster state will silently diverge.
+//
+// If fn needs the current time or any external value, encode it in the args
+// before calling Mutate — all replicas will then receive and apply the same bytes.
+//
+// If fn returns an error, the state machine is not updated and the error is
+// returned to the proposing caller.
+//
+// Call RegisterMutation before Start.
 func (c *Collection[T]) RegisterMutation(name string, fn func(current *T, args []byte) (*T, []byte, error)) {
 	c.store.registerMutation(c.name, name, func(currentRaw json.RawMessage, args json.RawMessage) (json.RawMessage, json.RawMessage, error) {
 		var current T
@@ -430,6 +578,8 @@ func (c *Collection[T]) RegisterMutation(name string, fn func(current *T, args [
 }
 
 // Create inserts a new item into the collection.
+// Returns [ErrKeyExists] if an item with that key already exists.
+// Returns [ErrNotLeader] if this node is not the current Raft leader.
 func (c *Collection[T]) Create(ctx context.Context, key string, value T) error {
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -445,6 +595,8 @@ func (c *Collection[T]) Create(ctx context.Context, key string, value T) error {
 }
 
 // Update replaces an existing item.
+// Returns [ErrKeyNotFound] if the key does not exist.
+// Returns [ErrNotLeader] if this node is not the current Raft leader.
 func (c *Collection[T]) Update(ctx context.Context, key string, value T) error {
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -460,6 +612,8 @@ func (c *Collection[T]) Update(ctx context.Context, key string, value T) error {
 }
 
 // Delete removes an existing item.
+// Returns [ErrKeyNotFound] if the key does not exist.
+// Returns [ErrNotLeader] if this node is not the current Raft leader.
 func (c *Collection[T]) Delete(ctx context.Context, key string) error {
 	_, err := c.store.propose(ctx, &command{
 		Op:         opDelete,
@@ -469,7 +623,10 @@ func (c *Collection[T]) Delete(ctx context.Context, key string) error {
 	return err
 }
 
-// CreateOnce inserts a new item into the collection with exactly-once semantics.
+// CreateOnce inserts a new item with exactly-once semantics. If the network
+// drops the response and the caller retries with the same (clientID, seqNum),
+// the cached result is returned without applying the command a second time.
+// seqNum must increase monotonically per clientID.
 func (c *Collection[T]) CreateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -485,6 +642,7 @@ func (c *Collection[T]) CreateOnce(ctx context.Context, clientID raft.NodeID, se
 }
 
 // UpdateOnce replaces an existing item with exactly-once semantics.
+// See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) UpdateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -500,6 +658,7 @@ func (c *Collection[T]) UpdateOnce(ctx context.Context, clientID raft.NodeID, se
 }
 
 // DeleteOnce removes an existing item with exactly-once semantics.
+// See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) DeleteOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string) error {
 	_, err := c.store.ProposeOnce(ctx, clientID, seqNum, &command{
 		Op:         opDelete,
@@ -509,7 +668,12 @@ func (c *Collection[T]) DeleteOnce(ctx context.Context, clientID raft.NodeID, se
 	return err
 }
 
-// Mutate executes a registered mutation atomically.
+// Mutate executes a named mutation registered with [Collection.RegisterMutation].
+// The mutation runs as a single Raft log entry — it is an atomic read-modify-write.
+// args is passed verbatim to the mutation function and may be nil.
+// Returns the response bytes returned by the mutation function, or an error.
+// Returns [ErrKeyNotFound] if the key does not exist.
+// Returns [ErrNotLeader] if this node is not the current Raft leader.
 func (c *Collection[T]) Mutate(ctx context.Context, key, name string, args []byte) ([]byte, error) {
 	return c.store.propose(ctx, &command{
 		Op:         opMutate,
@@ -521,6 +685,7 @@ func (c *Collection[T]) Mutate(ctx context.Context, key, name string, args []byt
 }
 
 // MutateOnce executes a registered mutation with exactly-once semantics.
+// See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key, name string, args []byte) ([]byte, error) {
 	return c.store.ProposeOnce(ctx, clientID, seqNum, &command{
 		Op:         opMutate,
@@ -531,7 +696,11 @@ func (c *Collection[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, se
 	})
 }
 
-// Read returns an item by key with linearizable consistency.
+// Read returns an item by key with linearizable consistency. It performs a
+// ReadIndexLease round-trip to confirm the local state machine is up to date
+// before serving from the local map.
+// Returns [ErrKeyNotFound] if the key does not exist.
+// Returns [ErrNotLeader] if this node cannot establish a read lease.
 func (c *Collection[T]) Read(ctx context.Context, key string) (T, error) {
 	var empty T
 	if c.store.node == nil {
@@ -543,7 +712,11 @@ func (c *Collection[T]) Read(ctx context.Context, key string) (T, error) {
 	return c.ReadStale(key)
 }
 
-// ReadStale returns an item by key from local state.
+// ReadStale returns an item by key directly from the local state machine,
+// without a leader round-trip. The result may lag behind the cluster by up to
+// one heartbeat interval. Use this for read-heavy workloads where bounded
+// staleness is acceptable.
+// Returns [ErrKeyNotFound] if the key does not exist locally.
 func (c *Collection[T]) ReadStale(key string) (T, error) {
 	var val T
 	c.store.mu.RLock()
@@ -564,7 +737,9 @@ func (c *Collection[T]) ReadStale(key string) (T, error) {
 	return val, nil
 }
 
-// ListStale returns all items in the collection from local state.
+// ListStale returns all items in the collection from the local state machine
+// without a leader round-trip. The result may be stale by up to one heartbeat.
+// Returns an empty map (not nil) if the collection has no items.
 func (c *Collection[T]) ListStale() (map[string]T, error) {
 	c.store.mu.RLock()
 	defer c.store.mu.RUnlock()
@@ -586,6 +761,8 @@ func (c *Collection[T]) ListStale() (map[string]T, error) {
 }
 
 // List returns all items in the collection with linearizable consistency.
+// It performs a ReadIndexLease round-trip before reading from local state.
+// Returns an empty map (not nil) if the collection has no items.
 func (c *Collection[T]) List(ctx context.Context) (map[string]T, error) {
 	if c.store.node == nil {
 		return nil, fmt.Errorf("easyraft: node not started")
@@ -613,7 +790,9 @@ func (c *Collection[T]) List(ctx context.Context) (map[string]T, error) {
 	return out, nil
 }
 
-// AddServer adds a new peer to the cluster.
+// AddServer registers addr with the transport and adds id as a voting member
+// of the Raft cluster. This must be called on the leader; it returns
+// [ErrNotLeader] otherwise. Blocks until the membership change is committed.
 func (s *Store) AddServer(ctx context.Context, id raft.NodeID, addr string) error {
 	if s.node == nil {
 		return errors.New("easyraft: node not started")
@@ -626,7 +805,9 @@ func (s *Store) AddServer(ctx context.Context, id raft.NodeID, addr string) erro
 	return s.node.AddServer(ctx, raft.PeerConfig{ID: id, Voter: true})
 }
 
-// RemoveServer removes a peer from the cluster.
+// RemoveServer removes id from the Raft cluster membership. Must be called on
+// the leader. If id is the current leader, it commits the removal and then
+// steps down; the caller is responsible for stopping the removed node.
 func (s *Store) RemoveServer(ctx context.Context, id raft.NodeID) error {
 	if s.node == nil {
 		return errors.New("easyraft: node not started")
@@ -634,7 +815,10 @@ func (s *Store) RemoveServer(ctx context.Context, id raft.NodeID) error {
 	return s.node.RemoveServer(ctx, id)
 }
 
-// TransferLeadership initiates a leadership transfer to the target node.
+// TransferLeadership gracefully hands off leadership to to. The leader waits
+// for to to catch up on the log, then sends a TimeoutNow RPC that causes it
+// to start an election immediately. Blocks until this node steps down or the
+// context expires.
 func (s *Store) TransferLeadership(ctx context.Context, to raft.NodeID) error {
 	if s.node == nil {
 		return errors.New("easyraft: node not started")
@@ -642,10 +826,15 @@ func (s *Store) TransferLeadership(ctx context.Context, to raft.NodeID) error {
 	return s.node.TransferLeadership(ctx, to)
 }
 
-// MutationFunc receives the raw current value and arbitrary raw arguments,
-// and returns the raw new value, an optional raw response, and an error.
-// The new value will be saved back into the state machine.
+// MutationFunc is the low-level, untyped mutation callback stored in the
+// registry. It receives the current value and args as raw JSON and must return
+// the new value and an optional response, both as raw JSON.
+//
+// Use [Collection.RegisterMutation] to register a typed wrapper instead of
+// implementing MutationFunc directly.
+//
 // If an error is returned, the state machine is NOT updated.
+// MutationFunc MUST be purely deterministic — see [Collection.RegisterMutation].
 type MutationFunc func(currentValue json.RawMessage, args json.RawMessage) (newValue json.RawMessage, response json.RawMessage, err error)
 
 func (s *Store) registerMutation(collection, name string, fn MutationFunc) {
@@ -769,6 +958,36 @@ func (s *Store) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) err
 	}
 	s.collections = collections
 	return nil
+}
+
+// raftTickInterval returns the configured tick interval, falling back to the
+// easyraft default of 100 ms (more conservative than the raft package default).
+func (s *Store) raftTickInterval() time.Duration {
+	if s.cfg.TickInterval > 0 {
+		return s.cfg.TickInterval
+	}
+	return 100 * time.Millisecond
+}
+
+func (s *Store) raftHeartbeatInterval() time.Duration {
+	if s.cfg.HeartbeatInterval > 0 {
+		return s.cfg.HeartbeatInterval
+	}
+	return 100 * time.Millisecond
+}
+
+func (s *Store) raftElectionTimeoutMin() time.Duration {
+	if s.cfg.ElectionTimeoutMin > 0 {
+		return s.cfg.ElectionTimeoutMin
+	}
+	return 1 * time.Second
+}
+
+func (s *Store) raftElectionTimeoutMax() time.Duration {
+	if s.cfg.ElectionTimeoutMax > 0 {
+		return s.cfg.ElectionTimeoutMax
+	}
+	return 2 * time.Second
 }
 
 // propose encodes a command and proposes it to the Raft node.

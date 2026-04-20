@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -57,7 +58,7 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	var val json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
 		return
 	}
 
@@ -91,16 +92,16 @@ func (s *Store) handleRead(w http.ResponseWriter, r *http.Request) {
 
 	coll := s.collections[collection]
 	if coll == nil {
-		s.writeError(w, http.StatusNotFound, "collection not found")
+		writeError(w, http.StatusNotFound, "collection not found", s.cfg.Logger)
 		return
 	}
 	raw, ok := coll[key]
 	if !ok {
-		s.writeError(w, http.StatusNotFound, ErrKeyNotFound.Error())
+		writeError(w, http.StatusNotFound, ErrKeyNotFound.Error(), s.cfg.Logger)
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, raw)
+	writeJSON(w, http.StatusOK, raw, s.cfg.Logger)
 }
 
 func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -109,7 +110,7 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var val json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
 		return
 	}
 
@@ -158,11 +159,11 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 
 	coll := s.collections[collection]
 	if coll == nil {
-		s.writeJSON(w, http.StatusOK, make(map[string]json.RawMessage))
+		writeJSON(w, http.StatusOK, make(map[string]json.RawMessage), s.cfg.Logger)
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, coll)
+	writeJSON(w, http.StatusOK, coll, s.cfg.Logger)
 }
 
 type mutateRequest struct {
@@ -176,7 +177,7 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 
 	var req mutateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
 		return
 	}
 
@@ -199,7 +200,7 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	status := s.node.Status()
-	s.writeJSON(w, http.StatusOK, status)
+	writeJSON(w, http.StatusOK, status, s.cfg.Logger)
 }
 
 func (s *Store) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -211,7 +212,7 @@ func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error
 	if errors.Is(err, ErrNotLeader) {
 		leaderID := s.node.Leader()
 		if leaderID == "" {
-			s.writeError(w, http.StatusServiceUnavailable, "no leader currently elected")
+			writeError(w, http.StatusServiceUnavailable, "no leader currently elected", s.cfg.Logger)
 			return
 		}
 
@@ -225,48 +226,40 @@ func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error
 		s.mu.RUnlock()
 
 		if leaderAddr != "" {
-			// If we have a functional address, use it for a real redirect.
-			// We only redirect if it looks like a full URL or host:port.
 			url := leaderAddr
 			if !strings.HasPrefix(url, "http") {
 				url = "http://" + url
 			}
-			// Append the current path and query
 			url += r.URL.Path
 			if r.URL.RawQuery != "" {
 				url += "?" + r.URL.RawQuery
 			}
 			w.Header().Set("Location", url)
-			s.writeError(w, http.StatusTemporaryRedirect, fmt.Sprintf("not leader; redirecting to %s", url))
+			writeError(w, http.StatusTemporaryRedirect, fmt.Sprintf("not leader; redirecting to %s", url), s.cfg.Logger)
 			return
 		}
 
-		s.writeError(w, http.StatusTemporaryRedirect, fmt.Sprintf("not leader; leader is %s", leaderID))
+		// Leader is known but its HTTP address has not been advertised yet.
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("not leader; leader is %s but its HTTP address is not yet known", leaderID), s.cfg.Logger)
 		return
 	}
 
 	if errors.Is(err, ErrKeyNotFound) {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), s.cfg.Logger)
 		return
 	}
 
 	if errors.Is(err, ErrKeyExists) {
-		s.writeError(w, http.StatusConflict, err.Error())
+		writeError(w, http.StatusConflict, err.Error(), s.cfg.Logger)
 		return
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		s.writeError(w, http.StatusRequestTimeout, err.Error())
+		writeError(w, http.StatusRequestTimeout, err.Error(), s.cfg.Logger)
 		return
 	}
 
-	s.writeError(w, http.StatusInternalServerError, err.Error())
-}
-
-func (s *Store) writeError(w http.ResponseWriter, code int, msg string) {
-	s.writeJSON(w, code, struct {
-		Error string `json:"error"`
-	}{Error: msg})
+	writeError(w, http.StatusInternalServerError, err.Error(), s.cfg.Logger)
 }
 
 func (m *Manager) serveHTTP() error {
@@ -326,7 +319,7 @@ func (m *Manager) getStore(r *http.Request) (*Store, error) {
 func (m *Manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 	s, err := m.getStore(r)
 	if err != nil {
-		m.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
 		return
 	}
 	s.handleCreate(w, r)
@@ -335,7 +328,7 @@ func (m *Manager) handleCreate(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleRead(w http.ResponseWriter, r *http.Request) {
 	s, err := m.getStore(r)
 	if err != nil {
-		m.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
 		return
 	}
 	s.handleRead(w, r)
@@ -344,7 +337,7 @@ func (m *Manager) handleRead(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	s, err := m.getStore(r)
 	if err != nil {
-		m.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
 		return
 	}
 	s.handleUpdate(w, r)
@@ -353,7 +346,7 @@ func (m *Manager) handleUpdate(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s, err := m.getStore(r)
 	if err != nil {
-		m.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
 		return
 	}
 	s.handleDelete(w, r)
@@ -362,7 +355,7 @@ func (m *Manager) handleDelete(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleList(w http.ResponseWriter, r *http.Request) {
 	s, err := m.getStore(r)
 	if err != nil {
-		m.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
 		return
 	}
 	s.handleList(w, r)
@@ -371,7 +364,7 @@ func (m *Manager) handleList(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleMutate(w http.ResponseWriter, r *http.Request) {
 	s, err := m.getStore(r)
 	if err != nil {
-		m.writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
 		return
 	}
 	s.handleMutate(w, r)
@@ -379,7 +372,7 @@ func (m *Manager) handleMutate(w http.ResponseWriter, r *http.Request) {
 
 func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := m.mgr.StatusAll()
-	m.writeJSON(w, http.StatusOK, status)
+	writeJSON(w, http.StatusOK, status, m.cfg.Logger)
 }
 
 func (m *Manager) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -387,28 +380,18 @@ func (m *Manager) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("OK"))
 }
 
-func (s *Store) writeJSON(w http.ResponseWriter, code int, val any) {
+// writeJSON sends a JSON-encoded response with the given status code.
+func writeJSON(w http.ResponseWriter, code int, val any, logger *slog.Logger) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(val); err != nil {
-		if s.cfg.Logger != nil {
-			s.cfg.Logger.Error("HTTP encode failed", "err", err)
-		}
+	if err := json.NewEncoder(w).Encode(val); err != nil && logger != nil {
+		logger.Error("HTTP encode failed", "err", err)
 	}
 }
 
-func (m *Manager) writeError(w http.ResponseWriter, code int, msg string) {
-	m.writeJSON(w, code, struct {
+// writeError sends a JSON error response with the given status code.
+func writeError(w http.ResponseWriter, code int, msg string, logger *slog.Logger) {
+	writeJSON(w, code, struct {
 		Error string `json:"error"`
-	}{Error: msg})
-}
-
-func (m *Manager) writeJSON(w http.ResponseWriter, code int, val any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(val); err != nil {
-		if m.cfg.Logger != nil {
-			m.cfg.Logger.Error("Manager HTTP encode failed", "err", err)
-		}
-	}
+	}{Error: msg}, logger)
 }

@@ -41,10 +41,15 @@ func BenchmarkRateLimiter(b *testing.B) {
 		}
 		stores[i] = s
 
-		// Register the 'take' mutation on all nodes
+		// Register a simplified "take" mutation for benchmarking purposes.
+		// The production mutation (in main.go) validates args and applies
+		// time-based refill; here we do a bare decrement to isolate Raft
+		// consensus overhead from application logic overhead.
 		qColl := easyraft.AddCollection[Quota](s, "quotas")
-		qColl.RegisterMutation("take", func(q *Quota, args []byte) (*Quota, []byte, error) {
-			q.CurrentTokens--
+		qColl.RegisterMutation("take", func(q *Quota, _ []byte) (*Quota, []byte, error) {
+			if q.CurrentTokens > 0 {
+				q.CurrentTokens--
+			}
 			return q, nil, nil
 		})
 
@@ -57,7 +62,7 @@ func BenchmarkRateLimiter(b *testing.B) {
 		}
 	}()
 
-	// Wait for a lead		// Wait for a leader to be elected and stable.
+	// Wait for a leader to be elected and stable.
 	var leaderStore *easyraft.Store
 	ctx := context.Background()
 
