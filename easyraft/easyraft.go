@@ -4,13 +4,20 @@ import (
 	"context"
 )
 
-// EasyRaft provides a high-level, type-safe API for a Raft-backed collection.
+// EasyRaft is a convenience wrapper that binds a [Store] to a single [Collection]
+// named "default". It exposes the full Collection API directly without requiring
+// the caller to manage Store and Collection separately.
+//
+// Use [New] when your service manages a single entity type. For multiple entity
+// types in one Raft group, use [NewStore] + [AddCollection] instead.
 type EasyRaft[T any] struct {
 	store      *Store
 	collection *Collection[T]
 }
 
-// New creates a new single-collection EasyRaft instance.
+// New creates a single-collection EasyRaft instance. The underlying collection
+// is named "default". [WithID], [WithRaftAddr], and [WithDataDir] are required.
+// Call Start after creating the instance and registering any mutations.
 func New[T any](opts ...Option) (*EasyRaft[T], error) {
 	s, err := NewStore(opts...)
 	if err != nil {
@@ -23,7 +30,7 @@ func New[T any](opts ...Option) (*EasyRaft[T], error) {
 	}, nil
 }
 
-// Start launches the Raft event loop.
+// Start launches the Raft event loop. Register all mutations before calling Start.
 func (e *EasyRaft[T]) Start() {
 	e.store.Start()
 }
@@ -33,8 +40,9 @@ func (e *EasyRaft[T]) Stop() {
 	e.store.Stop()
 }
 
-// RegisterMutation defines a named mutation that can be safely replicated
-// and executed atomically across the cluster.
+// RegisterMutation defines a named atomic read-modify-write operation.
+// fn must be purely deterministic — see [Collection.RegisterMutation] for the
+// full determinism contract. Call before Start.
 func (e *EasyRaft[T]) RegisterMutation(name string, fn func(current *T, args []byte) (*T, []byte, error)) {
 	e.collection.RegisterMutation(name, fn)
 }
