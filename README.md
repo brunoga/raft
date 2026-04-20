@@ -32,7 +32,7 @@ Requires Go 1.22+.
 16. [Multi-Raft — thousands of groups on shared infrastructure](#multi-raft--thousands-of-groups-on-shared-infrastructure)
 17. [Caveats and known limitations](#caveats-and-known-limitations)
 18. [EasyRaft — high-level abstraction](#easyraft--high-level-abstraction)
-19. [Reference implementation](#reference-implementation)
+19. [Reference implementations](#reference-implementation)
 
 ---
 
@@ -1021,6 +1021,8 @@ Key features at a glance:
 
 - **`New[T]`** — single typed collection; **`NewStore` + `AddCollection[T]`** — multiple collections.
 - **Mutations** — atomic read-modify-write operations replicated as a single log entry.
+- **`Upsert`** — atomic create-or-update in a single log entry; no `ErrKeyExists` / `ErrKeyNotFound`.
+- **`OnChange`** — callback fired on every replica after each committed write, outside the Raft lock; the primitive for watch/subscribe flows.
 - **`WithJoinAddr`** — join a running cluster via an HTTP seed node; no upfront peer list required.
 - **`WithJoinAsLearner`** — join as a non-voting replica that replicates the log without participating in elections.
 - **`WithLeaveOnStop`** — gracefully remove this node from the cluster membership on shutdown.
@@ -1037,7 +1039,7 @@ See [`easyraft/`](easyraft/) for the full documentation and API reference.
 
 ## Reference implementation
 
-Three fully-worked examples are provided, each targeting a different deployment pattern.
+Four fully-worked examples are provided, each targeting a different deployment pattern.
 
 ### `examples/idprovider` — single-group
 
@@ -1079,6 +1081,33 @@ go build -o ratelimiter ./examples/ratelimiter
 # Node 2 — joins node 1
 ./ratelimiter --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/rl/n2 \
               --join localhost:8001
+```
+
+### `examples/configsvc` — EasyRaft with watch/subscribe (SSE)
+
+See [`examples/configsvc`](examples/configsvc/) for a distributed configuration service built on `easyraft`. It demonstrates the watch/subscribe pattern — the one thing a plain KV store does not cover:
+
+- **`Collection.OnChange`**: fires on every replica after each committed write, outside the Raft lock. Used here to fan out change events to locally connected SSE clients without polling.
+- **`Collection.Upsert`**: atomic create-or-update in a single log entry.
+- **SSE watch streams**: `GET /watch/{key}` and `GET /watch` — any node can serve watchers; each fires independently from its own `OnChange` callback.
+- **Deterministic versioning**: `ConfigEntry.Version` is set by the HTTP handler before proposing so all replicas apply the same value.
+- **`WithJoinAddr`**: same one-at-a-time cluster growth as the ratelimiter example.
+
+```bash
+go build -o configsvc ./examples/configsvc
+
+# Node 1 — bootstrap
+./configsvc --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/cfg/n1
+
+# Node 2 — joins node 1; watch all keys
+./configsvc --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/cfg/n2 \
+            --join localhost:8001
+
+curl -N http://localhost:8002/watch   # SSE stream on node 2
+
+# Write on node 1 — event arrives on node 2's watcher
+curl -L -X PUT http://localhost:8001/configs/db.host \
+     -H 'Content-Type: application/json' -d '{"value":"localhost"}'
 ```
 
 ### `examples/shardkv` — multi-group (multi-raft) with leader balancing

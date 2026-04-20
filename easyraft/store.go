@@ -80,9 +80,19 @@ const (
 	opCreate opType = "create"
 	opUpdate opType = "update"
 	opDelete opType = "delete"
+	opUpsert opType = "upsert"
 	opMutate opType = "mutate"
 	opBatch  opType = "batch"
 )
+
+// changeEvent is an internal notification emitted after each successful write
+// and delivered to [Store.OnChange] callbacks outside the state-machine lock.
+type changeEvent struct {
+	collection string
+	key        string
+	value      json.RawMessage // nil when deleted
+	deleted    bool
+}
 
 type command struct {
 	Op         opType          `json:"op"`
@@ -122,6 +132,20 @@ type Store struct {
 	// and to build join responses.
 	raftPeers map[raft.NodeID]raftPeerInfo
 
+	// onChangeFns holds per-collection callbacks registered via OnChange.
+	// Protected by mu. Each key is a collection name; values are called
+	// outside the lock by the notification dispatcher.
+	onChangeFns map[string]func(key string, value json.RawMessage, deleted bool)
+
+	// notifyCh carries change events from Apply (state-machine goroutine) to
+	// the notification dispatcher (started by Start). Buffered so Apply never
+	// blocks; events are dropped if the dispatcher falls behind.
+	notifyCh chan changeEvent
+
+	// pendingEvents accumulates events during a single applyCommand call.
+	// Reset at the start of each Apply; only accessed under mu.
+	pendingEvents []changeEvent
+
 	cfg        Config
 	cancel     context.CancelFunc
 	stopCtx    context.Context
@@ -151,6 +175,8 @@ func NewStore(opts ...Option) (*Store, error) {
 		collections: make(map[string]map[string]json.RawMessage),
 		mutations:   make(map[string]map[string]MutationFunc),
 		raftPeers:   make(map[raft.NodeID]raftPeerInfo),
+		onChangeFns: make(map[string]func(string, json.RawMessage, bool)),
+		notifyCh:    make(chan changeEvent, 1024),
 		cfg:         c,
 		cancel:      cancel,
 		stopCtx:     ctx,
@@ -430,6 +456,8 @@ func (s *Store) Start() {
 		s.node.Start()
 	}
 
+	go s.dispatchChanges()
+
 	// Register our own HTTP address in the metadata collection so others can redirect to us.
 	if s.cfg.HTTPAddr != "" {
 		go s.advertiseMetadata()
@@ -508,6 +536,46 @@ func (s *Store) Ready(ctx context.Context) error {
 		case <-s.stopCtx.Done():
 			return errors.New("easyraft: store stopped")
 		case <-ticker.C:
+		}
+	}
+}
+
+// OnChange registers fn to be called on this node whenever a committed write
+// modifies collection. fn receives the key, the new serialised value (nil if
+// the key was deleted), and a deleted flag. It is called outside the
+// state-machine lock, in a dedicated dispatcher goroutine, after every Apply
+// that touches the collection — including on followers and during log replay
+// after a restart or snapshot restore.
+//
+// Only one handler per collection is supported; a second call for the same
+// collection replaces the first. Call before Start.
+func (s *Store) OnChange(collection string, fn func(key string, value json.RawMessage, deleted bool)) {
+	s.mu.Lock()
+	s.onChangeFns[collection] = fn
+	s.mu.Unlock()
+}
+
+// dispatchChanges reads changeEvents from notifyCh and calls the registered
+// OnChange handler for the affected collection. Runs until stopCtx is done.
+func (s *Store) dispatchChanges() {
+	for {
+		select {
+		case <-s.stopCtx.Done():
+			// Drain remaining events so Apply never blocks.
+			for {
+				select {
+				case <-s.notifyCh:
+				default:
+					return
+				}
+			}
+		case ev := <-s.notifyCh:
+			s.mu.RLock()
+			fn := s.onChangeFns[ev.collection]
+			s.mu.RUnlock()
+			if fn != nil {
+				fn(ev.key, ev.value, ev.deleted)
+			}
 		}
 	}
 }
@@ -730,6 +798,44 @@ func (c *Collection[T]) Delete(ctx context.Context, key string) error {
 		Key:        key,
 	})
 	return err
+}
+
+// Upsert inserts key if it does not exist, or replaces it if it does.
+// Unlike [Create] + [Update], Upsert is a single atomic operation that never
+// returns [ErrKeyExists] or [ErrKeyNotFound].
+// Returns [ErrNotLeader] if this node is not the current Raft leader.
+func (c *Collection[T]) Upsert(ctx context.Context, key string, value T) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("easyraft: encode value: %w", err)
+	}
+	_, err = c.store.propose(ctx, &command{
+		Op:         opUpsert,
+		Collection: c.name,
+		Key:        key,
+		Value:      b,
+	})
+	return err
+}
+
+// OnChange registers fn to be called on this node whenever a committed write
+// modifies this collection. fn receives the key, the new typed value (nil
+// on delete), and a deleted flag. It is called outside the state-machine lock
+// after every committed write that touches this collection — on every replica,
+// including during log replay after a restart or snapshot restore.
+//
+// Call before [Store.Start]. Only one handler per collection is supported.
+func (c *Collection[T]) OnChange(fn func(key string, value *T, deleted bool)) {
+	c.store.OnChange(c.name, func(key string, raw json.RawMessage, deleted bool) {
+		if deleted {
+			fn(key, nil, true)
+			return
+		}
+		var v T
+		if err := json.Unmarshal(raw, &v); err == nil {
+			fn(key, &v, false)
+		}
+	})
 }
 
 // CreateOnce inserts a new item with exactly-once semantics. If the network
@@ -968,9 +1074,22 @@ func (s *Store) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.pendingEvents = s.pendingEvents[:0]
+	result, err := s.applyCommand(&cmd)
+	// Steal the pending events slice before releasing the lock so the
+	// dispatcher sees a consistent snapshot. Assign nil so the next Apply
+	// starts with a fresh allocation rather than aliasing this one.
+	events := s.pendingEvents
+	s.pendingEvents = nil
+	s.mu.Unlock()
 
-	return s.applyCommand(&cmd)
+	for _, ev := range events {
+		select {
+		case s.notifyCh <- ev:
+		default: // drop if dispatcher is behind; watchers will miss this event
+		}
+	}
+	return result, err
 }
 
 func (s *Store) applyCommand(cmd *command) ([]byte, error) {
@@ -998,6 +1117,7 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 			return nil, ErrKeyExists
 		}
 		coll[cmd.Key] = cmd.Value
+		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
 
 	case opUpdate:
@@ -1005,6 +1125,12 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 			return nil, ErrKeyNotFound
 		}
 		coll[cmd.Key] = cmd.Value
+		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
+		return nil, nil
+
+	case opUpsert:
+		coll[cmd.Key] = cmd.Value
+		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
 
 	case opDelete:
@@ -1012,6 +1138,7 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 			return nil, ErrKeyNotFound
 		}
 		delete(coll, cmd.Key)
+		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, deleted: true})
 		return nil, nil
 
 	case opMutate:
@@ -1034,6 +1161,7 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 			return nil, err
 		}
 		coll[cmd.Key] = newVal
+		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: newVal})
 		return resp, nil
 
 	default:
