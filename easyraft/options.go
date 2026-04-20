@@ -25,6 +25,13 @@ type Config struct {
 	TLS               *tls.Config
 	PromRegisterer    prometheus.Registerer
 
+	// JoinAddrs are HTTP addresses of existing cluster nodes to contact on
+	// startup. The joining node POSTs its ID and Raft address to each seed in
+	// turn until one succeeds. The seed registers this node with the Raft
+	// cluster and returns the current peer list so the joiner can seed its
+	// own transport. Set via [WithJoinAddr].
+	JoinAddrs []string
+
 	// Raft timing overrides. Zero means use the easyraft defaults
 	// (100 ms tick/heartbeat, 1–2 s election timeout).
 	TickInterval       time.Duration
@@ -96,6 +103,19 @@ func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
 	return func(c *Config) {
 		c.Discovery = d
 		c.DiscoveryInterval = interval
+	}
+}
+
+// WithJoinAddr sets the HTTP address(es) of existing cluster nodes to contact
+// on startup for cluster joining. The joining node will POST its ID and Raft
+// address to each seed in turn until one succeeds; the seed will call
+// AddServer on behalf of the joiner and return the current peer list.
+//
+// Requires that the seed nodes have [WithHTTPAddr] configured. May be called
+// multiple times; addresses are appended.
+func WithJoinAddr(addrs ...string) Option {
+	return func(c *Config) {
+		c.JoinAddrs = append(c.JoinAddrs, addrs...)
 	}
 }
 
