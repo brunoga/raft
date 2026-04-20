@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/metrics/prommetrics"
@@ -15,8 +14,13 @@ import (
 	"github.com/brunoga/raft/transport/grpctransport"
 )
 
-// Manager coordinates multiple EasyRaft stores (Raft groups) on a single physical node.
-// It manages shared resources like the gRPC transport and the HTTP server.
+// Manager coordinates multiple EasyRaft [Store] instances (Raft groups) on a
+// single physical node. All groups share one gRPC transport listener, one HTTP
+// server, and one lifecycle context. Each group has its own Raft log, leader,
+// and storage directory.
+//
+// Use Manager when you want to shard your data across independent Raft groups
+// (e.g. for horizontal scalability). For a single group, use [NewStore] directly.
 type Manager struct {
 	mu     sync.RWMutex
 	stores map[uint64]*Store
@@ -50,8 +54,12 @@ func NewManager(opts ...Option) (*Manager, error) {
 	}, nil
 }
 
-// AddStore creates and registers a new EasyRaft store with the given group ID.
-// The store will share the manager's transport and ID, but have its own storage and consensus.
+// AddStore creates a Store for the given Raft group ID and registers it with
+// the Manager. The store inherits the Manager's NodeID, transport, and
+// lifecycle context, but has its own storage directory and Raft consensus.
+// [WithDataDir] is required on the store-level options.
+// Store-level options override Manager-level options.
+// AddStore must be called before [Manager.Start].
 func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 	// Merge manager-level options with store-specific options.
 	// Store-specific options (like DataDir) take precedence.
@@ -74,19 +82,20 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 	// We don't call initRaft here because it needs the shared transport.
 	// We'll initialize all stores in Manager.Start.
 	s := &Store{
-		collections:  make(map[string]map[string]json.RawMessage),
-		mutations:    make(map[string]map[string]MutationFunc),
-		waitForApply: 5 * time.Second,
-		cfg:          mergedCfg,
-		stopCtx:      m.stopCtx,
+		collections: make(map[string]map[string]json.RawMessage),
+		mutations:   make(map[string]map[string]MutationFunc),
+		cfg:         mergedCfg,
+		stopCtx:     m.stopCtx,
 	}
-	s.cfg.ID = m.cfg.ID // GroupID comes from the argument, but NodeID is shared.
+	s.cfg.ID = m.cfg.ID // NodeID is shared across all groups; GroupID comes from the argument.
 
 	m.stores[groupID] = s
 	return s, nil
 }
 
-// Start launches all registered stores and shared servers.
+// Start initialises the shared gRPC transport, starts all registered stores,
+// and (if WithHTTPAddr was set) starts the shared HTTP server.
+// All stores must be added via [Manager.AddStore] before calling Start.
 func (m *Manager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -127,7 +136,7 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// Stop shut down all stores and shared resources.
+// Stop shuts down all stores, the shared HTTP server, and the shared transport.
 func (m *Manager) Stop() {
 	m.cancel()
 	if m.httpServer != nil {
@@ -171,10 +180,10 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	rCfg.Storage = st
 	rCfg.StateMachine = s
 	rCfg.Logger = s.cfg.Logger
-	rCfg.TickInterval = 100 * time.Millisecond // Or 0 to use Manager.RunTicker
-	rCfg.ElectionTimeoutMin = 1 * time.Second
-	rCfg.ElectionTimeoutMax = 2 * time.Second
-	rCfg.HeartbeatInterval = 100 * time.Millisecond
+	rCfg.TickInterval = s.raftTickInterval() // Or 0 to use Manager.RunTicker
+	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
+	rCfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
+	rCfg.HeartbeatInterval = s.raftHeartbeatInterval()
 	rCfg.SnapshotThreshold = s.cfg.SnapCount
 	if rCfg.SnapshotThreshold == 0 {
 		rCfg.SnapshotThreshold = 1000
@@ -191,5 +200,14 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 
 	s.node = node
 	s.transport = tr
+
+	// Discovery: wire both transport connectivity and Raft membership, using
+	// the Manager's shared stop context so teardown is coordinated.
+	if s.cfg.Discovery != nil {
+		if pa, ok := tr.(peerAdder); ok {
+			s.startDiscovery(node, pa)
+		}
+	}
+
 	return nil
 }
