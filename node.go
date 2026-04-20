@@ -71,11 +71,12 @@ type Node struct {
 	lastApplied Index
 
 	// Atomic mirrors for safe external reads.
-	atomicState       atomic.Uint32 // mirrors state
-	atomicLeader      atomic.Value  // mirrors leaderID; stores string
-	atomicLastApplied atomic.Uint64 // mirrors lastApplied
-	atomicCommitIndex atomic.Uint64 // mirrors commitIndex
-	atomicTerm        atomic.Uint64 // mirrors currentTerm
+	atomicState         atomic.Uint32 // mirrors state
+	atomicLeader        atomic.Value  // mirrors leaderID; stores string
+	atomicLastApplied   atomic.Uint64 // mirrors lastApplied
+	atomicCommitIndex   atomic.Uint64 // mirrors commitIndex
+	atomicTerm          atomic.Uint64 // mirrors currentTerm
+	atomicSnapshotIndex atomic.Uint64 // mirrors log.snapMeta.LastIncludedIndex; updated by handleSnapshotResult
 	// atomicPeers mirrors cfg.Peers as a []NodeID snapshot; updated by
 	// applyConfigChange (event-loop only). Read by ReconfigureCluster outside
 	// the event loop to avoid a data race on cfg.Peers.
@@ -633,6 +634,14 @@ func (n *Node) waitApplied(ctx context.Context, index Index) (Index, error) {
 // loop.
 func (n *Node) LastApplied() Index {
 	return Index(n.atomicLastApplied.Load())
+}
+
+// SnapshotIndex returns the index of the last log entry included in the most
+// recent snapshot taken by this node (i.e. the compaction boundary). Zero
+// means no snapshot has been taken yet. Safe for concurrent use; reads from
+// the atomic mirror updated by handleSnapshotResult.
+func (n *Node) SnapshotIndex() Index {
+	return Index(n.atomicSnapshotIndex.Load())
 }
 
 // CommitIndex returns the index of the highest log entry known to be committed.
