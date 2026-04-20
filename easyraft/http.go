@@ -14,12 +14,34 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// joinRequest is the body of a POST /join request. The joining node sends its
+// own Raft node ID and gRPC address so the seed can register it.
+type joinRequest struct {
+	ID       raft.NodeID `json:"id"`
+	RaftAddr string      `json:"raft_addr"`
+}
+
+// joinPeer describes one cluster member in a join response.
+type joinPeer struct {
+	ID       raft.NodeID `json:"id"`
+	RaftAddr string      `json:"raft_addr"`
+}
+
+// joinResponse is returned by POST /join on success. It contains the current
+// set of cluster peers so the joining node can seed its own transport.
+type joinResponse struct {
+	Peers []joinPeer `json:"peers"`
+}
+
 func (s *Store) serveHTTP() error {
 	if s.cfg.HTTPAddr == "" {
 		return nil
 	}
 
 	mux := http.NewServeMux()
+
+	// Cluster join endpoint — must be registered before the wildcard routes.
+	mux.HandleFunc("POST /join", s.handleJoin)
 
 	// Multi-collection routing: /{collection}/{key}
 	mux.HandleFunc("POST /{collection}/{key}", s.handleCreate)
@@ -198,6 +220,65 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(resp)
 }
 
+// handleJoin handles POST /join. A new node posts its ID and Raft address;
+// this node registers it with the transport and calls AddServer. On success
+// the current cluster peer list (IDs + Raft addresses) is returned so the
+// joiner can bootstrap its own transport.
+//
+// If this node is not the leader the request is redirected to the leader
+// exactly like any other write operation.
+func (s *Store) handleJoin(w http.ResponseWriter, r *http.Request) {
+	var req joinRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		return
+	}
+	if req.ID == "" || req.RaftAddr == "" {
+		writeError(w, http.StatusBadRequest, "id and raft_addr are required", s.cfg.Logger)
+		return
+	}
+
+	// Register the joiner's Raft address with our transport so RPCs can be routed.
+	if pa, ok := s.transport.(peerAdder); ok {
+		pa.AddPeer(req.ID, req.RaftAddr)
+	}
+
+	// Propose the membership change. Only the leader can commit this; all other
+	// nodes will return ErrNotLeader and the client will follow the redirect.
+	addCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	err := s.node.AddServer(addCtx, raft.PeerConfig{ID: req.ID, Voter: true})
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+
+	// Record the new peer's Raft address so future join responses include it.
+	s.mu.Lock()
+	s.raftAddrs[req.ID] = req.RaftAddr
+	peers := s.currentPeers()
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, joinResponse{Peers: peers}, s.cfg.Logger)
+}
+
+// currentPeers returns a snapshot of all known peers (excluding self) with
+// their Raft addresses. Must be called with s.mu held (at least RLock).
+func (s *Store) currentPeers() []joinPeer {
+	peers := make([]joinPeer, 0, len(s.raftAddrs))
+	for id, addr := range s.raftAddrs {
+		if id == s.cfg.ID {
+			continue
+		}
+		peers = append(peers, joinPeer{ID: id, RaftAddr: addr})
+	}
+	// Also include self so the joining node can route RPCs back to us.
+	if s.cfg.RaftAddr != "" {
+		peers = append(peers, joinPeer{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr})
+	}
+	return peers
+}
+
 func (s *Store) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	status := s.node.Status()
 	writeJSON(w, http.StatusOK, status, s.cfg.Logger)
@@ -268,6 +349,9 @@ func (m *Manager) serveHTTP() error {
 	}
 
 	mux := http.NewServeMux()
+
+	// Cluster join endpoint per Raft group.
+	mux.HandleFunc("POST /groups/{groupID}/join", m.handleJoin)
 
 	// Multi-Raft routing: /groups/{groupID}/{collection}/{key}
 	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", m.handleCreate)
@@ -368,6 +452,15 @@ func (m *Manager) handleMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleMutate(w, r)
+}
+
+func (m *Manager) handleJoin(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		return
+	}
+	s.handleJoin(w, r)
 }
 
 func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
