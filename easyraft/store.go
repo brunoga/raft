@@ -110,6 +110,11 @@ type Store struct {
 	mutations   map[string]map[string]MutationFunc
 	node        *raft.Node
 
+	// raftAddrs maps known peer IDs to their Raft gRPC addresses. Seeded from
+	// cfg.Peers at init and updated when peers join via handleJoin. Protected
+	// by mu. Used to return the peer list in join responses.
+	raftAddrs map[raft.NodeID]string
+
 	cfg        Config
 	cancel     context.CancelFunc
 	stopCtx    context.Context
@@ -138,6 +143,7 @@ func NewStore(opts ...Option) (*Store, error) {
 	s := &Store{
 		collections: make(map[string]map[string]json.RawMessage),
 		mutations:   make(map[string]map[string]MutationFunc),
+		raftAddrs:   make(map[raft.NodeID]string),
 		cfg:         c,
 		cancel:      cancel,
 		stopCtx:     ctx,
@@ -278,6 +284,7 @@ func (s *Store) initRaft() error {
 		if id != s.cfg.ID {
 			tr.AddPeer(id, addr)
 			peerConfigs = append(peerConfigs, raft.PeerConfig{ID: id, Voter: true})
+			s.raftAddrs[id] = addr
 		}
 	}
 
@@ -398,7 +405,17 @@ func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 // Start launches the Raft event loop, begins advertising this node's HTTP
 // address to the cluster (if WithHTTPAddr was set), and starts the HTTP server.
 // Register all collections and mutations before calling Start.
+//
+// If [WithJoinAddr] was set, Start contacts the seed nodes to join the cluster
+// before starting the Raft event loop. A join failure is logged but not fatal —
+// the node will still start and may be added via discovery or a manual retry.
 func (s *Store) Start() {
+	if len(s.cfg.JoinAddrs) > 0 {
+		if err := s.joinCluster(s.stopCtx); err != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Warn("easyraft: cluster join failed", "err", err)
+		}
+	}
+
 	if s.node != nil {
 		s.node.Start()
 	}
@@ -483,6 +500,78 @@ func (s *Store) Ready(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// joinCluster contacts the configured seed HTTP addresses in order, posting
+// this node's ID and Raft address to each one until a join succeeds. On
+// success it registers the returned peer list with the local transport so
+// this node can route Raft RPCs to the existing members.
+func (s *Store) joinCluster(ctx context.Context) error {
+	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("easyraft: marshal join request: %w", err)
+	}
+
+	client := &http.Client{}
+	var lastErr error
+	for _, seed := range s.cfg.JoinAddrs {
+		url := seed
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			url = "http://" + url
+		}
+		url += "/join"
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var joinResp joinResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&joinResp)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("seed %s returned status %d", seed, resp.StatusCode)
+			continue
+		}
+		if decodeErr != nil {
+			lastErr = fmt.Errorf("seed %s: decode response: %w", seed, decodeErr)
+			continue
+		}
+
+		// Register all returned peers with the local transport.
+		pa, hasPeerAdder := s.transport.(peerAdder)
+		s.mu.Lock()
+		for _, p := range joinResp.Peers {
+			if p.ID == s.cfg.ID {
+				continue
+			}
+			s.raftAddrs[p.ID] = p.RaftAddr
+			if hasPeerAdder {
+				pa.AddPeer(p.ID, p.RaftAddr)
+			}
+		}
+		s.mu.Unlock()
+
+		if s.cfg.Logger != nil {
+			s.cfg.Logger.Info("easyraft: joined cluster", "seed", seed, "peers", len(joinResp.Peers))
+		}
+		return nil
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("easyraft: join failed (tried %d seed(s)): %w", len(s.cfg.JoinAddrs), lastErr)
+	}
+	return fmt.Errorf("easyraft: no join seed addresses configured")
 }
 
 // Status returns the current status of the underlying Raft node.
