@@ -14,24 +14,67 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// ---- Join types ------------------------------------------------------------
+
 // joinRequest is the body of a POST /join request. The joining node sends its
-// own Raft node ID and gRPC address so the seed can register it.
+// own Raft node ID, gRPC address, and voter preference.
 type joinRequest struct {
 	ID       raft.NodeID `json:"id"`
 	RaftAddr string      `json:"raft_addr"`
+	// Voter indicates whether the joining node should be a voting member.
+	// Omit or set true for a normal voter; set false for a learner/observer.
+	// Defaults to true when omitted.
+	Voter *bool `json:"voter,omitempty"`
 }
 
-// joinPeer describes one cluster member in a join response.
+// joinPeer describes one cluster member returned in a join response.
 type joinPeer struct {
 	ID       raft.NodeID `json:"id"`
 	RaftAddr string      `json:"raft_addr"`
+	Voter    bool        `json:"voter"`
 }
 
-// joinResponse is returned by POST /join on success. It contains the current
-// set of cluster peers so the joining node can seed its own transport.
+// joinResponse is returned by POST /join on success.
 type joinResponse struct {
 	Peers []joinPeer `json:"peers"`
 }
+
+// ---- Member types ----------------------------------------------------------
+
+// memberInfo describes one cluster member as returned by GET /members.
+type memberInfo struct {
+	ID       raft.NodeID `json:"id"`
+	RaftAddr string      `json:"raft_addr"`
+	Voter    bool        `json:"voter"`
+	Leader   bool        `json:"leader"`
+	Self     bool        `json:"self"`
+}
+
+// membersResponse is the body of a GET /members response.
+type membersResponse struct {
+	Members []memberInfo `json:"members"`
+}
+
+// ---- Transfer-leadership type ----------------------------------------------
+
+// transferLeadershipRequest is the body of a POST /transfer-leadership request.
+type transferLeadershipRequest struct {
+	To raft.NodeID `json:"to"`
+}
+
+// ---- Batch types -----------------------------------------------------------
+
+// batchOp is one operation in a POST /batch request.
+type batchOp struct {
+	Op         opType          `json:"op"`
+	Collection string          `json:"collection"`
+	Key        string          `json:"key"`
+	Value      json.RawMessage `json:"value,omitempty"`
+	MutateName string          `json:"mutate_name,omitempty"`
+	MutateArgs json.RawMessage `json:"mutate_args,omitempty"`
+}
+
+// ---- Store HTTP server -----------------------------------------------------
 
 func (s *Store) serveHTTP() error {
 	if s.cfg.HTTPAddr == "" {
@@ -40,8 +83,12 @@ func (s *Store) serveHTTP() error {
 
 	mux := http.NewServeMux()
 
-	// Cluster join endpoint — must be registered before the wildcard routes.
+	// Cluster management — registered before wildcards to take priority.
 	mux.HandleFunc("POST /join", s.handleJoin)
+	mux.HandleFunc("GET /members", s.handleMembers)
+	mux.HandleFunc("DELETE /members/{id}", s.handleRemoveMember)
+	mux.HandleFunc("POST /transfer-leadership", s.handleTransferLeadership)
+	mux.HandleFunc("POST /batch", s.handleBatch)
 
 	// Multi-collection routing: /{collection}/{key}
 	mux.HandleFunc("POST /{collection}/{key}", s.handleCreate)
@@ -238,6 +285,11 @@ func (s *Store) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	voter := true
+	if req.Voter != nil {
+		voter = *req.Voter
+	}
+
 	// Register the joiner's Raft address with our transport so RPCs can be routed.
 	if pa, ok := s.transport.(peerAdder); ok {
 		pa.AddPeer(req.ID, req.RaftAddr)
@@ -247,36 +299,148 @@ func (s *Store) handleJoin(w http.ResponseWriter, r *http.Request) {
 	// nodes will return ErrNotLeader and the client will follow the redirect.
 	addCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	err := s.node.AddServer(addCtx, raft.PeerConfig{ID: req.ID, Voter: true})
-	if err != nil {
+	if err := s.node.AddServer(addCtx, raft.PeerConfig{ID: req.ID, Voter: voter}); err != nil {
 		s.handleRPCError(w, r, err)
 		return
 	}
 
-	// Record the new peer's Raft address so future join responses include it.
+	// Record the new peer so future join responses and GET /members include it.
 	s.mu.Lock()
-	s.raftAddrs[req.ID] = req.RaftAddr
+	s.raftPeers[req.ID] = raftPeerInfo{addr: req.RaftAddr, voter: voter}
 	peers := s.currentPeers()
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, joinResponse{Peers: peers}, s.cfg.Logger)
 }
 
-// currentPeers returns a snapshot of all known peers (excluding self) with
-// their Raft addresses. Must be called with s.mu held (at least RLock).
+// currentPeers returns a snapshot of all known peers including self.
+// Must be called with s.mu held (at least RLock).
 func (s *Store) currentPeers() []joinPeer {
-	peers := make([]joinPeer, 0, len(s.raftAddrs))
-	for id, addr := range s.raftAddrs {
+	peers := make([]joinPeer, 0, len(s.raftPeers)+1)
+	for id, p := range s.raftPeers {
 		if id == s.cfg.ID {
 			continue
 		}
-		peers = append(peers, joinPeer{ID: id, RaftAddr: addr})
+		peers = append(peers, joinPeer{ID: id, RaftAddr: p.addr, Voter: p.voter})
 	}
-	// Also include self so the joining node can route RPCs back to us.
+	// Always include self so the joining node can route RPCs back to us.
 	if s.cfg.RaftAddr != "" {
-		peers = append(peers, joinPeer{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr})
+		peers = append(peers, joinPeer{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr, Voter: true})
 	}
 	return peers
+}
+
+// handleMembers handles GET /members. Returns all known cluster members with
+// their Raft addresses, voter status, and whether each is the current leader.
+func (s *Store) handleMembers(w http.ResponseWriter, r *http.Request) {
+	leaderID := s.node.Leader()
+
+	s.mu.RLock()
+	members := make([]memberInfo, 0, len(s.raftPeers)+1)
+	for id, p := range s.raftPeers {
+		if id == s.cfg.ID {
+			continue
+		}
+		members = append(members, memberInfo{
+			ID:       id,
+			RaftAddr: p.addr,
+			Voter:    p.voter,
+			Leader:   id == leaderID,
+		})
+	}
+	s.mu.RUnlock()
+
+	// Always include self.
+	members = append(members, memberInfo{
+		ID:       s.cfg.ID,
+		RaftAddr: s.cfg.RaftAddr,
+		Voter:    true,
+		Leader:   s.cfg.ID == leaderID,
+		Self:     true,
+	})
+
+	writeJSON(w, http.StatusOK, membersResponse{Members: members}, s.cfg.Logger)
+}
+
+// handleRemoveMember handles DELETE /members/{id}. Removes the named node from
+// the Raft cluster. Must be called on the leader; followers redirect.
+func (s *Store) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	id := raft.NodeID(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required", s.cfg.Logger)
+		return
+	}
+
+	rmCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := s.RemoveServer(rmCtx, id); err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTransferLeadership handles POST /transfer-leadership.
+// Body: {"to": "<nodeID>"}. Gracefully hands off leadership to the named node.
+func (s *Store) handleTransferLeadership(w http.ResponseWriter, r *http.Request) {
+	var req transferLeadershipRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		return
+	}
+	if req.To == "" {
+		writeError(w, http.StatusBadRequest, "to is required", s.cfg.Logger)
+		return
+	}
+
+	tlCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := s.TransferLeadership(tlCtx, req.To); err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBatch handles POST /batch. Accepts a JSON array of operations that are
+// committed as a single atomic log entry. Returns a JSON array of results in
+// the same order: null for CRUD operations, the mutation result for mutates.
+//
+// Request body:
+//
+//	[{"op":"create","collection":"col","key":"k","value":{...}}, ...]
+func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
+	var ops []batchOp
+	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		return
+	}
+	if len(ops) == 0 {
+		writeJSON(w, http.StatusOK, []json.RawMessage{}, s.cfg.Logger)
+		return
+	}
+
+	cmds := make([]command, len(ops))
+	for i, op := range ops {
+		cmds[i] = command{
+			Op:         op.Op,
+			Collection: op.Collection,
+			Key:        op.Key,
+			Value:      op.Value,
+			MutateName: op.MutateName,
+			MutateArgs: op.MutateArgs,
+		}
+	}
+
+	raw, err := s.propose(r.Context(), &command{Op: opBatch, Batch: cmds})
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 func (s *Store) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -343,6 +507,8 @@ func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error
 	writeError(w, http.StatusInternalServerError, err.Error(), s.cfg.Logger)
 }
 
+// ---- Manager HTTP server ---------------------------------------------------
+
 func (m *Manager) serveHTTP() error {
 	if m.cfg.HTTPAddr == "" {
 		return nil
@@ -350,8 +516,12 @@ func (m *Manager) serveHTTP() error {
 
 	mux := http.NewServeMux()
 
-	// Cluster join endpoint per Raft group.
+	// Cluster management per Raft group.
 	mux.HandleFunc("POST /groups/{groupID}/join", m.handleJoin)
+	mux.HandleFunc("GET /groups/{groupID}/members", m.handleMembers)
+	mux.HandleFunc("DELETE /groups/{groupID}/members/{id}", m.handleRemoveMember)
+	mux.HandleFunc("POST /groups/{groupID}/transfer-leadership", m.handleTransferLeadership)
+	mux.HandleFunc("POST /groups/{groupID}/batch", m.handleBatch)
 
 	// Multi-Raft routing: /groups/{groupID}/{collection}/{key}
 	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", m.handleCreate)
@@ -461,6 +631,42 @@ func (m *Manager) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleJoin(w, r)
+}
+
+func (m *Manager) handleMembers(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		return
+	}
+	s.handleMembers(w, r)
+}
+
+func (m *Manager) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		return
+	}
+	s.handleRemoveMember(w, r)
+}
+
+func (m *Manager) handleTransferLeadership(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		return
+	}
+	s.handleTransferLeadership(w, r)
+}
+
+func (m *Manager) handleBatch(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		return
+	}
+	s.handleBatch(w, r)
 }
 
 func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
