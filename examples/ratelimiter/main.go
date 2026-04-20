@@ -48,6 +48,7 @@ func main() {
 	httpAddr := flag.String("http", ":8001", "HTTP API listen address")
 	dataDir := flag.String("data", "data/n1", "Data directory")
 	peers := flag.String("peers", "", "Comma-separated list of id=addr")
+	join := flag.String("join", "", "Comma-separated list of existing node HTTP addresses to join (e.g. host1:8001,host2:8001)")
 	flag.Parse()
 
 	if *id == "" {
@@ -69,17 +70,30 @@ func main() {
 		}
 	}
 
+	var joinAddrs []string
+	if *join != "" {
+		for _, addr := range strings.Split(*join, ",") {
+			if addr = strings.TrimSpace(addr); addr != "" {
+				joinAddrs = append(joinAddrs, addr)
+			}
+		}
+	}
+
 	// 1. Initialize EasyRaft Store.
 	// For this example, we use a single store with one collection ("quotas").
 	// A production system with many tenants might shard via easyraft.NewManager.
-	store, err := easyraft.NewStore(
+	opts := []easyraft.Option{
 		easyraft.WithID(raft.NodeID(*id)),
 		easyraft.WithRaftAddr(*raftAddr),
 		easyraft.WithHTTPAddr(*httpAddr),
 		easyraft.WithDataDir(*dataDir),
 		easyraft.WithPeers(peerMap),
 		easyraft.WithLogger(slog.Default()),
-	)
+	}
+	if len(joinAddrs) > 0 {
+		opts = append(opts, easyraft.WithJoinAddr(joinAddrs...))
+	}
+	store, err := easyraft.NewStore(opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
