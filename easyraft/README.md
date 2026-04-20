@@ -173,6 +173,44 @@ Available for all write operations: `CreateOnce`, `UpdateOnce`, `DeleteOnce`, `M
 
 ---
 
+## Upsert — atomic create-or-update
+
+`Upsert` inserts a key if it does not exist, or replaces it if it does. Unlike calling `Create` and falling back to `Update` on `ErrKeyExists`, `Upsert` is a single atomic log entry with no race window:
+
+```go
+err := configs.Upsert(ctx, "db.host", ConfigEntry{Value: "localhost"})
+```
+
+---
+
+## Change notifications
+
+`OnChange` registers a callback that fires on **every replica** after each committed write is applied to that collection's local state — outside the state-machine lock, in a dedicated dispatcher goroutine. This is the primitive for building watch/subscribe flows.
+
+```go
+configs.OnChange(func(key string, entry *ConfigEntry, deleted bool) {
+    if deleted {
+        fmt.Printf("deleted: %s\n", key)
+        return
+    }
+    fmt.Printf("changed: %s = %s\n", key, entry.Value)
+})
+```
+
+The callback is called on followers as well as the leader, and during log replay after a restart or snapshot restore. One handler per collection is supported; a second call replaces the first. Register before `Start`.
+
+The raw-JSON variant is available on `Store` directly when you need to handle multiple collections or avoid the typed deserialisation:
+
+```go
+store.OnChange("configs", func(key string, raw json.RawMessage, deleted bool) {
+    // raw is nil on delete
+})
+```
+
+**What `OnChange` does not guarantee:** if `notifyCh` (capacity 1024) fills up because the handler is slow, events are dropped. For production watch implementations, keep the handler fast — fan out to channels and let consumers process asynchronously.
+
+---
+
 ## Multi-Raft — sharding across groups
 
 `easyraft.Manager` runs multiple independent Raft groups (shards) on a single physical node, sharing one gRPC transport and one HTTP server:
@@ -467,3 +505,4 @@ Prometheus metrics are exposed on `GET /metrics`. The option must be set before 
 ## Examples
 
 - [`examples/ratelimiter`](../examples/ratelimiter/) — token-bucket rate limiter with time-based refill. Demonstrates the deterministic mutation pattern.
+- [`examples/configsvc`](../examples/configsvc/) — distributed configuration service with SSE watch streams. Demonstrates `Upsert`, `OnChange`, and the replicated-state vs. local-subscriber pattern.
