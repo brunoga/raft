@@ -28,6 +28,14 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	}()
 
+	// Use static peers so the cluster forms reliably; discovery runs in parallel
+	// and exercises the AddServer path (peers are already members, so it's a
+	// harmless no-op after the first successful call).
+	peers := map[raft.NodeID]string{
+		"n1": "127.0.0.1:9092",
+		"n2": "127.0.0.1:9093",
+	}
+
 	// Node 1
 	d1, err := udpbroadcast.New(&udpbroadcast.Config{
 		NodeID: "n1",
@@ -40,7 +48,8 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 		easyraft.WithID("n1"),
 		easyraft.WithRaftAddr("127.0.0.1:9092"),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithDiscovery(d1, 100*time.Millisecond),
+		easyraft.WithPeers(peers),
+		easyraft.WithDiscovery(d1, 200*time.Millisecond),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +67,8 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 		easyraft.WithID("n2"),
 		easyraft.WithRaftAddr("127.0.0.1:9093"),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
-		easyraft.WithDiscovery(d2, 100*time.Millisecond),
+		easyraft.WithPeers(peers),
+		easyraft.WithDiscovery(d2, 200*time.Millisecond),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -69,20 +79,32 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 	er2.Start()
 	defer er2.Stop()
 
-	// Wait for discovery and election.
-	// We need to add n2 to n1 via membership change because EasyRaft doesn't
-	// automatically call AddServer on discovery (it only adds to transport).
-	// For a fresh cluster, usually one node starts and others are added.
-	time.Sleep(2 * time.Second)
+	// Wait for a leader to be elected and the cluster to be fully operational.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// Since they discovered each other at the transport level, we can now
-	// use the standard Raft membership change via the internal node if needed,
-	// but for this test, let's just verify they see each other.
-	// Actually, EasyRaft should probably have a way to auto-join?
-	// The current Raft implementation requires AddServer to be called by the leader.
+	var leaderER *easyraft.EasyRaft[Counter]
+	for ctx.Err() == nil {
+		for _, er := range []*easyraft.EasyRaft[Counter]{er1, er2} {
+			if errCreate := er.Create(ctx, "discovery-probe", Counter{Value: 1}); errCreate == nil {
+				leaderER = er
+				goto ready
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("timeout waiting for leader election with discovery enabled")
 
-	// For now, let's just check that it compiles and starts.
-	// DiscoveryAgent in easyraft.go calls tr.AddPeer.
+ready:
+	// ReadStale is sufficient here: we just committed via the leader so the data
+	// is in the state machine; we're testing cluster formation, not consistency.
+	c, err := leaderER.ReadStale("discovery-probe")
+	if err != nil {
+		t.Fatalf("ReadStale after discovery-assisted cluster formation: %v", err)
+	}
+	if c.Value != 1 {
+		t.Errorf("expected Value=1, got %d", c.Value)
+	}
 }
 
 func TestEasyRaft_Basic(t *testing.T) {
