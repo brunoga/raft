@@ -86,7 +86,7 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 	var leaderER *easyraft.EasyRaft[Counter]
 	for ctx.Err() == nil {
 		for _, er := range []*easyraft.EasyRaft[Counter]{er1, er2} {
-			if err := er.Create(ctx, "discovery-probe", Counter{Value: 1}); err == nil {
+			if errCreate := er.Create(ctx, "discovery-probe", Counter{Value: 1}); errCreate == nil {
 				leaderER = er
 				goto ready
 			}
