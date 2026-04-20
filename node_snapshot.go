@@ -400,6 +400,7 @@ func (n *Node) handleSnapshotResult(sr snapshotResult) {
 		return
 	}
 	n.log.snapMeta = sr.meta
+	n.atomicSnapshotIndex.Store(uint64(sr.meta.LastIncludedIndex))
 	n.logger.Info("snapshot saved", "index", sr.meta.LastIncludedIndex, "term", sr.meta.LastIncludedTerm)
 	if n.cfg.Metrics != nil {
 		n.cfg.Metrics.SnapshotTaken(n.cfg.ID, sr.meta.LastIncludedIndex, 0) // size unknown without more plumbing

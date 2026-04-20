@@ -719,24 +719,19 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		}
 	}
 
-	// Wait for a snapshot to be taken on the leader.
-	var snapIdx raft.Index
+	// Wait for a snapshot to be taken and the log to be compacted on the leader.
+	// We poll SnapshotIndex() which is updated atomically only after truncatePrefix
+	// completes, so a non-zero value guarantees compaction has occurred.
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		tick()
-		if leader.LastApplied() > raft.Index(numEntries) {
-			// Give the snapshot goroutine a moment to fire.
-			for j := 0; j < 20; j++ {
-				tick()
-			}
+		if leader.SnapshotIndex() > 0 {
 			break
 		}
 	}
-	// Peek at the snapshot index via the storage we have (memstore doesn't expose it
-	// directly, so we use a heuristic: if the leader's log no longer contains entry 1,
-	// compaction has occurred).
-	snapIdx = leader.LastApplied()
-	_ = snapIdx
+	if leader.SnapshotIndex() == 0 {
+		t.Fatal("leader never took a snapshot")
+	}
 
 	// Heal the partition.
 	net.Heal(ids[lagIdx])
