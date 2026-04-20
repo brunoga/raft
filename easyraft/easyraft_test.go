@@ -3,6 +3,7 @@ package easyraft_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -531,4 +532,241 @@ func TestEasyRaft_Join(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatal("n2 never caught up after joining")
+}
+
+// TestEasyRaft_Members verifies GET /members returns the correct member list.
+func TestEasyRaft_Members(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "easyraft-members-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	peers := map[raft.NodeID]string{
+		"n1": "127.0.0.1:9101",
+		"n2": "127.0.0.1:9102",
+	}
+
+	er1, err := easyraft.New[Counter](
+		easyraft.WithID("n1"),
+		easyraft.WithRaftAddr("127.0.0.1:9101"),
+		easyraft.WithHTTPAddr("127.0.0.1:8101"),
+		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
+		easyraft.WithPeers(peers),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er2, err := easyraft.New[Counter](
+		easyraft.WithID("n2"),
+		easyraft.WithRaftAddr("127.0.0.1:9102"),
+		easyraft.WithHTTPAddr("127.0.0.1:8102"),
+		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
+		easyraft.WithPeers(peers),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er1.Start()
+	defer er1.Stop()
+	er2.Start()
+	defer er2.Stop()
+
+	// Wait for a leader.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		if e := er1.Create(ctx, "__probe__", Counter{}); e == nil {
+			break
+		}
+		if e := er2.Create(ctx, "__probe__", Counter{}); e == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("no leader elected")
+	}
+
+	resp, err := http.Get("http://127.0.0.1:8101/members")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /members: status %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Members []struct {
+			ID   string `json:"id"`
+			Self bool   `json:"self"`
+		} `json:"members"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Members) != 2 {
+		t.Errorf("expected 2 members, got %d", len(body.Members))
+	}
+	selfCount := 0
+	for _, m := range body.Members {
+		if m.Self {
+			selfCount++
+			if m.ID != "n1" {
+				t.Errorf("self ID = %q, want n1", m.ID)
+			}
+		}
+	}
+	if selfCount != 1 {
+		t.Errorf("expected exactly 1 self member, got %d", selfCount)
+	}
+}
+
+// TestEasyRaft_Batch verifies that POST /batch commits multiple operations atomically.
+func TestEasyRaft_Batch(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "easyraft-batch-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	er, err := easyraft.New[Counter](
+		easyraft.WithID("n1"),
+		easyraft.WithRaftAddr("127.0.0.1:9103"),
+		easyraft.WithHTTPAddr("127.0.0.1:8103"),
+		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9103"}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er.Start()
+	defer er.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if e := er.Create(ctx, "__ready__", Counter{}); e != nil {
+		for ctx.Err() == nil {
+			if er.Create(ctx, "__ready__", Counter{}) == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	body := strings.NewReader(`[
+		{"op":"create","collection":"default","key":"a","value":{"value":1}},
+		{"op":"create","collection":"default","key":"b","value":{"value":2}}
+	]`)
+	resp, err := http.Post("http://127.0.0.1:8103/batch", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /batch: status %d", resp.StatusCode)
+	}
+
+	// Both keys should now exist.
+	a, err := er.ReadStale("a")
+	if err != nil {
+		t.Fatalf("ReadStale a: %v", err)
+	}
+	if a.Value != 1 {
+		t.Errorf("a.Value = %d, want 1", a.Value)
+	}
+	b, err := er.ReadStale("b")
+	if err != nil {
+		t.Fatalf("ReadStale b: %v", err)
+	}
+	if b.Value != 2 {
+		t.Errorf("b.Value = %d, want 2", b.Value)
+	}
+}
+
+// TestEasyRaft_LeaveOnStop verifies that WithLeaveOnStop removes the node from
+// the cluster before shutdown so remaining nodes adjust their membership.
+func TestEasyRaft_LeaveOnStop(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "easyraft-leave-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	peers := map[raft.NodeID]string{
+		"n1": "127.0.0.1:9104",
+		"n2": "127.0.0.1:9105",
+		"n3": "127.0.0.1:9106",
+	}
+
+	makeNode := func(id string, raftPort int, leave bool) (*easyraft.EasyRaft[Counter], error) {
+		opts := []easyraft.Option{
+			easyraft.WithID(raft.NodeID(id)),
+			easyraft.WithRaftAddr(fmt.Sprintf("127.0.0.1:%d", raftPort)),
+			easyraft.WithDataDir(filepath.Join(tmpDir, id)),
+			easyraft.WithPeers(peers),
+		}
+		if leave {
+			opts = append(opts, easyraft.WithLeaveOnStop())
+		}
+		return easyraft.New[Counter](opts...)
+	}
+
+	er1, err := makeNode("n1", 9104, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er2, err := makeNode("n2", 9105, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er3, err := makeNode("n3", 9106, true) // n3 will leave gracefully
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	er1.Start()
+	defer er1.Stop()
+	er2.Start()
+	defer er2.Stop()
+	er3.Start()
+
+	// Wait for the cluster to be operational.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		if er1.Create(ctx, "__probe__", Counter{}) == nil {
+			break
+		}
+		if er2.Create(ctx, "__probe__", Counter{}) == nil {
+			break
+		}
+		if er3.Create(ctx, "__probe__", Counter{}) == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("no leader elected")
+	}
+
+	// Stop n3 with LeaveOnStop — it should remove itself from the cluster.
+	er3.Stop()
+
+	// n1 and n2 should still be able to commit (2-node quorum of the original 3).
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	for ctx2.Err() == nil {
+		if er1.Create(ctx2, "after-leave", Counter{Value: 42}) == nil {
+			break
+		}
+		if er2.Create(ctx2, "after-leave", Counter{Value: 42}) == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if ctx2.Err() != nil {
+		t.Error("cluster could not commit after n3 left gracefully")
+	}
 }
