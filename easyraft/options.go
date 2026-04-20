@@ -24,6 +24,13 @@ type Config struct {
 	DiscoveryInterval time.Duration
 	TLS               *tls.Config
 	PromRegisterer    prometheus.Registerer
+
+	// Raft timing overrides. Zero means use the easyraft defaults
+	// (100 ms tick/heartbeat, 1–2 s election timeout).
+	TickInterval       time.Duration
+	HeartbeatInterval  time.Duration
+	ElectionTimeoutMin time.Duration
+	ElectionTimeoutMax time.Duration
 }
 
 // Option configures an EasyRaft node.
@@ -49,8 +56,11 @@ func WithDataDir(dir string) Option {
 	return func(c *Config) { c.DataDir = dir }
 }
 
-// WithPeers adds a static list of initial peers.
-// Each peer should be in the form "id=address" (e.g. "n2=127.0.0.1:7002").
+// WithPeers adds a static list of initial peers. The map keys are node IDs
+// and the values are host:port addresses for Raft RPC (e.g. "127.0.0.1:7002").
+// WithPeers may be called multiple times; maps are merged.
+// Peers are pre-populated as known Raft members, so discovery will not issue
+// redundant AddServer calls for them.
 func WithPeers(peers map[raft.NodeID]string) Option {
 	return func(c *Config) {
 		if c.Peers == nil {
@@ -74,7 +84,14 @@ func WithSnapCount(count uint64) Option {
 	}
 }
 
-// WithDiscovery sets a custom discovery mechanism.
+// WithDiscovery enables dynamic peer discovery. EasyRaft polls d every
+// interval: for each returned peer it calls tr.AddPeer (transport) and, if the
+// peer is not already a known cluster member, node.AddServer (Raft membership).
+// AddServer calls that fail because this node is not the leader are retried on
+// the next poll. A zero interval defaults to 30 s.
+//
+// Static peers from [WithPeers] are treated as already-known members and will
+// not trigger AddServer calls.
 func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
 	return func(c *Config) {
 		c.Discovery = d
@@ -86,6 +103,18 @@ func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
 func WithTLS(tlsCfg *tls.Config) Option {
 	return func(c *Config) {
 		c.TLS = tlsCfg
+	}
+}
+
+// WithRaftTiming overrides the Raft protocol timing parameters.
+// Zero values are ignored and the easyraft defaults are used instead
+// (100 ms tick/heartbeat, 1 s / 2 s election timeout).
+func WithRaftTiming(tick, heartbeat, electionMin, electionMax time.Duration) Option {
+	return func(c *Config) {
+		c.TickInterval = tick
+		c.HeartbeatInterval = heartbeat
+		c.ElectionTimeoutMin = electionMin
+		c.ElectionTimeoutMax = electionMax
 	}
 }
 
