@@ -469,3 +469,66 @@ func TestManager_MultiRaft(t *testing.T) {
 		t.Errorf("HTTP group 1: expected 200, got %d", resp.StatusCode)
 	}
 }
+
+// TestEasyRaft_Join verifies that a new node can join an existing single-node
+// cluster by posting to the seed's /join endpoint via WithJoinAddr, without
+// knowing any peer addresses upfront.
+func TestEasyRaft_Join(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "easyraft-join-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	// --- n1: the existing single-node cluster with HTTP enabled ---
+	er1, err := easyraft.New[Counter](
+		easyraft.WithID("n1"),
+		easyraft.WithRaftAddr("127.0.0.1:9099"),
+		easyraft.WithHTTPAddr("127.0.0.1:8089"),
+		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9099"}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er1.Start()
+	defer er1.Stop()
+
+	// Wait for n1 to elect itself leader before n2 tries to join.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for ctx.Err() == nil {
+		if errProbe := er1.Create(ctx, "__join_probe__", Counter{}); errProbe == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("n1 never became leader")
+	}
+
+	// --- n2: a new node that knows only the seed's HTTP address ---
+	er2, err := easyraft.New[Counter](
+		easyraft.WithID("n2"),
+		easyraft.WithRaftAddr("127.0.0.1:9100"),
+		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
+		easyraft.WithJoinAddr("127.0.0.1:8089"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er2.Start()
+	defer er2.Stop()
+
+	// Wait until n2 is part of the cluster: it should be able to read the
+	// entry that n1 committed (stale read is fine — we just need it caught up).
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	for ctx2.Err() == nil {
+		if _, readErr := er2.ReadStale("__join_probe__"); readErr == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("n2 never caught up after joining")
+}
