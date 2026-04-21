@@ -259,14 +259,23 @@ import "github.com/brunoga/raft/examples/shardkv/client"
 // Initialize client with physical node addresses and shard count.
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"}, 4)
 
-// Put a key
+// Put a key (routes to the correct shard leader automatically).
 err := c.Put(ctx, "user-42", `{"name":"alice"}`)
 
-// Get a key
+// Get a key.
 val, err := c.Get(ctx, "user-42")
+if errors.Is(err, client.ErrKeyNotFound) {
+    log.Println("key does not exist")
+}
 
-// Delete a key
+// Delete a key.
 err = c.Delete(ctx, "user-42")
+
+// Inspect shard states on a specific node.
+shards, err := c.Shards(ctx, "http://localhost:8001")
+for _, s := range shards {
+    fmt.Printf("shard %d: %s (term=%d)\n", s.GroupID, s.State, s.Term)
+}
 ```
 
 ## HTTP status codes

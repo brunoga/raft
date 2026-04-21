@@ -93,30 +93,45 @@ import "github.com/brunoga/raft/examples/ratelimiter/client"
 
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
 
-// Take 5 tokens
+// Create a quota — returns ErrConflict if the key already exists.
+err := c.CreateQuota(ctx, "premium-user", client.Quota{
+    MaxTokens: 100, CurrentTokens: 100, RefillRate: 1,
+})
+
+// Create-or-update (tries POST; falls back to PUT on conflict).
+err = c.SetQuota(ctx, "premium-user", client.Quota{
+    MaxTokens: 200, CurrentTokens: 200, RefillRate: 2,
+})
+
+// Consume tokens.
 resp, err := c.Take(ctx, "premium-user", 5)
-if resp.Allowed {
+if err == nil && resp.Allowed {
     fmt.Printf("Allowed! Tokens remaining: %d\n", resp.Remains)
 }
 
-// Get quota status
+// Read quota status (linearizable by default; pass true for a stale read).
 quota, err := c.GetQuota(ctx, "premium-user", false)
+if errors.Is(err, client.ErrNotFound) {
+    log.Println("quota does not exist")
+}
+
+// Remove a quota.
+err = c.DeleteQuota(ctx, "premium-user")
 ```
 
-## Performance & Benchmarking
+## HTTP status codes
 
-The rate limiter includes a built-in benchmark to measure the overhead of distributed consensus.
-
-To run the benchmark:
-```bash
-go test -bench . -benchmem
-```
-
-### Expected Performance (3-Node Cluster)
-On modern hardware (e.g., Apple M-series or high-end x86), you can expect:
-- **Distributed Mutations (Take)**: ~10,000 ops/sec. This involves a full Raft round-trip, disk I/O for logging, and state machine application across 3 nodes.
-- **Linearizable Reads**: ~1.3 Million ops/sec. Using `ReadIndexLease` provides strong consistency with almost zero overhead.
-- **Stale Reads**: ~1.8 Million ops/sec. Local state access without cluster coordination.
+| Code | Meaning |
+|------|---------|
+| `200 OK` | Read or mutation succeeded |
+| `201 Created` | Quota created (`POST /quotas/{key}`) |
+| `204 No Content` | Quota updated or deleted |
+| `307 Temporary Redirect` | This node is not the leader; `Location` points at the leader |
+| `400 Bad Request` | Malformed JSON or invalid mutation args |
+| `404 Not Found` | Quota key does not exist |
+| `409 Conflict` | Quota key already exists (`POST /quotas/{key}`) |
+| `503 Service Unavailable` | Leader unknown (e.g. during an election) |
+| `500 Internal Server Error` | Storage failure or mutation error |
 
 ## Production Notes
 
