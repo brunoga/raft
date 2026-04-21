@@ -211,6 +211,59 @@ store.OnChange("configs", func(key string, raw json.RawMessage, deleted bool) {
 
 ---
 
+## Watcher[T] — channel-based subscriptions
+
+`Watcher[T]` converts `OnChange` events into buffered Go channels, making it easy to fan out to multiple concurrent consumers (e.g. SSE connections). Wire it up before `Start`:
+
+```go
+w := easyraft.NewWatcher[ConfigEntry]()
+configs.OnChange(w.Notify) // Notify matches the OnChange callback signature
+
+// In a handler goroutine:
+ch := w.Subscribe("")        // "" = all keys
+defer w.Unsubscribe("", ch)
+
+for ev := range ch {          // ev is ChangeEvent[ConfigEntry]
+    fmt.Printf("%s: deleted=%v\n", ev.Key, ev.Deleted)
+}
+
+// Or for a single key:
+ch = w.Subscribe("db.host")
+defer w.Unsubscribe("db.host", ch)
+```
+
+`ChangeEvent[T]` carries `Key string`, `Value *T` (nil on delete), and `Deleted bool`.
+
+Events that arrive while a subscriber's channel (capacity 64) is full are silently dropped — keep consumers fast or size the channel appropriately.
+
+### ServeSSE — streaming events over HTTP
+
+`ServeSSE` handles the full SSE lifecycle: sets headers, sends a snapshot of existing entries on connect, then streams live events until the client disconnects:
+
+```go
+func (s *server) handleWatch(w http.ResponseWriter, r *http.Request) {
+    snap, _ := s.configs.ListStale()
+    s.watcher.ServeSSE(w, r, r.PathValue("key"), snap)
+}
+```
+
+The `key` argument scopes the stream — pass `""` to receive all keys. SSE events are JSON-encoded `ChangeEvent[T]`:
+
+```
+event: snapshot
+data: {"key":"db.host","value":{...}}
+
+event: change
+data: {"key":"db.host","value":{...}}
+
+event: delete
+data: {"key":"db.host","deleted":true}
+```
+
+See [`examples/configsvc`](../examples/configsvc/) for a complete SSE watch service.
+
+---
+
 ## Multi-Raft — sharding across groups
 
 `easyraft.Manager` runs multiple independent Raft groups (shards) on a single physical node, sharing one gRPC transport and one HTTP server:
@@ -368,7 +421,22 @@ if err := store.Ready(ctx); err != nil {
 
 ## HTTP API
 
-When `WithHTTPAddr` is set, EasyRaft mounts a REST API automatically.
+When `WithHTTPAddr` is set, EasyRaft mounts a REST API automatically. If your application already runs its own HTTP server on the same address, use `WithHTTPMux` instead to register EasyRaft's routes on your mux — EasyRaft will not start a separate server:
+
+```go
+mux := http.NewServeMux()
+
+store, _ := easyraft.NewStore(
+    easyraft.WithHTTPAddr(":8001"), // advertise URL for leader redirects
+    easyraft.WithHTTPMux(mux),      // register /join, /members, CRUD routes here
+    // ...
+)
+
+mux.HandleFunc("GET /my-route", myHandler) // add your own routes
+
+store.Start()
+http.ListenAndServe(":8001", mux) // one server, no conflict
+```
 
 ### `Store` routes
 
@@ -477,7 +545,8 @@ Prometheus metrics are exposed on `GET /metrics`. The option must be set before 
 |--------|-------------|
 | `WithID(id)` | Node ID — required |
 | `WithRaftAddr(addr)` | gRPC listen address for Raft RPCs — required |
-| `WithHTTPAddr(addr)` | HTTP listen address; enables the REST API |
+| `WithHTTPAddr(addr)` | HTTP listen address; enables the REST API and sets the advertised URL for leader redirects |
+| `WithHTTPMux(mux)` | Register EasyRaft routes on an existing mux instead of starting a dedicated server; pair with `WithHTTPAddr` for redirect advertising |
 | `WithDataDir(dir)` | Persistent storage directory — required |
 | `WithPeers(map[NodeID]string)` | Static initial peer list |
 | `WithJoinAddr(addrs...)` | HTTP address(es) of seed nodes to join on startup |
