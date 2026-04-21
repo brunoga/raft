@@ -122,9 +122,50 @@ curl -L -X POST http://localhost:8001/transfers \
 curl -L -X POST http://localhost:8001/transfers \
      -H 'Content-Type: application/json' \
      -d '{"from":"alice","to":"bob","amount":99999,"client_id":"cli1","seq":2}'
-# 500 Internal Server Error: insufficient funds: balance 900 < 99999
+# 422 Unprocessable Entity: insufficient funds: balance 900 < 99999
 # (alice still has 900 — the whole Txn rolled back)
 ```
+
+---
+
+## Go Client Library
+
+A high-level Go client is available in the [`client`](./client) package. It handles node discovery, leader redirection, and provides a type-safe API for accounts and transfers.
+
+```go
+import "github.com/brunoga/raft/examples/ledger/client"
+
+c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
+
+// Create accounts
+alice, err := c.CreateAccount(ctx, "alice", 1000)
+bob, err := c.CreateAccount(ctx, "bob", 0)
+
+// Transfer funds (idempotent — retry with same clientID+seq is safe)
+tr, err := c.Transfer(ctx, "alice", "bob", 100, "cli1", 1)
+if errors.Is(err, client.ErrInsufficientFunds) {
+    log.Println("not enough balance")
+}
+
+// Read current balances (linearizable)
+alice, err = c.GetAccount(ctx, "alice")
+fmt.Printf("alice balance: %d\n", alice.Balance)
+```
+
+## HTTP status codes
+
+| Code | Meaning |
+|------|---------|
+| `200 OK` | Read succeeded |
+| `201 Created` | Account or transfer record created |
+| `400 Bad Request` | Malformed JSON or missing required fields |
+| `404 Not Found` | Account does not exist |
+| `409 Conflict` | Account with that ID already exists |
+| `422 Unprocessable Entity` | Insufficient funds |
+| `503 Service Unavailable` | This node is not the leader |
+| `500 Internal Server Error` | Storage failure or unexpected error |
+
+Clients should retry `503` — the node will redirect to the leader after a brief election. `409` on `POST /accounts` indicates a duplicate key; the client returns `ErrConflict`. `422` on `POST /transfers` indicates the source account has too little balance; the client returns `ErrInsufficientFunds`.
 
 ---
 
