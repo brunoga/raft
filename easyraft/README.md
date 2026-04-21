@@ -575,3 +575,4 @@ Prometheus metrics are exposed on `GET /metrics`. The option must be set before 
 
 - [`examples/ratelimiter`](../examples/ratelimiter/) — token-bucket rate limiter with time-based refill. Demonstrates the deterministic mutation pattern.
 - [`examples/configsvc`](../examples/configsvc/) — distributed configuration service with SSE watch streams. Demonstrates `Upsert`, `OnChange`, and the replicated-state vs. local-subscriber pattern.
+- [`examples/ledger`](../examples/ledger/) — double-entry ledger with atomic multi-collection transactions. Demonstrates `Store.Txn`, idempotent transfers via `ErrKeyExists`, and mutation-enforced invariants.
