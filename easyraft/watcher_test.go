@@ -233,12 +233,12 @@ func TestWatcher_ServeSSE_SnapshotAndLiveEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
@@ -314,12 +314,12 @@ func TestWatcher_ServeSSE_KeyFilter(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	events := readSSEEvents(resp.Body)
 
@@ -382,12 +382,12 @@ func TestWatcher_ServeSSE_NonFlusher(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, http.NoBody)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Should get 500 with "streaming not supported".
 	if resp.StatusCode != http.StatusInternalServerError {
