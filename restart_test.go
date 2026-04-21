@@ -657,7 +657,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 5
-		cfg.SnapshotChunkSize = 512 // enough to still force multiple chunks for kvSM
+		cfg.SnapshotChunkSize = 64 // forces ~3-4 chunks for a 10-entry kvSM snapshot (~100-200 bytes)
 
 		n, err := raft.New(&cfg)
 		if err != nil {
@@ -680,7 +680,20 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		for _, n := range nodes {
 			n.Tick()
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// tickActive skips the partitioned follower so we don't spawn PreVote
+	// goroutines that block for rpcTimeout (150ms) on each tick under CI load.
+	// lagIdx is set below; this closure captures the variable by reference.
+	lagIdx := -1
+	tickActive := func() {
+		for i, n := range nodes {
+			if i != lagIdx {
+				n.Tick()
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	// Wait for a leader.
@@ -703,7 +716,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	}
 
 	// Partition one follower so it misses all entries.
-	lagIdx := (leaderIdx + 1) % 3
+	lagIdx = (leaderIdx + 1) % 3
 	net.Partition(ids[lagIdx]) // island: no messages in or out
 
 	// Commit enough entries to cross SnapshotThreshold and trigger compaction
@@ -722,9 +735,11 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	// Wait for a snapshot to be taken and the log to be compacted on the leader.
 	// We poll SnapshotIndex() which is updated atomically only after truncatePrefix
 	// completes, so a non-zero value guarantees compaction has occurred.
+	// Use tickActive (skips the partitioned follower) to avoid spawning PreVote
+	// goroutines that block for rpcTimeout on each tick under CI load.
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		tick()
+		tickActive()
 		if leader.SnapshotIndex() > 0 {
 			break
 		}
