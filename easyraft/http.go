@@ -76,13 +76,8 @@ type batchOp struct {
 
 // ---- Store HTTP server -----------------------------------------------------
 
-func (s *Store) serveHTTP() error {
-	if s.cfg.HTTPAddr == "" {
-		return nil
-	}
-
-	mux := http.NewServeMux()
-
+// registerRoutes registers all Store management and CRUD routes on mux.
+func (s *Store) registerRoutes(mux *http.ServeMux) {
 	// Cluster management — registered before wildcards to take priority.
 	mux.HandleFunc("POST /join", s.handleJoin)
 	mux.HandleFunc("GET /members", s.handleMembers)
@@ -101,6 +96,23 @@ func (s *Store) serveHTTP() error {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.Handle("GET /metrics", promhttp.Handler())
+}
+
+func (s *Store) serveHTTP() error {
+	// If the caller provided their own mux, register routes there and let them
+	// start the server. This avoids a port conflict when the application runs
+	// its own HTTP server on the same address.
+	if s.cfg.HTTPMux != nil {
+		s.registerRoutes(s.cfg.HTTPMux)
+		return nil
+	}
+
+	if s.cfg.HTTPAddr == "" {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
 
 	s.httpServer = &http.Server{
 		Addr:         s.cfg.HTTPAddr,
@@ -693,4 +705,15 @@ func writeError(w http.ResponseWriter, code int, msg string, logger *slog.Logger
 	writeJSON(w, code, struct {
 		Error string `json:"error"`
 	}{Error: msg}, logger)
+}
+
+// writeSSEEvent writes a single Server-Sent Event to w. v is JSON-encoded as
+// the event data. Errors encoding v are silently ignored (the connection will
+// be detected as stale on the next write).
+func writeSSEEvent(w http.ResponseWriter, event string, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 }
