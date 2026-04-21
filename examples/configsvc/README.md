@@ -18,6 +18,9 @@ Additional patterns:
 
 - **`Collection.Upsert`** — atomic create-or-update with no race window between checking existence and writing.
 - **`Collection.OnChange`** — callback fired after each committed write, outside the Raft lock, on every replica.
+- **`easyraft.Watcher[T]`** — generic pub/sub fan-out that converts `OnChange` events into buffered Go channels; wired with `configs.OnChange(watcher.Notify)`.
+- **`Watcher[T].ServeSSE`** — streams `ChangeEvent[T]` values to HTTP clients as Server-Sent Events; handles headers, snapshot-on-connect, and live events.
+- **`WithHTTPMux`** — registers EasyRaft management routes (`/join`, `/members`, etc.) on the application's own mux so a single HTTP server handles everything.
 - **Deterministic versioning** — `ConfigEntry.Version` is set by the HTTP handler (as `time.Now().UnixNano()`) before proposing, so all replicas apply the same value rather than reading the clock inside `Apply`.
 - **`WithJoinAddr`** — nodes join one at a time without a full peer list.
 
@@ -38,12 +41,14 @@ Additional patterns:
 
 ### SSE event format
 
+Events are JSON-encoded [`easyraft.ChangeEvent[ConfigEntry]`](../../easyraft/watcher.go). The `value` field carries the full `ConfigEntry` object:
+
 ```
 event: snapshot
-data: {"key":"db.host","value":"localhost","version":1712345678901234567}
+data: {"key":"db.host","value":{"value":"localhost","version":1712345678901234567}}
 
 event: change
-data: {"key":"db.host","value":"db2.example.com","version":1712345690000000000}
+data: {"key":"db.host","value":{"value":"db2.example.com","version":1712345690000000000}}
 
 event: delete
 data: {"key":"db.host","deleted":true}
@@ -99,10 +104,10 @@ The watcher on node 2 will print:
 
 ```
 event: change
-data: {"key":"db.host","value":"localhost","version":1712345678901234567}
+data: {"key":"db.host","value":{"value":"localhost","version":1712345678901234567}}
 
 event: change
-data: {"key":"db.port","value":"5432","version":1712345679012345678}
+data: {"key":"db.port","value":{"value":"5432","version":1712345679012345678}}
 ```
 
 **Watch a single key**
@@ -122,7 +127,7 @@ The single-key watcher receives:
 
 ```
 event: change
-data: {"key":"db.host","value":"db2.example.com","version":1712345690000000000}
+data: {"key":"db.host","value":{"value":"db2.example.com","version":1712345690000000000}}
 ```
 
 **Delete**
@@ -149,16 +154,14 @@ curl 'http://localhost:8003/configs/db.port?consistency=stale'
 
 ### Why watches work on every node
 
-Each node runs an independent copy of the config state machine. After every committed log entry is applied, EasyRaft's internal dispatcher calls `OnChange` outside the Raft lock. The `configsvc` handler receives the typed `*ConfigEntry` and calls `WatcherRegistry.notify`, which fans out to all locally connected SSE clients for that key.
+Each node runs an independent copy of the config state machine. After every committed log entry is applied, EasyRaft's internal dispatcher calls `OnChange` outside the Raft lock. `configsvc` wires `configs.OnChange(watcher.Notify)`, so `Watcher[T].Notify` fans out `ChangeEvent[ConfigEntry]` values to every locally subscribed SSE connection.
 
 ```
 Leader applies entry → all followers replicate and apply the same entry
          ↓ (on every node)
-     OnChange fires
+     OnChange fires → Watcher[T].Notify
          ↓
-  WatcherRegistry.notify
-         ↓
-  SSE clients on this node receive the event
+  ServeSSE streams ChangeEvent[T] to SSE clients on this node
 ```
 
 Clients watching on different nodes may receive events at slightly different wall-clock times (bounded by log replication latency), but they all receive the same events in the same order.
