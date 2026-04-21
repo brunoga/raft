@@ -585,6 +585,11 @@ func (s *Store) dispatchChanges() {
 // this node's ID and Raft address to each one until a join succeeds. On
 // success it registers the returned peer list with the local transport so
 // this node can route Raft RPCs to the existing members.
+//
+// If all seeds are unreachable or return a transient error (connection refused,
+// no leader elected yet), joinCluster retries with a 500 ms interval for up to
+// 30 seconds so that callers do not need to guarantee the seeds are fully
+// bootstrapped before starting the joining node.
 func (s *Store) joinCluster(ctx context.Context) error {
 	voter := !s.cfg.JoinAsNonVoter
 	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr, Voter: &voter}
@@ -594,64 +599,84 @@ func (s *Store) joinCluster(ctx context.Context) error {
 	}
 
 	client := &http.Client{}
+
+	const retryInterval = 500 * time.Millisecond
+	const joinTimeout = 30 * time.Second
+
+	joinCtx, cancel := context.WithTimeout(ctx, joinTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(retryInterval)
+	defer ticker.Stop()
+
 	var lastErr error
-	for _, seed := range s.cfg.JoinAddrs {
-		url := seed
-		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-			url = "http://" + url
-		}
-		url += "/join"
+	for {
+		for _, seed := range s.cfg.JoinAddrs {
+			url := seed
+			if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+				url = "http://" + url
+			}
+			url += "/join"
 
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(httpReq)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		var joinResp joinResponse
-		decodeErr := json.NewDecoder(resp.Body).Decode(&joinResp)
-		_ = resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("seed %s returned status %d", seed, resp.StatusCode)
-			continue
-		}
-		if decodeErr != nil {
-			lastErr = fmt.Errorf("seed %s: decode response: %w", seed, decodeErr)
-			continue
-		}
-
-		// Register all returned peers with the local transport.
-		pa, hasPeerAdder := s.transport.(peerAdder)
-		s.mu.Lock()
-		for _, p := range joinResp.Peers {
-			if p.ID == s.cfg.ID {
+			httpReq, err := http.NewRequestWithContext(joinCtx, http.MethodPost, url, strings.NewReader(string(body)))
+			if err != nil {
+				lastErr = err
 				continue
 			}
-			s.raftPeers[p.ID] = raftPeerInfo{addr: p.RaftAddr, voter: p.Voter}
-			if hasPeerAdder {
-				pa.AddPeer(p.ID, p.RaftAddr)
+			httpReq.Header.Set("Content-Type", "application/json")
+
+			resp, err := client.Do(httpReq)
+			if err != nil {
+				lastErr = err
+				continue
 			}
-		}
-		s.mu.Unlock()
 
+			var joinResp joinResponse
+			decodeErr := json.NewDecoder(resp.Body).Decode(&joinResp)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				lastErr = fmt.Errorf("seed %s returned status %d", seed, resp.StatusCode)
+				continue
+			}
+			if decodeErr != nil {
+				lastErr = fmt.Errorf("seed %s: decode response: %w", seed, decodeErr)
+				continue
+			}
+
+			// Register all returned peers with the local transport.
+			pa, hasPeerAdder := s.transport.(peerAdder)
+			s.mu.Lock()
+			for _, p := range joinResp.Peers {
+				if p.ID == s.cfg.ID {
+					continue
+				}
+				s.raftPeers[p.ID] = raftPeerInfo{addr: p.RaftAddr, voter: p.Voter}
+				if hasPeerAdder {
+					pa.AddPeer(p.ID, p.RaftAddr)
+				}
+			}
+			s.mu.Unlock()
+
+			if s.cfg.Logger != nil {
+				s.cfg.Logger.Info("easyraft: joined cluster", "seed", seed, "peers", len(joinResp.Peers))
+			}
+			return nil
+		}
+
+		// All seeds failed this round; wait and retry unless time is up.
 		if s.cfg.Logger != nil {
-			s.cfg.Logger.Info("easyraft: joined cluster", "seed", seed, "peers", len(joinResp.Peers))
+			s.cfg.Logger.Debug("easyraft: join attempt failed, retrying", "err", lastErr)
 		}
-		return nil
+		select {
+		case <-joinCtx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("easyraft: join timed out after %s (last error: %w)", joinTimeout, lastErr)
+			}
+			return fmt.Errorf("easyraft: no join seed addresses configured")
+		case <-ticker.C:
+		}
 	}
-
-	if lastErr != nil {
-		return fmt.Errorf("easyraft: join failed (tried %d seed(s)): %w", len(s.cfg.JoinAddrs), lastErr)
-	}
-	return fmt.Errorf("easyraft: no join seed addresses configured")
 }
 
 // Status returns the current status of the underlying Raft node.

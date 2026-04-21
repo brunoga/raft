@@ -31,6 +31,44 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# Wait for a Raft leader to be elected, then print per-node status.
+wait_and_show_status() {
+    local ports=(8001 8002 8003)
+    local timeout=15
+
+    printf "==> Waiting for cluster (up to %ds)..." "$timeout"
+    local deadline=$((SECONDS + timeout))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local elected=false
+        for port in "${ports[@]}"; do
+            local body
+            body=$(curl -sf "http://localhost:$port/status" 2>/dev/null) || continue
+            if printf '%s' "$body" | grep -q '"Leader"'; then
+                elected=true
+                break
+            fi
+        done
+        $elected && { printf ' done.\n'; break; }
+        sleep 0.3
+    done
+    if [[ $SECONDS -ge $deadline ]]; then
+        printf ' timed out (check %s/n*.log).\n' "$DATA_ROOT"
+        return
+    fi
+
+    printf '==> Node status:\n'
+    for port in "${ports[@]}"; do
+        local body
+        body=$(curl -sf "http://localhost:$port/status" 2>/dev/null) || { printf '  :%-4s  unreachable\n' "$port"; continue; }
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq -r '"  \(.node_id)  \(.state)  term=\(.term)  last_applied=\(.last_applied)"'
+        else
+            printf '  :%s  %s\n' "$port" "$body"
+        fi
+    done
+    printf '\n'
+}
+
 echo "==> Starting n1..."
 "$BINARY" --id n1 --raft-addr :7001 --http-addr :8001 --data-dir "$DATA_ROOT/n1" \
     --peer n2=localhost:7002 --peer n3=localhost:7003 \
@@ -49,8 +87,9 @@ echo "==> Starting n3..."
     >"$DATA_ROOT/n3.log" 2>&1 &
 PIDS+=($!)
 
-echo ""
-echo "Cluster is up. Endpoints:"
+wait_and_show_status
+
+echo "Endpoints:"
 echo "  n1  http://localhost:8001"
 echo "  n2  http://localhost:8002"
 echo "  n3  http://localhost:8003"
