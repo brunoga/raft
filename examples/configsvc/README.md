@@ -50,18 +50,47 @@ import "github.com/brunoga/raft/examples/configsvc/client"
 
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
 
-// Set a value
+// Set (upsert) a value.
 err := c.Set(ctx, "db.host", "localhost")
 
-// Get a value (linearizable)
+// Get a value — linearizable by default; pass true for a local stale read.
 entry, err := c.Get(ctx, "db.host", false)
+if errors.Is(err, client.ErrNotFound) {
+    log.Println("key does not exist")
+}
 
-// Watch for changes
+// Delete a key.
+err = c.Delete(ctx, "db.host")
+
+// List all keys — linearizable by default; pass true for a stale read.
+all, err := c.List(ctx, false)
+for k, v := range all {
+    fmt.Printf("%s = %s\n", k, v.Value)
+}
+
+// Watch for changes on a single key. Pass "" to watch all keys.
 ch, err := c.Watch(ctx, "db.host")
 for ev := range ch {
-    fmt.Printf("Change: %s = %s\n", ev.Key, ev.Value.Value)
+    switch ev.Type {
+    case "snapshot", "change":
+        fmt.Printf("%s: %s = %s\n", ev.Type, ev.Key, ev.Value.Value)
+    case "delete":
+        fmt.Printf("deleted: %s\n", ev.Key)
+    }
 }
 ```
+
+## HTTP status codes
+
+| Code | Meaning |
+|------|---------|
+| `200 OK` | Read succeeded |
+| `204 No Content` | Write or delete succeeded |
+| `307 Temporary Redirect` | This node is not the leader; `Location` points at the leader |
+| `400 Bad Request` | Malformed JSON or missing key |
+| `404 Not Found` | Config key does not exist (GET or DELETE) |
+| `503 Service Unavailable` | Leader unknown (e.g. during an election) |
+| `500 Internal Server Error` | Storage failure or unexpected error |
 
 ---
 

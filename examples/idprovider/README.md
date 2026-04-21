@@ -228,17 +228,29 @@ A high-level Go client is available in the [`client`](./client) package. It hand
 import "github.com/brunoga/raft/examples/idprovider/client"
 
 // Initialize client with seed nodes and a stable client ID.
+// The client ID must be unique per process for exactly-once semantics.
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"}, "checkout-svc-1")
 
-// Create a domain
+// Create a domain (idempotent — safe to call again if it already exists).
 err := c.CreateDomain(ctx, "orders")
 
-// Allocate 100 IDs (idempotent)
+// Allocate 100 IDs. If the reply is lost, retrying with the same client
+// instance returns the same range without re-executing the allocation.
 res, err := c.Next(ctx, "orders", 100)
+if errors.Is(err, client.ErrDomainNotFound) {
+    log.Println("domain does not exist")
+}
 fmt.Printf("Reserved IDs [%d, %d)\n", res.Start, res.Start+res.Count)
 
-// Get current high-water mark
+// Get current high-water mark — linearizable by default; pass true for stale.
 info, err := c.Current(ctx, "orders", false)
+fmt.Printf("high-water mark: %d\n", info.Current)
+
+// List all domains and their counters.
+domains, err := c.ListDomains(ctx, false)
+
+// Delete a domain.
+err = c.DeleteDomain(ctx, "orders")
 ```
 
 ## HTTP status codes
