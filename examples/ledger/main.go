@@ -95,6 +95,19 @@ type creditArgs struct {
 	Amount int64 `json:"amount"`
 }
 
+// errInsufficientFunds is a typed error returned by the debit mutation when
+// the account balance is too low. Using a distinct type lets writeErr map it
+// to 422 Unprocessable Entity so the client can distinguish it from generic
+// server errors.
+type errInsufficientFunds struct {
+	Balance int64
+	Amount  int64
+}
+
+func (e *errInsufficientFunds) Error() string {
+	return fmt.Sprintf("insufficient funds: balance %d, requested %d", e.Balance, e.Amount)
+}
+
 // server wires together EasyRaft and the HTTP handlers.
 type server struct {
 	store     *easyraft.Store
@@ -117,7 +130,7 @@ func newServer(store *easyraft.Store) *server {
 			return nil, nil, fmt.Errorf("debit: bad args: %w", err)
 		}
 		if current.Balance < a.Amount {
-			return nil, nil, fmt.Errorf("insufficient funds: balance %d < %d", current.Balance, a.Amount)
+			return nil, nil, &errInsufficientFunds{Balance: current.Balance, Amount: a.Amount}
 		}
 		updated := *current
 		updated.Balance -= a.Amount
@@ -300,6 +313,10 @@ func (s *server) handleListTransfers(w http.ResponseWriter, r *http.Request) {
 func (s *server) writeErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, easyraft.ErrNotLeader) {
 		http.Error(w, "not leader", http.StatusServiceUnavailable)
+		return
+	}
+	if _, ok := errors.AsType[*errInsufficientFunds](err); ok {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
 	http.Error(w, err.Error(), http.StatusInternalServerError)
