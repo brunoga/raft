@@ -384,7 +384,7 @@ func TestStore_Txn_Rollback(t *testing.T) {
 	defer cancel()
 
 	// Seed one account so the second op in the batch can fail with ErrKeyExists.
-	if err := accounts.Create(ctx, "existing", "old"); err != nil {
+	if err = accounts.Create(ctx, "existing", "old"); err != nil {
 		t.Fatal(err)
 	}
 
