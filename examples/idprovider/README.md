@@ -21,6 +21,16 @@ the operation.
 
 ## Three-node quick-start
 
+The quickest way to start a local cluster is with the provided script:
+
+```bash
+./cluster.sh
+```
+
+It builds the binary, wipes any previous data directories, starts all three nodes, waits for a leader to be elected, and prints a node status table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
+
+Alternatively, start the nodes manually:
+
 ```bash
 # Build
 go build -o idprovider ./examples/idprovider
