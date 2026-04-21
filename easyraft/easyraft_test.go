@@ -356,6 +356,66 @@ func TestStore_Txn(t *testing.T) {
 	}
 }
 
+func TestStore_Txn_Rollback(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "store-txn-rollback-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	s, err := easyraft.NewStore(
+		easyraft.WithID("n1"),
+		easyraft.WithRaftAddr("127.0.0.1:9107"),
+		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9107"}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accounts := easyraft.AddCollection[string](s, "accounts")
+
+	s.Start()
+	defer s.Stop()
+
+	time.Sleep(3 * time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Seed one account so the second op in the batch can fail with ErrKeyExists.
+	if err := accounts.Create(ctx, "existing", "old"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Txn: first op creates "new-key" (would succeed), second op creates
+	// "existing" (fails with ErrKeyExists). The whole batch must roll back so
+	// "new-key" is not persisted.
+	_, err = s.Txn(ctx, func(tx *easyraft.Txn) error {
+		_ = tx.Create("accounts", "new-key", "value")
+		_ = tx.Create("accounts", "existing", "conflict")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected Txn to fail, got nil")
+	}
+
+	// "new-key" must not exist — the rollback must have undone the first op.
+	_, readErr := accounts.ReadStale("new-key")
+	if readErr == nil {
+		t.Error("new-key exists after a rolled-back Txn — rollback bug")
+	}
+
+	// "existing" must still hold the original value.
+	v, readErr := accounts.ReadStale("existing")
+	if readErr != nil {
+		t.Fatalf("existing key disappeared: %v", readErr)
+	}
+	if v != "old" {
+		t.Errorf("existing value = %q, want %q", v, "old")
+	}
+}
+
 func TestStore_ProposeOnce(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "store-once-test-*")
 	if err != nil {
