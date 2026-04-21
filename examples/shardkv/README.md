@@ -249,6 +249,26 @@ curl -s http://localhost:8001/status | jq
 # }
 ```
 
+## Go Client Library
+
+A high-level Go client is available in the [`client`](./client) package. It handles key hashing (FNV-32a), node discovery, and automatic leader redirection for each shard.
+
+```go
+import "github.com/brunoga/raft/examples/shardkv/client"
+
+// Initialize client with physical node addresses and shard count.
+c := client.New([]string{"http://localhost:8001", "http://localhost:8002"}, 4)
+
+// Put a key
+err := c.Put(ctx, "user-42", `{"name":"alice"}`)
+
+// Get a key
+val, err := c.Get(ctx, "user-42")
+
+// Delete a key
+err = c.Delete(ctx, "user-42")
+```
+
 ## HTTP status codes
 
 | Code | Meaning |
