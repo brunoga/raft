@@ -1,0 +1,292 @@
+// Package client provides a high-level Go client for the ledger service.
+//
+// The client handles leader discovery and automatic redirection transparently:
+// any node address can be used as a seed, and write requests are routed to the
+// current leader. The leader address is cached and revalidated on each failure.
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+)
+
+// Sentinel errors returned by the client.
+var (
+	// ErrNotFound is returned when the requested account or transfer does not exist.
+	ErrNotFound = errors.New("not found")
+
+	// ErrConflict is returned when creating an account that already exists.
+	ErrConflict = errors.New("already exists")
+
+	// ErrInsufficientFunds is returned when a transfer would make the source
+	// account balance negative.
+	ErrInsufficientFunds = errors.New("insufficient funds")
+
+	// ErrNotLeader is returned when the request reaches a follower and no
+	// redirect is available. This is transient; retrying usually succeeds.
+	ErrNotLeader = errors.New("not the cluster leader")
+)
+
+// Account holds the current balance for one participant.
+type Account struct {
+	ID      string `json:"id"`
+	Balance int64  `json:"balance"`
+}
+
+// Transfer is the immutable record of a committed fund movement.
+type Transfer struct {
+	ID        string `json:"id"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Amount    int64  `json:"amount"`
+	Timestamp int64  `json:"timestamp"` // Unix nanoseconds
+}
+
+// Client is a thread-safe, high-level client for the ledger service.
+type Client struct {
+	addrs []string // seed node addresses, e.g. "http://host:8001"
+
+	// httpClient does not follow redirects so we can intercept 307 responses
+	// and update the cached leader address ourselves.
+	httpClient *http.Client
+
+	mu         sync.RWMutex
+	leaderAddr string // cached leader; empty means unknown
+}
+
+// New returns a new ledger client. addrs should be the HTTP addresses of one or
+// more cluster nodes (e.g. "http://localhost:8001"). At least one reachable
+// address is required; the rest are used as fallbacks.
+func New(addrs []string) *Client {
+	return &Client{
+		addrs: addrs,
+		httpClient: &http.Client{
+			// Disable automatic redirect following so we can intercept 307
+			// responses and update the cached leader address.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+}
+
+// CreateAccount creates a new account with the given initial balance.
+// Returns ErrConflict if an account with that ID already exists.
+func (c *Client) CreateAccount(ctx context.Context, id string, balance int64) (Account, error) {
+	body, err := json.Marshal(map[string]any{"id": id, "balance": balance})
+	if err != nil {
+		return Account{}, err
+	}
+	var acc Account
+	if err := c.do(ctx, http.MethodPost, "/accounts", body, &acc); err != nil {
+		return Account{}, err
+	}
+	return acc, nil
+}
+
+// GetAccount returns the current state of an account with linearizable
+// consistency. Returns ErrNotFound if no such account exists.
+func (c *Client) GetAccount(ctx context.Context, id string) (Account, error) {
+	var acc Account
+	if err := c.do(ctx, http.MethodGet, "/accounts/"+id, nil, &acc); err != nil {
+		return Account{}, err
+	}
+	return acc, nil
+}
+
+// ListAccounts returns all accounts with linearizable consistency.
+func (c *Client) ListAccounts(ctx context.Context) (map[string]Account, error) {
+	var all map[string]Account
+	if err := c.do(ctx, http.MethodGet, "/accounts", nil, &all); err != nil {
+		return nil, err
+	}
+	return all, nil
+}
+
+// Transfer moves amount from one account to another atomically.
+//
+// The (clientID, seq) pair is the idempotency key: if the network drops the
+// response after the transfer commits, retrying with the same pair returns the
+// previously committed Transfer record without re-executing the operation.
+//
+// Returns ErrNotFound if either account does not exist.
+// Returns ErrInsufficientFunds if the source account balance is too low.
+// Returns ErrConflict if the (clientID, seq) transfer record already exists
+// (which should not happen in well-behaved callers — the client returns the
+// existing record instead of this error in the normal duplicate-retry case).
+func (c *Client) Transfer(ctx context.Context, from, to string, amount int64, clientID string, seq uint64) (Transfer, error) {
+	body, err := json.Marshal(map[string]any{
+		"from":      from,
+		"to":        to,
+		"amount":    amount,
+		"client_id": clientID,
+		"seq":       seq,
+	})
+	if err != nil {
+		return Transfer{}, err
+	}
+	var tr Transfer
+	if err := c.do(ctx, http.MethodPost, "/transfers", body, &tr); err != nil {
+		return Transfer{}, err
+	}
+	return tr, nil
+}
+
+// GetTransfer returns a transfer record by its ID. IDs have the form
+// "clientID:seq". Returns ErrNotFound if no such record exists.
+func (c *Client) GetTransfer(ctx context.Context, id string) (Transfer, error) {
+	var tr Transfer
+	if err := c.do(ctx, http.MethodGet, "/transfers/"+id, nil, &tr); err != nil {
+		return Transfer{}, err
+	}
+	return tr, nil
+}
+
+// ListTransfers returns all transfer records with linearizable consistency.
+func (c *Client) ListTransfers(ctx context.Context) (map[string]Transfer, error) {
+	var all map[string]Transfer
+	if err := c.do(ctx, http.MethodGet, "/transfers", nil, &all); err != nil {
+		return nil, err
+	}
+	return all, nil
+}
+
+// do executes a request, trying the cached leader first and falling back to
+// seed nodes. It refreshes the leader cache on 307 redirects and invalidates
+// it when the cached leader stops responding.
+func (c *Client) do(ctx context.Context, method, path string, body []byte, result any) error {
+	// 1. Try the cached leader first.
+	c.mu.RLock()
+	leader := c.leaderAddr
+	c.mu.RUnlock()
+
+	if leader != "" {
+		err := c.doOnce(ctx, leader, method, path, body, result, false)
+		if err == nil {
+			return nil
+		}
+		if isTerminal(err) {
+			return err
+		}
+		// Leader is stale (down or re-elected). Clear the cache so future
+		// calls skip straight to the seed fan-out.
+		c.mu.Lock()
+		if c.leaderAddr == leader { // another goroutine may have already updated it
+			c.leaderAddr = ""
+		}
+		c.mu.Unlock()
+	}
+
+	// 2. Fan out to seed nodes until one succeeds.
+	var lastErr error
+	for _, addr := range c.addrs {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err := c.doOnce(ctx, addr, method, path, body, result, false)
+		if err == nil {
+			return nil
+		}
+		if isTerminal(err) {
+			return err
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no nodes available")
+}
+
+// doOnce performs a single HTTP request against addr. If the server responds
+// with a 307 redirect and followed is false, it updates the leader cache and
+// retries once against the new address. The followed flag prevents redirect
+// loops.
+func (c *Client) doOnce(ctx context.Context, addr, method, path string, body []byte, result any, followed bool) error {
+	urlStr := strings.TrimSuffix(addr, "/") + path
+
+	var reqBody io.Reader
+	if body != nil {
+		reqBody = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, reqBody)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		if followed {
+			return errors.New("redirect loop detected")
+		}
+		location := resp.Header.Get("Location")
+		if location == "" {
+			return errors.New("redirect with empty Location")
+		}
+		u, err := url.Parse(location)
+		if err != nil {
+			return fmt.Errorf("bad redirect location %q: %w", location, err)
+		}
+		newBase := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+
+		c.mu.Lock()
+		c.leaderAddr = newBase
+		c.mu.Unlock()
+
+		return c.doOnce(ctx, newBase, method, path, body, result, true)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if result != nil {
+			return json.NewDecoder(resp.Body).Decode(result)
+		}
+		return nil
+	}
+
+	// Read the response body for a meaningful error message (capped to avoid
+	// consuming runaway responses).
+	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	msg := strings.TrimSpace(string(errBody))
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return ErrNotFound
+	case http.StatusConflict:
+		return ErrConflict
+	case http.StatusUnprocessableEntity:
+		return fmt.Errorf("%w: %s", ErrInsufficientFunds, msg)
+	case http.StatusServiceUnavailable:
+		return ErrNotLeader
+	default:
+		if msg != "" {
+			return fmt.Errorf("server error %d: %s", resp.StatusCode, msg)
+		}
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+}
+
+// isTerminal reports whether err should stop the retry loop immediately.
+// Network errors and ErrNotLeader are retried; domain errors are not.
+func isTerminal(err error) bool {
+	return errors.Is(err, ErrNotFound) ||
+		errors.Is(err, ErrConflict) ||
+		errors.Is(err, ErrInsufficientFunds)
+}

@@ -1110,6 +1110,33 @@ curl -L -X PUT http://localhost:8001/configs/db.host \
      -H 'Content-Type: application/json' -d '{"value":"localhost"}'
 ```
 
+### `examples/ledger` — EasyRaft with atomic multi-collection transactions
+
+See [`examples/ledger`](examples/ledger/) for a distributed double-entry ledger built on `easyraft`. It demonstrates the `Store.Txn` API — the pattern none of the other examples cover:
+
+- **`Store.Txn`**: commits a debit, a credit, and a transfer record across two collections in a single Raft log entry. Any failure rolls back the entire batch — no partial state.
+- **Idempotent transfers**: the transfer record is created first inside the Txn, keyed by `client_id:seq`. A retry hits `ErrKeyExists` before any balance mutations run.
+- **`Collection.RegisterMutation`**: the `debit` mutation enforces the "no negative balance" invariant inside `Apply` on every replica.
+- **`WithHTTPMux`**: easyraft management routes share the application's mux.
+
+```bash
+go build -o ledger ./examples/ledger
+
+# Node 1 — bootstrap
+./ledger --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/lgr/n1
+
+# Node 2 — joins node 1
+./ledger --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/lgr/n2 \
+         --join localhost:8001
+
+# Create accounts and transfer funds
+curl -X POST http://localhost:8001/accounts \
+     -H 'Content-Type: application/json' -d '{"id":"alice","balance":1000}'
+curl -L -X POST http://localhost:8001/transfers \
+     -H 'Content-Type: application/json' \
+     -d '{"from":"alice","to":"bob","amount":100,"client_id":"cli1","seq":1}'
+```
+
 ### `examples/shardkv` — multi-group (multi-raft) with leader balancing
 
 See [`examples/shardkv`](examples/shardkv/) for a horizontally-sharded key-value

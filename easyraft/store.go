@@ -47,6 +47,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -1094,10 +1095,42 @@ func (s *Store) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
 
 func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 	if cmd.Op == opBatch {
+		// Snapshot every collection touched by the batch so we can roll back on
+		// failure.  json.RawMessage values are immutable []byte slices, so a
+		// shallow copy of the inner map is sufficient.
+		type collSnap struct {
+			entries map[string]json.RawMessage
+			existed bool
+		}
+		snapshots := make(map[string]collSnap, len(cmd.Batch))
+		for i := range cmd.Batch {
+			name := cmd.Batch[i].Collection
+			if _, seen := snapshots[name]; !seen {
+				coll := s.collections[name]
+				snap := collSnap{existed: coll != nil}
+				if coll != nil {
+					snap.entries = make(map[string]json.RawMessage, len(coll))
+					maps.Copy(snap.entries, coll)
+				}
+				snapshots[name] = snap
+			}
+		}
+		preBatchEventsLen := len(s.pendingEvents)
+
 		results := make([]json.RawMessage, 0, len(cmd.Batch))
 		for i := range cmd.Batch {
 			res, err := s.applyCommand(&cmd.Batch[i])
 			if err != nil {
+				// Restore all touched collections to their pre-batch state.
+				for name, snap := range snapshots {
+					if !snap.existed {
+						delete(s.collections, name)
+					} else {
+						s.collections[name] = snap.entries
+					}
+				}
+				// Discard any partial change events emitted during the batch.
+				s.pendingEvents = s.pendingEvents[:preBatchEventsLen]
 				return nil, err
 			}
 			results = append(results, res)
@@ -1177,9 +1210,7 @@ func (s *Store) Snapshot(_ context.Context, w io.Writer) error {
 	snap := make(map[string]map[string]json.RawMessage, len(s.collections))
 	for collName, items := range s.collections {
 		collCopy := make(map[string]json.RawMessage, len(items))
-		for k, v := range items {
-			collCopy[k] = v
-		}
+		maps.Copy(collCopy, items)
 		snap[collName] = collCopy
 	}
 	s.mu.RUnlock()
