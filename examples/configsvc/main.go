@@ -54,7 +54,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/brunoga/raft"
@@ -67,97 +66,19 @@ type ConfigEntry struct {
 	Version int64  `json:"version"` // Unix nanoseconds; set by caller, not inside Apply
 }
 
-// WatchEvent is what SSE clients receive.
-type WatchEvent struct {
-	Key     string `json:"key"`
-	Value   string `json:"value,omitempty"`
-	Version int64  `json:"version,omitempty"`
-	Deleted bool   `json:"deleted,omitempty"`
-}
-
-// WatcherRegistry manages SSE subscriptions. It is entirely local — subscriptions
-// are not replicated. OnChange fires on every node, so every node independently
-// notifies its own subscribers.
-type WatcherRegistry struct {
-	mu       sync.Mutex
-	all      []chan WatchEvent            // subscriptions to all keys
-	byKey    map[string][]chan WatchEvent // subscriptions to a specific key
-}
-
-func newWatcherRegistry() *WatcherRegistry {
-	return &WatcherRegistry{byKey: make(map[string][]chan WatchEvent)}
-}
-
-// subscribe returns a buffered channel that will receive events for key.
-// Pass key="" to receive events for all keys.
-func (r *WatcherRegistry) subscribe(key string) chan WatchEvent {
-	ch := make(chan WatchEvent, 64)
-	r.mu.Lock()
-	if key == "" {
-		r.all = append(r.all, ch)
-	} else {
-		r.byKey[key] = append(r.byKey[key], ch)
-	}
-	r.mu.Unlock()
-	return ch
-}
-
-// unsubscribe removes ch from the registry.
-func (r *WatcherRegistry) unsubscribe(key string, ch chan WatchEvent) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if key == "" {
-		r.all = removeCh(r.all, ch)
-	} else {
-		r.byKey[key] = removeCh(r.byKey[key], ch)
-	}
-}
-
-func removeCh(s []chan WatchEvent, ch chan WatchEvent) []chan WatchEvent {
-	for i, c := range s {
-		if c == ch {
-			return append(s[:i], s[i+1:]...)
-		}
-	}
-	return s
-}
-
-// notify dispatches ev to all matching subscribers. Called from the OnChange
-// handler — must not block. Full subscriber channels drop the event.
-func (r *WatcherRegistry) notify(ev WatchEvent) {
-	r.mu.Lock()
-	targets := append(append([]chan WatchEvent(nil), r.all...), r.byKey[ev.Key]...)
-	r.mu.Unlock()
-	for _, ch := range targets {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
-}
-
 // server wires together EasyRaft and the HTTP handlers.
 type server struct {
 	configs *easyraft.Collection[ConfigEntry]
-	reg     *WatcherRegistry
+	watcher *easyraft.Watcher[ConfigEntry]
 }
 
 func newServer(configs *easyraft.Collection[ConfigEntry]) *server {
-	reg := newWatcherRegistry()
-
+	w := easyraft.NewWatcher[ConfigEntry]()
 	// Wire up the OnChange hook. This fires on every replica after each
 	// committed write — outside the Raft lock, in a dedicated dispatcher
 	// goroutine. We just fan out to local SSE subscribers.
-	configs.OnChange(func(key string, entry *ConfigEntry, deleted bool) {
-		ev := WatchEvent{Key: key, Deleted: deleted}
-		if !deleted && entry != nil {
-			ev.Value = entry.Value
-			ev.Version = entry.Version
-		}
-		reg.notify(ev)
-	})
-
-	return &server{configs: configs, reg: reg}
+	configs.OnChange(w.Notify)
+	return &server{configs: configs, watcher: w}
 }
 
 // setConfig upserts a config entry with the current timestamp as version.
@@ -266,67 +187,13 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 // handleWatch streams SSE events to the client. Path /watch/{key} scopes to
 // one key; path /watch (no key) streams all changes.
 //
-// SSE format:
+// handleWatch streams SSE events to the client. Path /watch/{key} scopes to
+// one key; path /watch (no key) streams all changes.
 //
-//	event: change
-//	data: {"key":"db.host","value":"localhost","version":1712345678901234567}
-//
-//	event: delete
-//	data: {"key":"db.host","deleted":true}
+// SSE format: see [easyraft.ChangeEvent].
 func (s *server) handleWatch(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key") // empty for /watch
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
-	flusher.Flush()
-
-	ch := s.reg.subscribe(key)
-	defer s.reg.unsubscribe(key, ch)
-
-	// Send current snapshot on connect so the client starts from a known state.
-	if all, err := s.configs.ListStale(); err == nil {
-		for k, entry := range all {
-			if key != "" && k != key {
-				continue
-			}
-			ev := WatchEvent{Key: k, Value: entry.Value, Version: entry.Version}
-			sendSSE(w, "snapshot", ev)
-		}
-		flusher.Flush()
-	}
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
-			eventType := "change"
-			if ev.Deleted {
-				eventType = "delete"
-			}
-			sendSSE(w, eventType, ev)
-			flusher.Flush()
-		}
-	}
-}
-
-func sendSSE(w http.ResponseWriter, event string, v any) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+	snap, _ := s.configs.ListStale()
+	s.watcher.ServeSSE(w, r, r.PathValue("key"), snap)
 }
 
 func main() {
@@ -344,10 +211,17 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// Build the mux first so WithHTTPMux can hand it to the store.
+	// easyraft registers its management routes (/join, /members, CRUD, etc.)
+	// on this mux during Start; we add the app routes below. One HTTP server
+	// serves everything — no port conflict.
+	mux := http.NewServeMux()
+
 	opts := []easyraft.Option{
 		easyraft.WithID(raft.NodeID(*id)),
 		easyraft.WithRaftAddr(*raftAddr),
-		easyraft.WithHTTPAddr(*httpAddr),
+		easyraft.WithHTTPAddr(*httpAddr), // advertise URL for leader redirect
+		easyraft.WithHTTPMux(mux),        // register easyraft routes on our mux
 		easyraft.WithDataDir(*dataDir),
 		easyraft.WithLogger(logger),
 	}
@@ -357,8 +231,6 @@ func main() {
 		opts = append(opts, easyraft.WithJoinAddr(addrs...))
 	}
 
-	// Build the store and typed collection handle separately so we can
-	// register the OnChange hook before Start is called.
 	store, err := easyraft.NewStore(opts...)
 	if err != nil {
 		logger.Error("failed to create store", "err", err)
@@ -366,11 +238,10 @@ func main() {
 	}
 
 	configs := easyraft.AddCollection[ConfigEntry](store, "configs")
-
 	srv := newServer(configs)
 
-	// HTTP routes
-	mux := http.NewServeMux()
+	// App-specific routes (registered before store.Start so everything is
+	// wired before the server accepts connections).
 	mux.HandleFunc("PUT /configs/{key}", srv.handleSet)
 	mux.HandleFunc("GET /configs/{key}", srv.handleGet)
 	mux.HandleFunc("DELETE /configs/{key}", srv.handleDelete)
@@ -383,7 +254,7 @@ func main() {
 		Handler: mux,
 	}
 
-	store.Start()
+	store.Start() // registers easyraft routes on mux
 	defer store.Stop()
 
 	logger.Info("configsvc started", "id", *id, "raft", *raftAddr, "http", *httpAddr)
