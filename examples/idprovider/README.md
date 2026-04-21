@@ -220,6 +220,27 @@ curl -s 'http://localhost:8001/domains/orders/current?consistency=stale'
 # {"domain":"orders","current":101}
 ```
 
+## Go Client Library
+
+A high-level Go client is available in the [`client`](./client) package. It handles node discovery, leader redirection (via 307 redirects), and provides exactly-once semantics for ID allocations using a stable client ID.
+
+```go
+import "github.com/brunoga/raft/examples/idprovider/client"
+
+// Initialize client with seed nodes and a stable client ID.
+c := client.New([]string{"http://localhost:8001", "http://localhost:8002"}, "checkout-svc-1")
+
+// Create a domain
+err := c.CreateDomain(ctx, "orders")
+
+// Allocate 100 IDs (idempotent)
+res, err := c.Next(ctx, "orders", 100)
+fmt.Printf("Reserved IDs [%d, %d)\n", res.Start, res.Start+res.Count)
+
+// Get current high-water mark
+info, err := c.Current(ctx, "orders", false)
+```
+
 ## HTTP status codes
 
 | Code | Meaning |
