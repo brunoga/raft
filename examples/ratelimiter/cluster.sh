@@ -31,6 +31,41 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# Wait for a Raft leader to be elected, then print the member table.
+wait_and_show_status() {
+    local seed="http://localhost:8001"
+    local timeout=30
+
+    printf "==> Waiting for cluster (up to %ds)..." "$timeout"
+    local deadline=$((SECONDS + timeout))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local body
+        body=$(curl -sf "$seed/members" 2>/dev/null) || { sleep 0.3; continue; }
+        if printf '%s' "$body" | grep -q '"leader":true'; then
+            printf ' done.\n'
+            break
+        fi
+        sleep 0.3
+    done
+    if [[ $SECONDS -ge $deadline ]]; then
+        printf ' timed out (check %s/n*.log).\n' "$DATA_ROOT"
+        return
+    fi
+
+    printf '==> Cluster members:\n'
+    local body
+    body=$(curl -sf "$seed/members" 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$body" | jq -r '
+            .members | sort_by(.id)[] |
+            "  \(.id)  \(if .leader then "leader  " else "follower" end)  \(.raft_addr)"
+        '
+    else
+        printf '%s\n' "$body"
+    fi
+    printf '\n'
+}
+
 echo "==> Starting n1 (bootstrap)..."
 "$BINARY" -id n1 -raft :7001 -http :8001 -data "$DATA_ROOT/n1" \
     -peers n1=127.0.0.1:7001 \
@@ -53,8 +88,9 @@ echo "==> Starting n3 (joining n1)..."
     >"$DATA_ROOT/n3.log" 2>&1 &
 PIDS+=($!)
 
-echo ""
-echo "Cluster is up. Endpoints:"
+wait_and_show_status
+
+echo "Endpoints:"
 echo "  n1  http://localhost:8001"
 echo "  n2  http://localhost:8002"
 echo "  n3  http://localhost:8003"

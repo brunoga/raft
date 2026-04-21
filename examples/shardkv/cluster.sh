@@ -33,6 +33,41 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# Wait for all shards to elect leaders, then print the shard table from p1.
+wait_and_show_status() {
+    local seed="http://localhost:8001"
+    local timeout=15
+
+    printf "==> Waiting for %d shards to elect leaders (up to %ds)..." "$SHARDS" "$timeout"
+    local deadline=$((SECONDS + timeout))
+    while [[ $SECONDS -lt $deadline ]]; do
+        local body
+        body=$(curl -sf "$seed/shards" 2>/dev/null) || { sleep 0.3; continue; }
+        local leader_count
+        leader_count=$(printf '%s' "$body" | grep -c '"state":"Leader"' 2>/dev/null || true)
+        if [[ "$leader_count" -ge "$SHARDS" ]]; then
+            printf ' done.\n'
+            break
+        fi
+        sleep 0.3
+    done
+    if [[ $SECONDS -ge $deadline ]]; then
+        printf ' timed out (check %s/p*.log).\n' "$DATA_ROOT"
+        return
+    fi
+
+    printf '==> Shard status (via p1):\n'
+    local body
+    body=$(curl -sf "$seed/shards" 2>/dev/null)
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$body" | jq -r 'sort_by(.group_id)[] |
+            "  shard=\(.group_id)  \(.state)  term=\(.term)  last_applied=\(.last_applied)"'
+    else
+        printf '%s\n' "$body"
+    fi
+    printf '\n'
+}
+
 echo "==> Starting p1..."
 "$BINARY" --id p1 --shards "$SHARDS" --raft-addr :7001 --http-addr :8001 \
     --data-dir "$DATA_ROOT/p1" \
@@ -57,8 +92,9 @@ echo "==> Starting p3..."
     >"$DATA_ROOT/p3.log" 2>&1 &
 PIDS+=($!)
 
-echo ""
-echo "Cluster is up: $SHARDS shards × 3 physical nodes. Endpoints:"
+wait_and_show_status
+
+echo "Endpoints ($SHARDS shards × 3 physical nodes):"
 echo "  p1  http://localhost:8001"
 echo "  p2  http://localhost:8002"
 echo "  p3  http://localhost:8003"
