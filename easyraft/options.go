@@ -3,6 +3,7 @@ package easyraft
 import (
 	"crypto/tls"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/brunoga/raft"
@@ -42,6 +43,14 @@ type Config struct {
 	// from the cluster. Set via [WithLeaveOnStop].
 	LeaveOnStop bool
 
+	// HTTPMux, when set, causes the store to register its management routes
+	// (join, members, CRUD, etc.) on the provided mux instead of starting its
+	// own HTTP server. The caller is responsible for serving the mux.
+	// HTTPAddr is still used to advertise this node's URL to the cluster for
+	// leader redirects — set it to the address the caller will listen on.
+	// Set via [WithHTTPMux].
+	HTTPMux *http.ServeMux
+
 	// Raft timing overrides. Zero means use the easyraft defaults
 	// (100 ms tick/heartbeat, 1–2 s election timeout).
 	TickInterval       time.Duration
@@ -66,6 +75,17 @@ func WithRaftAddr(addr string) Option {
 // WithHTTPAddr sets the optional listen address for the HTTP API (e.g., ":8001").
 func WithHTTPAddr(addr string) Option {
 	return func(c *Config) { c.HTTPAddr = addr }
+}
+
+// WithHTTPMux registers the store's management routes on mux instead of
+// starting a dedicated HTTP server. Use this when your application already
+// runs its own HTTP server and you want easyraft routes (/join, /members, /{collection}/...,
+// etc.) to share the same listener. The caller must start a server using mux.
+//
+// [WithHTTPAddr] should still be set to the address the caller will listen on
+// so easyraft can advertise the correct URL to peers for leader redirects.
+func WithHTTPMux(mux *http.ServeMux) Option {
+	return func(c *Config) { c.HTTPMux = mux }
 }
 
 // WithDataDir sets the directory for persistent log and snapshots.
