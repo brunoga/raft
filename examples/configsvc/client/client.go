@@ -1,6 +1,10 @@
 // Package client provides a high-level Go client for the configsvc example.
-// It handles cluster bootstrapping, leader discovery, and provides a type-safe
-// API for configuration management and real-time watches.
+//
+// The client handles leader discovery and automatic redirection transparently.
+// Any node address can be used as a seed; write requests are routed to the
+// current leader and the leader address is cached and revalidated on failure.
+// Watch connections can be established to any node — each node fires SSE
+// events independently from its own OnChange callback.
 package client
 
 import (
@@ -17,98 +21,118 @@ import (
 	"sync"
 )
 
-// ConfigEntry is the value stored in the "configs" collection.
-type ConfigEntry struct {
-	Value   string `json:"value"`
-	Version int64  `json:"version"`
-}
-
-// ChangeEvent is delivered to subscribers when a config entry changes.
-type ChangeEvent struct {
-	Key     string       `json:"key"`
-	Value   *ConfigEntry `json:"value,omitempty"`
-	Deleted bool         `json:"deleted,omitempty"`
-	Type    string       `json:"type"` // "snapshot", "change", or "delete"
-}
-
+// Sentinel errors returned by the client.
 var (
-	ErrNotFound  = errors.New("config key not found")
+	// ErrNotFound is returned when the requested config key does not exist.
+	ErrNotFound = errors.New("config key not found")
+
+	// ErrNotLeader is returned when the request reaches a follower and no
+	// redirect is available. This is transient; retrying usually succeeds.
 	ErrNotLeader = errors.New("node is not the leader")
 )
 
-// Client is a high-level client for the configsvc.
+// ConfigEntry is the value stored in the "configs" collection.
+type ConfigEntry struct {
+	Value   string `json:"value"`
+	Version int64  `json:"version"` // Unix nanoseconds
+}
+
+// ChangeEvent is delivered to Watch subscribers when a config entry changes.
+// Type is one of "snapshot", "change", or "delete".
+type ChangeEvent struct {
+	Type    string       `json:"type"`
+	Key     string       `json:"key"`
+	Value   *ConfigEntry `json:"value,omitempty"`
+	Deleted bool         `json:"deleted,omitempty"`
+}
+
+// Client is a thread-safe, high-level client for the configsvc.
 type Client struct {
-	addrs      []string
+	addrs []string // seed node addresses, e.g. "http://host:8001"
+
+	// httpClient does not follow redirects so we can intercept 307 responses
+	// and update the cached leader address ourselves.
 	httpClient *http.Client
 
 	mu         sync.RWMutex
-	leaderAddr string
+	leaderAddr string // cached leader; empty means unknown
 }
 
-// New returns a new configsvc client. addrs should be a list of HTTP addresses
-// of the nodes in the cluster (e.g., "http://localhost:8001").
+// New returns a new configsvc client. addrs should be the HTTP addresses of
+// one or more cluster nodes (e.g. "http://localhost:8001"). At least one
+// reachable address is required; the rest serve as fallbacks.
 func New(addrs []string) *Client {
 	return &Client{
 		addrs: addrs,
 		httpClient: &http.Client{
-			// Don't follow redirects automatically. We want to catch the 307
-			// ourselves so we can update the cached leaderAddr.
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Disable automatic redirect following so we can intercept 307
+			// responses and update the cached leader address ourselves.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
 	}
 }
 
-// Set upserts a config entry.
+// Set upserts a config entry with an updated version timestamp.
 func (c *Client) Set(ctx context.Context, key, value string) error {
 	body, err := json.Marshal(map[string]string{"value": value})
 	if err != nil {
 		return err
 	}
-
-	return c.doWithRetry(ctx, http.MethodPut, "/configs/"+key, bytes.NewReader(body), nil)
+	return c.do(ctx, http.MethodPut, "/configs/"+key, body, nil)
 }
 
-// Get retrieves a config entry. If consistency is "stale", it performs a local
-// read from any node. Otherwise, it performs a linearizable read.
+// Get retrieves a config entry. If stale is true it performs a local read from
+// any node; otherwise it performs a linearizable read.
+// Returns ErrNotFound if the key does not exist.
 func (c *Client) Get(ctx context.Context, key string, stale bool) (ConfigEntry, error) {
 	path := "/configs/" + key
 	if stale {
 		path += "?consistency=stale"
 	}
-
 	var entry ConfigEntry
-	err := c.doWithRetry(ctx, http.MethodGet, path, nil, &entry)
-	return entry, err
+	if err := c.do(ctx, http.MethodGet, path, nil, &entry); err != nil {
+		return ConfigEntry{}, err
+	}
+	return entry, nil
 }
 
-// Delete removes a config entry.
+// Delete removes a config entry. Returns ErrNotFound if the key does not exist.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	return c.doWithRetry(ctx, http.MethodDelete, "/configs/"+key, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/configs/"+key, nil, nil)
 }
 
-// List retrieves all config entries.
+// List retrieves all config entries. If stale is true it performs a local read
+// from any node; otherwise it performs a linearizable read.
 func (c *Client) List(ctx context.Context, stale bool) (map[string]ConfigEntry, error) {
 	path := "/configs"
 	if stale {
 		path += "?consistency=stale"
 	}
-
 	var all map[string]ConfigEntry
-	err := c.doWithRetry(ctx, http.MethodGet, path, nil, &all)
-	return all, err
+	if err := c.do(ctx, http.MethodGet, path, nil, &all); err != nil {
+		return nil, err
+	}
+	return all, nil
 }
 
-// Watch subscribes to changes for a given key (or all keys if key is empty).
-// It returns a channel of ChangeEvents and an error if the connection fails.
-// The channel is closed when the context is cancelled or the connection is lost.
+// Watch subscribes to changes for the given key. If key is empty, all changes
+// are delivered. The returned channel is closed when the context is cancelled
+// or the connection is lost.
+//
+// Each new connection starts with one "snapshot" event per matching key
+// already in the collection, followed by "change" and "delete" events as they
+// are committed. Watch can connect to any node — watches do not require the
+// leader.
 func (c *Client) Watch(ctx context.Context, key string) (<-chan ChangeEvent, error) {
 	path := "/watch"
 	if key != "" {
 		path += "/" + key
 	}
 
+	// Watches work on any node, but try the cached leader first since it is
+	// likely still reachable.
 	c.mu.RLock()
 	leader := c.leaderAddr
 	c.mu.RUnlock()
@@ -126,13 +150,11 @@ func (c *Client) Watch(ctx context.Context, key string) (<-chan ChangeEvent, err
 			return ch, nil
 		}
 	}
-
 	return nil, errors.New("failed to connect to any node for watch")
 }
 
 func (c *Client) watchOnce(ctx context.Context, addr, path string) (<-chan ChangeEvent, error) {
-	urlStr := strings.TrimSuffix(addr, "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(addr, "/")+path, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -143,15 +165,14 @@ func (c *Client) watchOnce(ctx context.Context, addr, path string) (<-chan Chang
 	}
 
 	if resp.StatusCode == http.StatusTemporaryRedirect {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		location := resp.Header.Get("Location")
 		if location == "" {
-			return nil, errors.New("redirect without location")
+			return nil, errors.New("redirect with empty Location")
 		}
-
 		u, err := url.Parse(location)
 		if err != nil {
-			return nil, fmt.Errorf("invalid redirect location: %w", err)
+			return nil, fmt.Errorf("bad redirect location %q: %w", location, err)
 		}
 		newBase := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 
@@ -163,126 +184,140 @@ func (c *Client) watchOnce(ctx context.Context, addr, path string) (<-chan Chang
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 
 	ch := make(chan ChangeEvent, 64)
 	go c.streamSSE(ctx, resp.Body, ch)
-
 	return ch, nil
 }
 
 func (c *Client) streamSSE(ctx context.Context, body io.ReadCloser, ch chan<- ChangeEvent) {
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	defer close(ch)
 
 	scanner := bufio.NewScanner(body)
-	var currentEvent ChangeEvent
+	var current ChangeEvent
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
-			// Empty line marks the end of an event.
-			if currentEvent.Type != "" {
+			// Empty line marks end of one event.
+			if current.Type != "" {
 				select {
-				case ch <- currentEvent:
+				case ch <- current:
 				case <-ctx.Done():
 					return
 				}
-				currentEvent = ChangeEvent{}
+				current = ChangeEvent{}
 			}
 			continue
 		}
-
-		parts := strings.SplitN(line, ": ", 2)
-		if len(parts) < 2 {
+		field, value, ok := strings.Cut(line, ": ")
+		if !ok {
 			continue
 		}
-
-		key, value := parts[0], parts[1]
-		switch key {
+		switch field {
 		case "event":
-			currentEvent.Type = value
+			current.Type = value
 		case "data":
-			if err := json.Unmarshal([]byte(value), &currentEvent); err != nil {
-				// Log or handle error? For now just skip.
-				continue
+			// The data field is a JSON-encoded ChangeEvent; merge it into
+			// current so the Type we set from "event:" is preserved.
+			var ev ChangeEvent
+			if err := json.Unmarshal([]byte(value), &ev); err == nil {
+				ev.Type = current.Type
+				current = ev
 			}
 		}
 	}
 }
 
-func (c *Client) doWithRetry(ctx context.Context, method, path string, body io.Reader, result any) error {
-	var bodyBytes []byte
-	if body != nil {
-		var err error
-		bodyBytes, err = io.ReadAll(body)
-		if err != nil {
-			return err
-		}
-	}
-
+// do executes a request, trying the cached leader first and falling back to
+// seed nodes. It refreshes the leader cache on 307 redirects and invalidates
+// it when the cached leader stops responding.
+func (c *Client) do(ctx context.Context, method, path string, body []byte, result any) error {
 	// 1. Try the cached leader first.
 	c.mu.RLock()
 	leader := c.leaderAddr
 	c.mu.RUnlock()
 
 	if leader != "" {
-		err := c.doOnce(ctx, leader, method, path, bodyBytes, result)
+		err := c.doOnce(ctx, leader, method, path, body, result, false)
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, ErrNotFound) {
+		if isTerminal(err) {
 			return err
 		}
-		// Leader might have changed or node is down.
+		// Leader is stale (down or re-elected). Clear the cache so future
+		// calls skip straight to the seed fan-out.
+		c.mu.Lock()
+		if c.leaderAddr == leader {
+			c.leaderAddr = ""
+		}
+		c.mu.Unlock()
 	}
 
-	// 2. Fall back to seed nodes.
+	// 2. Fan out to seed nodes until one succeeds.
 	var lastErr error
 	for _, addr := range c.addrs {
-		err := c.doOnce(ctx, addr, method, path, bodyBytes, result)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err := c.doOnce(ctx, addr, method, path, body, result, false)
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, ErrNotFound) {
+		if isTerminal(err) {
 			return err
 		}
 		lastErr = err
 	}
 
-	return lastErr
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no nodes available")
 }
 
-func (c *Client) doOnce(ctx context.Context, addr, method, path string, bodyBytes []byte, result any) error {
+// doOnce performs a single HTTP request against addr. If the server responds
+// with a 307 redirect and followed is false, it updates the leader cache and
+// retries once against the new address. The followed flag prevents redirect
+// loops.
+func (c *Client) doOnce(ctx context.Context, addr, method, path string, body []byte, result any, followed bool) error {
 	urlStr := strings.TrimSuffix(addr, "/") + path
+
 	var reqBody io.Reader
-	if bodyBytes != nil {
-		reqBody = bytes.NewReader(bodyBytes)
+	if body != nil {
+		reqBody = bytes.NewReader(body)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, reqBody)
 	if err != nil {
 		return err
 	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTemporaryRedirect {
+		if followed {
+			return errors.New("redirect loop detected")
+		}
 		location := resp.Header.Get("Location")
 		if location == "" {
-			return errors.New("redirect without location")
+			return errors.New("redirect with empty Location")
 		}
-
-		// Extract base URL from redirect location.
 		u, err := url.Parse(location)
 		if err != nil {
-			return fmt.Errorf("invalid redirect location: %w", err)
+			return fmt.Errorf("bad redirect location %q: %w", location, err)
 		}
 		newBase := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 
@@ -290,8 +325,7 @@ func (c *Client) doOnce(ctx context.Context, addr, method, path string, bodyByte
 		c.leaderAddr = newBase
 		c.mu.Unlock()
 
-		// Immediate retry against the new leader.
-		return c.doOnce(ctx, newBase, method, path, bodyBytes, result)
+		return c.doOnce(ctx, newBase, method, path, body, result, true)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -301,13 +335,26 @@ func (c *Client) doOnce(ctx context.Context, addr, method, path string, bodyByte
 		return nil
 	}
 
-	if resp.StatusCode == http.StatusNotFound {
+	// Read the response body for a meaningful error message (capped to avoid
+	// consuming runaway responses).
+	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	msg := strings.TrimSpace(string(errBody))
+
+	switch resp.StatusCode {
+	case http.StatusNotFound:
 		return ErrNotFound
-	}
-
-	if resp.StatusCode == http.StatusServiceUnavailable {
+	case http.StatusServiceUnavailable:
 		return ErrNotLeader
+	default:
+		if msg != "" {
+			return fmt.Errorf("server error %d: %s", resp.StatusCode, msg)
+		}
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
+}
 
-	return fmt.Errorf("unexpected status: %s", resp.Status)
+// isTerminal reports whether err should stop the retry loop immediately.
+// Domain errors are terminal; network errors and ErrNotLeader are retried.
+func isTerminal(err error) bool {
+	return errors.Is(err, ErrNotFound)
 }
