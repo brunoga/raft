@@ -380,6 +380,5 @@ func main() {
 
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("HTTP server error", "err", err)
-		os.Exit(1)
 	}
 }
