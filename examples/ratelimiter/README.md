@@ -84,6 +84,25 @@ curl -L -X POST http://localhost:8002/quotas/premium-user/mutate \
   -d "{\"name\": \"take\", \"args\": {\"requested\": 1, \"now\": $(date +%s)}}"
 ```
 
+## Go Client Library
+
+A high-level Go client is available in the [`client`](./client) package. It handles node discovery, leader redirection, and provides a type-safe API for managing quotas and requesting tokens.
+
+```go
+import "github.com/brunoga/raft/examples/ratelimiter/client"
+
+c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
+
+// Take 5 tokens
+resp, err := c.Take(ctx, "premium-user", 5)
+if resp.Allowed {
+    fmt.Printf("Allowed! Tokens remaining: %d\n", resp.Remains)
+}
+
+// Get quota status
+quota, err := c.GetQuota(ctx, "premium-user", false)
+```
+
 ## Performance & Benchmarking
 
 The rate limiter includes a built-in benchmark to measure the overhead of distributed consensus.

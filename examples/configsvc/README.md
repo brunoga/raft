@@ -39,6 +39,32 @@ Additional patterns:
 | `GET` | `/watch/{key}` | SSE stream for one key |
 | `GET` | `/watch` | SSE stream for all keys |
 
+---
+
+## Go Client Library
+
+A high-level Go client is available in the [`client`](./client) package. It handles node discovery (retrying other nodes if one is down), automatic redirects to the leader, and provides a type-safe API for CRUD operations and SSE watches.
+
+```go
+import "github.com/brunoga/raft/examples/configsvc/client"
+
+c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
+
+// Set a value
+err := c.Set(ctx, "db.host", "localhost")
+
+// Get a value (linearizable)
+entry, err := c.Get(ctx, "db.host", false)
+
+// Watch for changes
+ch, err := c.Watch(ctx, "db.host")
+for ev := range ch {
+    fmt.Printf("Change: %s = %s\n", ev.Key, ev.Value.Value)
+}
+```
+
+---
+
 ### SSE event format
 
 Events are JSON-encoded [`easyraft.ChangeEvent[ConfigEntry]`](../../easyraft/watcher.go). The `value` field carries the full `ConfigEntry` object:
