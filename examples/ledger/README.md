@@ -51,6 +51,16 @@ The `(client_id, seq)` pair is the idempotency key. Retrying with the same pair 
 
 ## Running a 3-node cluster
 
+The quickest way to start a local cluster is with the provided script:
+
+```bash
+./cluster.sh
+```
+
+It builds the binary, wipes any previous data directories, starts all three nodes, waits for a leader to be elected, and prints a member table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
+
+Alternatively, start the nodes manually in separate terminals:
+
 **Terminal 1 — bootstrap node**
 
 ```bash

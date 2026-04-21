@@ -115,6 +115,16 @@ On connect, the server sends one `snapshot` event per existing key in the collec
 
 ## Running a 3-node cluster
 
+The quickest way to start a local cluster is with the provided script:
+
+```bash
+./cluster.sh
+```
+
+It builds the binary, wipes any previous data directories, starts all three nodes, waits for a leader to be elected, and prints a member table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
+
+Alternatively, start the nodes manually in separate terminals:
+
 **Terminal 1 — bootstrap node**
 
 ```bash

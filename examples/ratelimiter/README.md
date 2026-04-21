@@ -10,7 +10,15 @@ This example demonstrates how to build a production-grade Distributed Rate Limit
 
 ## Running a 3-Node Cluster
 
-There are two ways to form a cluster: **static peers** (all addresses known upfront) or **join** (nodes added one at a time to an existing cluster).
+The quickest way to start a local cluster is with the provided script:
+
+```bash
+./cluster.sh
+```
+
+It builds the binary, wipes any previous data directories, starts all three nodes (using `--join`), waits for a leader to be elected, and prints a member table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
+
+Alternatively, start the nodes manually. There are two ways to form a cluster: **static peers** (all addresses known upfront) or **join** (nodes added one at a time to an existing cluster).
 
 ### Option A: Static peers (all addresses known upfront)
 
