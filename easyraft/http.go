@@ -715,5 +715,5 @@ func writeSSEEvent(w http.ResponseWriter, event string, v any) {
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 }
