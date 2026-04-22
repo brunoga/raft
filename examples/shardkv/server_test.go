@@ -91,7 +91,11 @@ func newShardCluster(t *testing.T, numPhysical int, numShards uint64) *shardClus
 				}
 			}
 
-			sm := &KvSM{data: make(map[string]string)}
+			sm, err := NewKvSM(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewKvSM(shard %d, phys %s): %v", gid, physID, err)
+			}
+			t.Cleanup(func() { sm.Close() }) //nolint:errcheck
 			smsByPhys[i][gid] = sm
 
 			cfg := raft.DefaultConfig()
@@ -467,7 +471,11 @@ func TestHTTP_SnapshotPreservesData(t *testing.T) {
 					peers = append(peers, raft.PeerConfig{ID: id, Voter: true})
 				}
 			}
-			sm := &KvSM{data: make(map[string]string)}
+			sm, err := NewKvSM(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewKvSM(shard %d, phys %s): %v", gid, pid, err)
+			}
+			t.Cleanup(func() { sm.Close() }) //nolint:errcheck
 			smsByPhys[i][gid] = sm
 
 			cfg := raft.DefaultConfig()

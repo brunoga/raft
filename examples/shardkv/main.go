@@ -200,7 +200,11 @@ func main() {
 			peerIDs = append(peerIDs, raft.PeerConfig{ID: shardNodeID(gid, peerPhysID), Voter: true})
 		}
 
-		sm := &KvSM{data: make(map[string]string)}
+		sm, err := NewKvSM(fmt.Sprintf("%s/kvdb", shardDir))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shardkv: NewKvSM(shard %d): %v\n", gid, err)
+			os.Exit(1)
+		}
 		sms[gid] = sm
 
 		cfg := raft.DefaultConfig()
@@ -273,7 +277,15 @@ func main() {
 	slog.Info("shardkv: shutting down")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(shutCtx) //nolint:errcheck // best-effort shutdown
+	srv.Shutdown(shutCtx) //nolint:errcheck
+
+	// Flush and close all shard databases after the HTTP server has stopped
+	// accepting requests, so no reads or writes are in flight.
+	for gid, sm := range sms {
+		if err := sm.Close(); err != nil {
+			slog.Warn("shardkv: close kvdb", "shard", gid, "err", err)
+		}
+	} // best-effort shutdown
 }
 
 // buildMux constructs the HTTP handler for one physical shardkv node. It is

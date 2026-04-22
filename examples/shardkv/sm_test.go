@@ -13,7 +13,19 @@ import (
 	"github.com/brunoga/raft"
 )
 
-func newKvSM() *KvSM { return &KvSM{data: make(map[string]string)} }
+func newKvSM(t *testing.T) *KvSM {
+	t.Helper()
+	sm, err := NewKvSM(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewKvSM: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sm.Close(); err != nil {
+			t.Errorf("KvSM.Close: %v", err)
+		}
+	})
+	return sm
+}
 
 func applyKv(t *testing.T, sm *KvSM, cmd kvCmd) error {
 	t.Helper()
@@ -28,7 +40,7 @@ func applyKv(t *testing.T, sm *KvSM, cmd kvCmd) error {
 // --- Set ---
 
 func TestKvSM_Set(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	if err := applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "v"}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
@@ -39,7 +51,7 @@ func TestKvSM_Set(t *testing.T) {
 }
 
 func TestKvSM_SetOverwrites(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "first"})
 	applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "second"})
 	if v, _ := sm.Get("k"); v != "second" {
@@ -50,7 +62,7 @@ func TestKvSM_SetOverwrites(t *testing.T) {
 // --- Delete ---
 
 func TestKvSM_Delete(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "v"})
 	if err := applyKv(t, sm, kvCmd{Op: opDel, Key: "k"}); err != nil {
 		t.Fatalf("del: %v", err)
@@ -61,7 +73,7 @@ func TestKvSM_Delete(t *testing.T) {
 }
 
 func TestKvSM_DeleteMissing(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	err := applyKv(t, sm, kvCmd{Op: opDel, Key: "absent"})
 	if !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("expected ErrKeyNotFound, got %v", err)
@@ -71,7 +83,7 @@ func TestKvSM_DeleteMissing(t *testing.T) {
 // --- Get ---
 
 func TestKvSM_GetMissing(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	if _, ok := sm.Get("nope"); ok {
 		t.Error("Get on empty SM should return false")
 	}
@@ -80,7 +92,7 @@ func TestKvSM_GetMissing(t *testing.T) {
 // --- Key isolation ---
 
 func TestKvSM_KeysAreIsolated(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	applyKv(t, sm, kvCmd{Op: opSet, Key: "a", Value: "1"})
 	applyKv(t, sm, kvCmd{Op: opSet, Key: "b", Value: "2"})
 	applyKv(t, sm, kvCmd{Op: opDel, Key: "a"})
@@ -96,7 +108,7 @@ func TestKvSM_KeysAreIsolated(t *testing.T) {
 // --- Unknown op ---
 
 func TestKvSM_UnknownOp(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	err := applyKv(t, sm, kvCmd{Op: "bogus", Key: "k"})
 	if err == nil {
 		t.Fatal("expected error for unknown op")
@@ -106,7 +118,7 @@ func TestKvSM_UnknownOp(t *testing.T) {
 // --- Snapshot / Restore ---
 
 func TestKvSM_SnapshotRestore(t *testing.T) {
-	src := newKvSM()
+	src := newKvSM(t)
 	applyKv(t, src, kvCmd{Op: opSet, Key: "x", Value: "10"})
 	applyKv(t, src, kvCmd{Op: opSet, Key: "y", Value: "20"})
 
@@ -115,7 +127,7 @@ func TestKvSM_SnapshotRestore(t *testing.T) {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
-	dst := newKvSM()
+	dst := newKvSM(t)
 	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, &buf); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -128,10 +140,10 @@ func TestKvSM_SnapshotRestore(t *testing.T) {
 }
 
 func TestKvSM_RestoreClearsExistingState(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	applyKv(t, sm, kvCmd{Op: opSet, Key: "stale", Value: "old"})
 
-	fresh := newKvSM()
+	fresh := newKvSM(t)
 	applyKv(t, fresh, kvCmd{Op: opSet, Key: "fresh", Value: "new"})
 	var buf bytes.Buffer
 	_ = fresh.Snapshot(context.Background(), &buf)
@@ -148,11 +160,11 @@ func TestKvSM_RestoreClearsExistingState(t *testing.T) {
 }
 
 func TestKvSM_RestoreEmptySnapshot(t *testing.T) {
-	sm := newKvSM()
+	sm := newKvSM(t)
 	var buf bytes.Buffer
 	_ = sm.Snapshot(context.Background(), &buf)
 
-	dst := newKvSM()
+	dst := newKvSM(t)
 	applyKv(t, dst, kvCmd{Op: opSet, Key: "old", Value: "v"})
 	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, &buf); err != nil {
 		t.Fatalf("Restore from empty: %v", err)
