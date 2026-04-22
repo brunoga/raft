@@ -90,7 +90,7 @@ func newIDPCluster(t *testing.T, n int, opts ...func(*raft.Config)) *idpCluster 
 		if err != nil {
 			t.Fatalf("raft.New(%s): %v", id, err)
 		}
-		network.Register(id, node)
+		network.Register(id, node.Handler())
 		node.Start()
 
 		c.nodes[i] = node
@@ -140,7 +140,7 @@ func (c *idpCluster) LeaderIdx() int {
 	deadline := time.Now().Add(testElectionTimeout)
 	for time.Now().Before(deadline) {
 		for i, nd := range c.nodes {
-			if nd.StateSnapshot() == raft.Leader {
+			if nd.State() == raft.Leader {
 				return i
 			}
 		}

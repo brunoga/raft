@@ -89,6 +89,7 @@ func (s *Store) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /{collection}/{key}", s.handleCreate)
 	mux.HandleFunc("GET /{collection}/{key}", s.handleRead)
 	mux.HandleFunc("PUT /{collection}/{key}", s.handleUpdate)
+	mux.HandleFunc("PATCH /{collection}/{key}", s.handleUpsert)
 	mux.HandleFunc("DELETE /{collection}/{key}", s.handleDelete)
 	mux.HandleFunc("GET /{collection}", s.handleList)
 	mux.HandleFunc("POST /{collection}/{key}/mutate", s.handleMutate)
@@ -197,6 +198,29 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	_, err := s.propose(r.Context(), &command{
 		Op:         opUpdate,
+		Collection: collection,
+		Key:        key,
+		Value:      val,
+	})
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
+	collection := r.PathValue("collection")
+	key := r.PathValue("key")
+
+	var val json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		return
+	}
+
+	_, err := s.propose(r.Context(), &command{
+		Op:         opUpsert,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
@@ -536,6 +560,7 @@ func (m *Manager) serveHTTP() error {
 	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", m.handleCreate)
 	mux.HandleFunc("GET /groups/{groupID}/{collection}/{key}", m.handleRead)
 	mux.HandleFunc("PUT /groups/{groupID}/{collection}/{key}", m.handleUpdate)
+	mux.HandleFunc("PATCH /groups/{groupID}/{collection}/{key}", m.handleUpsert)
 	mux.HandleFunc("DELETE /groups/{groupID}/{collection}/{key}", m.handleDelete)
 	mux.HandleFunc("GET /groups/{groupID}/{collection}", m.handleList)
 	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}/mutate", m.handleMutate)
@@ -604,6 +629,15 @@ func (m *Manager) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleUpdate(w, r)
+}
+
+func (m *Manager) handleUpsert(w http.ResponseWriter, r *http.Request) {
+	s, err := m.getStore(r)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		return
+	}
+	s.handleUpsert(w, r)
 }
 
 func (m *Manager) handleDelete(w http.ResponseWriter, r *http.Request) {

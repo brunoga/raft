@@ -107,7 +107,7 @@ func newShardCluster(t *testing.T, numPhysical int, numShards uint64) *shardClus
 			if err != nil {
 				t.Fatalf("raft.New(shard %d, phys %s): %v", gid, physID, err)
 			}
-			network.Register(nodeID, node)
+			network.Register(nodeID, node.Handler())
 
 			if err := mgrs[i].Add(gid, node); err != nil {
 				t.Fatalf("mgrs[%d].Add(shard %d): %v", i, gid, err)
@@ -185,7 +185,7 @@ func (c *shardCluster) waitAllLeaders(timeout time.Duration) {
 				if err != nil {
 					continue
 				}
-				if node.StateSnapshot() == raft.Leader {
+				if node.State() == raft.Leader {
 					hasLeader = true
 					break
 				}
@@ -484,7 +484,7 @@ func TestHTTP_SnapshotPreservesData(t *testing.T) {
 			if err != nil {
 				t.Fatalf("raft.New: %v", err)
 			}
-			network.Register(nodeID, node)
+			network.Register(nodeID, node.Handler())
 			if err := mgrs[i].Add(gid, node); err != nil {
 				t.Fatalf("mgrs[%d].Add(shard %d): %v", i, gid, err)
 			}
@@ -527,7 +527,7 @@ func TestHTTP_SnapshotPreservesData(t *testing.T) {
 			hasLeader := false
 			for _, mgr := range mgrs {
 				node, err := mgr.Get(gid)
-				if err == nil && node.StateSnapshot() == raft.Leader {
+				if err == nil && node.State() == raft.Leader {
 					hasLeader = true
 					break
 				}
