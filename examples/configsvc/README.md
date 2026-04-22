@@ -123,6 +123,46 @@ The quickest way to start a local cluster is with the provided script:
 
 It builds the binary, wipes any previous data directories, starts all three nodes, waits for a leader to be elected, and prints a member table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
 
+### Interactive REPL client
+
+Once the cluster is running, use the REPL for interactive exploration:
+
+```bash
+go run ./examples/configsvc/repl
+```
+
+```
+configsvc> set db.host localhost
+ok
+configsvc> get db.host
+db.host = "localhost"  (version 1734567890123456789)
+configsvc> list
+  db.host                         "localhost"
+configsvc> watch db.host
+watching — press Enter to stop
+  snapshot  db.host = "localhost"
+  change    db.host = "prod-db-01"
+
+configsvc> stats
+=== Stats: http://localhost:8001 ===
+
+Cluster Members:
+  n1  leader   :7001
+  n2  follower  :7002
+  n3  follower  :7003
+
+Node Status:
+  id=n1           state=Leader      term=1     last_applied=3
+...
+configsvc> help
+```
+
+Use `--nodes` to point at a non-default cluster:
+
+```bash
+go run ./examples/configsvc/repl --nodes http://host1:8001,http://host2:8001,http://host3:8001
+```
+
 Alternatively, start the nodes manually in separate terminals:
 
 **Terminal 1 — bootstrap node**

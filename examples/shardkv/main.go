@@ -55,8 +55,11 @@ import (
 	"time"
 
 	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/metrics/prommetrics"
 	"github.com/brunoga/raft/storage/filestore"
 	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // peerFlag accumulates --peer physID=raftAddr[,httpAddr] flags.
@@ -174,6 +177,11 @@ func main() {
 	// Create one Raft node per shard and register each with the Manager.
 	// All nodes share the single transport tr; cfg.GroupID stamps every outbound
 	// RPC so the remote transport can route the response back to the right node.
+	//
+	// A single Metrics instance is shared across all shard nodes. prommetrics.New
+	// registers metric descriptors once; individual shard series are
+	// disambiguated by the "node" label on each observation.
+	shardMetrics := prommetrics.New(prometheus.DefaultRegisterer)
 	sms := make(map[uint64]*KvSM, *numShards)
 	for gid := uint64(1); gid <= *numShards; gid++ {
 		shardDir := fmt.Sprintf("%s/shards/%d", *dataDir, gid)
@@ -201,9 +209,10 @@ func main() {
 		cfg.Peers = peerIDs
 		cfg.Storage = store
 		cfg.StateMachine = sm
-		cfg.Transport = tr   // shared: one port for all shards
-		cfg.TickInterval = 0 // driven by mgr.RunTicker below
+		cfg.Transport = tr    // shared: one port for all shards
+		cfg.TickInterval = 0  // driven by mgr.RunTicker below
 		cfg.Logger = logger
+		cfg.Metrics = shardMetrics // shared instance; series tagged by node label
 
 		node, err := raft.New(&cfg)
 		if err != nil {
@@ -287,6 +296,7 @@ func buildMux(
 	// GET  /raft/status   → Manager.StatusAll() as JSON (used by HTTPNodeProvider)
 	// POST /raft/transfer → Manager.TransferGroupLeadership (used by BalanceController)
 	mux.Handle("/raft/", http.StripPrefix("/raft", mgr.Handler()))
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// PUT /keys/{key}
 	//

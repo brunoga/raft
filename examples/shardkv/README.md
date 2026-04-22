@@ -96,6 +96,45 @@ The quickest way to start a local cluster is with the provided script:
 
 It builds the binary, wipes any previous data directories, starts all three nodes, waits for all shard leaders to be elected, and prints a shard status table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
 
+### Interactive REPL client
+
+Once the cluster is running, use the REPL for interactive exploration:
+
+```bash
+go run ./examples/shardkv/repl
+```
+
+```
+shardkv> put hello world
+ok
+shardkv> get hello
+hello = "world"
+shardkv> shards
+  shard=1    Follower      term=1    last_applied=1
+  shard=2    Leader        term=1    last_applied=1
+  shard=3    Follower      term=1    last_applied=1
+  shard=4    Leader        term=1    last_applied=1
+shardkv> stats
+=== Shard Status (all nodes) ===
+
+Node p1 (http://localhost:8001):
+  shard=1    Follower      term=1    last_applied=2
+  ...
+Leader Placement:
+  shard=1    leader=p2
+  shard=2    leader=p1
+  ...
+shardkv> help
+```
+
+Use `--nodes` and `--shards` to customise:
+
+```bash
+go run ./examples/shardkv/repl \
+    --nodes http://host1:8001,http://host2:8001,http://host3:8001 \
+    --shards 4
+```
+
 Alternatively, start the nodes manually:
 
 ```bash

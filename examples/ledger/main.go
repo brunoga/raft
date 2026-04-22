@@ -68,6 +68,7 @@ import (
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/easyraft"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Account holds the current balance for one participant.
@@ -346,6 +347,7 @@ func main() {
 		easyraft.WithHTTPMux(mux),
 		easyraft.WithDataDir(*dataDir),
 		easyraft.WithLogger(logger),
+		easyraft.WithPrometheus(prometheus.DefaultRegisterer),
 	}
 
 	if *join != "" {

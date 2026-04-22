@@ -76,8 +76,11 @@ import (
 	"github.com/brunoga/raft/discovery"
 	"github.com/brunoga/raft/discovery/dnsdiscovery"
 	"github.com/brunoga/raft/discovery/udpbroadcast"
+	"github.com/brunoga/raft/metrics/prommetrics"
 	"github.com/brunoga/raft/storage/filestore"
 	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // peerFlag accumulates --peer id=raft_addr[,http_addr] flags.
@@ -319,6 +322,7 @@ func main() {
 	cfg.StateMachine = sm
 	cfg.Transport = tr
 	cfg.Logger = logger
+	cfg.Metrics = prommetrics.New(prometheus.DefaultRegisterer)
 
 	node, err := raft.New(&cfg)
 	if err != nil {
@@ -509,6 +513,8 @@ func buildMux(nodeID string, node *raft.Node, sm *IDSM, httpAddrMap map[raft.Nod
 			slog.Warn("idprovider: encode status", "err", err)
 		}
 	})
+
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return mux
 }

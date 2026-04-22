@@ -29,6 +29,39 @@ The quickest way to start a local cluster is with the provided script:
 
 It builds the binary, wipes any previous data directories, starts all three nodes, waits for a leader to be elected, and prints a node status table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
 
+### Interactive REPL client
+
+Once the cluster is running, use the REPL for interactive exploration:
+
+```bash
+go run ./examples/idprovider/repl
+```
+
+```
+idprovider> create orders
+created
+idprovider> next orders 10
+allocated [1, 11)  (start=1 count=10)
+idprovider> list
+  orders                          next=11
+idprovider> stats
+=== Cluster Status ===
+
+  http://localhost:8001  id=n1    Leader        last_applied=3
+  http://localhost:8002  id=n2    Follower      last_applied=3
+  http://localhost:8003  id=n3    Follower      last_applied=3
+...
+idprovider> help
+```
+
+Use `--nodes` and `--client-id` to customise:
+
+```bash
+go run ./examples/idprovider/repl \
+    --nodes http://host1:8001,http://host2:8001,http://host3:8001 \
+    --client-id my-repl
+```
+
 Alternatively, start the nodes manually:
 
 ```bash
