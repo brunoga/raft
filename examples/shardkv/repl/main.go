@@ -18,20 +18,20 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
 	"syscall"
 
+	"github.com/brunoga/raft/examples/internal/exampleutil"
 	"github.com/brunoga/raft/examples/shardkv/client"
 )
 
 func main() {
+
 	nodes := flag.String("nodes",
 		"http://localhost:8001,http://localhost:8002,http://localhost:8003",
 		"comma-separated list of cluster node HTTP addresses")
@@ -150,24 +150,24 @@ func showStats(ctx context.Context, addrs []string) {
 
 	// Collect per-node shard status from /raft/status (Manager.StatusAll).
 	type nodeReport struct {
-		addr    string
-		shards  []shardStatus
-		nodeID  string
-		err     error
+		addr   string
+		shards []shardStatus
+		nodeID string
+		err    error
 	}
 
 	reports := make([]nodeReport, len(addrs))
 	for i, addr := range addrs {
 		addr = strings.TrimSuffix(addr, "/")
 		var shards []shardStatus
-		err := fetchJSON(ctx, addr+"/raft/status", &shards)
+		err := exampleutil.FetchJSON(ctx, addr+"/raft/status", &shards)
 
 		// Also fetch static config for the node ID.
 		nodeID := addr
 		var cfg struct {
 			ID string `json:"id"`
 		}
-		if fetchJSON(ctx, addr+"/status", &cfg) == nil && cfg.ID != "" {
+		if exampleutil.FetchJSON(ctx, addr+"/status", &cfg) == nil && cfg.ID != "" {
 			nodeID = cfg.ID
 		}
 
@@ -221,70 +221,15 @@ func showStats(ctx context.Context, addrs []string) {
 		if r.err != nil {
 			continue
 		}
-		if err := fetchRaftMetrics(ctx, r.addr+"/metrics"); err != nil {
+		if err := exampleutil.FetchRaftMetrics(ctx, r.addr+"/metrics"); err != nil {
 			fmt.Fprintln(os.Stderr, "  metrics:", err)
 		}
 		break
 	}
 }
 
-// fetchRaftMetrics GETs a Prometheus /metrics endpoint and prints raft_ lines.
-func fetchRaftMetrics(ctx context.Context, url string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	found := false
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "raft_") {
-			continue
-		}
-		found = true
-		name, rest, hasLabels := strings.Cut(line, "{")
-		if hasLabels {
-			labels, value, _ := strings.Cut(rest, "} ")
-			fmt.Printf("  %-42s {%s}  %s\n", name, labels, strings.TrimSpace(value))
-		} else {
-			parts := strings.Fields(line)
-			if len(parts) == 2 {
-				fmt.Printf("  %-42s  %s\n", parts[0], parts[1])
-			}
-		}
-	}
-	if !found {
-		fmt.Println("  (no raft_ metrics)")
-	}
-	return scanner.Err()
-}
-
-func fetchJSON(ctx context.Context, url string, dst any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return json.NewDecoder(resp.Body).Decode(dst)
-}
-
 func printHelp() {
+
 	fmt.Print(`commands:
   put <key> <value>    set a key
   get <key>            get a key

@@ -501,16 +501,43 @@ func buildMux(nodeID string, node *raft.Node, sm *IDSM, httpAddrMap map[raft.Nod
 
 	// GET /status
 	//
-	// Returns cluster status: node state, current leader, and last applied index.
+	// Returns this node's Raft status (node_id, state, term, last_applied).
+	// Uses Node.Status() directly so the response format is identical to
+	// easyraft and can be consumed by exampleutil.ShowNodeStats.
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"id":           nodeID,
-			"state":        node.StateSnapshot().String(),
-			"leader":       string(node.Leader()),
-			"last_applied": node.LastApplied(),
-		}); err != nil {
+		if err := json.NewEncoder(w).Encode(node.Status()); err != nil {
 			slog.Warn("idprovider: encode status", "err", err)
+		}
+	})
+
+	// GET /members
+	//
+	// Returns cluster membership as committed in the Raft log (via
+	// Node.Members()), so the response is always consistent with the
+	// authoritative Raft state rather than an application-level cache.
+	mux.HandleFunc("GET /members", func(w http.ResponseWriter, r *http.Request) {
+		leaderID := node.Leader()
+		raftMembers := node.Members()
+
+		type memberInfo struct {
+			ID     string `json:"id"`
+			Voter  bool   `json:"voter"`
+			Leader bool   `json:"leader"`
+			Self   bool   `json:"self"`
+		}
+		result := make([]memberInfo, 0, len(raftMembers))
+		for _, p := range raftMembers {
+			result = append(result, memberInfo{
+				ID:     string(p.ID),
+				Voter:  p.Voter,
+				Leader: p.ID == leaderID,
+				Self:   string(p.ID) == nodeID,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{"members": result}); err != nil {
+			slog.Warn("idprovider: encode members", "err", err)
 		}
 	})
 

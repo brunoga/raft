@@ -307,6 +307,17 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	}
 	n.log.snapMeta = r.meta
 
+	// Preemptively advance lastApplied to the snapshot boundary. This
+	// prevents duplicate snapInstallResult messages — which arise when
+	// concurrent snapshot goroutines overlap (e.g. after a dropped
+	// transfer triggers an immediate retry that races with the original
+	// install completing) — from passing the stale guard above and
+	// pushing a second restore onto restoreSnapshotCh. applyRestore
+	// will sync atomicLastApplied when it actually runs in applyLoop.
+	if n.lastApplied < r.meta.LastIncludedIndex {
+		n.lastApplied = r.meta.LastIncludedIndex
+	}
+
 	// Signal applyLoop to restore the state machine.
 	install := snapshotInstall{
 		meta:        r.meta,
@@ -499,7 +510,15 @@ func (n *Node) handleInstallSnapshotResult(r *installSnapshotResult) {
 		delete(n.snapshotInflight, r.peer)
 	}
 	if r.dropped {
-		return // RPC failed; the next heartbeat will trigger a retry.
+		// RPC failed. Retry immediately: if we wait for the next heartbeat
+		// rejection to call replicateToPeer, that rejection may have already
+		// been processed (before this dropped result arrived in rpcCh), in
+		// which case snapshotInflight was still set and the retry was silently
+		// skipped — leaving the follower permanently stuck.
+		if n.snapshotInflight != nil {
+			n.replicateToPeer(r.peer)
+		}
+		return
 	}
 	if r.term > n.currentTerm {
 		n.becomeFollower(r.term, "")
