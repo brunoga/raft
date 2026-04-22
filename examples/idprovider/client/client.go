@@ -58,10 +58,14 @@ type Client struct {
 // stable, unique identifier for this client instance used for idempotent
 // exactly-once semantics; it must not be empty.
 func New(addrs []string, clientID string) *Client {
-	return &Client{
-		inner:    exampleutil.NewClient(addrs),
-		clientID: clientID,
+	c := exampleutil.NewClient(addrs)
+	c.ErrorMapper = func(status int, _ string) error {
+		if status == http.StatusNotFound {
+			return ErrDomainNotFound
+		}
+		return nil
 	}
+	return &Client{inner: c, clientID: clientID}
 }
 
 // CreateDomain creates a new ID domain. The operation is idempotent: calling

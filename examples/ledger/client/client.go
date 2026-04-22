@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/brunoga/raft/examples/internal/exampleutil"
@@ -55,9 +56,19 @@ type Client struct {
 // more cluster nodes (e.g. "http://localhost:8001"). At least one reachable
 // address is required; the rest are used as fallbacks.
 func New(addrs []string) *Client {
-	return &Client{
-		inner: exampleutil.NewClient(addrs),
+	c := exampleutil.NewClient(addrs)
+	c.ErrorMapper = func(status int, body string) error {
+		switch status {
+		case http.StatusNotFound:
+			return ErrNotFound
+		case http.StatusConflict:
+			return ErrConflict
+		case http.StatusUnprocessableEntity:
+			return fmt.Errorf("%s: %w", body, ErrInsufficientFunds)
+		}
+		return nil
 	}
+	return &Client{inner: c}
 }
 
 // CreateAccount creates a new account with the given initial balance.

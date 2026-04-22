@@ -146,10 +146,7 @@ func TestClient_Redirect_UpdatesLeaderCache(t *testing.T) {
 		t.Errorf("leaderCalled = %d, want 1", leaderCalled)
 	}
 
-	c.mu.RLock()
-	cached := c.leaderAddrs[gid]
-	c.mu.RUnlock()
-	if cached != url2 {
+	if cached := c.inner.GetLeader(gid); cached != url2 {
 		t.Errorf("leaderAddrs[%d] = %q, want %q", gid, cached, url2)
 	}
 
@@ -172,9 +169,7 @@ func TestClient_StaleLeader_ClearedOnFailure(t *testing.T) {
 	c := New([]string{url}, 4)
 	gid := c.shardForKey("mykey")
 
-	c.mu.Lock()
-	c.leaderAddrs[gid] = "http://127.0.0.1:0" // guaranteed dead
-	c.mu.Unlock()
+	c.inner.SetLeader(gid, "http://127.0.0.1:0") // guaranteed dead
 
 	val, err := c.Get(context.Background(), "mykey")
 	if err != nil {
@@ -184,10 +179,7 @@ func TestClient_StaleLeader_ClearedOnFailure(t *testing.T) {
 		t.Errorf("val = %q, want val", val)
 	}
 
-	c.mu.RLock()
-	_, still := c.leaderAddrs[gid]
-	c.mu.RUnlock()
-	if still && c.leaderAddrs[gid] == "http://127.0.0.1:0" {
+	if c.inner.GetLeader(gid) == "http://127.0.0.1:0" {
 		t.Error("stale leader address was not cleared after failure")
 	}
 }

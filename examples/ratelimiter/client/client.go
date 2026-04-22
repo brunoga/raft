@@ -51,9 +51,17 @@ type Client struct {
 // one or more cluster nodes (e.g. "http://localhost:8001"). At least one
 // reachable address is required; the rest serve as fallbacks.
 func New(addrs []string) *Client {
-	return &Client{
-		inner: exampleutil.NewClient(addrs),
+	c := exampleutil.NewClient(addrs)
+	c.ErrorMapper = func(status int, _ string) error {
+		switch status {
+		case http.StatusNotFound:
+			return ErrNotFound
+		case http.StatusConflict:
+			return ErrConflict
+		}
+		return nil
 	}
+	return &Client{inner: c}
 }
 
 // CreateQuota creates a new quota entry. Returns ErrConflict if the key

@@ -55,9 +55,14 @@ type Client struct {
 // one or more cluster nodes (e.g. "http://localhost:8001"). At least one
 // reachable address is required; the rest serve as fallbacks.
 func New(addrs []string) *Client {
-	return &Client{
-		inner: exampleutil.NewClient(addrs),
+	c := exampleutil.NewClient(addrs)
+	c.ErrorMapper = func(status int, _ string) error {
+		if status == http.StatusNotFound {
+			return ErrNotFound
+		}
+		return nil
 	}
+	return &Client{inner: c}
 }
 
 // Set upserts a config entry with an updated version timestamp.

@@ -48,10 +48,14 @@ type Client struct {
 // or more cluster nodes (e.g. "http://localhost:8001"). numShards must match
 // the --shards value used when starting the cluster.
 func New(addrs []string, numShards uint64) *Client {
-	return &Client{
-		inner:     exampleutil.NewClient(addrs),
-		numShards: numShards,
+	c := exampleutil.NewClient(addrs)
+	c.ErrorMapper = func(status int, _ string) error {
+		if status == http.StatusNotFound {
+			return ErrKeyNotFound
+		}
+		return nil
 	}
+	return &Client{inner: c, numShards: numShards}
 }
 
 // Put sets key to value.

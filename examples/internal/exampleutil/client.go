@@ -22,11 +22,17 @@ var (
 // RequestOption is a callback that can modify an outgoing HTTP request.
 type RequestOption func(*http.Request)
 
+// ErrorMapper translates a non-2xx, non-307, non-503 HTTP response into a
+// domain-specific error. Return nil to fall through to the default
+// "server error N: body" formatting.
+type ErrorMapper func(statusCode int, body string) error
+
 // Client is a generic thread-safe client that handles leader discovery,
 // 307 redirects, and retries against seed nodes.
 type Client struct {
-	Addrs      []string
-	HTTPClient *http.Client
+	Addrs       []string
+	HTTPClient  *http.Client
+	ErrorMapper ErrorMapper // optional; called before default error formatting
 
 	mu          sync.RWMutex
 	leaderAddrs map[uint64]string // shardID -> leaderAddr (0 for single-shard)
@@ -173,6 +179,12 @@ func (c *Client) doOnce(ctx context.Context, shardID uint64, addr, method, path 
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return ErrNotLeader
+	}
+
+	if c.ErrorMapper != nil {
+		if mapped := c.ErrorMapper(resp.StatusCode, msg); mapped != nil {
+			return mapped
+		}
 	}
 
 	if msg != "" {
