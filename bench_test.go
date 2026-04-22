@@ -22,11 +22,11 @@ func BenchmarkPropose_SingleNode(b *testing.B) {
 	for time.Now().Before(deadline) {
 		n.Tick()
 		time.Sleep(time.Millisecond)
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			break
 		}
 	}
-	if n.StateSnapshot() != raft.Leader {
+	if n.State() != raft.Leader {
 		b.Fatal("node did not become leader")
 	}
 

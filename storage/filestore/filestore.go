@@ -677,7 +677,7 @@ func (fs *FileStore) GetLogEntries(_ context.Context, lo, hi raft.Index) ([]raft
 	return result, nil
 }
 
-func (fs *FileStore) FirstIndex(_ context.Context) (raft.Index, error) {
+func (fs *FileStore) FirstIndex() (raft.Index, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	if len(fs.segs) == 0 {
@@ -686,7 +686,7 @@ func (fs *FileStore) FirstIndex(_ context.Context) (raft.Index, error) {
 	return fs.segs[0].firstID, nil
 }
 
-func (fs *FileStore) LastIndex(_ context.Context) (raft.Index, error) {
+func (fs *FileStore) LastIndex() (raft.Index, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	active := fs.activeSeg()

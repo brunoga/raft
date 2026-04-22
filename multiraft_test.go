@@ -74,7 +74,7 @@ func newMRCluster(t testing.TB, numGroups, numPhysical int) *mrCluster {
 			if err != nil {
 				t.Fatalf("raft.New g=%d p=%d: %v", g+1, p, err)
 			}
-			net.Register(id, node)
+			net.Register(id, node.Handler())
 			if err := mgrs[p].Add(groupID, node); err != nil {
 				t.Fatalf("mgrs[%d].Add(g=%d): %v", p, g+1, err)
 			}
@@ -120,7 +120,7 @@ func (c *mrCluster) TickN(n int) {
 // or -1 if none.
 func (c *mrCluster) leaderOf(g int) int {
 	for p, n := range c.groups[g] {
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			return p
 		}
 	}
@@ -304,7 +304,7 @@ func TestMultiRaft_ThreeGroups_ThreeNodes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("raft.New group=%d physical=%d: %v", groupID, p, err)
 			}
-			net.Register(id, node)
+			net.Register(id, node.Handler())
 			if err := mgrs[p].Add(groupID, node); err != nil {
 				t.Fatalf("mgrs[%d].Add(group=%d): %v", p, groupID, err)
 			}
@@ -342,7 +342,7 @@ func TestMultiRaft_ThreeGroups_ThreeNodes(t *testing.T) {
 				continue
 			}
 			for _, n := range groupNodes {
-				if n.StateSnapshot() == raft.Leader {
+				if n.State() == raft.Leader {
 					leaders[g] = n
 					break
 				}
@@ -416,7 +416,7 @@ func TestMultiRaft_ThreeGroups_ThreeNodes(t *testing.T) {
 	for g := 1; g < numGroups; g++ { // groups 2, 3 (index 1, 2)
 		hasLeader := false
 		for _, n := range nodes[g] {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				hasLeader = true
 				break
 			}
@@ -465,7 +465,7 @@ func TestChaos_MultiRaft_LeaderCrashes(t *testing.T) {
 			c.Tick()
 			time.Sleep(time.Millisecond)
 			for np := range numPhysical {
-				if np != p && c.groups[g][np].StateSnapshot() == raft.Leader {
+				if np != p && c.groups[g][np].State() == raft.Leader {
 					newLeader = np
 					break
 				}
@@ -548,7 +548,7 @@ func TestChaos_MultiRaft_PhysicalNodePartition(t *testing.T) {
 			c.Tick()
 			time.Sleep(time.Millisecond)
 			for p := range numPhysical {
-				if p != victim && c.groups[g][p].StateSnapshot() == raft.Leader {
+				if p != victim && c.groups[g][p].State() == raft.Leader {
 					found = true
 					break
 				}

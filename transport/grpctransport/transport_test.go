@@ -181,7 +181,7 @@ func newGRPCCluster(t *testing.T, n int) *grpcCluster {
 		if err != nil {
 			t.Fatalf("New node %s: %v", ids[i], err)
 		}
-		transports[i].Register(ids[i], node)
+		transports[i].Register(ids[i], node.Handler())
 		c.nodes = append(c.nodes, node)
 		c.sms = append(c.sms, sm)
 	}
@@ -211,7 +211,7 @@ func (c *grpcCluster) waitLeader() *raft.Node {
 		var leader *raft.Node
 		count := 0
 		for _, n := range c.nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leader = n
 				count++
 			}
@@ -234,7 +234,7 @@ func (c *grpcCluster) propose(cmd []byte) ([]byte, error) {
 	deadline := time.Now().Add(electionTimeout)
 	for time.Now().Before(deadline) {
 		for _, n := range c.nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leader = n
 				break
 			}
@@ -262,7 +262,7 @@ func TestGRPC_LeaderElected(t *testing.T) {
 	// Exactly one leader.
 	count := 0
 	for _, n := range c.nodes {
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			count++
 		}
 	}
@@ -357,7 +357,7 @@ func TestGRPC_ReelectAfterLeaderStop(t *testing.T) {
 	for time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 		for _, n := range c.nodes {
-			if n != leader && n.StateSnapshot() == raft.Leader {
+			if n != leader && n.State() == raft.Leader {
 				newLeader = n
 				break
 			}
@@ -465,7 +465,7 @@ func TestGRPC_TLS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New node %s: %v", ids[i], err)
 		}
-		transports[i].Register(ids[i], node)
+		transports[i].Register(ids[i], node.Handler())
 		nodes = append(nodes, node)
 		sms = append(sms, sm)
 	}
@@ -486,7 +486,7 @@ func TestGRPC_TLS(t *testing.T) {
 	var leader *raft.Node
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leader = n
 				break
 			}
@@ -585,7 +585,7 @@ func TestGRPC_GroupIDStamped(t *testing.T) {
 			t.Fatalf("New: %v", err)
 		}
 		nodes[i] = node
-		captures[i] = &capture{Handler: node, observed: make(chan uint64, 1)}
+		captures[i] = &capture{Handler: node.Handler(), observed: make(chan uint64, 1)}
 		transports[i].Register(ids[i], captures[i])
 	}
 	// Implement AppendEntries capture.
@@ -1427,7 +1427,7 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 				continue
 			}
 			for p, n := range nodes[g] {
-				if n.StateSnapshot() == raft.Leader {
+				if n.State() == raft.Leader {
 					leaders[g] = n
 					leaderPhys[g] = p
 					break
@@ -1489,7 +1489,7 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 	transferred := false
 	for time.Now().Before(deadline) {
 		for p, n := range nodes[transferGroup] {
-			if p != leaderP && n.StateSnapshot() == raft.Leader {
+			if p != leaderP && n.State() == raft.Leader {
 				transferred = true
 				break
 			}
@@ -1582,7 +1582,7 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	cfg1.Transport = t1
 	cfg1.TickInterval = 2 * time.Millisecond
 	n1, _ := raft.New(&cfg1)
-	t1.Register("a", n1)
+	t1.Register("a", n1.Handler())
 	n1.Start()
 	defer n1.Stop()
 
@@ -1594,7 +1594,7 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	cfg2.Transport = t2
 	cfg2.TickInterval = 2 * time.Millisecond
 	n2, _ := raft.New(&cfg2)
-	t2.Register("b", n2)
+	t2.Register("b", n2.Handler())
 	n2.Start()
 	defer n2.Stop()
 

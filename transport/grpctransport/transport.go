@@ -81,15 +81,35 @@ type GRPCTransport struct {
 // transport has served as a receiver. Intended for testing and monitoring.
 func (t *GRPCTransport) BatchHeartbeatsServed() int64 { return t.batchHBServed.Load() }
 
+// ResetBatchHeartbeatsServed atomically resets the BatchHeartbeatsServed
+// counter to zero and returns the previous value. Use this for rate monitoring:
+// call once per reporting interval and treat the return as the count during
+// that interval.
+func (t *GRPCTransport) ResetBatchHeartbeatsServed() int64 { return t.batchHBServed.Swap(0) }
+
 // BatchHeartbeatEntriesServed returns the total number of individual heartbeat
 // entries dispatched across all BatchHeartbeats RPCs. Dividing by
 // BatchHeartbeatsServed gives the average batch size.
 func (t *GRPCTransport) BatchHeartbeatEntriesServed() int64 { return t.batchHBEntries.Load() }
 
+// ResetBatchHeartbeatEntriesServed atomically resets the
+// BatchHeartbeatEntriesServed counter to zero and returns the previous value.
+// Use this for rate monitoring: call once per reporting interval and treat the
+// return as the count during that interval.
+func (t *GRPCTransport) ResetBatchHeartbeatEntriesServed() int64 {
+	return t.batchHBEntries.Swap(0)
+}
+
 // BatchHeartbeatErrors returns the number of heartbeat entries that could not
 // be dispatched (group not found or HandleAppendEntries error). A non-zero
 // sustained value warrants investigation.
 func (t *GRPCTransport) BatchHeartbeatErrors() int64 { return t.batchHBErrors.Load() }
+
+// ResetBatchHeartbeatErrors atomically resets the BatchHeartbeatErrors counter
+// to zero and returns the previous value. Use this for rate monitoring: call
+// once per reporting interval and treat the return as the count during that
+// interval.
+func (t *GRPCTransport) ResetBatchHeartbeatErrors() int64 { return t.batchHBErrors.Swap(0) }
 
 // HeartbeatSendBlocked returns the cumulative number of times a heartbeat
 // Send had to block waiting for space in a per-peer batcher channel. A

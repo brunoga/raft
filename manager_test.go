@@ -37,7 +37,7 @@ func newManagedNode(t *testing.T, mgr *raft.Manager, net *memtransport.Network,
 	if err := mgr.Add(groupID, node); err != nil {
 		t.Fatalf("mgr.Add: %v", err)
 	}
-	net.Register(nodeID, node)
+	net.Register(nodeID, node.Handler())
 	return node
 }
 
@@ -142,7 +142,7 @@ func TestManager_RunTicker(t *testing.T) {
 	cfg.TickInterval = 0 // use Manager's ticker
 	node, _ := raft.New(&cfg)
 	_ = mgr.Add(1, node)
-	net.Register("n1", node)
+	net.Register("n1", node.Handler())
 	node.Start()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -154,7 +154,7 @@ func TestManager_RunTicker(t *testing.T) {
 	// Wait for the node to become leader (RunTicker is driving ticks).
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if node.StateSnapshot() == raft.Leader {
+		if node.State() == raft.Leader {
 			cancel()
 			return
 		}
@@ -186,13 +186,13 @@ func TestManager_Multiplexing(t *testing.T) {
 	// Wait for both to become leader.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if node1.StateSnapshot() == raft.Leader && node2.StateSnapshot() == raft.Leader {
+		if node1.State() == raft.Leader && node2.State() == raft.Leader {
 			goto success
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Errorf("groups failed to elect leaders: g1=%s g2=%s",
-		node1.StateSnapshot(), node2.StateSnapshot())
+		node1.State(), node2.State())
 
 success:
 	// Both groups are still reachable via the Manager.
@@ -370,7 +370,7 @@ func TestManager_RemoveGraceful(t *testing.T) {
 			// Only add node 0 to the manager for this test.
 			_ = mgr.Add(gid, n)
 		}
-		net.Register(id, n)
+		net.Register(id, n.Handler())
 		n.Start()
 	}
 
@@ -387,7 +387,7 @@ func TestManager_RemoveGraceful(t *testing.T) {
 	for time.Now().Before(deadline) {
 		tick()
 		for i, n := range nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leaderIdx = i
 				break
 			}
@@ -456,7 +456,7 @@ removed:
 	for range 10 {
 		tick()
 		for i, n := range nodes {
-			if i != leaderIdx && n.StateSnapshot() == raft.Leader {
+			if i != leaderIdx && n.State() == raft.Leader {
 				hasLeader = true
 				break
 			}
@@ -508,7 +508,7 @@ func TestManager_RemoveGraceful_Race(t *testing.T) {
 		cfg.TickInterval = 0
 		node, _ := raft.New(&cfg)
 		nodes[id] = node
-		net.Register(id, node)
+		net.Register(id, node.Handler())
 		node.Start()
 	}
 
@@ -520,7 +520,7 @@ func TestManager_RemoveGraceful_Race(t *testing.T) {
 			n.Tick()
 		}
 		for id, n := range nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leaderID = id
 				break
 			}
@@ -636,7 +636,7 @@ func TestManager_SnapshotThrottling(t *testing.T) {
 			n.Tick()
 			time.Sleep(time.Millisecond)
 		}
-		if n.StateSnapshot() != raft.Leader {
+		if n.State() != raft.Leader {
 			t.Fatalf("node %d did not become leader", i)
 		}
 	}
@@ -854,7 +854,7 @@ func newUnregisteredNode(t *testing.T, net *memtransport.Network,
 	if err != nil {
 		t.Fatalf("raft.New(%s): %v", nodeID, err)
 	}
-	net.Register(nodeID, node)
+	net.Register(nodeID, node.Handler())
 	return node
 }
 

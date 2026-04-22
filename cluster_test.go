@@ -74,7 +74,7 @@ func newClusterWith(t testing.TB, n int, mutate func(*raft.Config)) *Cluster {
 			t.Fatalf("raft.New(%d): %v", i+1, err)
 		}
 		c.nodes = append(c.nodes, node)
-		c.net.Register(cfg.ID, node)
+		c.net.Register(cfg.ID, node.Handler())
 	}
 
 	for _, node := range c.nodes {
@@ -114,7 +114,7 @@ func (c *Cluster) WaitLeader(timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for i, node := range c.nodes {
-			if node.StateSnapshot() == raft.Leader {
+			if node.State() == raft.Leader {
 				return i
 			}
 		}
@@ -136,7 +136,7 @@ func (c *Cluster) Leader(timeout time.Duration) *raft.Node {
 
 func (c *Cluster) LeaderIndex() int {
 	for i, node := range c.nodes {
-		if node.StateSnapshot() == raft.Leader {
+		if node.State() == raft.Leader {
 			return i
 		}
 	}

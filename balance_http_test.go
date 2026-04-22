@@ -91,7 +91,7 @@ func TestManagerHTTP_Transfer_OK(t *testing.T) {
 			t.Fatalf("raft.New %s: %v", id, err)
 		}
 		nodes[i] = n
-		net.Register(id, n)
+		net.Register(id, n.Handler())
 		n.Start()
 	}
 	// Only register node 0 in the manager for this test.
@@ -110,12 +110,12 @@ func TestManagerHTTP_Transfer_OK(t *testing.T) {
 		for _, n := range nodes {
 			n.Tick()
 		}
-		if nodes[0].StateSnapshot() == raft.Leader {
+		if nodes[0].State() == raft.Leader {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if nodes[0].StateSnapshot() != raft.Leader {
+	if nodes[0].State() != raft.Leader {
 		t.Skip("node 0 is not the leader; skipping transfer test")
 	}
 

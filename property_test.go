@@ -28,11 +28,11 @@ func makeLeaderNode(t *testing.T) *raft.Node {
 	n := newTestNode(t, "leader", nil)
 	n.Start()
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && n.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n.State() != raft.Leader {
 		n.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n.StateSnapshot() != raft.Leader {
+	if n.State() != raft.Leader {
 		t.Fatal("node did not become leader")
 	}
 	return n
@@ -75,7 +75,7 @@ func TestProperty_RequestVote_ResponseTermNeverLower(t *testing.T) {
 		n := makeFollowerNode(t, nodeTerm, "")
 		defer n.Stop()
 
-		resp, err := n.HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+		resp, err := n.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
 			Term:         raft.Term(reqTerm),
 			CandidateID:  "candidate",
 			LastLogIndex: 0,
@@ -101,7 +101,7 @@ func TestProperty_RequestVote_StaleTerm_NeverGranted(t *testing.T) {
 		n := makeFollowerNode(t, raft.Term(nodeTerm), "")
 		defer n.Stop()
 
-		resp, err := n.HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+		resp, err := n.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
 			Term:        raft.Term(nodeTerm) - 1,
 			CandidateID: "candidate",
 		})
@@ -125,7 +125,7 @@ func TestProperty_RequestVote_AlreadyVoted_DifferentCandidate_Denied(t *testing.
 		n := makeFollowerNode(t, raft.Term(term), "existing-vote")
 		defer n.Stop()
 
-		resp, err := n.HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+		resp, err := n.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
 			Term:        raft.Term(term),
 			CandidateID: "other-candidate",
 		})
@@ -147,7 +147,7 @@ func TestProperty_RequestVote_HigherTerm_EmptyLog_Granted(t *testing.T) {
 		n := makeFollowerNode(t, raft.Term(nodeTerm), "")
 		defer n.Stop()
 
-		resp, err := n.HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+		resp, err := n.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
 			Term:        raft.Term(nodeTerm) + 1,
 			CandidateID: "candidate",
 		})
@@ -172,7 +172,7 @@ func TestProperty_AppendEntries_StaleTerm_Rejected(t *testing.T) {
 		n := makeFollowerNode(t, raft.Term(nodeTerm), "")
 		defer n.Stop()
 
-		resp, err := n.HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+		resp, err := n.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
 			Term:     raft.Term(nodeTerm) - 1,
 			LeaderID: "leader",
 		})
@@ -192,7 +192,7 @@ func TestProperty_AppendEntries_ResponseTermNotLowerThanRequest(t *testing.T) {
 		n := makeFollowerNode(t, 0, "")
 		defer n.Stop()
 
-		resp, err := n.HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+		resp, err := n.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
 			Term:     raft.Term(reqTerm),
 			LeaderID: "leader",
 		})
@@ -216,7 +216,7 @@ func TestProperty_AppendEntries_PrevLogMismatch_Empty_Rejected(t *testing.T) {
 		n := makeFollowerNode(t, 0, "")
 		defer n.Stop()
 
-		resp, err := n.HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+		resp, err := n.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
 			Term:         raft.Term(term) + 1,
 			LeaderID:     "leader",
 			PrevLogIndex: raft.Index(prevIdx),
@@ -239,7 +239,7 @@ func TestProperty_AppendEntries_Heartbeat_HigherTerm_Succeeds(t *testing.T) {
 		n := makeFollowerNode(t, raft.Term(nodeTerm), "")
 		defer n.Stop()
 
-		resp, err := n.HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+		resp, err := n.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
 			Term:     raft.Term(nodeTerm) + 1,
 			LeaderID: "leader",
 		})
@@ -286,7 +286,7 @@ func TestProperty_InstallSnapshot_StaleSnapshot_Ignored(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 
 		// A stale install-snapshot should not crash and should return a valid response.
-		resp, err := n.HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
+		resp, err := n.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
 			Term:              2,
 			LeaderID:          "leader",
 			LastIncludedIndex: raft.Index(reqIdx),
@@ -315,7 +315,7 @@ func TestProperty_InstallSnapshot_StaleTerm_Rejected(t *testing.T) {
 		n := makeFollowerNode(t, raft.Term(nodeTerm), "")
 		defer n.Stop()
 
-		resp, err := n.HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
+		resp, err := n.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
 			Term:              raft.Term(nodeTerm) - 1,
 			LeaderID:          "leader",
 			LastIncludedIndex: 100,
@@ -343,7 +343,7 @@ func TestProperty_AppendEntries_LeaderRejectsStalePeer(t *testing.T) {
 		n := makeLeaderNode(t)
 		defer n.Stop()
 
-		resp, err := n.HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+		resp, err := n.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
 			Term:     0, // term 0 is always stale
 			LeaderID: "stale-peer",
 		})
@@ -370,7 +370,7 @@ func TestProperty_RequestVote_VoteOncePerTerm(t *testing.T) {
 
 		reqTerm := raft.Term(term)
 		// First vote: candidate-A in reqTerm
-		resp1, err := n.HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+		resp1, err := n.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
 			Term:        reqTerm,
 			CandidateID: "candidate-A",
 		})
@@ -379,7 +379,7 @@ func TestProperty_RequestVote_VoteOncePerTerm(t *testing.T) {
 		}
 
 		// Second vote: candidate-B in same term — must be denied.
-		resp2, err := n.HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+		resp2, err := n.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
 			Term:        reqTerm,
 			CandidateID: "candidate-B",
 		})

@@ -86,14 +86,14 @@ func TestRestart_TermPreservedAcrossRestart(t *testing.T) {
 
 	// Start a single-node cluster, let it elect itself (term=1).
 	n := newPersistentNode(t, "n1", nil, dir, tr, sm1)
-	net.Register("n1", n)
+	net.Register("n1", n.Handler())
 	n.Start()
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && n.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n.State() != raft.Leader {
 		n.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n.StateSnapshot() != raft.Leader {
+	if n.State() != raft.Leader {
 		t.Fatal("did not become leader")
 	}
 	n.Stop()
@@ -122,17 +122,17 @@ func TestRestart_TermPreservedAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
-	net.Register("n1", n2)
+	net.Register("n1", n2.Handler())
 	n2.Start()
 	defer n2.Stop()
 
 	// n2 must reach term >= 1 (it will re-elect in term >=1).
 	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && n2.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n2.State() != raft.Leader {
 		n2.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n2.StateSnapshot() != raft.Leader {
+	if n2.State() != raft.Leader {
 		t.Fatal("restarted single-node did not re-elect")
 	}
 }
@@ -147,15 +147,15 @@ func TestRestart_CommittedEntriesSurviveCrash(t *testing.T) {
 
 	// Phase 1: start a single-node cluster, commit a few entries.
 	n := newPersistentNode(t, "n1", nil, dir, tr, sm1)
-	net.Register("n1", n)
+	net.Register("n1", n.Handler())
 	n.Start()
 
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && n.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n.State() != raft.Leader {
 		n.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n.StateSnapshot() != raft.Leader {
+	if n.State() != raft.Leader {
 		t.Fatal("did not become leader")
 	}
 
@@ -191,17 +191,17 @@ func TestRestart_CommittedEntriesSurviveCrash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
-	net.Register("n1", n2)
+	net.Register("n1", n2.Handler())
 	n2.Start()
 	defer n2.Stop()
 
 	// Wait for the node to re-elect and re-apply all committed entries.
 	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && n2.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n2.State() != raft.Leader {
 		n2.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n2.StateSnapshot() != raft.Leader {
+	if n2.State() != raft.Leader {
 		t.Fatal("restarted node did not become leader")
 	}
 
@@ -247,15 +247,15 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New: %v", err)
 	}
-	net.Register("n1", n)
+	net.Register("n1", n.Handler())
 	n.Start()
 
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && n.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n.State() != raft.Leader {
 		n.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n.StateSnapshot() != raft.Leader {
+	if n.State() != raft.Leader {
 		t.Fatal("did not become leader")
 	}
 
@@ -305,16 +305,16 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
-	net.Register("n1", n2)
+	net.Register("n1", n2.Handler())
 	n2.Start()
 	defer n2.Stop()
 
 	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && n2.StateSnapshot() != raft.Leader {
+	for time.Now().Before(deadline) && n2.State() != raft.Leader {
 		n2.Tick()
 		time.Sleep(time.Millisecond)
 	}
-	if n2.StateSnapshot() != raft.Leader {
+	if n2.State() != raft.Leader {
 		t.Fatal("restarted node did not become leader")
 	}
 
@@ -384,7 +384,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 		nodes[i] = n
 	}
 	for i, n := range nodes {
-		net.Register(ids[i], n)
+		net.Register(ids[i], n.Handler())
 		n.Start()
 	}
 
@@ -401,7 +401,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	for time.Now().Before(deadline) {
 		tick()
 		for i, n := range nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leaderIdx = i
 				break
 			}
@@ -444,7 +444,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New restart follower: %v", err)
 	}
-	net.Register(ids[followerIdx], restartedNode)
+	net.Register(ids[followerIdx], restartedNode.Handler())
 	restartedNode.Start()
 	defer restartedNode.Stop()
 	nodes[followerIdx] = restartedNode
@@ -510,7 +510,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New: %v", err)
 	}
-	net.Register("n1", n)
+	net.Register("n1", n.Handler())
 	n.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -519,11 +519,11 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	waitLeader := func(node *raft.Node) {
 		t.Helper()
 		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) && node.StateSnapshot() != raft.Leader {
+		for time.Now().Before(deadline) && node.State() != raft.Leader {
 			node.Tick()
 			time.Sleep(time.Millisecond)
 		}
-		if node.StateSnapshot() != raft.Leader {
+		if node.State() != raft.Leader {
 			t.Fatal("did not become leader")
 		}
 	}
@@ -577,7 +577,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raft.New restart: %v", err)
 	}
-	net.Register("n1", n2)
+	net.Register("n1", n2.Handler())
 	n2.Start()
 	defer n2.Stop()
 
@@ -667,7 +667,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	}
 
 	for i, n := range nodes {
-		net.Register(ids[i], n)
+		net.Register(ids[i], n.Handler())
 		n.Start()
 	}
 	defer func() {
@@ -702,7 +702,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	for time.Now().Before(deadline) {
 		tick()
 		for i, n := range nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				leaderIdx = i
 				break
 			}

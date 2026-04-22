@@ -540,7 +540,7 @@ func TestJoint_ReplaceOnePeer(t *testing.T) {
 	}
 
 	for i, id := range ids {
-		net.Register(id, nodes[i])
+		net.Register(id, nodes[i].Handler())
 	}
 	for _, node := range nodes {
 		node.Start()
@@ -564,7 +564,7 @@ func TestJoint_ReplaceOnePeer(t *testing.T) {
 	for time.Now().Before(deadline) {
 		tick()
 		for _, node := range nodes {
-			if node.StateSnapshot() == raft.Leader {
+			if node.State() == raft.Leader {
 				leaderNode = node
 				goto elected
 			}
@@ -593,7 +593,7 @@ elected:
 	if err != nil {
 		t.Fatalf("New n4: %v", err)
 	}
-	net.Register(n4ID, n4)
+	net.Register(n4ID, n4.Handler())
 	n4.Start()
 	t.Cleanup(n4.Stop)
 	nodes = append(nodes, n4)
@@ -711,7 +711,7 @@ jointCommitted:
 	for time.Now().Before(deadline) {
 		c.Tick()
 		time.Sleep(time.Millisecond)
-		if leader.StateSnapshot() != raft.Leader {
+		if leader.State() != raft.Leader {
 			goto leaderStepped
 		}
 	}
