@@ -58,6 +58,7 @@ import (
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/easyraft"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // ConfigEntry is the value stored in the "configs" collection.
@@ -224,6 +225,7 @@ func main() {
 		easyraft.WithHTTPMux(mux),        // register easyraft routes on our mux
 		easyraft.WithDataDir(*dataDir),
 		easyraft.WithLogger(logger),
+		easyraft.WithPrometheus(prometheus.DefaultRegisterer),
 	}
 
 	if *join != "" {

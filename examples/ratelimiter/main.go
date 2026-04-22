@@ -15,6 +15,7 @@ import (
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/easyraft"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Quota represents the rate limit configuration for an API key.
@@ -89,6 +90,7 @@ func main() {
 		easyraft.WithDataDir(*dataDir),
 		easyraft.WithPeers(peerMap),
 		easyraft.WithLogger(slog.Default()),
+		easyraft.WithPrometheus(prometheus.DefaultRegisterer),
 	}
 	if len(joinAddrs) > 0 {
 		opts = append(opts, easyraft.WithJoinAddr(joinAddrs...))

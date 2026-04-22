@@ -59,6 +59,43 @@ The quickest way to start a local cluster is with the provided script:
 
 It builds the binary, wipes any previous data directories, starts all three nodes, waits for a leader to be elected, and prints a member table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
 
+### Interactive REPL client
+
+Once the cluster is running, use the REPL for interactive exploration:
+
+```bash
+go run ./examples/ledger/repl
+```
+
+```
+ledger> create-account alice 1000
+  alice                 balance=1000
+ledger> create-account bob 500
+  bob                   balance=500
+ledger> transfer alice bob 200
+  ledger-repl:1  alice → bob  amount=200
+ledger> list-accounts
+  alice                 balance=800
+  bob                   balance=700
+ledger> stats
+=== Stats: http://localhost:8001 ===
+
+Cluster Members:
+  n1  leader   :7001
+  n2  follower  :7002
+  n3  follower  :7003
+...
+ledger> help
+```
+
+Use `--nodes` and `--client-id` to customise:
+
+```bash
+go run ./examples/ledger/repl \
+    --nodes http://host1:8001,http://host2:8001,http://host3:8001 \
+    --client-id my-repl
+```
+
 Alternatively, start the nodes manually in separate terminals:
 
 **Terminal 1 — bootstrap node**

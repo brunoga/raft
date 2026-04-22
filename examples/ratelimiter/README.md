@@ -18,6 +18,40 @@ The quickest way to start a local cluster is with the provided script:
 
 It builds the binary, wipes any previous data directories, starts all three nodes (using `--join`), waits for a leader to be elected, and prints a member table confirming the cluster is healthy. Press Ctrl-C to stop all nodes and clean up.
 
+### Interactive REPL client
+
+Once the cluster is running, use the REPL for interactive exploration:
+
+```bash
+go run ./examples/ratelimiter/repl
+```
+
+```
+ratelimiter> create api-key-1 100 10
+created
+ratelimiter> get api-key-1
+  api-key-1                       tokens=100/100  refill=10/s
+ratelimiter> take api-key-1 30
+allowed  remains=70
+ratelimiter> take api-key-1 80
+denied   remains=70
+ratelimiter> stats
+=== Stats: http://localhost:8001 ===
+
+Cluster Members:
+  n1  leader   :7001
+  n2  follower  :7002
+  n3  follower  :7003
+...
+ratelimiter> help
+```
+
+Use `--nodes` to point at a non-default cluster:
+
+```bash
+go run ./examples/ratelimiter/repl --nodes http://host1:8001,http://host2:8001,http://host3:8001
+```
+
 Alternatively, start the nodes manually. There are two ways to form a cluster: **static peers** (all addresses known upfront) or **join** (nodes added one at a time to an existing cluster).
 
 ### Option A: Static peers (all addresses known upfront)
