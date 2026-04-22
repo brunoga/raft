@@ -23,8 +23,8 @@ func (s *stubStorage) GetLogEntry(_ context.Context, _ Index) (LogEntry, error) 
 func (s *stubStorage) GetLogEntries(_ context.Context, _, _ Index) ([]LogEntry, error) {
 	return nil, nil
 }
-func (s *stubStorage) FirstIndex() (Index, error)     { return 0, nil }
-func (s *stubStorage) LastIndex() (Index, error)      { return 0, nil }
+func (s *stubStorage) FirstIndex() (Index, error)                      { return 0, nil }
+func (s *stubStorage) LastIndex() (Index, error)                       { return 0, nil }
 func (s *stubStorage) TruncateSuffix(_ context.Context, _ Index) error { return nil }
 func (s *stubStorage) TruncatePrefix(_ context.Context, _ Index) error { return nil }
 func (s *stubStorage) SaveSnapshot(_ context.Context, _ SnapshotMeta, _ io.Reader) error {
