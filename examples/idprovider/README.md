@@ -37,15 +37,15 @@ go build -o idprovider ./examples/idprovider
 
 # Node 1
 ./idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/idp/n1 \
-             --peer n2=localhost:7002 --peer n3=localhost:7003
+             --peer n2=localhost:7002,localhost:8002 --peer n3=localhost:7003,localhost:8003
 
 # Node 2 (separate terminal)
 ./idprovider --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/idp/n2 \
-             --peer n1=localhost:7001 --peer n3=localhost:7003
+             --peer n1=localhost:7001,localhost:8001 --peer n3=localhost:7003,localhost:8003
 
 # Node 3 (separate terminal)
 ./idprovider --id n3 --raft-addr :7003 --http-addr :8003 --data-dir /tmp/idp/n3 \
-             --peer n1=localhost:7001 --peer n2=localhost:7002
+             --peer n1=localhost:7001,localhost:8001 --peer n2=localhost:7002,localhost:8002
 ```
 
 After a leader is elected (~300 ms) any node's HTTP endpoint can be queried.
@@ -134,7 +134,7 @@ Creates a domain. Idempotent — succeeds whether or not the domain already
 exists.
 
 ```bash
-curl -s -X POST http://localhost:8001/domains/orders
+curl -s -L -X POST http://localhost:8001/domains/orders
 # 200 OK
 ```
 
@@ -146,7 +146,7 @@ Deletes a domain and its counter. Returns `404` if the domain does not exist.
 Outstanding IDs already allocated from the domain remain valid.
 
 ```bash
-curl -s -X DELETE http://localhost:8001/domains/orders
+curl -s -L -X DELETE http://localhost:8001/domains/orders
 # 204 No Content
 ```
 
@@ -185,12 +185,12 @@ range. Returns `404` if the domain does not exist.
 
 ```bash
 # Allocate one ID (idempotent — same range on retry with same headers)
-curl -s -X POST http://localhost:8001/domains/orders/next \
+curl -s -L -X POST http://localhost:8001/domains/orders/next \
      -H 'X-Client-ID: checkout-svc' -H 'X-Seq-Num: 1'
 # {"start":1,"count":1}
 
 # Allocate 100 IDs at once
-curl -s -X POST 'http://localhost:8001/domains/orders/next?count=100' \
+curl -s -L -X POST 'http://localhost:8001/domains/orders/next?count=100' \
      -H 'X-Client-ID: checkout-svc' -H 'X-Seq-Num: 2'
 # {"start":2,"count":100}
 ```
@@ -300,7 +300,7 @@ curl -s http://localhost:8001/status | jq
 | `--raft-addr` | `:7001` | gRPC listen address for Raft peer RPCs |
 | `--http-addr` | `:8001` | HTTP listen address for client requests |
 | `--data-dir` | required | Directory for persistent log and snapshot |
-| `--peer id=addr` | (repeatable) | Peer node: ID and its Raft gRPC address |
+| `--peer id=raft_addr[,http_addr]` | (repeatable) | Peer node: ID, Raft gRPC address, and optional HTTP address for client redirects |
 | `--udp-discovery` | `false` | Use UDP broadcast for peer discovery |
 | `--udp-broadcast-addr` | `255.255.255.255:9199` | UDP broadcast address |
 | `--udp-discovery-timeout` | `3s` | Initial UDP discovery window |

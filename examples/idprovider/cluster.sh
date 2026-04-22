@@ -39,16 +39,18 @@ wait_and_show_status() {
     printf "==> Waiting for cluster (up to %ds)..." "$timeout"
     local deadline=$((SECONDS + timeout))
     while [[ $SECONDS -lt $deadline ]]; do
+        local up=0
         local elected=false
         for port in "${ports[@]}"; do
             local body
             body=$(curl -sf "http://localhost:$port/status" 2>/dev/null) || continue
-            if printf '%s' "$body" | grep -q '"Leader"'; then
-                elected=true
-                break
-            fi
+            (( up++ )) || true
+            printf '%s' "$body" | grep -q '"Leader"' && elected=true
         done
-        $elected && { printf ' done.\n'; break; }
+        if [[ $up -ge 3 ]] && $elected; then
+            printf ' done.\n'
+            break
+        fi
         sleep 0.3
     done
     if [[ $SECONDS -ge $deadline ]]; then
@@ -61,7 +63,7 @@ wait_and_show_status() {
         local body
         body=$(curl -sf "http://localhost:$port/status" 2>/dev/null) || { printf '  :%-4s  unreachable\n' "$port"; continue; }
         if command -v jq >/dev/null 2>&1; then
-            printf '%s' "$body" | jq -r '"  \(.node_id)  \(.state)  term=\(.term)  last_applied=\(.last_applied)"'
+            printf '%s' "$body" | jq -r '"  \(.id)  \(.state)  leader=\(.leader)  last_applied=\(.last_applied)"'
         else
             printf '  :%s  %s\n' "$port" "$body"
         fi
@@ -71,19 +73,19 @@ wait_and_show_status() {
 
 echo "==> Starting n1..."
 "$BINARY" --id n1 --raft-addr :7001 --http-addr :8001 --data-dir "$DATA_ROOT/n1" \
-    --peer n2=localhost:7002 --peer n3=localhost:7003 \
+    --peer n2=localhost:7002,localhost:8002 --peer n3=localhost:7003,localhost:8003 \
     >"$DATA_ROOT/n1.log" 2>&1 &
 PIDS+=($!)
 
 echo "==> Starting n2..."
 "$BINARY" --id n2 --raft-addr :7002 --http-addr :8002 --data-dir "$DATA_ROOT/n2" \
-    --peer n1=localhost:7001 --peer n3=localhost:7003 \
+    --peer n1=localhost:7001,localhost:8001 --peer n3=localhost:7003,localhost:8003 \
     >"$DATA_ROOT/n2.log" 2>&1 &
 PIDS+=($!)
 
 echo "==> Starting n3..."
 "$BINARY" --id n3 --raft-addr :7003 --http-addr :8003 --data-dir "$DATA_ROOT/n3" \
-    --peer n1=localhost:7001 --peer n2=localhost:7002 \
+    --peer n1=localhost:7001,localhost:8001 --peer n2=localhost:7002,localhost:8002 \
     >"$DATA_ROOT/n3.log" 2>&1 &
 PIDS+=($!)
 
@@ -96,9 +98,9 @@ echo "  n3  http://localhost:8003"
 echo ""
 echo "Quick smoke-test:"
 echo "  # Create a domain"
-echo "  curl -s -X POST http://localhost:8001/domains/orders"
+echo "  curl -s -L -X POST http://localhost:8001/domains/orders"
 echo "  # Allocate IDs"
-echo "  curl -s -X POST 'http://localhost:8001/domains/orders/next?count=10' -H 'X-Client-ID: svc1' -H 'X-Seq-Num: 1'"
+echo "  curl -s -L -X POST 'http://localhost:8001/domains/orders/next?count=10' -H 'X-Client-ID: svc1' -H 'X-Seq-Num: 1'"
 echo "  # List domains"
 echo "  curl -s http://localhost:8002/domains | jq"
 echo "  # Node status"

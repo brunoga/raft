@@ -35,16 +35,21 @@ trap cleanup INT TERM
 
 # Wait for all shards to elect leaders, then print the shard table from p1.
 wait_and_show_status() {
-    local seed="http://localhost:8001"
+    local ports=(8001 8002 8003)
     local timeout=15
 
     printf "==> Waiting for %d shards to elect leaders (up to %ds)..." "$SHARDS" "$timeout"
     local deadline=$((SECONDS + timeout))
     while [[ $SECONDS -lt $deadline ]]; do
-        local body
-        body=$(curl -sf "$seed/shards" 2>/dev/null) || { sleep 0.3; continue; }
+        # Collect group_ids that have a leader on any node.
+        local leaders_found
+        leaders_found=$(
+            for port in "${ports[@]}"; do
+                curl -sf "http://localhost:$port/shards" 2>/dev/null || true
+            done | grep -o '"group_id":[0-9]*,"state":"Leader"' | grep -o '[0-9]*' | sort -un || true
+        )
         local leader_count
-        leader_count=$(printf '%s' "$body" | grep -c '"state":"Leader"' 2>/dev/null || true)
+        leader_count=$(printf '%s' "$leaders_found" | grep -c '[0-9]' 2>/dev/null || true)
         if [[ "$leader_count" -ge "$SHARDS" ]]; then
             printf ' done.\n'
             break
@@ -56,15 +61,18 @@ wait_and_show_status() {
         return
     fi
 
-    printf '==> Shard status (via p1):\n'
-    local body
-    body=$(curl -sf "$seed/shards" 2>/dev/null)
-    if command -v jq >/dev/null 2>&1; then
-        printf '%s' "$body" | jq -r 'sort_by(.group_id)[] |
-            "  shard=\(.group_id)  \(.state)  term=\(.term)  last_applied=\(.last_applied)"'
-    else
-        printf '%s\n' "$body"
-    fi
+    printf '==> Shard leaders:\n'
+    for port in "${ports[@]}"; do
+        local body
+        body=$(curl -sf "http://localhost:$port/shards" 2>/dev/null) || continue
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq -r --arg p ":$port" '
+                sort_by(.group_id)[] | select(.state == "Leader") |
+                "  shard=\(.group_id)  leader on \($p)  term=\(.term)"'
+        else
+            printf '%s\n' "$body"
+        fi
+    done
     printf '\n'
 }
 
