@@ -32,7 +32,7 @@ Requires Go 1.22+.
 16. [Multi-Raft — thousands of groups on shared infrastructure](#multi-raft--thousands-of-groups-on-shared-infrastructure)
 17. [Caveats and known limitations](#caveats-and-known-limitations)
 18. [EasyRaft — high-level abstraction](#easyraft--high-level-abstraction)
-19. [Reference implementations](#reference-implementation)
+19. [Reference implementation](#reference-implementation)
 
 ---
 
@@ -79,17 +79,17 @@ func main() {
     cfg.Transport = net.NewTransport("n1")
     cfg.TickInterval = 10 * time.Millisecond // drive ticks automatically
 
-    node, err := raft.New(cfg)
+    node, err := raft.New(&cfg)
     if err != nil {
         log.Fatal(err)
     }
-    net.Register("n1", node)
+    net.Register("n1", node.Handler())
     node.Start()
     defer node.Stop()
 
     // Wait for this single node to elect itself.
     ctx := context.Background()
-    for node.StateSnapshot() != raft.Leader {
+    for node.State() != raft.Leader {
         time.Sleep(10 * time.Millisecond)
     }
 
@@ -186,16 +186,16 @@ Key constraints:
 // 1. Build config (start from the production defaults).
 cfg := raft.DefaultConfig()
 cfg.ID        = "node-1"
-cfg.Peers     = []raft.NodeID{"node-2", "node-3"}
+cfg.Peers     = []raft.PeerConfig{{ID: "node-2", Voter: true}, {ID: "node-3", Voter: true}}
 cfg.Storage   = store   // raft.Storage implementation
 cfg.StateMachine = sm   // your StateMachine
 cfg.Transport = tr      // raft.Transport implementation
 
 // 2. Create the node (loads persisted state; does NOT start goroutines).
-node, err := raft.New(cfg)
+node, err := raft.New(&cfg)
 
 // 3. Register with the transport so inbound RPCs are routed here.
-tr.Register(cfg.ID, node) // or net.Register(cfg.ID, node) for memtransport
+tr.Register(cfg.ID, node.Handler()) // or net.Register(cfg.ID, node.Handler()) for memtransport
 
 // 4. Start background goroutines.
 node.Start()
@@ -355,7 +355,7 @@ cfg.Clock = myClock // implements raft.Clock: Now() time.Time
 
 ```go
 // Add a new node (blocks until committed).
-err := node.AddServer(ctx, "node-4")
+err := node.AddServer(ctx, raft.PeerConfig{ID: "node-4", Voter: true})
 
 // Remove a node (blocks until committed).
 err := node.RemoveServer(ctx, "node-2")
@@ -375,7 +375,12 @@ two-phase joint consensus protocol (§4.3 of the Raft dissertation):
 // Phase 2: commits a finalise entry (C_new only) — happens automatically.
 // ReconfigureCluster returns after Phase 1 commits; Phase 2 completes in
 // the background (or is re-driven by the next leader if a crash occurs).
-err := node.ReconfigureCluster(ctx, []raft.NodeID{"n1", "n3", "n4", "n5"})
+err := node.ReconfigureCluster(ctx, []raft.PeerConfig{
+    {ID: "n1", Voter: true},
+    {ID: "n3", Voter: true},
+    {ID: "n4", Voter: true},
+    {ID: "n5", Voter: true},
+})
 ```
 
 `newMembers` must not contain duplicates; `ReconfigureCluster` returns an
@@ -406,7 +411,7 @@ Start from `raft.DefaultConfig()` and override only what you need:
 ```go
 cfg := raft.DefaultConfig()
 cfg.ID        = "node-1"                    // required
-cfg.Peers     = []raft.NodeID{"n2", "n3"}   // required (initial peers, excluding self)
+cfg.Peers     = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}   // required (initial peers, excluding self)
 cfg.Storage   = store                       // required
 cfg.StateMachine = sm                       // required
 cfg.Transport = tr                          // required
@@ -583,9 +588,12 @@ Implementations must **not block** — they are called synchronously from the ev
 ### Prometheus (`metrics/prommetrics`)
 
 ```go
-import "github.com/brunoga/raft/metrics/prommetrics"
+import (
+    "github.com/brunoga/raft/metrics/prommetrics"
+    "github.com/prometheus/client_golang/prometheus"
+)
 
-m := prommetrics.New() // registers metrics on prometheus.DefaultRegisterer
+m := prommetrics.New(prometheus.DefaultRegisterer) // registers metrics on prometheus.DefaultRegisterer
 cfg.Metrics = m
 ```
 
@@ -632,7 +640,12 @@ nodes := make([]*raft.Node, 3)
 ids := []raft.NodeID{"n1", "n2", "n3"}
 
 for i, id := range ids {
-    peers := slices.DeleteFunc(slices.Clone(ids), func(p raft.NodeID) bool { return p == id })
+    var peers []raft.PeerConfig
+    for _, p := range ids {
+        if p != id {
+            peers = append(peers, raft.PeerConfig{ID: p, Voter: true})
+        }
+    }
     cfg := raft.DefaultConfig()
     cfg.ID = id
     cfg.Peers = peers
@@ -640,8 +653,8 @@ for i, id := range ids {
     cfg.StateMachine = &MySM{}
     cfg.Transport = net.NewTransport(id)
     cfg.TickInterval = 0 // manual ticks
-    nodes[i], _ = raft.New(cfg)
-    net.Register(id, nodes[i])
+    nodes[i], _ = raft.New(&cfg)
+    net.Register(id, nodes[i].Handler())
     nodes[i].Start()
 }
 
@@ -780,8 +793,8 @@ for _, shard := range shards {
     cfg.Storage = filestore.Open(fmt.Sprintf("data/groups/%d", shard.ID))
     cfg.StateMachine = newShardSM(shard)
     cfg.Transport = tr                              // shared transport
-    node, _ := raft.New(cfg)
-    tr.Register(myNodeID, node)                     // single-group: still needed
+    node, _ := raft.New(&cfg)
+    tr.Register(myNodeID, node.Handler())            // single-group: still needed
     mgr.Add(shard.ID, node)
 }
 
@@ -992,178 +1005,14 @@ The internal `proposeCh` has a fixed capacity of 1,024 entries. When the leader'
 
 ## EasyRaft — high-level abstraction
 
-`easyraft` is a batteries-included layer on top of the core `raft` package. It handles transport (gRPC), storage (filestore), snapshotting, leader routing, peer discovery, and an HTTP REST API — so you can build a strongly-consistent replicated service by describing **what** data to store rather than how to replicate it.
+`easyraft` is a batteries-included layer on top of the core `raft` package that handles transport (gRPC), storage (filestore), snapshotting, leader routing, peer discovery, and an HTTP REST API — letting you build a strongly-consistent replicated service by describing **what** data to store rather than how.
 
-```go
-import "github.com/brunoga/raft/easyraft"
-
-type Counter struct{ Value int64 `json:"value"` }
-
-er, _ := easyraft.New[Counter](
-    easyraft.WithID("n1"),
-    easyraft.WithRaftAddr(":7001"),
-    easyraft.WithHTTPAddr(":8001"),
-    easyraft.WithDataDir("/data/n1"),
-    easyraft.WithPeers(map[raft.NodeID]string{
-        "n2": "host2:7001",
-        "n3": "host3:7001",
-    }),
-)
-er.Start()
-defer er.Stop()
-
-ctx := context.Background()
-er.Create(ctx, "alice", Counter{Value: 0})
-c, _ := er.Read(ctx, "alice")  // linearizable
-```
-
-Key features at a glance:
-
-- **`New[T]`** — single typed collection; **`NewStore` + `AddCollection[T]`** — multiple collections.
-- **Mutations** — atomic read-modify-write operations replicated as a single log entry.
-- **`Upsert`** — atomic create-or-update in a single log entry; no `ErrKeyExists` / `ErrKeyNotFound`.
-- **`OnChange`** — callback fired on every replica after each committed write, outside the Raft lock; the primitive for watch/subscribe flows.
-- **`WithJoinAddr`** — join a running cluster via an HTTP seed node; no upfront peer list required.
-- **`WithJoinAsLearner`** — join as a non-voting replica that replicates the log without participating in elections.
-- **`WithLeaveOnStop`** — gracefully remove this node from the cluster membership on shutdown.
-- **`RemoveServer` / `TransferLeadership`** — cluster management from Go or over HTTP (`DELETE /members/{id}`, `POST /transfer-leadership`).
-- **`GET /members`** — list all cluster members with voter status and leader flag.
-- **`POST /batch`** — apply multiple operations across collections atomically.
-- **Multi-Raft** via `easyraft.Manager` — multiple independent Raft groups on one process.
-- **Dynamic discovery** via `WithDiscovery`.
-- **TLS** via `WithTLS`, **Prometheus** via `WithPrometheus`.
-
-See [`easyraft/`](easyraft/) for the full documentation and API reference.
+See [`easyraft/`](easyraft/) for the full API reference, option guide, and usage examples.
 
 ---
 
 ## Reference implementation
 
-Five fully-worked examples are provided, each targeting a different deployment pattern.
+Five fully-worked examples are provided, each targeting a different deployment pattern — from a single-group service using the core `raft` package directly, to a multi-raft sharded store with automatic leader balancing.
 
-### `examples/idprovider` — single-group
-
-See [`examples/idprovider`](examples/idprovider/) for a production-ready distributed
-monotonic ID allocation service that demonstrates all major single-group features:
-
-- **State machine**: multiple independent domains, each with a `uint64`
-  counter; each allocation atomically reserves a range `[start, start+count)`.
-- **Domain management**: `POST /domains/{name}` to create, `DELETE` to remove,
-  `GET /domains` for a linearizable listing of all domains and their counters.
-- **Exactly-once allocation**: clients supply `X-Client-ID` and `X-Seq-Num`
-  headers; retrying with the same pair returns the original range.
-- **Linearizable reads**: `GET /domains/{name}/current` uses `ReadIndex`.
-- **Stale reads**: append `?consistency=stale` to any read endpoint to bypass
-  the leader round-trip and serve directly from the local state machine.
-- **Leader routing**: non-leader nodes return `503` with `X-Raft-Leader`.
-- **gRPC transport** + **filestore** + graceful shutdown.
-
-```bash
-go build -o idprovider ./examples/idprovider
-./idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
-             --peer n2=localhost:7002 --peer n3=localhost:7003
-```
-
-### `examples/ratelimiter` — EasyRaft with deterministic mutations
-
-See [`examples/ratelimiter`](examples/ratelimiter/) for a distributed token-bucket rate limiter built on `easyraft`. It demonstrates:
-
-- **EasyRaft `New[T]`**: single-collection setup with full REST API.
-- **Deterministic mutations**: the current timestamp is encoded into the mutation args before proposing, so the time-based refill is applied identically on every node.
-- **`WithJoinAddr`**: nodes can join a running cluster one at a time using the `-join` flag instead of configuring the full peer list upfront.
-
-```bash
-go build -o ratelimiter ./examples/ratelimiter
-
-# Node 1 — bootstrap
-./ratelimiter --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/rl/n1
-
-# Node 2 — joins node 1
-./ratelimiter --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/rl/n2 \
-              --join localhost:8001
-```
-
-### `examples/configsvc` — EasyRaft with watch/subscribe (SSE)
-
-See [`examples/configsvc`](examples/configsvc/) for a distributed configuration service built on `easyraft`. It demonstrates the watch/subscribe pattern — the one thing a plain KV store does not cover:
-
-- **`Collection.OnChange`**: fires on every replica after each committed write, outside the Raft lock. Used here to fan out change events to locally connected SSE clients without polling.
-- **`Collection.Upsert`**: atomic create-or-update in a single log entry.
-- **SSE watch streams**: `GET /watch/{key}` and `GET /watch` — any node can serve watchers; each fires independently from its own `OnChange` callback.
-- **Deterministic versioning**: `ConfigEntry.Version` is set by the HTTP handler before proposing so all replicas apply the same value.
-- **`WithJoinAddr`**: same one-at-a-time cluster growth as the ratelimiter example.
-
-```bash
-go build -o configsvc ./examples/configsvc
-
-# Node 1 — bootstrap
-./configsvc --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/cfg/n1
-
-# Node 2 — joins node 1; watch all keys
-./configsvc --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/cfg/n2 \
-            --join localhost:8001
-
-curl -N http://localhost:8002/watch   # SSE stream on node 2
-
-# Write on node 1 — event arrives on node 2's watcher
-curl -L -X PUT http://localhost:8001/configs/db.host \
-     -H 'Content-Type: application/json' -d '{"value":"localhost"}'
-```
-
-### `examples/ledger` — EasyRaft with atomic multi-collection transactions
-
-See [`examples/ledger`](examples/ledger/) for a distributed double-entry ledger built on `easyraft`. It demonstrates the `Store.Txn` API — the pattern none of the other examples cover:
-
-- **`Store.Txn`**: commits a debit, a credit, and a transfer record across two collections in a single Raft log entry. Any failure rolls back the entire batch — no partial state.
-- **Idempotent transfers**: the transfer record is created first inside the Txn, keyed by `client_id:seq`. A retry hits `ErrKeyExists` before any balance mutations run.
-- **`Collection.RegisterMutation`**: the `debit` mutation enforces the "no negative balance" invariant inside `Apply` on every replica.
-- **`WithHTTPMux`**: easyraft management routes share the application's mux.
-
-```bash
-go build -o ledger ./examples/ledger
-
-# Node 1 — bootstrap
-./ledger --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/lgr/n1
-
-# Node 2 — joins node 1
-./ledger --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/lgr/n2 \
-         --join localhost:8001
-
-# Create accounts and transfer funds
-curl -X POST http://localhost:8001/accounts \
-     -H 'Content-Type: application/json' -d '{"id":"alice","balance":1000}'
-curl -L -X POST http://localhost:8001/transfers \
-     -H 'Content-Type: application/json' \
-     -d '{"from":"alice","to":"bob","amount":100,"client_id":"cli1","seq":1}'
-```
-
-### `examples/shardkv` — multi-group (multi-raft) with leader balancing
-
-See [`examples/shardkv`](examples/shardkv/) for a horizontally-sharded key-value
-store that demonstrates the canonical multi-raft pattern: N independent Raft
-groups (shards) co-located on each physical node, sharing one gRPC transport and
-one `Manager` ticker, with a `BalanceController` distributing leaders evenly
-across machines.
-
-- **Multi-raft wiring**: `Manager`, `cfg.GroupID`, `tr.SetGroupLookup`, `RunTicker`.
-- **FNV-hash routing**: keys are deterministically mapped to shards; the HTTP
-  layer resolves the correct group and redirects writes to the shard leader.
-- **Heartbeat batching**: enabled automatically by `SetGroupLookup` — O(G×P)
-  heartbeats per tick are coalesced into O(P) `BatchHeartbeats` RPCs.
-- **Independent fault domains**: stopping or partitioning one shard's nodes does
-  not affect other shards' availability or leadership.
-- **Cross-machine leader balancing**: a `BalanceController` on each node uses
-  `HTTPNodeProvider` to query peers' `/raft/status` endpoints and drives
-  leadership transfers to maintain ±1 leader balance across physical nodes.
-
-```bash
-go build -o shardkv ./examples/shardkv
-
-# Node 1 — hosts one replica of each of the 4 shards
-./shardkv --id p1 --shards 4 --raft-addr :7001 --http-addr :8001 \
-          --data-dir /tmp/sk/p1 \
-          --peer p2=localhost:7002,localhost:8002 \
-          --peer p3=localhost:7003,localhost:8003
-
-# Node 2 and 3 follow the same pattern (see examples/shardkv/README.md)
-```
+See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
