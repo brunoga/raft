@@ -342,34 +342,31 @@ func (s *Store) currentPeers() []joinPeer {
 	return peers
 }
 
-// handleMembers handles GET /members. Returns all known cluster members with
+// handleMembers handles GET /members. Returns all committed cluster members
+// (from Node.Members(), which reflects the last applied config entry) with
 // their Raft addresses, voter status, and whether each is the current leader.
 func (s *Store) handleMembers(w http.ResponseWriter, r *http.Request) {
 	leaderID := s.node.Leader()
+	raftMembers := s.node.Members() // authoritative: committed membership only
 
 	s.mu.RLock()
-	members := make([]memberInfo, 0, len(s.raftPeers)+1)
-	for id, p := range s.raftPeers {
-		if id == s.cfg.ID {
-			continue
+	members := make([]memberInfo, 0, len(raftMembers))
+	for _, p := range raftMembers {
+		var addr string
+		if p.ID == s.cfg.ID {
+			addr = s.cfg.RaftAddr
+		} else if info, ok := s.raftPeers[p.ID]; ok {
+			addr = info.addr
 		}
 		members = append(members, memberInfo{
-			ID:       id,
-			RaftAddr: p.addr,
-			Voter:    p.voter,
-			Leader:   id == leaderID,
+			ID:       p.ID,
+			RaftAddr: addr,
+			Voter:    p.Voter,
+			Leader:   p.ID == leaderID,
+			Self:     p.ID == s.cfg.ID,
 		})
 	}
 	s.mu.RUnlock()
-
-	// Always include self.
-	members = append(members, memberInfo{
-		ID:       s.cfg.ID,
-		RaftAddr: s.cfg.RaftAddr,
-		Voter:    true,
-		Leader:   s.cfg.ID == leaderID,
-		Self:     true,
-	})
 
 	writeJSON(w, http.StatusOK, membersResponse{Members: members}, s.cfg.Logger)
 }

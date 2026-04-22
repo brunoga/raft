@@ -515,11 +515,12 @@ func TestHTTP_Status(t *testing.T) {
 		t.Fatalf("GET /status = %d", code)
 	}
 
+	// /status now returns GroupStatus from Node.Status():
+	// {"group_id":0,"node_id":"n1","state":"Leader","term":1,"last_applied":N}
 	var status struct {
-		ID          string `json:"id"`
-		State       string `json:"state"`
-		Leader      string `json:"leader"`
-		LastApplied uint64 `json:"last_applied"`
+		NodeID string `json:"node_id"`
+		State  string `json:"state"`
+		Term   uint64 `json:"term"`
 	}
 	if err := json.Unmarshal(body, &status); err != nil {
 		t.Fatalf("decode status: %v\n%s", err, body)
@@ -527,12 +528,12 @@ func TestHTTP_Status(t *testing.T) {
 	if status.State != "Leader" {
 		t.Errorf("state = %q, want Leader", status.State)
 	}
-	if status.Leader == "" {
-		t.Error("leader field should be non-empty on the leader")
+	if status.Term == 0 {
+		t.Error("term should be non-zero on an elected leader")
 	}
 	wantID := fmt.Sprintf("n%d", leaderIdx+1)
-	if status.ID != wantID {
-		t.Errorf("id = %q, want %q", status.ID, wantID)
+	if status.NodeID != wantID {
+		t.Errorf("node_id = %q, want %q", status.NodeID, wantID)
 	}
 }
 

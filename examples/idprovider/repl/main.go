@@ -152,7 +152,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "usage: stats")
 				continue
 			}
-			showStats(ctx, addrs)
+			exampleutil.ShowNodeStats(ctx, addrs[0])
 
 		case "help":
 			printHelp()
@@ -170,59 +170,6 @@ func main() {
 	}
 }
 
-// showStats polls every node's /status and /metrics for a cluster-wide view.
-func showStats(ctx context.Context, addrs []string) {
-	fmt.Printf("=== Cluster Status ===\n\n")
-
-	type nodeStatus struct {
-		ID          string `json:"id"`
-		State       string `json:"state"`
-		Leader      string `json:"leader"`
-		LastApplied uint64 `json:"last_applied"`
-	}
-
-	type result struct {
-		addr   string
-		status nodeStatus
-		err    error
-	}
-
-	results := make([]result, len(addrs))
-	for i, addr := range addrs {
-		var ns nodeStatus
-		err := exampleutil.FetchJSON(ctx, strings.TrimSuffix(addr, "/")+"/status", &ns)
-		results[i] = result{addr: addr, status: ns, err: err}
-	}
-
-	sort.Slice(results, func(i, j int) bool { return results[i].addr < results[j].addr })
-
-	for _, r := range results {
-		if r.err != nil {
-			fmt.Printf("  %-30s  unreachable (%v)\n", r.addr, r.err)
-			continue
-		}
-		s := r.status
-		leaderInfo := ""
-		if s.Leader != "" && s.Leader != s.ID {
-			leaderInfo = fmt.Sprintf("  leader=%s", s.Leader)
-		}
-		fmt.Printf("  %-30s  id=%-6s  %-12s  last_applied=%-6d%s\n",
-			r.addr, s.ID, s.State, s.LastApplied, leaderInfo)
-	}
-	fmt.Println()
-
-	// Show Raft metrics from the first reachable node.
-	fmt.Println("Raft Metrics:")
-	for _, r := range results {
-		if r.err != nil {
-			continue
-		}
-		if err := exampleutil.FetchRaftMetrics(ctx, strings.TrimSuffix(r.addr, "/")+"/metrics"); err != nil {
-			fmt.Fprintln(os.Stderr, "  metrics:", err)
-		}
-		break
-	}
-}
 
 func printDomains(domains map[string]uint64) {
 
