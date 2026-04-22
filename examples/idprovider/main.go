@@ -14,7 +14,7 @@
 // # Usage (three-node example with static peers)
 //
 //	idprovider --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/n1 \
-//	           --peer n2=localhost:7002 --peer n3=localhost:7003
+//	           --peer n2=localhost:7002,localhost:8002 --peer n3=localhost:7003,localhost:8003
 //
 // # Usage (three-node example with UDP broadcast discovery)
 //

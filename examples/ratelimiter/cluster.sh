@@ -41,7 +41,8 @@ wait_and_show_status() {
     while [[ $SECONDS -lt $deadline ]]; do
         local body
         body=$(curl -sf "$seed/members" 2>/dev/null) || { sleep 0.3; continue; }
-        if printf '%s' "$body" | grep -q '"leader":true'; then
+        member_count=$(printf '%s' "$body" | grep -o '"leader":' | wc -l)
+        if [[ $member_count -ge 3 ]] && printf '%s' "$body" | grep -q '"leader":true'; then
             printf ' done.\n'
             break
         fi
