@@ -51,11 +51,11 @@ func newRaftLog(s Storage) (*raftLog, error) {
 		return nil, fmt.Errorf("raftLog: load snapshot: %w", loadErr)
 	}
 
-	first, err := s.FirstIndex(ctx)
+	first, err := s.FirstIndex()
 	if err != nil {
 		return nil, fmt.Errorf("raftLog: first index: %w", err)
 	}
-	last, err := s.LastIndex(ctx)
+	last, err := s.LastIndex()
 	if err != nil {
 		return nil, fmt.Errorf("raftLog: last index: %w", err)
 	}

@@ -199,14 +199,6 @@ configs.OnChange(func(key string, entry *ConfigEntry, deleted bool) {
 
 The callback is called on followers as well as the leader, and during log replay after a restart or snapshot restore. One handler per collection is supported; a second call replaces the first. Register before `Start`.
 
-The raw-JSON variant is available on `Store` directly when you need to handle multiple collections or avoid the typed deserialisation:
-
-```go
-store.OnChange("configs", func(key string, raw json.RawMessage, deleted bool) {
-    // raw is nil on delete
-})
-```
-
 **What `OnChange` does not guarantee:** if `notifyCh` (capacity 1024) fills up because the handler is slow, events are dropped. For production watch implementations, keep the handler fast — fan out to channels and let consumers process asynchronously.
 
 ---
@@ -451,6 +443,7 @@ http.ListenAndServe(":8001", mux) // one server, no conflict
 | `GET` | `/{collection}/{key}` | Read — linearizable |
 | `GET` | `/{collection}/{key}?consistency=stale` | Read — local, no round-trip |
 | `PUT` | `/{collection}/{key}` | Update item |
+| `PATCH` | `/{collection}/{key}` | Upsert item (create or replace) |
 | `DELETE` | `/{collection}/{key}` | Delete item |
 | `GET` | `/{collection}` | List all — linearizable |
 | `GET` | `/{collection}?consistency=stale` | List all — local |
@@ -488,13 +481,14 @@ Same as the `Store` routes above, prefixed with `/groups/{groupID}` (e.g. `GET /
   { "op": "create", "collection": "users",   "key": "alice", "value": {"name":"Alice"} },
   { "op": "create", "collection": "scores",  "key": "alice", "value": 100 },
   { "op": "update", "collection": "counters","key": "total", "value": 42 },
+  { "op": "upsert", "collection": "configs", "key": "db.host", "value": "localhost" },
   { "op": "delete", "collection": "sessions","key": "old-session" },
   { "op": "mutate", "collection": "quotas",  "key": "alice",
     "mutate_name": "decrement", "mutate_args": 1 }
 ]
 ```
 
-Valid `op` values: `create`, `update`, `delete`, `mutate`.
+Valid `op` values: `create`, `update`, `upsert`, `delete`, `mutate`.
 
 ### Leader routing
 

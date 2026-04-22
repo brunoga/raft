@@ -139,7 +139,7 @@ func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo
 	if !exists {
 		return ErrGroupNotFound
 	}
-	if node.StateSnapshot() == Leader {
+	if node.State() == Leader {
 		// Best-effort: ignore transfer errors (e.g. no quorum, ErrStopped from a
 		// concurrent StopAll that stopped the node between our RUnlock and here)
 		// and fall through to the unconditional stop below.
@@ -151,7 +151,7 @@ func (m *Manager) RemoveGraceful(ctx context.Context, groupID uint64, transferTo
 			// Remove — the node must always be stopped regardless of transfer
 			// outcome.
 		stepDown:
-			for node.StateSnapshot() == Leader {
+			for node.State() == Leader {
 				select {
 				case <-ctx.Done():
 					break stepDown
@@ -196,13 +196,22 @@ func (m *Manager) GroupIDs() []uint64 {
 }
 
 // Lookup returns the Handler for groupID and true, or nil and false if no node
-// is registered for that ID. It satisfies the group-lookup signature consumed
-// by GRPCTransport.SetGroupLookup.
+// is registered for that ID. It satisfies the group-lookup callback signature
+// required by [grpctransport.GRPCTransport.SetGroupLookup]:
+//
+//	t.SetGroupLookup(mgr.Lookup)
+//
+// The (T, bool) convention — rather than (T, error) used by [Manager.Get] — is
+// intentional: the transport calls Lookup on every inbound RPC and expects a
+// simple presence check, not a detailed error.
 func (m *Manager) Lookup(groupID uint64) (Handler, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	n, ok := m.nodes[groupID]
-	return n, ok
+	if !ok {
+		return nil, false
+	}
+	return n.Handler(), true
 }
 
 // StartAll calls Start on every registered node. Nodes that have already been
@@ -280,7 +289,7 @@ func (m *Manager) StatusAll() []GroupStatus {
 		out = append(out, GroupStatus{
 			GroupID:     e.gid,
 			NodeID:      e.n.cfg.ID,
-			State:       e.n.StateSnapshot(),
+			State:       e.n.State(),
 			Term:        e.n.Term(),
 			LastApplied: e.n.LastApplied(),
 		})

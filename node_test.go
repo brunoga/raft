@@ -116,7 +116,7 @@ func TestReadStale_ReturnsLastApplied(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if n.StateSnapshot() != raft.Leader {
+	if n.State() != raft.Leader {
 		t.Fatal("node should be leader")
 	}
 
@@ -216,5 +216,5 @@ func (s *slowSM) Restore(_ context.Context, _ raft.SnapshotMeta, _ io.Reader) er
 	return nil
 }
 
-// Compile-time check that *Node implements Handler.
-var _ raft.Handler = (*raft.Node)(nil)
+// Compile-time check that Node.Handler() returns a value that satisfies Handler.
+var _ func(*raft.Node) raft.Handler = (*raft.Node).Handler

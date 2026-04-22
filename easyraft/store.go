@@ -10,7 +10,9 @@
 //
 // [Collection] is a type-safe namespace within a Store. Multiple collections
 // can share a single Store (and thus a single Raft group). Each collection
-// provides Create, Read, Update, Delete, List, and Mutate operations.
+// provides Create, Read, Update, Delete, List, and Mutate operations, plus
+// exactly-once variants (CreateOnce, UpdateOnce, DeleteOnce, MutateOnce) for
+// idempotent retries across network failures.
 //
 // [EasyRaft] is a convenience wrapper that binds one Store to one Collection
 // named "default". Use it when your service manages a single entity type.
@@ -26,6 +28,19 @@
 // do not call time.Now, rand, or any external I/O inside a mutation. If a
 // mutation needs the current time, encode the timestamp in the args before
 // proposing — all nodes will then apply the same value.
+//
+// # Exactly-once semantics
+//
+// Every write method on [Collection] has a corresponding *Once variant
+// ([Collection.CreateOnce], [Collection.UpdateOnce], [Collection.DeleteOnce],
+// [Collection.MutateOnce]). The *Once variants accept a (clientID, seqNum)
+// pair and deduplicate retries: if a network failure causes the caller to
+// retry with the same (clientID, seqNum), the cluster applies the command
+// exactly once and returns the cached result to the retrying caller.
+//
+// seqNum must increase monotonically per clientID. Use the *Once variants
+// whenever retrying a write on ErrNotLeader or context timeout to avoid
+// duplicate application.
 //
 // # Getting started
 //
@@ -69,11 +84,24 @@ var (
 	// collection.
 	ErrKeyExists = errors.New("easyraft: key already exists")
 
-	// ErrNotLeader is returned by any write or linearizable-read operation when
-	// this node is not the current Raft leader. The HTTP layer translates this
-	// into a 307 redirect (if the leader's address is known) or a 503 response.
-	ErrNotLeader = errors.New("easyraft: not leader")
+	// ErrNotLeader is an alias for [raft.ErrNotLeader]. It is returned by any
+	// write or linearizable-read operation when this node is not the current
+	// Raft leader. The HTTP layer translates this into a 307 redirect (if the
+	// leader's address is known) or a 503 response.
+	// Use errors.As(err, &easyraft.NotLeaderError{}) to extract the leader hint.
+	ErrNotLeader = raft.ErrNotLeader
 )
+
+// NotLeaderError is an alias for [raft.NotLeaderError]. It is returned when a
+// write or linearizable-read is attempted on a non-leader node. The Leader
+// field carries a hint about who the current leader is; it may be empty if
+// this node does not know.
+//
+// Callers can use either the raft or easyraft package name interchangeably:
+//
+//	var nle *easyraft.NotLeaderError        // same type as *raft.NotLeaderError
+//	if errors.As(err, &nle) { ... nle.Leader ... }
+type NotLeaderError = raft.NotLeaderError
 
 type opType string
 
@@ -124,7 +152,7 @@ type raftPeerInfo struct {
 type Store struct {
 	mu          sync.RWMutex
 	collections map[string]map[string]json.RawMessage
-	mutations   map[string]map[string]MutationFunc
+	mutations   map[string]map[string]mutationFunc
 	node        *raft.Node
 
 	// raftPeers maps known peer IDs to their Raft gRPC address and voter
@@ -174,7 +202,7 @@ func NewStore(opts ...Option) (*Store, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
 		collections: make(map[string]map[string]json.RawMessage),
-		mutations:   make(map[string]map[string]MutationFunc),
+		mutations:   make(map[string]map[string]mutationFunc),
 		raftPeers:   make(map[raft.NodeID]raftPeerInfo),
 		onChangeFns: make(map[string]func(string, json.RawMessage, bool)),
 		notifyCh:    make(chan changeEvent, 1024),
@@ -188,6 +216,27 @@ func NewStore(opts ...Option) (*Store, error) {
 	}
 
 	return s, nil
+}
+
+// TxnResults is the ordered result set returned by [Store.Txn]. Each element
+// corresponds to one operation added to the transaction, in the order it was
+// added. CRUD operations (Create, Update, Delete) produce a nil entry; Mutate
+// operations produce the []byte returned by the mutation function.
+//
+// Use [TxnResults.Decode] to decode a single result by index into a Go value.
+type TxnResults []json.RawMessage
+
+// Decode unmarshals the result at position index into dst, which must be a
+// non-nil pointer. It returns an error if index is out of range, if the result
+// is nil (the operation was a non-returning CRUD), or if JSON decoding fails.
+func (r TxnResults) Decode(index int, dst any) error {
+	if index < 0 || index >= len(r) {
+		return fmt.Errorf("easyraft: TxnResults index %d out of range [0, %d)", index, len(r))
+	}
+	if r[index] == nil {
+		return fmt.Errorf("easyraft: TxnResults[%d] is nil (non-returning operation)", index)
+	}
+	return json.Unmarshal(r[index], dst)
 }
 
 // Txn accumulates operations across multiple collections to be committed as a
@@ -228,12 +277,30 @@ func (t *Txn) Update(collection, key string, value any) error {
 }
 
 // Delete adds a delete operation to the transaction.
-func (t *Txn) Delete(collection, key string) {
+func (t *Txn) Delete(collection, key string) error {
 	t.cmds = append(t.cmds, command{
 		Op:         opDelete,
 		Collection: collection,
 		Key:        key,
 	})
+	return nil
+}
+
+// Upsert adds an upsert operation to the transaction. It inserts key if it
+// does not exist, or replaces it if it does — without ever returning
+// [ErrKeyExists] or [ErrKeyNotFound].
+func (t *Txn) Upsert(collection, key string, value any) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	t.cmds = append(t.cmds, command{
+		Op:         opUpsert,
+		Collection: collection,
+		Key:        key,
+		Value:      b,
+	})
+	return nil
 }
 
 // Mutate adds a mutation operation to the transaction.
@@ -260,10 +327,11 @@ func (t *Txn) Mutate(collection, key, name string, args any) error {
 // batch as a single Raft log entry. Either all operations succeed or the whole
 // entry fails — there is no partial application.
 //
-// The returned slice has one json.RawMessage per operation in the order they
-// were added; mutation results are included, CRUD results are null.
-// An empty transaction (no operations added) returns nil, nil.
-func (s *Store) Txn(ctx context.Context, fn func(tx *Txn) error) ([]json.RawMessage, error) {
+// The returned [TxnResults] has one entry per operation in the order they were
+// added. Mutation results carry the bytes returned by the mutation function;
+// CRUD results are nil. Use [TxnResults.Decode] to decode a mutation result by
+// its positional index. An empty transaction (no operations added) returns nil, nil.
+func (s *Store) Txn(ctx context.Context, fn func(tx *Txn) error) (TxnResults, error) {
 	tx := &Txn{store: s}
 	if err := fn(tx); err != nil {
 		return nil, err
@@ -281,7 +349,7 @@ func (s *Store) Txn(ctx context.Context, fn func(tx *Txn) error) ([]json.RawMess
 		return nil, err
 	}
 
-	var results []json.RawMessage
+	var results TxnResults
 	if err := json.Unmarshal(res, &results); err != nil {
 		return nil, fmt.Errorf("easyraft: decode txn results: %w", err)
 	}
@@ -349,7 +417,7 @@ func (s *Store) initRaft() error {
 		return fmt.Errorf("new raft node: %w", err)
 	}
 
-	tr.Register(s.cfg.ID, node)
+	tr.Register(s.cfg.ID, node.Handler())
 	s.transport = tr
 	s.storage = st
 
@@ -541,16 +609,16 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 }
 
-// OnChange registers fn to be called on this node whenever a committed write
-// modifies collection. fn receives the key, the new serialised value (nil if
-// the key was deleted), and a deleted flag. It is called outside the
+// onChangeRaw registers fn to be called on this node whenever a committed
+// write modifies collection. fn receives the key, the new serialised value (nil
+// if the key was deleted), and a deleted flag. It is called outside the
 // state-machine lock, in a dedicated dispatcher goroutine, after every Apply
 // that touches the collection — including on followers and during log replay
 // after a restart or snapshot restore.
 //
 // Only one handler per collection is supported; a second call for the same
 // collection replaces the first. Call before Start.
-func (s *Store) OnChange(collection string, fn func(key string, value json.RawMessage, deleted bool)) {
+func (s *Store) onChangeRaw(collection string, fn func(key string, value json.RawMessage, deleted bool)) {
 	s.mu.Lock()
 	s.onChangeFns[collection] = fn
 	s.mu.Unlock()
@@ -591,7 +659,7 @@ func (s *Store) dispatchChanges() {
 // 30 seconds so that callers do not need to guarantee the seeds are fully
 // bootstrapped before starting the joining node.
 func (s *Store) joinCluster(ctx context.Context) error {
-	voter := !s.cfg.JoinAsNonVoter
+	voter := !s.cfg.JoinAsLearner
 	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr, Voter: &voter}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -684,6 +752,25 @@ func (s *Store) Status() raft.GroupStatus {
 	return s.node.Status()
 }
 
+// Members returns the current cluster membership as seen by this node.
+// The list includes this node and reflects the last committed configuration
+// change. Safe for concurrent use.
+func (s *Store) Members() []raft.PeerConfig {
+	if s.node == nil {
+		return nil
+	}
+	return s.node.Members()
+}
+
+// Leader returns the NodeID of the node this node believes to be the current
+// Raft leader, or empty string if the leader is unknown. Safe for concurrent use.
+func (s *Store) Leader() raft.NodeID {
+	if s.node == nil {
+		return ""
+	}
+	return s.node.Leader()
+}
+
 // Stop cancels the store's context (terminating discovery goroutines), shuts
 // down the HTTP server, stops the Raft node, and closes persistent storage.
 // It is safe to call Stop more than once.
@@ -720,6 +807,19 @@ func (s *Store) Stop() {
 //
 // A Collection is a lightweight handle — it is safe to create multiple
 // Collection values pointing at the same name and store.
+//
+// # Write operations
+//
+// Most write methods have both a standard and an exactly-once variant:
+//   - Standard: [Collection.Create], [Collection.Update], [Collection.Delete],
+//     [Collection.Upsert], [Collection.Mutate] — at-least-once on retry.
+//   - Exactly-once: [Collection.CreateOnce], [Collection.UpdateOnce],
+//     [Collection.DeleteOnce], [Collection.MutateOnce] — deduplicated by
+//     (clientID, seqNum); safe to retry after a network failure without
+//     risk of double-application.
+//
+// [Collection.Upsert] has no *Once variant because it is already idempotent:
+// applying the same upsert twice produces the same final state.
 type Collection[T any] struct {
 	store *Store
 	name  string
@@ -852,7 +952,7 @@ func (c *Collection[T]) Upsert(ctx context.Context, key string, value T) error {
 //
 // Call before [Store.Start]. Only one handler per collection is supported.
 func (c *Collection[T]) OnChange(fn func(key string, value *T, deleted bool)) {
-	c.store.OnChange(c.name, func(key string, raw json.RawMessage, deleted bool) {
+	c.store.onChangeRaw(c.name, func(key string, raw json.RawMessage, deleted bool) {
 		if deleted {
 			fn(key, nil, true)
 			return
@@ -873,7 +973,7 @@ func (c *Collection[T]) CreateOnce(ctx context.Context, clientID raft.NodeID, se
 	if err != nil {
 		return fmt.Errorf("easyraft: encode value: %w", err)
 	}
-	_, err = c.store.ProposeOnce(ctx, clientID, seqNum, &command{
+	_, err = c.store.proposeOnce(ctx, clientID, seqNum, &command{
 		Op:         opCreate,
 		Collection: c.name,
 		Key:        key,
@@ -889,7 +989,7 @@ func (c *Collection[T]) UpdateOnce(ctx context.Context, clientID raft.NodeID, se
 	if err != nil {
 		return fmt.Errorf("easyraft: encode value: %w", err)
 	}
-	_, err = c.store.ProposeOnce(ctx, clientID, seqNum, &command{
+	_, err = c.store.proposeOnce(ctx, clientID, seqNum, &command{
 		Op:         opUpdate,
 		Collection: c.name,
 		Key:        key,
@@ -901,7 +1001,7 @@ func (c *Collection[T]) UpdateOnce(ctx context.Context, clientID raft.NodeID, se
 // DeleteOnce removes an existing item with exactly-once semantics.
 // See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) DeleteOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string) error {
-	_, err := c.store.ProposeOnce(ctx, clientID, seqNum, &command{
+	_, err := c.store.proposeOnce(ctx, clientID, seqNum, &command{
 		Op:         opDelete,
 		Collection: c.name,
 		Key:        key,
@@ -928,7 +1028,7 @@ func (c *Collection[T]) Mutate(ctx context.Context, key, name string, args []byt
 // MutateOnce executes a registered mutation with exactly-once semantics.
 // See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key, name string, args []byte) ([]byte, error) {
-	return c.store.ProposeOnce(ctx, clientID, seqNum, &command{
+	return c.store.proposeOnce(ctx, clientID, seqNum, &command{
 		Op:         opMutate,
 		Collection: c.name,
 		Key:        key,
@@ -1073,22 +1173,22 @@ func (s *Store) TransferLeadership(ctx context.Context, to raft.NodeID) error {
 	return s.node.TransferLeadership(ctx, to)
 }
 
-// MutationFunc is the low-level, untyped mutation callback stored in the
+// mutationFunc is the low-level, untyped mutation callback stored in the
 // registry. It receives the current value and args as raw JSON and must return
 // the new value and an optional response, both as raw JSON.
 //
 // Use [Collection.RegisterMutation] to register a typed wrapper instead of
-// implementing MutationFunc directly.
+// implementing mutationFunc directly.
 //
 // If an error is returned, the state machine is NOT updated.
-// MutationFunc MUST be purely deterministic — see [Collection.RegisterMutation].
-type MutationFunc func(currentValue json.RawMessage, args json.RawMessage) (newValue json.RawMessage, response json.RawMessage, err error)
+// mutationFunc MUST be purely deterministic — see [Collection.RegisterMutation].
+type mutationFunc func(currentValue json.RawMessage, args json.RawMessage) (newValue json.RawMessage, response json.RawMessage, err error)
 
-func (s *Store) registerMutation(collection, name string, fn MutationFunc) {
+func (s *Store) registerMutation(collection, name string, fn mutationFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mutations[collection] == nil {
-		s.mutations[collection] = make(map[string]MutationFunc)
+		s.mutations[collection] = make(map[string]mutationFunc)
 	}
 	s.mutations[collection][name] = fn
 }
@@ -1300,18 +1400,11 @@ func (s *Store) propose(ctx context.Context, cmd *command) ([]byte, error) {
 		return nil, fmt.Errorf("easyraft: encode cmd: %w", err)
 	}
 
-	res, err := s.node.Propose(ctx, b)
-	if err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return nil, ErrNotLeader
-		}
-		return nil, err
-	}
-	return res, nil
+	return s.node.Propose(ctx, b)
 }
 
-// ProposeOnce submits a command for replication with exactly-once semantics.
-func (s *Store) ProposeOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, cmd *command) ([]byte, error) {
+// proposeOnce submits a command for replication with exactly-once semantics.
+func (s *Store) proposeOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, cmd *command) ([]byte, error) {
 	if s.node == nil {
 		return nil, errors.New("easyraft: node not started")
 	}
@@ -1321,12 +1414,5 @@ func (s *Store) ProposeOnce(ctx context.Context, clientID raft.NodeID, seqNum ui
 		return nil, fmt.Errorf("easyraft: encode cmd: %w", err)
 	}
 
-	res, err := s.node.ProposeOnce(ctx, clientID, seqNum, b)
-	if err != nil {
-		if errors.Is(err, raft.ErrNotLeader) {
-			return nil, ErrNotLeader
-		}
-		return nil, err
-	}
-	return res, nil
+	return s.node.ProposeOnce(ctx, clientID, seqNum, b)
 }

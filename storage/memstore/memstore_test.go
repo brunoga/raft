@@ -61,8 +61,8 @@ func TestAppendAndGet(t *testing.T) {
 		t.Fatalf("AppendLogEntries: %v", err)
 	}
 
-	first, _ := m.FirstIndex(ctx)
-	last, _ := m.LastIndex(ctx)
+	first, _ := m.FirstIndex()
+	last, _ := m.LastIndex()
 	if first != 1 || last != 5 {
 		t.Fatalf("first=%d last=%d, want 1,5", first, last)
 	}
@@ -116,7 +116,7 @@ func TestTruncateSuffix(t *testing.T) {
 	if err := m.TruncateSuffix(ctx, 6); err != nil {
 		t.Fatalf("TruncateSuffix: %v", err)
 	}
-	last, _ := m.LastIndex(ctx)
+	last, _ := m.LastIndex()
 	if last != 5 {
 		t.Fatalf("expected last=5 after truncate at 6, got %d", last)
 	}
@@ -132,8 +132,8 @@ func TestTruncateSuffix_All(t *testing.T) {
 	if err := m.TruncateSuffix(ctx, 1); err != nil {
 		t.Fatalf("TruncateSuffix: %v", err)
 	}
-	last, _ := m.LastIndex(ctx)
-	first, _ := m.FirstIndex(ctx)
+	last, _ := m.LastIndex()
+	first, _ := m.FirstIndex()
 	if first != 0 || last != 0 {
 		t.Fatalf("expected empty log (first=0, last=0), got first=%d last=%d", first, last)
 	}
@@ -147,7 +147,7 @@ func TestTruncatePrefix(t *testing.T) {
 	if err := m.TruncatePrefix(ctx, 4); err != nil {
 		t.Fatalf("TruncatePrefix: %v", err)
 	}
-	first, _ := m.FirstIndex(ctx)
+	first, _ := m.FirstIndex()
 	if first != 4 {
 		t.Fatalf("expected firstIndex=4, got %d", first)
 	}
@@ -166,8 +166,8 @@ func TestTruncatePrefix_All(t *testing.T) {
 	if err := m.TruncatePrefix(ctx, 6); err != nil {
 		t.Fatalf("TruncatePrefix: %v", err)
 	}
-	first, _ := m.FirstIndex(ctx)
-	last, _ := m.LastIndex(ctx)
+	first, _ := m.FirstIndex()
+	last, _ := m.LastIndex()
 	if first != 0 || last != 0 {
 		t.Fatalf("expected empty log, got first=%d last=%d", first, last)
 	}
@@ -231,12 +231,11 @@ func TestSnapshot_DataIsolated(t *testing.T) {
 
 func TestEmptyLog(t *testing.T) {
 	m := memstore.New()
-	ctx := context.Background()
-	first, err := m.FirstIndex(ctx)
+	first, err := m.FirstIndex()
 	if err != nil || first != 0 {
 		t.Fatalf("empty FirstIndex: got %d, %v", first, err)
 	}
-	last, err := m.LastIndex(ctx)
+	last, err := m.LastIndex()
 	if err != nil || last != 0 {
 		t.Fatalf("empty LastIndex: got %d, %v", last, err)
 	}
@@ -248,7 +247,7 @@ func TestAppendEmpty(t *testing.T) {
 	if err := m.AppendLogEntries(ctx, nil); err != nil {
 		t.Fatalf("AppendLogEntries(nil): %v", err)
 	}
-	last, _ := m.LastIndex(ctx)
+	last, _ := m.LastIndex()
 	if last != 0 {
 		t.Fatalf("expected last=0 after appending nothing, got %d", last)
 	}

@@ -64,9 +64,40 @@ func (e *EasyRaft[T]) Delete(ctx context.Context, key string) error {
 	return e.collection.Delete(ctx, key)
 }
 
+// Upsert inserts key if it does not exist, or replaces it if it does.
+// Unlike Create + Update, Upsert is a single atomic operation that never
+// returns [ErrKeyExists] or [ErrKeyNotFound].
+func (e *EasyRaft[T]) Upsert(ctx context.Context, key string, value T) error {
+	return e.collection.Upsert(ctx, key, value)
+}
+
 // Mutate executes a registered mutation atomically.
 func (e *EasyRaft[T]) Mutate(ctx context.Context, key, name string, args []byte) ([]byte, error) {
 	return e.collection.Mutate(ctx, key, name, args)
+}
+
+// CreateOnce inserts a new item with exactly-once semantics.
+// See [Collection.CreateOnce] for the (clientID, seqNum) contract.
+func (e *EasyRaft[T]) CreateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
+	return e.collection.CreateOnce(ctx, clientID, seqNum, key, value)
+}
+
+// UpdateOnce replaces an existing item with exactly-once semantics.
+// See [Collection.CreateOnce] for the (clientID, seqNum) contract.
+func (e *EasyRaft[T]) UpdateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
+	return e.collection.UpdateOnce(ctx, clientID, seqNum, key, value)
+}
+
+// DeleteOnce removes an existing item with exactly-once semantics.
+// See [Collection.CreateOnce] for the (clientID, seqNum) contract.
+func (e *EasyRaft[T]) DeleteOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string) error {
+	return e.collection.DeleteOnce(ctx, clientID, seqNum, key)
+}
+
+// MutateOnce executes a registered mutation with exactly-once semantics.
+// See [Collection.CreateOnce] for the (clientID, seqNum) contract.
+func (e *EasyRaft[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key, name string, args []byte) ([]byte, error) {
+	return e.collection.MutateOnce(ctx, clientID, seqNum, key, name, args)
 }
 
 // Read returns an item by key with linearizable consistency.
@@ -87,6 +118,42 @@ func (e *EasyRaft[T]) ListStale() (map[string]T, error) {
 // List returns all items in the collection with linearizable consistency.
 func (e *EasyRaft[T]) List(ctx context.Context) (map[string]T, error) {
 	return e.collection.List(ctx)
+}
+
+// OnChange registers fn to be called whenever a committed write modifies the
+// default collection. fn receives the key, the new typed value (nil on delete),
+// and a deleted flag. Call before [EasyRaft.Start].
+func (e *EasyRaft[T]) OnChange(fn func(key string, value *T, deleted bool)) {
+	e.collection.OnChange(fn)
+}
+
+// Ready blocks until this node has a known leader and has applied at least one
+// entry in the current term. Call after Start to avoid spurious [ErrNotLeader]
+// errors during leader election. Returns ctx.Err() if the context expires.
+func (e *EasyRaft[T]) Ready(ctx context.Context) error {
+	return e.store.Ready(ctx)
+}
+
+// Status returns a point-in-time snapshot of this node's Raft state.
+func (e *EasyRaft[T]) Status() raft.GroupStatus {
+	return e.store.Status()
+}
+
+// Members returns the current cluster membership as seen by this node.
+func (e *EasyRaft[T]) Members() []raft.PeerConfig {
+	return e.store.Members()
+}
+
+// Leader returns the NodeID of the node this node believes to be the current
+// Raft leader, or empty string if unknown.
+func (e *EasyRaft[T]) Leader() raft.NodeID {
+	return e.store.Leader()
+}
+
+// AddServer registers addr with the transport and adds id as a voting member
+// of the Raft cluster. Must be called on the leader; returns [ErrNotLeader] otherwise.
+func (e *EasyRaft[T]) AddServer(ctx context.Context, id raft.NodeID, addr string) error {
+	return e.store.AddServer(ctx, id, addr)
 }
 
 // RemoveServer removes id from the Raft cluster membership. Must be called on

@@ -45,11 +45,13 @@ type Storage interface {
 
 	// FirstIndex returns the index of the first available log entry.
 	// Returns 0 if the log is empty (or fully compacted).
-	FirstIndex(ctx context.Context) (Index, error)
+	// This is a synchronous, non-blocking call and does not require a context.
+	FirstIndex() (Index, error)
 
 	// LastIndex returns the index of the last log entry.
 	// Returns 0 if the log is empty.
-	LastIndex(ctx context.Context) (Index, error)
+	// This is a synchronous, non-blocking call and does not require a context.
+	LastIndex() (Index, error)
 
 	// TruncateSuffix deletes all entries with index >= fromIndex.
 	// Used when a follower discovers its log conflicts with the leader's.

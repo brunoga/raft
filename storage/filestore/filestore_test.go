@@ -103,8 +103,8 @@ func TestLog_AppendAndGet(t *testing.T) {
 		t.Fatalf("AppendLogEntries: %v", err)
 	}
 
-	first, _ := fs.FirstIndex(ctx)
-	last, _ := fs.LastIndex(ctx)
+	first, _ := fs.FirstIndex()
+	last, _ := fs.LastIndex()
 	if first != 1 || last != 5 {
 		t.Fatalf("want first=1 last=5, got first=%d last=%d", first, last)
 	}
@@ -137,7 +137,7 @@ func TestLog_PersistsAcrossReopen(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	last, _ := fs2.LastIndex(ctx)
+	last, _ := fs2.LastIndex()
 	if last != 3 {
 		t.Fatalf("expected lastIndex=3 after reopen, got %d", last)
 	}
@@ -178,7 +178,7 @@ func TestLog_TruncateSuffix(t *testing.T) {
 	if err := fs.TruncateSuffix(ctx, 6); err != nil {
 		t.Fatalf("TruncateSuffix: %v", err)
 	}
-	last, _ := fs.LastIndex(ctx)
+	last, _ := fs.LastIndex()
 	if last != 5 {
 		t.Fatalf("expected last=5, got %d", last)
 	}
@@ -202,7 +202,7 @@ func TestLog_TruncateSuffix_PersistsAcrossReopen(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	last, _ := fs2.LastIndex(ctx)
+	last, _ := fs2.LastIndex()
 	if last != 5 {
 		t.Fatalf("expected last=5 after reopen, got %d", last)
 	}
@@ -216,7 +216,7 @@ func TestLog_TruncatePrefix(t *testing.T) {
 	if err := fs.TruncatePrefix(ctx, 4); err != nil {
 		t.Fatalf("TruncatePrefix: %v", err)
 	}
-	first, _ := fs.FirstIndex(ctx)
+	first, _ := fs.FirstIndex()
 	if first != 4 {
 		t.Fatalf("expected firstIndex=4, got %d", first)
 	}
@@ -243,8 +243,8 @@ func TestLog_TruncatePrefix_PersistsAcrossReopen(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	first, _ := fs2.FirstIndex(ctx)
-	last, _ := fs2.LastIndex(ctx)
+	first, _ := fs2.FirstIndex()
+	last, _ := fs2.LastIndex()
 	if first != 4 || last != 10 {
 		t.Fatalf("expected first=4 last=10, got first=%d last=%d", first, last)
 	}
@@ -252,12 +252,11 @@ func TestLog_TruncatePrefix_PersistsAcrossReopen(t *testing.T) {
 
 func TestLog_EmptyLog(t *testing.T) {
 	fs, _ := openFresh(t)
-	ctx := context.Background()
-	first, err := fs.FirstIndex(ctx)
+	first, err := fs.FirstIndex()
 	if err != nil || first != 0 {
 		t.Fatalf("expected first=0 on empty log, got %d %v", first, err)
 	}
-	last, err := fs.LastIndex(ctx)
+	last, err := fs.LastIndex()
 	if err != nil || last != 0 {
 		t.Fatalf("expected last=0 on empty log, got %d %v", last, err)
 	}
@@ -287,7 +286,7 @@ func TestRecovery_CorruptTail(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	last, _ := fs2.LastIndex(ctx)
+	last, _ := fs2.LastIndex()
 	if last < 1 || last > 5 {
 		t.Fatalf("unexpected lastIndex after recovery: %d", last)
 	}
@@ -376,7 +375,7 @@ func TestSegment_TruncatePrefixDropsWholeSegment(t *testing.T) {
 		t.Fatalf("TruncatePrefix: %v", err)
 	}
 
-	first, _ := fs.FirstIndex(ctx)
+	first, _ := fs.FirstIndex()
 	if first != 5 {
 		t.Fatalf("expected firstIndex=5, got %d", first)
 	}
@@ -407,8 +406,8 @@ func TestSegment_PersistsAcrossReopen(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	first, _ := fs2.FirstIndex(ctx)
-	last, _ := fs2.LastIndex(ctx)
+	first, _ := fs2.FirstIndex()
+	last, _ := fs2.LastIndex()
 	if first != 1 || last != 10 {
 		t.Fatalf("after reopen: first=%d last=%d, want 1 10", first, last)
 	}
@@ -519,7 +518,7 @@ func TestPhase2Crash_BothTmps(t *testing.T) {
 	}
 	defer func() { _ = fs2.Close() }()
 
-	last, _ := fs2.LastIndex(ctx)
+	last, _ := fs2.LastIndex()
 	if last != 10 {
 		t.Fatalf("expected lastIndex=10 (original data intact), got %d", last)
 	}
@@ -598,7 +597,7 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 	defer func() { _ = fs3.Close() }()
 
 	// The store should be readable from index 2 onward.
-	first, _ := fs3.FirstIndex(ctx)
+	first, _ := fs3.FirstIndex()
 	if first != 2 {
 		t.Fatalf("expected firstIndex=2 after recovery, got %d", first)
 	}
@@ -640,7 +639,7 @@ func TestPhase2Crash_OnlyLogTmp(t *testing.T) {
 	defer func() { _ = fs2.Close() }()
 
 	// Original data should be intact.
-	last, _ := fs2.LastIndex(ctx)
+	last, _ := fs2.LastIndex()
 	if last != 10 {
 		t.Fatalf("expected lastIndex=10, got %d", last)
 	}

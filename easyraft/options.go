@@ -33,10 +33,10 @@ type Config struct {
 	// own transport. Set via [WithJoinAddr].
 	JoinAddrs []string
 
-	// JoinAsNonVoter, when true, causes the node to join as a non-voting
-	// member (learner/observer). Non-voters replicate the log but do not
+	// JoinAsLearner, when true, causes the node to join as a non-voting
+	// member (learner/observer). Learners replicate the log but do not
 	// participate in elections or commit quorum. Set via [WithJoinAsLearner].
-	JoinAsNonVoter bool
+	JoinAsLearner bool
 
 	// LeaveOnStop, when true, causes Stop to call RemoveServer(self) with a
 	// 5-second timeout before shutting down, gracefully removing this node
@@ -154,7 +154,7 @@ func WithJoinAddr(addrs ...string) Option {
 // log but do not vote in elections or count toward commit quorum. Useful for
 // read-replica nodes or nodes that should be promoted to voter later.
 func WithJoinAsLearner() Option {
-	return func(c *Config) { c.JoinAsNonVoter = true }
+	return func(c *Config) { c.JoinAsLearner = true }
 }
 
 // WithLeaveOnStop causes [Store.Stop] to call RemoveServer(self) before

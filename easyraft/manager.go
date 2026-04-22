@@ -79,13 +79,21 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("easyraft: store %d already exists", groupID)
 	}
 
+	// Give each store its own derived context so RemoveStore can cancel its
+	// dispatchChanges goroutine without stopping the entire Manager.
+	stopCtx, cancel := context.WithCancel(m.stopCtx)
+
 	// We don't call initRaft here because it needs the shared transport.
 	// We'll initialize all stores in Manager.Start.
 	s := &Store{
 		collections: make(map[string]map[string]json.RawMessage),
-		mutations:   make(map[string]map[string]MutationFunc),
+		mutations:   make(map[string]map[string]mutationFunc),
+		raftPeers:   make(map[raft.NodeID]raftPeerInfo),
+		onChangeFns: make(map[string]func(string, json.RawMessage, bool)),
+		notifyCh:    make(chan changeEvent, 1024),
 		cfg:         mergedCfg,
-		stopCtx:     m.stopCtx,
+		stopCtx:     stopCtx,
+		cancel:      cancel,
 	}
 	s.cfg.ID = m.cfg.ID // NodeID is shared across all groups; GroupID comes from the argument.
 
@@ -96,6 +104,9 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 // Start initialises the shared gRPC transport, starts all registered stores,
 // and (if WithHTTPAddr was set) starts the shared HTTP server.
 // All stores must be added via [Manager.AddStore] before calling Start.
+//
+// If Start returns an error, all partially-initialised resources (nodes,
+// goroutines, transport) are cleaned up; the caller does not need to call Stop.
 func (m *Manager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -115,20 +126,49 @@ func (m *Manager) Start() error {
 	m.transport = tr
 	tr.SetGroupLookup(m.mgr.Lookup)
 
+	// cleanup tears down all resources initialised so far; called on any error.
+	cleanup := func() {
+		m.cancel()      // cancels all per-store derived contexts (dispatchChanges)
+		m.mgr.StopAll() // stops any Raft nodes that were started
+		for _, s := range m.stores {
+			if s.storage != nil {
+				if c, ok := s.storage.(interface{ Close() error }); ok {
+					_ = c.Close()
+				}
+			}
+		}
+		_ = tr.Close()
+		m.transport = nil
+	}
+
 	// 2. Initialize and Start all Stores
 	for groupID, s := range m.stores {
 		if err := s.initRaftForManager(groupID, tr); err != nil {
+			cleanup()
 			return fmt.Errorf("init store %d: %w", groupID, err)
 		}
 		if err := m.mgr.Add(groupID, s.node); err != nil {
+			cleanup()
 			return fmt.Errorf("register store %d: %w", groupID, err)
 		}
+		// Join an existing cluster before starting the event loop, if configured.
+		if len(s.cfg.JoinAddrs) > 0 {
+			if err := s.joinCluster(s.stopCtx); err != nil && s.cfg.Logger != nil {
+				s.cfg.Logger.Warn("easyraft: cluster join failed", "err", err)
+			}
+		}
 		s.node.Start()
+		go s.dispatchChanges()
+		// Advertise this node's HTTP address so the cluster can redirect clients.
+		if s.cfg.HTTPAddr != "" {
+			go s.advertiseMetadata()
+		}
 	}
 
 	// 3. Shared HTTP Server (Multi-Raft capable)
 	if m.cfg.HTTPAddr != "" {
 		if err := m.serveHTTP(); err != nil {
+			cleanup()
 			return err
 		}
 	}
@@ -146,6 +186,99 @@ func (m *Manager) Stop() {
 	if m.transport != nil {
 		_ = m.transport.Close()
 	}
+}
+
+// GetStore returns the Store registered under groupID, or an error if no store
+// is registered for that ID.
+func (m *Manager) GetStore(groupID uint64) (*Store, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.stores[groupID]
+	if !ok {
+		return nil, fmt.Errorf("easyraft: group %d not found", groupID)
+	}
+	return s, nil
+}
+
+// GroupIDs returns a sorted snapshot of all group IDs currently registered
+// with the Manager. Additions and removals after the call are not reflected.
+func (m *Manager) GroupIDs() []uint64 {
+	return m.mgr.GroupIDs()
+}
+
+// StatusAll returns a point-in-time snapshot of every registered group's
+// Raft state. The slice order is not guaranteed.
+func (m *Manager) StatusAll() []raft.GroupStatus {
+	return m.mgr.StatusAll()
+}
+
+// RemoveStore stops and unregisters the Store for groupID, closing its
+// storage. Returns an error if no store is registered for that ID.
+// Unlike [Manager.Stop], RemoveStore affects only one Raft group; the others
+// continue running.
+//
+// For production use, prefer [Manager.RemoveStoreGraceful] which attempts a
+// leadership transfer before stopping the node, preventing an election gap.
+func (m *Manager) RemoveStore(groupID uint64) error {
+	m.mu.Lock()
+	s, ok := m.stores[groupID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("easyraft: group %d not found", groupID)
+	}
+	delete(m.stores, groupID)
+	m.mu.Unlock()
+
+	// Cancel the store's context to stop its dispatchChanges goroutine.
+	if s.cancel != nil {
+		s.cancel()
+	}
+	// Stop the Raft node via the underlying raft.Manager (also unregisters it).
+	_ = m.mgr.Remove(groupID)
+	// Close persistent storage.
+	if s.storage != nil {
+		if closer, ok := s.storage.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+	return nil
+}
+
+// RemoveStoreGraceful attempts a leadership transfer to transferTo before
+// stopping the Store for groupID. If the group is not the leader or the
+// transfer cannot complete before ctx expires, it falls through to an
+// unconditional stop. Returns an error if no store is registered for that ID.
+func (m *Manager) RemoveStoreGraceful(ctx context.Context, groupID uint64, transferTo raft.NodeID) error {
+	m.mu.Lock()
+	s, ok := m.stores[groupID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("easyraft: group %d not found", groupID)
+	}
+	delete(m.stores, groupID)
+	m.mu.Unlock()
+
+	// Cancel the store's context to stop its dispatchChanges goroutine.
+	if s.cancel != nil {
+		s.cancel()
+	}
+	// Delegate graceful removal (leadership transfer + node stop) to raft.Manager.
+	removeErr := m.mgr.RemoveGraceful(ctx, groupID, transferTo)
+	// Close persistent storage regardless of whether the graceful transfer succeeded.
+	if s.storage != nil {
+		if closer, ok := s.storage.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+	return removeErr
+}
+
+// TransferGroupLeadership asks the node managing groupID to transfer
+// leadership to the peer identified by to. Returns an error if groupID is not
+// registered. Use this to rebalance leaders across physical nodes without
+// stopping any group.
+func (m *Manager) TransferGroupLeadership(ctx context.Context, groupID uint64, to raft.NodeID) error {
+	return m.mgr.TransferGroupLeadership(ctx, groupID, to)
 }
 
 // initRaftForManager is a modified initRaft that uses a shared transport.

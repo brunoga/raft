@@ -203,7 +203,7 @@ func TestChaos_RandomLeaderCrashes(t *testing.T) {
 			c.Tick()
 			time.Sleep(time.Millisecond)
 			for i, n := range c.nodes {
-				if i != leaderIdx && n.StateSnapshot() == raft.Leader {
+				if i != leaderIdx && n.State() == raft.Leader {
 					newLeader = i
 					break
 				}
@@ -267,7 +267,7 @@ func TestChaos_NetworkPartitionAndHeal(t *testing.T) {
 	// Minority nodes must not be able to elect a leader (only 2/5 nodes).
 	c.TickN(100)
 	for _, idx := range minorityGroup {
-		if s := c.nodes[idx].StateSnapshot(); s == raft.Leader {
+		if s := c.nodes[idx].State(); s == raft.Leader {
 			t.Errorf("minority node %d became Leader during partition", idx)
 		}
 	}

@@ -95,7 +95,7 @@ func (m *MemStore) GetLogEntries(_ context.Context, lo, hi raft.Index) ([]raft.L
 	return slices.Clone(m.entries[lo-first : hi-first]), nil
 }
 
-func (m *MemStore) FirstIndex(_ context.Context) (raft.Index, error) {
+func (m *MemStore) FirstIndex() (raft.Index, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(m.entries) == 0 {
@@ -104,7 +104,7 @@ func (m *MemStore) FirstIndex(_ context.Context) (raft.Index, error) {
 	return m.entries[0].Index, nil
 }
 
-func (m *MemStore) LastIndex(_ context.Context) (raft.Index, error) {
+func (m *MemStore) LastIndex() (raft.Index, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if len(m.entries) == 0 {

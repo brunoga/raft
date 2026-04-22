@@ -268,6 +268,10 @@ type Node struct {
 
 	// --- RNG (used only in the event-loop goroutine) ------------------------
 	rng *rand.Rand
+
+	// handler is the Handler wrapper registered with the Transport. Created
+	// once in New() so Handler() always returns the same value.
+	handler *nodeHandler
 }
 
 // New creates a Node from cfg, loads persisted state, and caches the log
@@ -334,6 +338,7 @@ func New(cfg *Config) (*Node, error) {
 		rng:               rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
 	n.stopCtx, n.stopCancel = context.WithCancel(context.Background())
+	n.handler = &nodeHandler{n: n}
 
 	// If a snapshot exists, seed initialSnap so applyLoop can restore the
 	// state machine on its first iteration.
@@ -359,7 +364,7 @@ func New(cfg *Config) (*Node, error) {
 	n.resetElectionTimeout()
 
 	// Register with the transport so we can receive inbound RPCs.
-	n.cfg.Transport.Register(n.cfg.ID, n)
+	n.cfg.Transport.Register(n.cfg.ID, n.handler)
 
 	return n, nil
 }
@@ -411,6 +416,10 @@ func (n *Node) Tick() {
 // applied to the state machine, returning the state machine's result.
 // Returns ErrNotLeader if this node is not the leader, or ErrStopped if the
 // node has been stopped.
+//
+// ctx controls the caller-side wait: cancelling it unblocks Propose and
+// returns ctx.Err(). It does not set the deadline on outbound Raft RPCs —
+// use [Config.RPCTimeout] for that.
 func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	// Non-blocking pre-check: if stopCh is already closed, return immediately
 	// rather than racing with a buffered proposeCh.
@@ -466,7 +475,7 @@ func (n *Node) Status() GroupStatus {
 	return GroupStatus{
 		GroupID:     n.cfg.GroupID,
 		NodeID:      n.cfg.ID,
-		State:       n.StateSnapshot(),
+		State:       n.State(),
 		Term:        n.Term(),
 		LastApplied: n.LastApplied(),
 	}
@@ -490,9 +499,10 @@ func (n *Node) Members() []PeerConfig {
 	return out
 }
 
-// StateSnapshot returns the current role of this node. Safe for concurrent
-// use; reads from the atomic mirror that the event loop keeps in sync.
-func (n *Node) StateSnapshot() State {
+// State returns the current role of this node (Follower, Candidate, Leader, or
+// PreCandidate). Safe for concurrent use; reads from the atomic mirror that
+// the event loop keeps in sync.
+func (n *Node) State() State {
 	return State(n.atomicState.Load())
 }
 
@@ -528,6 +538,10 @@ func (n *Node) ProposeOnce(ctx context.Context, clientID NodeID, seqNum uint64, 
 // from their local state machine immediately after ReadIndex returns and
 // observe a linearizable snapshot.
 //
+// ctx controls the caller-side wait: cancelling it unblocks ReadIndex and
+// returns ctx.Err(). It does not set the deadline on the outbound ReadIndex
+// RPC to the leader — use [Config.RPCTimeout] for that.
+//
 // Returns ErrStopped if the node has been stopped.
 func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 	select {
@@ -538,7 +552,7 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 
 	// Fast path: if we are a follower and we know the leader, forward the RPC.
 	// We do this outside the event loop for better concurrency.
-	if n.StateSnapshot() != Leader {
+	if n.State() != Leader {
 		leaderID := n.Leader()
 		if leaderID == "" {
 			return 0, &NotLeaderError{}
@@ -596,7 +610,7 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	default:
 	}
 
-	if n.StateSnapshot() != Leader {
+	if n.State() != Leader {
 		return n.ReadIndex(ctx)
 	}
 
@@ -692,7 +706,7 @@ func (n *Node) ReadStale() Index {
 // if a transfer is already underway, and ErrStopped if the node is stopped.
 // On success the transfer has been initiated: the leader will stop accepting
 // proposals and send a TimeoutNow RPC to target once it is sufficiently
-// caught-up. The caller may poll StateSnapshot() to observe the step-down.
+// caught-up. The caller may poll State() to observe the step-down.
 func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 	select {
 	case <-n.stopCh:
@@ -863,24 +877,36 @@ func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
 	}
 }
 
-func (n *Node) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
-	return dispatchRPC[*RequestVoteResponse](ctx, n, req)
+// nodeHandler wraps a *Node and implements the Handler interface. It is the
+// value registered with the Transport so that the Handle* dispatch methods do
+// not appear on the public Node API.
+type nodeHandler struct{ n *Node }
+
+func (h *nodeHandler) HandleRequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	return dispatchRPC[*RequestVoteResponse](ctx, h.n, req)
 }
 
-func (n *Node) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
-	return dispatchRPC[*AppendEntriesResponse](ctx, n, req)
+func (h *nodeHandler) HandleAppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	return dispatchRPC[*AppendEntriesResponse](ctx, h.n, req)
 }
 
-func (n *Node) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
-	return dispatchRPC[*InstallSnapshotResponse](ctx, n, req)
+func (h *nodeHandler) HandleInstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	return dispatchRPC[*InstallSnapshotResponse](ctx, h.n, req)
 }
 
-func (n *Node) HandleTimeoutNow(ctx context.Context, req *TimeoutNowRequest) (*TimeoutNowResponse, error) {
-	return dispatchRPC[*TimeoutNowResponse](ctx, n, req)
+func (h *nodeHandler) HandleTimeoutNow(ctx context.Context, req *TimeoutNowRequest) (*TimeoutNowResponse, error) {
+	return dispatchRPC[*TimeoutNowResponse](ctx, h.n, req)
 }
 
-func (n *Node) HandleReadIndex(ctx context.Context, req *ReadIndexRequest) (*ReadIndexResponse, error) {
-	return dispatchRPC[*ReadIndexResponse](ctx, n, req)
+func (h *nodeHandler) HandleReadIndex(ctx context.Context, req *ReadIndexRequest) (*ReadIndexResponse, error) {
+	return dispatchRPC[*ReadIndexResponse](ctx, h.n, req)
+}
+
+// Handler returns the Handler that this node registers with its Transport.
+// Use this when you need to pass the node's RPC handler to a transport or
+// router (e.g. Manager.Lookup returns Handler values for a shared transport).
+func (n *Node) Handler() Handler {
+	return n.handler
 }
 
 // --- Internal helpers -------------------------------------------------------

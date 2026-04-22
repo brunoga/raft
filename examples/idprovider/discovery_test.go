@@ -62,7 +62,7 @@ func lateJoiner(t *testing.T, c *idpCluster, id raft.NodeID, knownPeers []raft.P
 	if err != nil {
 		t.Fatalf("raft.New(%s): %v", id, err)
 	}
-	c.net.Register(id, node)
+	c.net.Register(id, node.Handler())
 	node.Start()
 	return node
 }

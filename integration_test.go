@@ -38,7 +38,7 @@ func TestElection_SingleLeaderElected(t *testing.T) {
 	// Verify exactly one leader.
 	leaders := 0
 	for _, n := range c.nodes {
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			leaders++
 		}
 	}
@@ -66,7 +66,7 @@ func TestElection_ReelectAfterLeaderCrash(t *testing.T) {
 		c.Tick()
 		time.Sleep(time.Millisecond)
 		for i, n := range c.nodes {
-			if i != oldIdx && n.StateSnapshot() == raft.Leader {
+			if i != oldIdx && n.State() == raft.Leader {
 				newLeaderIdx = i
 				break
 			}
@@ -108,7 +108,7 @@ func TestElection_FollowerDoesNotGrantStaleVote(t *testing.T) {
 	c.TickN(20)
 	leaders := 0
 	for _, n := range c.nodes {
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			leaders++
 		}
 	}
@@ -250,14 +250,14 @@ func TestHeartbeat_LeaderMaintainsAuthority(t *testing.T) {
 	// The leader should remain leader (heartbeats prevent followers from timing out).
 	c.TickN(60)
 
-	if c.nodes[leaderIdx].StateSnapshot() != raft.Leader {
+	if c.nodes[leaderIdx].State() != raft.Leader {
 		t.Fatalf("leader should still be leader after heartbeats; state=%s",
-			c.nodes[leaderIdx].StateSnapshot())
+			c.nodes[leaderIdx].State())
 	}
 	// And still exactly one leader.
 	leaders := 0
 	for _, n := range c.nodes {
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			leaders++
 		}
 	}
@@ -275,7 +275,7 @@ func TestHeartbeat_FollowerDoesNotTimeOutUnderHeartbeat(t *testing.T) {
 
 	candidates := 0
 	for _, n := range c.nodes {
-		if n.StateSnapshot() == raft.Candidate {
+		if n.State() == raft.Candidate {
 			candidates++
 		}
 	}
@@ -524,7 +524,7 @@ func TestReadIndex_ForwardedRead_LeaderStepsDown(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		// Simulate a forwarded ReadIndex RPC arriving at the leader's handler.
-		_, err := leader.HandleReadIndex(ctx, &raft.ReadIndexRequest{Term: leaderTerm})
+		_, err := leader.Handler().HandleReadIndex(ctx, &raft.ReadIndexRequest{Term: leaderTerm})
 		errCh <- err
 	}()
 
@@ -575,7 +575,7 @@ func TestReadIndexRPC_StaleTerm_ServesRead(t *testing.T) {
 	}
 	resultCh := make(chan riResult, 1)
 	go func() {
-		resp, err := leader.HandleReadIndex(ctx, &raft.ReadIndexRequest{Term: 0})
+		resp, err := leader.Handler().HandleReadIndex(ctx, &raft.ReadIndexRequest{Term: 0})
 		resultCh <- riResult{resp, err}
 	}()
 
@@ -609,12 +609,12 @@ func TestReadIndexRPC_HigherTerm_StepsDown(t *testing.T) {
 	defer cancel()
 
 	// Send a ReadIndex RPC with a term higher than the leader's current term.
-	resp, err := leader.HandleReadIndex(ctx, &raft.ReadIndexRequest{Term: currentTerm + 1})
+	resp, err := leader.Handler().HandleReadIndex(ctx, &raft.ReadIndexRequest{Term: currentTerm + 1})
 	if !errors.Is(err, raft.ErrNotLeader) {
 		t.Fatalf("expected ErrNotLeader, got resp=%v err=%v", resp, err)
 	}
 	// The leader must have stepped down to follower.
-	if s := leader.StateSnapshot(); s != raft.Follower {
+	if s := leader.State(); s != raft.Follower {
 		t.Errorf("after higher-term ReadIndex, state = %s, want Follower", s)
 	}
 }
@@ -639,7 +639,7 @@ func TestPreVote_NodeBecomesPreCandidateFirst(t *testing.T) {
 	for range 60 {
 		n.Tick()
 		time.Sleep(time.Millisecond)
-		s := n.StateSnapshot()
+		s := n.State()
 		if s == raft.Candidate || s == raft.Leader {
 			t.Fatalf("node skipped PreCandidate and went directly to %s", s)
 		}
@@ -671,14 +671,14 @@ func TestPreVote_PartitionedNodeDoesNotDisruptCluster(t *testing.T) {
 	// The isolated node must still be a PreCandidate (stuck, can't win pre-vote)
 	// and must NOT have incremented into a real Candidate or done anything
 	// to the rest of the cluster.
-	if s := c.nodes[isolatedIdx].StateSnapshot(); s == raft.Candidate || s == raft.Leader {
+	if s := c.nodes[isolatedIdx].State(); s == raft.Candidate || s == raft.Leader {
 		t.Errorf("isolated node reached state %s, want PreCandidate or Follower", s)
 	}
 
 	// The remaining 4 nodes should still have exactly one leader.
 	leaders := 0
 	for i, n := range c.nodes {
-		if i != isolatedIdx && n.StateSnapshot() == raft.Leader {
+		if i != isolatedIdx && n.State() == raft.Leader {
 			leaders++
 		}
 	}
@@ -692,7 +692,7 @@ func TestPreVote_PartitionedNodeDoesNotDisruptCluster(t *testing.T) {
 
 	leaders = 0
 	for _, n := range c.nodes {
-		if n.StateSnapshot() == raft.Leader {
+		if n.State() == raft.Leader {
 			leaders++
 		}
 	}
@@ -763,7 +763,7 @@ func TestMembership_AddServer(t *testing.T) {
 		nodes = append(nodes, node)
 	}
 	for i, node := range nodes {
-		net.Register(ids[i], node)
+		net.Register(ids[i], node.Handler())
 	}
 	for _, node := range nodes {
 		node.Start()
@@ -786,7 +786,7 @@ func TestMembership_AddServer(t *testing.T) {
 		for time.Now().Before(deadline) {
 			tick()
 			for _, node := range nodes {
-				if node.StateSnapshot() == raft.Leader {
+				if node.State() == raft.Leader {
 					return node
 				}
 			}
@@ -833,7 +833,7 @@ proposed:
 	if err != nil {
 		t.Fatalf("New n3: %v", err)
 	}
-	net.Register("n3", n3)
+	net.Register("n3", n3.Handler())
 	n3.Start()
 	t.Cleanup(n3.Stop)
 	nodes = append(nodes, n3)
@@ -934,12 +934,12 @@ func TestLeadershipTransfer_LeaderStepsDown(t *testing.T) {
 	for time.Now().Before(deadline) {
 		c.Tick()
 		time.Sleep(time.Millisecond)
-		if leader.StateSnapshot() != raft.Leader {
+		if leader.State() != raft.Leader {
 			break
 		}
 	}
 
-	if leader.StateSnapshot() == raft.Leader {
+	if leader.State() == raft.Leader {
 		t.Fatal("old leader did not step down after leadership transfer")
 	}
 
@@ -950,7 +950,7 @@ func TestLeadershipTransfer_LeaderStepsDown(t *testing.T) {
 		c.Tick()
 		time.Sleep(time.Millisecond)
 		for i, n := range c.nodes {
-			if n.StateSnapshot() == raft.Leader {
+			if n.State() == raft.Leader {
 				newLeaderIdx = i
 				break
 			}
