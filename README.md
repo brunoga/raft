@@ -122,7 +122,7 @@ func main() {
       │  event loop │         │  event loop │
       └──────┬──────┘         └──────┬──────┘
              │   Transport RPC       │
-      ┌──────▼───────────────────────▼──────┐
+      ┌──────▼───────────────────────▼───────┐
       │  memtransport  │  grpctransport      │
       │                │  (batched hb: O(P)) │
       └────────────────┴─────────────────────┘
@@ -1039,7 +1039,7 @@ See [`easyraft/`](easyraft/) for the full documentation and API reference.
 
 ## Reference implementation
 
-Four fully-worked examples are provided, each targeting a different deployment pattern.
+Five fully-worked examples are provided, each targeting a different deployment pattern.
 
 ### `examples/idprovider` — single-group
 
