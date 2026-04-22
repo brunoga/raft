@@ -157,7 +157,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, "usage: stats [addr]")
 				continue
 			}
-			showStats(ctx, addr)
+			exampleutil.ShowNodeStats(ctx, addr)
 
 		case "help":
 			printHelp()
@@ -173,10 +173,6 @@ func main() {
 			return
 		}
 	}
-}
-
-func showStats(ctx context.Context, addr string) {
-	exampleutil.ShowNodeStats(ctx, addr)
 }
 
 func parseQuota(maxStr, refillStr string) (client.Quota, bool) {
