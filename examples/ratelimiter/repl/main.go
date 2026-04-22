@@ -150,11 +150,8 @@ func main() {
 			}
 
 		case "stats":
-			addr := addrs[0]
-			if len(fields) == 2 {
-				addr = fields[1]
-			} else if len(fields) > 2 {
-				fmt.Fprintln(os.Stderr, "usage: stats [addr]")
+			addr, ok := exampleutil.ParseOptionalAddr(fields, addrs[0])
+			if !ok {
 				continue
 			}
 			exampleutil.ShowNodeStats(ctx, addr)

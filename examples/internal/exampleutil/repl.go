@@ -11,6 +11,22 @@ import (
 	"strings"
 )
 
+// ParseOptionalAddr resolves the optional [addr] argument for the "stats"
+// command. fields is the already-split command line (fields[0] == "stats").
+// If no address argument is present, defaultAddr is returned. If the argument
+// count is wrong, an error is printed and ok is false.
+func ParseOptionalAddr(fields []string, defaultAddr string) (addr string, ok bool) {
+	switch len(fields) {
+	case 1:
+		return defaultAddr, true
+	case 2:
+		return fields[1], true
+	default:
+		fmt.Fprintln(os.Stderr, "usage: stats [addr]")
+		return "", false
+	}
+}
+
 // FetchJSON GETs a URL and decodes the JSON response into dst.
 func FetchJSON(ctx context.Context, url string, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
