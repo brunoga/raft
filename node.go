@@ -77,10 +77,10 @@ type Node struct {
 	atomicCommitIndex   atomic.Uint64 // mirrors commitIndex
 	atomicTerm          atomic.Uint64 // mirrors currentTerm
 	atomicSnapshotIndex atomic.Uint64 // mirrors log.snapMeta.LastIncludedIndex; updated by handleSnapshotResult
-	// atomicPeers mirrors cfg.Peers as a []NodeID snapshot; updated by
-	// applyConfigChange (event-loop only). Read by ReconfigureCluster outside
-	// the event loop to avoid a data race on cfg.Peers.
-	atomicPeers atomic.Value // stores []NodeID
+	// atomicPeers mirrors cfg.Peers as a []PeerConfig snapshot; updated by
+	// applyConfigChange (event-loop only). Read by ReconfigureCluster and
+	// Members outside the event loop to avoid a data race on cfg.Peers.
+	atomicPeers atomic.Value // stores []PeerConfig
 
 	// --- Volatile state (leader only; nil when not leader) ------------------
 	nextIndex  map[NodeID]Index
@@ -470,6 +470,24 @@ func (n *Node) Status() GroupStatus {
 		Term:        n.Term(),
 		LastApplied: n.LastApplied(),
 	}
+}
+
+// Members returns the current cluster membership as seen by this node: the
+// full peer list from the last applied configuration entry, plus this node
+// itself. The returned slice is a snapshot; it will not reflect future
+// membership changes.
+//
+// Safe for concurrent use; reads from the same atomic mirror that
+// ReconfigureCluster uses to avoid data races with the event loop.
+func (n *Node) Members() []PeerConfig {
+	var peers []PeerConfig
+	if v := n.atomicPeers.Load(); v != nil {
+		peers = v.([]PeerConfig)
+	}
+	out := make([]PeerConfig, 0, len(peers)+1)
+	out = append(out, PeerConfig{ID: n.cfg.ID, Voter: n.cfg.Voter})
+	out = append(out, peers...)
+	return out
 }
 
 // StateSnapshot returns the current role of this node. Safe for concurrent
@@ -1035,8 +1053,20 @@ func (n *Node) tickerLoop() {
 // applyRestore installs a snapshot into the state machine and resets the
 // apply goroutine's local tracking state. Called from both the priority-select
 // drain and the main select in applyLoop to avoid code duplication.
-func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index) map[NodeID]clientEntry {
+//
+// current is the apply goroutine's current client table. If the snapshot is
+// stale (its index ≤ localLastApplied) the restore is skipped and current is
+// returned unchanged. This guards against the following race: a duplicate
+// install result (caused by two concurrent snapshot goroutines both completing
+// for the same snapshot index) can push two restores onto restoreSnapshotCh;
+// if the second fires after log entries beyond the snapshot have already been
+// applied, skipping it prevents overwriting the newer SM state.
+func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current map[NodeID]clientEntry) map[NodeID]clientEntry {
 	defer func() { _ = si.r.Close() }()
+	if si.meta.LastIncludedIndex <= *localLastApplied {
+		// Stale restore: the SM already reflects a more recent state.
+		return current
+	}
 	if err := n.cfg.StateMachine.Restore(ctx, si.meta, si.r); err != nil {
 		n.logger.Error("applyLoop: Restore", "err", err)
 	}
@@ -1115,14 +1145,14 @@ func (n *Node) applyLoop() {
 		// goroutine reads (log entries via Storage) is immutable after being written.
 		select {
 		case si := <-n.restoreSnapshotCh:
-			localClientTable = n.applyRestore(ctx, si, &localLastApplied)
+			localClientTable = n.applyRestore(ctx, si, &localLastApplied, localClientTable)
 			continue
 		default:
 		}
 
 		select {
 		case si := <-n.restoreSnapshotCh:
-			localClientTable = n.applyRestore(ctx, si, &localLastApplied)
+			localClientTable = n.applyRestore(ctx, si, &localLastApplied, localClientTable)
 
 		case trig := <-n.snapshotTriggerCh:
 			// Take the snapshot here in applyLoop so Snapshot() and Apply()
