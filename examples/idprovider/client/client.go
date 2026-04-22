@@ -12,17 +12,14 @@
 package client
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"strconv"
-	"strings"
 	"sync"
+
+	"github.com/brunoga/raft/examples/internal/exampleutil"
 )
 
 // Sentinel errors returned by the client.
@@ -32,7 +29,7 @@ var (
 
 	// ErrNotLeader is returned when the request reaches a follower and no
 	// redirect is available. This is transient; retrying usually succeeds.
-	ErrNotLeader = errors.New("node is not the leader")
+	ErrNotLeader = exampleutil.ErrNotLeader
 )
 
 // AllocResult is returned by Next.
@@ -49,16 +46,11 @@ type DomainInfo struct {
 
 // Client is a thread-safe, high-level client for the idprovider service.
 type Client struct {
-	addrs    []string // seed node addresses, e.g. "http://host:8001"
-	clientID string   // stable identifier used for idempotency headers
+	inner    *exampleutil.Client
+	clientID string // stable identifier used for idempotency headers
 
-	// httpClient does not follow redirects so we can intercept 307 responses
-	// and update the cached leader address ourselves.
-	httpClient *http.Client
-
-	mu         sync.Mutex
-	leaderAddr string // cached leader; empty means unknown
-	seqNum     uint64 // monotonically increasing, protected by mu
+	mu     sync.Mutex
+	seqNum uint64 // monotonically increasing, protected by mu
 }
 
 // New returns a new idprovider client. addrs should be the HTTP addresses of
@@ -67,15 +59,8 @@ type Client struct {
 // exactly-once semantics; it must not be empty.
 func New(addrs []string, clientID string) *Client {
 	return &Client{
-		addrs:    addrs,
+		inner:    exampleutil.NewClient(addrs),
 		clientID: clientID,
-		httpClient: &http.Client{
-			// Disable automatic redirect following so we can intercept 307
-			// responses and update the cached leader address ourselves.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
 	}
 }
 
@@ -137,134 +122,22 @@ func (c *Client) Current(ctx context.Context, domain string, stale bool) (Domain
 // seed nodes. Idempotent operations carry X-Client-ID / X-Seq-Num headers;
 // the sequence number is incremented once per logical call (not per retry).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, result any, idempotent bool) error {
-	// Increment the sequence number exactly once per logical call so all
-	// retries of the same call share the same seq.
-	var seq uint64
+	var opts []exampleutil.RequestOption
 	if idempotent {
 		c.mu.Lock()
 		c.seqNum++
-		seq = c.seqNum
-		c.mu.Unlock()
-	}
-
-	// 1. Try the cached leader first.
-	c.mu.Lock()
-	leader := c.leaderAddr
-	c.mu.Unlock()
-
-	if leader != "" {
-		err := c.doOnce(ctx, leader, method, path, body, result, seq, false)
-		if err == nil {
-			return nil
-		}
-		if isTerminal(err) {
-			return err
-		}
-		// Leader is stale (down or re-elected). Clear the cache so future
-		// calls skip straight to the seed fan-out.
-		c.mu.Lock()
-		if c.leaderAddr == leader {
-			c.leaderAddr = ""
-		}
-		c.mu.Unlock()
-	}
-
-	// 2. Fan out to seed nodes until one succeeds.
-	var lastErr error
-	for _, addr := range c.addrs {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		err := c.doOnce(ctx, addr, method, path, body, result, seq, false)
-		if err == nil {
-			return nil
-		}
-		if isTerminal(err) {
-			return err
-		}
-		lastErr = err
-	}
-
-	if lastErr != nil {
-		return lastErr
-	}
-	return errors.New("no nodes available")
-}
-
-// doOnce performs a single HTTP request against addr. Idempotency headers are
-// set when seq > 0. If the server responds with a 307 redirect and followed is
-// false, it updates the leader cache and retries once. The followed flag
-// prevents redirect loops.
-func (c *Client) doOnce(ctx context.Context, addr, method, path string, body []byte, result any, seq uint64, followed bool) error {
-	urlStr := strings.TrimSuffix(addr, "/") + path
-
-	var reqBody io.Reader
-	if body != nil {
-		reqBody = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, reqBody)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if seq > 0 && c.clientID != "" {
-		req.Header.Set("X-Client-ID", c.clientID)
-		req.Header.Set("X-Seq-Num", strconv.FormatUint(seq, 10))
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTemporaryRedirect {
-		if followed {
-			return errors.New("redirect loop detected")
-		}
-		location := resp.Header.Get("Location")
-		if location == "" {
-			return errors.New("redirect with empty Location")
-		}
-		u, err := url.Parse(location)
-		if err != nil {
-			return fmt.Errorf("bad redirect location %q: %w", location, err)
-		}
-		newBase := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
-
-		c.mu.Lock()
-		c.leaderAddr = newBase
+		seq := c.seqNum
 		c.mu.Unlock()
 
-		return c.doOnce(ctx, newBase, method, path, body, result, seq, true)
+		opts = append(opts, func(req *http.Request) {
+			if c.clientID != "" {
+				req.Header.Set("X-Client-ID", c.clientID)
+				req.Header.Set("X-Seq-Num", strconv.FormatUint(seq, 10))
+			}
+		})
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if result != nil {
-			return json.NewDecoder(resp.Body).Decode(result)
-		}
-		return nil
-	}
-
-	// Read the response body for a meaningful error message (capped to avoid
-	// consuming runaway responses).
-	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	msg := strings.TrimSpace(string(errBody))
-
-	switch resp.StatusCode {
-	case http.StatusNotFound:
-		return ErrDomainNotFound
-	case http.StatusServiceUnavailable:
-		return ErrNotLeader
-	default:
-		if msg != "" {
-			return fmt.Errorf("server error %d: %s", resp.StatusCode, msg)
-		}
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
+	return c.inner.Do(ctx, 0, method, path, body, result, isTerminal, opts...)
 }
 
 // isTerminal reports whether err should stop the retry loop immediately.
