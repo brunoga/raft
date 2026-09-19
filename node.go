@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -127,6 +126,22 @@ type Node struct {
 	// jointSelfVoter is true if this node is a voter in the new configuration
 	// during joint consensus.
 	jointSelfVoter bool
+	// jointSelfVoterOld is this node's voting role in C_old, captured when the
+	// joint configuration was adopted. Quorum checks against C_old need it
+	// because cfg.Voter may already describe the new role.
+	jointSelfVoterOld bool
+
+	// --- Membership provenance ----------------------------------------------
+	// baseMembership is the membership recorded in the snapshot this node
+	// started from, or the bootstrap membership from Config when there is no
+	// snapshot. It is the base that config entries in the log are replayed on
+	// top of by rebuildMembership.
+	baseMembership membershipState
+	// configIndex is the log index of the config entry that established the
+	// membership currently in effect, or the snapshot index when it came from
+	// the snapshot base. A truncation at or below it invalidates the
+	// membership and forces a rebuild.
+	configIndex Index
 
 	// --- Check-quorum state (leader only) -----------------------------------
 	// leaderQuorumElapsed counts ticks since quorumAcks was last reset.
@@ -230,7 +245,12 @@ type Node struct {
 	readBatchGen       uint64              // incremented each time a new barrier is broadcast
 	readBatchAcks      map[NodeID]bool     // peers that ACKed the current barrier heartbeat
 	readBatchIndex     Index               // commitIndex captured when the batch started
-	pendingReads       []readIndexResolver // clients waiting for read-index confirmation
+	pendingReads       []readIndexResolver // clients waiting for the round in flight
+	// waitingReads holds requests that arrived while a confirmation round was
+	// already in flight. They cannot be answered by that round -- it proves
+	// leadership as of a moment before they arrived -- so they wait for the
+	// next one, started as soon as the current round completes.
+	waitingReads []readIndexResolver
 	// leaseExpiry is the wall-clock time until which the leader holds a valid
 	// read lease. Zero means no lease. Set in confirmReadBatch; cleared in
 	// becomeFollower. Used by ReadIndexLease to skip the heartbeat round-trip.
@@ -414,15 +434,30 @@ func New(cfg *Config) (*Node, error) {
 		rl.snapClientTable = nil // release reference
 	}
 
+	// Recover the membership. Config.Peers is only a bootstrap value: it
+	// applies when this node has no snapshot membership and no config entry in
+	// its log. Anything the cluster has since agreed takes precedence, because
+	// membership is replicated state and a node that forgets it can vote under
+	// the wrong quorum rules.
+	if rl.hasSnapMembership {
+		n.baseMembership = rl.snapMembership
+	} else {
+		n.baseMembership = membershipState{
+			members: withSelf(cfg.Peers, cfg.ID, true, cfg.Voter),
+		}
+	}
+	rl.snapMembership = membershipState{}
+	if err := n.rebuildMembership(context.Background()); err != nil {
+		return nil, fmt.Errorf("raft.New: recover membership: %w", err)
+	}
+
 	// Initialise atomic mirrors so external readers never see a nil value.
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
-	initPeers := make([]PeerConfig, len(cfg.Peers))
-	copy(initPeers, cfg.Peers)
-	n.atomicPeers.Store(initPeers)
+	n.storePeers()
 	n.resetElectionTimeout()
 
 	// Register with the transport so we can receive inbound RPCs.
@@ -884,7 +919,14 @@ func (n *Node) setLeaderID(id NodeID) {
 }
 
 // setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
+//
+// commitIndex is monotonic: an entry, once committed, stays committed. A
+// request that would move it backwards (a reordered or delayed RPC carrying an
+// older LeaderCommit) is ignored rather than trusted.
 func (n *Node) setCommitIndex(idx Index) {
+	if idx <= n.commitIndex {
+		return
+	}
 	n.commitIndex = idx
 	n.atomicCommitIndex.Store(uint64(idx))
 }
@@ -1109,10 +1151,12 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 		}
 		select {
 		case n.rpcCh <- rpcEnvelope{req: &appendResult{
-			peer:    peer,
-			term:    resp.Term,
-			success: resp.Success,
-			req:     req,
+			peer:          peer,
+			term:          resp.Term,
+			success:       resp.Success,
+			req:           req,
+			conflictIndex: resp.ConflictIndex,
+			conflictTerm:  resp.ConflictTerm,
 		}}:
 		case <-stop:
 			return
@@ -1147,7 +1191,7 @@ func (n *Node) tickerLoop() {
 // for the same snapshot index) can push two restores onto restoreSnapshotCh;
 // if the second fires after log entries beyond the snapshot have already been
 // applied, skipping it prevents overwriting the newer SM state.
-func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current map[NodeID]clientEntry) map[NodeID]clientEntry {
+func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current *clientLRU) *clientLRU {
 	defer func() { _ = si.r.Close() }()
 	if si.meta.LastIncludedIndex <= *localLastApplied {
 		// Stale restore: the SM already reflects a more recent state.
@@ -1162,8 +1206,8 @@ func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastAp
 	case n.applyAdvancedCh <- struct{}{}:
 	default:
 	}
-	newTable := make(map[NodeID]clientEntry, len(si.clientTable))
-	maps.Copy(newTable, si.clientTable)
+	newTable := newClientLRU(n.cfg.MaxClientTableSize)
+	newTable.loadFrom(si.clientTable)
 	return newTable
 }
 
@@ -1192,8 +1236,12 @@ func (n *Node) applyLoop() {
 	//
 	// Keeping a separate copy here (rather than reading n.clientTable) is
 	// necessary because n.clientTable is owned by the event-loop goroutine and
-	// must not be read from the apply goroutine without synchronisation.
-	localClientTable := make(map[NodeID]clientEntry)
+	// must not be read from the apply goroutine without synchronisation. It is
+	// bounded exactly like the event loop's copy and updated from the same
+	// sequence of entries, so the two hold the same contents, and so does every
+	// other replica's: whether a retry is deduplicated must not depend on which
+	// replica applies it.
+	localClientTable := newClientLRU(n.cfg.MaxClientTableSize)
 
 	// On restart from a snapshot: restore the state machine once before
 	// processing any committed entries. initialSnap is set once in New()
@@ -1202,7 +1250,7 @@ func (n *Node) applyLoop() {
 		_, r, err := n.cfg.Storage.LoadSnapshot(ctx)
 		if err == nil {
 			// Skip the framing header (meta and table already handled in New).
-			_, smReader, rerr := readWrappedSnapshot(r)
+			_, _, _, smReader, rerr := readWrappedSnapshot(r)
 			if rerr == nil {
 				if restoreErr := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, smReader); restoreErr != nil {
 					n.logger.Error("applyLoop: initial snapshot restore", "err", restoreErr)
@@ -1216,7 +1264,7 @@ func (n *Node) applyLoop() {
 		}
 		// Seed localClientTable from the snapshot's table so that entries
 		// already covered by the snapshot are not applied again on log replay.
-		maps.Copy(localClientTable, n.initialSnap.clientTable)
+		localClientTable.loadFrom(n.initialSnap.clientTable)
 		n.initialSnap = nil // release memory; event loop never reads this field
 	}
 
@@ -1249,7 +1297,7 @@ func (n *Node) applyLoop() {
 				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
 			}()
 
-			serr := writeWrappedSnapshot(pw, trig.clientTable, func(w io.Writer) error {
+			serr := writeWrappedSnapshot(pw, trig.clientTable, &trig.membership, func(w io.Writer) error {
 				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
 			})
 			_ = pw.Close() // signals EOF to SaveSnapshot
@@ -1261,8 +1309,9 @@ func (n *Node) applyLoop() {
 
 			select {
 			case n.snapshotResultCh <- snapshotResult{
-				meta: trig.meta,
-				err:  serr,
+				meta:       trig.meta,
+				membership: trig.membership,
+				err:        serr,
 			}:
 			case <-n.stopCh:
 				return
@@ -1317,7 +1366,7 @@ func (n *Node) applyLoop() {
 						// Malformed dedup header; apply as-is.
 						val, applyErr := n.cfg.StateMachine.Apply(ctx, entry)
 						ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
-					} else if cached, ok := localClientTable[clientID]; ok && seqNum == cached.seqNum {
+					} else if cached, ok := localClientTable.get(clientID); ok && seqNum == cached.seqNum {
 						// Exact duplicate: return the cached result without re-applying.
 						ar = applyResult{index: i, val: cached.result, cmd: entry.Command}
 					} else {
@@ -1329,7 +1378,7 @@ func (n *Node) applyLoop() {
 						// Update the local table immediately so subsequent entries
 						// in this batch see the up-to-date dedup state.
 						if applyErr == nil {
-							localClientTable[clientID] = clientEntry{seqNum: seqNum, result: val}
+							localClientTable.put(clientID, clientEntry{seqNum: seqNum, result: val})
 						}
 					}
 				default:

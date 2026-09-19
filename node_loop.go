@@ -66,7 +66,7 @@ func (n *Node) run() {
 			n.handleApplyResult(&ar)
 
 		case sr := <-n.snapshotResultCh:
-			n.handleSnapshotResult(sr)
+			n.handleSnapshotResult(&sr)
 		}
 	}
 }
@@ -144,7 +144,7 @@ func (n *Node) tick() {
 				if n.jointOld == nil {
 					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
 				} else {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, true) &&
+					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, n.jointSelfVoterOld) &&
 						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 				}
 				if !hasQuorum {
@@ -296,15 +296,20 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 
 	// Apply config changes to Raft's own peer list.
 	if ar.configCmd != nil {
-		n.applyConfigChange(ar.configCmd)
+		n.applyConfigChange(ar.configCmd, ar.index)
 		if n.pendingConfigIndex == ar.index {
 			n.pendingConfigIndex = 0
 		}
 	}
 
-	// Update the client dedup table for ProposeOnce entries. The LRU evicts
-	// the least-recently-used client automatically on put() when over cap.
-	if isDedupCmd(ar.cmd) {
+	// Record the outcome of a ProposeOnce entry so a retry gets the same answer.
+	//
+	// Only a successful apply is recorded. Caching a failure as though it were
+	// a result would answer the retry with a nil error and a nil result, so a
+	// caller whose command the state machine rejected would be told it
+	// succeeded. A failed command left unrecorded is simply re-run, which is
+	// the correct outcome for a command that never took effect.
+	if isDedupCmd(ar.cmd) && ar.err == nil {
 		if clientID, seqNum, _, err := decodeDedupCmd(ar.cmd); err == nil {
 			if cached, ok := n.clientTable.get(clientID); !ok || seqNum >= cached.seqNum {
 				n.clientTable.put(clientID, clientEntry{seqNum: seqNum, result: ar.val})
@@ -357,11 +362,20 @@ func (n *Node) drainPending(err error) {
 	n.drainPendingReads(err)
 }
 
-// drainPendingReads rejects all pending ReadIndex futures.
+// drainPendingReads rejects all outstanding ReadIndex futures, both those
+// waiting on the round in flight and those waiting for the next one.
 func (n *Node) drainPendingReads(err error) {
 	for _, p := range n.pendingReads {
 		p.reject(err)
 	}
+	clear(n.pendingReads)
 	n.pendingReads = n.pendingReads[:0]
+
+	for _, p := range n.waitingReads {
+		p.reject(err)
+	}
+	clear(n.waitingReads)
+	n.waitingReads = n.waitingReads[:0]
+
 	n.readBatchAcks = nil
 }

@@ -138,13 +138,24 @@ type Config struct {
 	// MaxClientTableSize caps the number of entries in the client dedup table
 	// used by ProposeOnce. Each entry records the latest (seqNum, result) pair
 	// for one client NodeID. When the table would exceed this size, the entry
-	// with the smallest seqNum (least recently active client) is evicted.
+	// written longest ago is evicted. Eviction order depends only on the order
+	// entries were written, which is the order of the log, so every replica
+	// evicts the same entry at the same point.
 	//
-	// In long-running clusters with many ephemeral client IDs the table grows
-	// without bound if this is zero, consuming memory indefinitely.
-	// DefaultConfig sets this to 100_000, which comfortably covers typical
-	// client populations while bounding the per-node overhead to a few tens
-	// of MiB.
+	// MUST be the same on every node in a group. A node with a smaller table
+	// forgets requests its peers still remember, so a client retry is
+	// re-executed there and skipped elsewhere, and the replicas diverge.
+	//
+	// Eviction is a real limit on the exactly-once guarantee: a client that
+	// retries a request after its entry has been evicted has that request
+	// executed a second time. Size the table so that it comfortably outlives
+	// the retry window of the slowest client.
+	//
+	// The bound is on entry count, not bytes; each entry also retains the
+	// result the state machine returned, so a state machine with large results
+	// needs a smaller table. In long-running clusters with many ephemeral
+	// client IDs the table grows without bound if this is zero, consuming
+	// memory indefinitely. DefaultConfig sets this to 100_000.
 	//
 	// Set to 0 to disable eviction (not recommended in production).
 	//
