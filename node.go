@@ -377,6 +377,12 @@ func New(cfg *Config) (*Node, error) {
 	electionMinTicks := max(2, int(cfg.ElectionTimeoutMin/tickInterval))
 	electionMaxTicks := max(electionMinTicks+1, int(cfg.ElectionTimeoutMax/tickInterval))
 
+	if cfg.SnapshotThreshold > 0 && cfg.TrailingLogs >= cfg.SnapshotThreshold {
+		logger.Warn("TrailingLogs is at or above SnapshotThreshold; capping it so that "+
+			"compaction still reclaims log space",
+			"trailingLogs", cfg.TrailingLogs, "snapshotThreshold", cfg.SnapshotThreshold)
+	}
+
 	rl, err := newRaftLog(cfg.Storage)
 	if err != nil {
 		return nil, fmt.Errorf("raft.New: %w", err)
@@ -1068,6 +1074,16 @@ func (n *Node) resetElectionTimeout() {
 	}
 	n.electionTimeout = n.electionMinTicks + n.rng.IntN(span)
 	n.electionElapsed = 0
+}
+
+// trailingLogs returns how many entries to retain behind the snapshot point,
+// capped so that compaction always reclaims something.
+func (n *Node) trailingLogs() Index {
+	trailing := Index(n.cfg.TrailingLogs)
+	if n.cfg.SnapshotThreshold > 0 && trailing >= Index(n.cfg.SnapshotThreshold) {
+		trailing = Index(n.cfg.SnapshotThreshold) - 1
+	}
+	return trailing
 }
 
 // snapshotChunkSize returns the maximum bytes per InstallSnapshot RPC chunk.
