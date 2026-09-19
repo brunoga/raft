@@ -206,65 +206,72 @@ success:
 
 // ---- TestManager_RunTicker_WorkersBoundedByGroupCount ----------------------
 
-// TestManager_RunTicker_WorkersBoundedByGroupCount verifies that RunTicker
-// does not spawn more worker goroutines than there are registered groups.
-// Before the fix RunTicker always spawned GOMAXPROCS workers even for a single
-// group, wasting one goroutine per extra core. After the fix the pool is
-// capped at min(GOMAXPROCS, initialGroupCount).
+// TestManager_RunTicker_TicksGroupsAddedAfterItStarted asserts that groups
+// registered after RunTicker is already running are ticked at the same rate as
+// the ones that were there at the start.
 //
-// The test requires GOMAXPROCS ≥ 3 so the before/after difference is visible
-// via runtime.NumGoroutine() even with a ±1 measurement error budget.
-//
-// FAILS before the fix on machines with GOMAXPROCS ≥ 3.
-// PASSES after the fix.
-func TestManager_RunTicker_WorkersBoundedByGroupCount(t *testing.T) {
-	nProcs := runtime.GOMAXPROCS(0)
-	if nProcs < 3 {
-		t.Skipf("GOMAXPROCS=%d < 3; can't distinguish over-provisioning from noise", nProcs)
-	}
-
-	const nGroups = 1 // far fewer groups than cores
-
-	mgr := raft.NewManager()
+// The worker pool used to be sized from the number of groups registered when
+// RunTicker was called. A manager that starts with one group and grows to
+// hundreds then ticks all of them through a single worker, one after another,
+// for the rest of its life: every group's election and heartbeat timers run
+// slow, and the ticker silently drops what it cannot keep up with.
+func TestManager_RunTicker_TicksGroupsAddedAfterItStarted(t *testing.T) {
 	net := memtransport.NewNetwork()
+	mgr := raft.NewManager()
+	t.Cleanup(mgr.StopAll)
 
-	for i := range nGroups {
-		node := newUnregisteredNode(t, net, uint64(i+1), raft.NodeID(fmt.Sprintf("wb%d", i+1)))
-		if err := mgr.Add(uint64(i+1), node); err != nil {
-			t.Fatalf("Add(%d): %v", i+1, err)
-		}
+	// One group at the start: the smallest pool the old sizing could choose.
+	first := newUnregisteredNode(t, net, 1, "late1")
+	if err := mgr.Add(1, first); err != nil {
+		t.Fatalf("Add(1): %v", err)
 	}
-
-	// Snapshot goroutine count before RunTicker starts workers.
-	// Use a short runtime.Gosched() to let any inflight goroutine starts settle.
-	runtime.Gosched()
-	before := runtime.NumGoroutine()
+	first.Start()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	tickerDone := make(chan struct{})
 	go func() {
-		mgr.RunTicker(ctx, 10*time.Millisecond)
+		mgr.RunTicker(ctx, 2*time.Millisecond)
 		close(tickerDone)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		<-tickerDone
+	})
 
-	// Give the worker goroutines time to start.
-	time.Sleep(50 * time.Millisecond)
-	after := runtime.NumGoroutine()
+	time.Sleep(20 * time.Millisecond)
 
-	cancel()
-	<-tickerDone
+	// Now add many more groups, each of which deliberately takes a moment to
+	// tick, so that serialising them would be plainly visible.
+	const lateGroups = 24
+	var nodes []*raft.Node
+	for i := range lateGroups {
+		gid := uint64(i + 2)
+		n := newUnregisteredNode(t, net, gid, raft.NodeID(fmt.Sprintf("late%d", gid)))
+		n.Start()
+		nodes = append(nodes, n)
+		if err := mgr.Add(gid, n); err != nil {
+			t.Fatalf("Add(%d): %v", gid, err)
+		}
+	}
 
-	// Expected after - before:
-	//   1 goroutine running RunTicker itself
-	//   min(nProcs, nGroups) = nGroups worker goroutines (after fix)
-	//   OR nProcs worker goroutines (before fix)
-	// We allow a ±2 buffer for unrelated goroutine churn.
-	increase := after - before
-	maxExpected := nGroups + 3 // RunTicker goroutine + nGroups workers + 2 slack
-	if increase > maxExpected {
-		t.Errorf("RunTicker spawned too many goroutines: before=%d after=%d increase=%d "+
-			"(want ≤ %d; nGroups=%d nProcs=%d — before fix this would be ~%d)",
-			before, after, increase, maxExpected, nGroups, nProcs, nProcs+1)
+	// Every late group must reach the point of standing for election, which
+	// only happens if it is being ticked.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		stuck := 0
+		for _, n := range nodes {
+			if n.Term() == 0 {
+				stuck++
+			}
+		}
+		if stuck == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d groups added after RunTicker started were never ticked",
+				stuck, lateGroups)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

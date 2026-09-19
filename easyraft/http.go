@@ -713,7 +713,7 @@ func (m *Manager) handleBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
-	status := m.mgr.StatusAll()
+	status := m.mgr.StatusAll(r.Context())
 	writeJSON(w, http.StatusOK, status, m.cfg.Logger)
 }
 

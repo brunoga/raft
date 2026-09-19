@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -127,6 +126,22 @@ type Node struct {
 	// jointSelfVoter is true if this node is a voter in the new configuration
 	// during joint consensus.
 	jointSelfVoter bool
+	// jointSelfVoterOld is this node's voting role in C_old, captured when the
+	// joint configuration was adopted. Quorum checks against C_old need it
+	// because cfg.Voter may already describe the new role.
+	jointSelfVoterOld bool
+
+	// --- Membership provenance ----------------------------------------------
+	// baseMembership is the membership recorded in the snapshot this node
+	// started from, or the bootstrap membership from Config when there is no
+	// snapshot. It is the base that config entries in the log are replayed on
+	// top of by rebuildMembership.
+	baseMembership membershipState
+	// configIndex is the log index of the config entry that established the
+	// membership currently in effect, or the snapshot index when it came from
+	// the snapshot base. A truncation at or below it invalidates the
+	// membership and forces a rebuild.
+	configIndex Index
 
 	// --- Check-quorum state (leader only) -----------------------------------
 	// leaderQuorumElapsed counts ticks since quorumAcks was last reset.
@@ -230,7 +245,12 @@ type Node struct {
 	readBatchGen       uint64              // incremented each time a new barrier is broadcast
 	readBatchAcks      map[NodeID]bool     // peers that ACKed the current barrier heartbeat
 	readBatchIndex     Index               // commitIndex captured when the batch started
-	pendingReads       []readIndexResolver // clients waiting for read-index confirmation
+	pendingReads       []readIndexResolver // clients waiting for the round in flight
+	// waitingReads holds requests that arrived while a confirmation round was
+	// already in flight. They cannot be answered by that round -- it proves
+	// leadership as of a moment before they arrived -- so they wait for the
+	// next one, started as soon as the current round completes.
+	waitingReads []readIndexResolver
 	// leaseExpiry is the wall-clock time until which the leader holds a valid
 	// read lease. Zero means no lease. Set in confirmReadBatch; cleared in
 	// becomeFollower. Used by ReadIndexLease to skip the heartbeat round-trip.
@@ -272,6 +292,68 @@ type Node struct {
 	// handler is the Handler wrapper registered with the Transport. Created
 	// once in New() so Handler() always returns the same value.
 	handler *nodeHandler
+
+	// fatalErr holds the first durable-write failure this node hit, if any.
+	// Setting it stops the node; it is read by FatalError and reported in
+	// place of ErrStopped by every operation afterwards.
+	fatalErr atomic.Value // stores error
+}
+
+// fail stops the node because a write Raft's safety argument depends on did not
+// reach stable storage. Only the first failure is recorded. Event-loop only.
+//
+// Continuing is not an option: a node that acts on a term, vote or log entry
+// that may not survive a restart can vote twice in one term, or acknowledge
+// entries a leader then counts towards a commit quorum although they are not
+// durable. Stopping keeps the failure local to this node, where the rest of the
+// cluster treats it as an ordinary unreachable peer.
+func (n *Node) fail(err error, op string) {
+	wrapped := fmt.Errorf("%w: %s: %w", ErrNodeFailed, op, err)
+	if !n.fatalErr.CompareAndSwap(nil, wrapped) {
+		return // already failing; keep the first error
+	}
+	n.logger.Error("fatal: durable write failed; stopping this node",
+		"op", op, "err", err)
+	if n.cfg.OnFatal != nil {
+		go n.cfg.OnFatal(wrapped)
+	}
+	// Stop from a separate goroutine: Stop waits for the event loop to exit,
+	// and fail is called from inside it.
+	go n.Stop()
+}
+
+// FatalError returns the durable-write failure that stopped this node, or nil
+// if it is running or was stopped normally. Safe for concurrent use.
+func (n *Node) FatalError() error {
+	if v := n.fatalErr.Load(); v != nil {
+		return v.(error)
+	}
+	return nil
+}
+
+// checkRunning reports why an operation cannot proceed, or nil if the node is
+// running. A node that stopped because of a durable-write failure reports that
+// failure rather than a plain shutdown, so a caller can tell "this node is
+// broken" from "this node was asked to stop".
+func (n *Node) checkRunning() error {
+	if err := n.FatalError(); err != nil {
+		return err
+	}
+	select {
+	case <-n.stopCh:
+		return ErrStopped
+	default:
+	}
+	return nil
+}
+
+// stoppedErr is what operations report once the node is no longer running:
+// the failure that stopped it if there was one, ErrStopped otherwise.
+func (n *Node) stoppedErr() error {
+	if err := n.FatalError(); err != nil {
+		return err
+	}
+	return ErrStopped
 }
 
 // New creates a Node from cfg, loads persisted state, and caches the log
@@ -294,6 +376,12 @@ func New(cfg *Config) (*Node, error) {
 	heartbeatTicks := max(1, int(cfg.HeartbeatInterval/tickInterval))
 	electionMinTicks := max(2, int(cfg.ElectionTimeoutMin/tickInterval))
 	electionMaxTicks := max(electionMinTicks+1, int(cfg.ElectionTimeoutMax/tickInterval))
+
+	if cfg.SnapshotThreshold > 0 && cfg.TrailingLogs >= cfg.SnapshotThreshold {
+		logger.Warn("TrailingLogs is at or above SnapshotThreshold; capping it so that "+
+			"compaction still reclaims log space",
+			"trailingLogs", cfg.TrailingLogs, "snapshotThreshold", cfg.SnapshotThreshold)
+	}
 
 	rl, err := newRaftLog(cfg.Storage)
 	if err != nil {
@@ -352,15 +440,30 @@ func New(cfg *Config) (*Node, error) {
 		rl.snapClientTable = nil // release reference
 	}
 
+	// Recover the membership. Config.Peers is only a bootstrap value: it
+	// applies when this node has no snapshot membership and no config entry in
+	// its log. Anything the cluster has since agreed takes precedence, because
+	// membership is replicated state and a node that forgets it can vote under
+	// the wrong quorum rules.
+	if rl.hasSnapMembership {
+		n.baseMembership = rl.snapMembership
+	} else {
+		n.baseMembership = membershipState{
+			members: withSelf(cfg.Peers, cfg.ID, true, cfg.Voter),
+		}
+	}
+	rl.snapMembership = membershipState{}
+	if err := n.rebuildMembership(context.Background()); err != nil {
+		return nil, fmt.Errorf("raft.New: recover membership: %w", err)
+	}
+
 	// Initialise atomic mirrors so external readers never see a nil value.
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
-	initPeers := make([]PeerConfig, len(cfg.Peers))
-	copy(initPeers, cfg.Peers)
-	n.atomicPeers.Store(initPeers)
+	n.storePeers()
 	n.resetElectionTimeout()
 
 	// Register with the transport so we can receive inbound RPCs.
@@ -417,16 +520,18 @@ func (n *Node) Tick() {
 // Returns ErrNotLeader if this node is not the leader, or ErrStopped if the
 // node has been stopped.
 //
+// cmd is retained, not copied: it is written to the log, sent to followers, and
+// handed to StateMachine.Apply. The caller must not modify it after this call,
+// including after it returns, since a snapshot may still read it.
+//
 // ctx controls the caller-side wait: cancelling it unblocks Propose and
 // returns ctx.Err(). It does not set the deadline on outbound Raft RPCs —
 // use [Config.RPCTimeout] for that.
 func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
-	// Non-blocking pre-check: if stopCh is already closed, return immediately
-	// rather than racing with a buffered proposeCh.
-	select {
-	case <-n.stopCh:
-		return nil, ErrStopped
-	default:
+	// Non-blocking pre-check: if the node is stopped or broken, return
+	// immediately rather than racing with a buffered proposeCh.
+	if err := n.checkRunning(); err != nil {
+		return nil, err
 	}
 
 	respCh := make(chan result[[]byte], 1)
@@ -436,7 +541,7 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.stopCh:
-		return nil, ErrStopped
+		return nil, n.stoppedErr()
 	}
 	select {
 	case r := <-respCh:
@@ -444,7 +549,7 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.stopCh:
-		return nil, ErrStopped
+		return nil, n.stoppedErr()
 	}
 }
 
@@ -472,12 +577,20 @@ func (n *Node) isSingleVoter() bool {
 // GroupStatus. It is a convenience wrapper that performs the same atomic reads
 // as Manager.StatusAll and is useful when you hold a *Node directly.
 func (n *Node) Status() GroupStatus {
+	voter := false
+	for _, m := range n.Members() {
+		if m.ID == n.cfg.ID {
+			voter = m.Voter
+			break
+		}
+	}
 	return GroupStatus{
 		GroupID:     n.cfg.GroupID,
 		NodeID:      n.cfg.ID,
 		State:       n.State(),
 		Term:        n.Term(),
 		LastApplied: n.LastApplied(),
+		Voter:       voter,
 	}
 }
 
@@ -522,6 +635,9 @@ func (n *Node) Leader() NodeID {
 // The caller is responsible for choosing seqNums correctly: a new, never-seen
 // seqNum triggers a normal propose; the same seqNum retried after a timeout
 // returns the cached result idempotently.
+//
+// As with Propose, cmd is retained rather than copied and must not be modified
+// after this call.
 func (n *Node) ProposeOnce(ctx context.Context, clientID NodeID, seqNum uint64, cmd []byte) ([]byte, error) {
 	return n.Propose(ctx, encodeDedupCmd(clientID, seqNum, cmd))
 }
@@ -544,10 +660,8 @@ func (n *Node) ProposeOnce(ctx context.Context, clientID NodeID, seqNum uint64, 
 //
 // Returns ErrStopped if the node has been stopped.
 func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
-	select {
-	case <-n.stopCh:
-		return 0, ErrStopped
-	default:
+	if err := n.checkRunning(); err != nil {
+		return 0, err
 	}
 
 	// Fast path: if we are a follower and we know the leader, forward the RPC.
@@ -578,7 +692,7 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 	select {
 	case r := <-respCh:
@@ -592,7 +706,7 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 }
 
@@ -604,10 +718,8 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 // If called on a follower, it behaves exactly like ReadIndex (forwarding to the
 // leader), as followers do not hold read leases.
 func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
-	select {
-	case <-n.stopCh:
-		return 0, ErrStopped
-	default:
+	if err := n.checkRunning(); err != nil {
+		return 0, err
 	}
 
 	if n.State() != Leader {
@@ -624,7 +736,7 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 	select {
 	case r := <-respCh:
@@ -638,7 +750,7 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 }
 
@@ -654,7 +766,7 @@ func (n *Node) waitApplied(ctx context.Context, index Index) (Index, error) {
 		case <-ctx.Done():
 			return last, ctx.Err()
 		case <-n.stopCh:
-			return last, ErrStopped
+			return last, n.stoppedErr()
 		case <-n.applyAdvancedCh:
 			// Re-check LastApplied on next iteration.
 		}
@@ -708,10 +820,8 @@ func (n *Node) ReadStale() Index {
 // proposals and send a TimeoutNow RPC to target once it is sufficiently
 // caught-up. The caller may poll State() to observe the step-down.
 func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
-	select {
-	case <-n.stopCh:
-		return ErrStopped
-	default:
+	if err := n.checkRunning(); err != nil {
+		return err
 	}
 
 	respCh := make(chan error, 1)
@@ -721,7 +831,7 @@ func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-n.stopCh:
-		return ErrStopped
+		return n.stoppedErr()
 	}
 	select {
 	case err := <-respCh:
@@ -729,7 +839,7 @@ func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-n.stopCh:
-		return ErrStopped
+		return n.stoppedErr()
 	}
 }
 
@@ -830,7 +940,14 @@ func (n *Node) setLeaderID(id NodeID) {
 }
 
 // setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
+//
+// commitIndex is monotonic: an entry, once committed, stays committed. A
+// request that would move it backwards (a reordered or delayed RPC carrying an
+// older LeaderCommit) is ignored rather than trusted.
 func (n *Node) setCommitIndex(idx Index) {
+	if idx <= n.commitIndex {
+		return
+	}
 	n.commitIndex = idx
 	n.atomicCommitIndex.Store(uint64(idx))
 }
@@ -843,6 +960,11 @@ func (n *Node) setCommitIndex(idx Index) {
 // event-loop goroutine and waits for the response. The type parameter R is
 // the expected concrete response type.
 func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
+	if err := n.checkRunning(); err != nil {
+		var zero R
+		return zero, err
+	}
+
 	respCh := make(chan rpcResponse, 1)
 	env := rpcEnvelope{req: req, respCh: respCh}
 
@@ -853,7 +975,7 @@ func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
 		return zero, ctx.Err()
 	case <-n.stopCh:
 		var zero R
-		return zero, ErrStopped
+		return zero, n.stoppedErr()
 	}
 
 	select {
@@ -873,7 +995,7 @@ func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
 		return zero, ctx.Err()
 	case <-n.stopCh:
 		var zero R
-		return zero, ErrStopped
+		return zero, n.stoppedErr()
 	}
 }
 
@@ -923,6 +1045,7 @@ func (n *Node) saveTerm(term Term, votedFor NodeID) error {
 		CurrentTerm: term,
 		VotedFor:    votedFor,
 	}); err != nil {
+		n.fail(err, "persist term and vote")
 		return fmt.Errorf("saveTerm: %w", err)
 	}
 	n.currentTerm = term
@@ -966,6 +1089,16 @@ func (n *Node) resetElectionTimeout() {
 	}
 	n.electionTimeout = n.electionMinTicks + n.rng.IntN(span)
 	n.electionElapsed = 0
+}
+
+// trailingLogs returns how many entries to retain behind the snapshot point,
+// capped so that compaction always reclaims something.
+func (n *Node) trailingLogs() Index {
+	trailing := Index(n.cfg.TrailingLogs)
+	if n.cfg.SnapshotThreshold > 0 && trailing >= Index(n.cfg.SnapshotThreshold) {
+		trailing = Index(n.cfg.SnapshotThreshold) - 1
+	}
+	return trailing
 }
 
 // snapshotChunkSize returns the maximum bytes per InstallSnapshot RPC chunk.
@@ -1049,10 +1182,12 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 		}
 		select {
 		case n.rpcCh <- rpcEnvelope{req: &appendResult{
-			peer:    peer,
-			term:    resp.Term,
-			success: resp.Success,
-			req:     req,
+			peer:          peer,
+			term:          resp.Term,
+			success:       resp.Success,
+			req:           req,
+			conflictIndex: resp.ConflictIndex,
+			conflictTerm:  resp.ConflictTerm,
 		}}:
 		case <-stop:
 			return
@@ -1087,7 +1222,7 @@ func (n *Node) tickerLoop() {
 // for the same snapshot index) can push two restores onto restoreSnapshotCh;
 // if the second fires after log entries beyond the snapshot have already been
 // applied, skipping it prevents overwriting the newer SM state.
-func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current map[NodeID]clientEntry) map[NodeID]clientEntry {
+func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current *clientLRU) *clientLRU {
 	defer func() { _ = si.r.Close() }()
 	if si.meta.LastIncludedIndex <= *localLastApplied {
 		// Stale restore: the SM already reflects a more recent state.
@@ -1102,8 +1237,8 @@ func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastAp
 	case n.applyAdvancedCh <- struct{}{}:
 	default:
 	}
-	newTable := make(map[NodeID]clientEntry, len(si.clientTable))
-	maps.Copy(newTable, si.clientTable)
+	newTable := newClientLRU(n.cfg.MaxClientTableSize)
+	newTable.loadFrom(si.clientTable)
 	return newTable
 }
 
@@ -1132,8 +1267,12 @@ func (n *Node) applyLoop() {
 	//
 	// Keeping a separate copy here (rather than reading n.clientTable) is
 	// necessary because n.clientTable is owned by the event-loop goroutine and
-	// must not be read from the apply goroutine without synchronisation.
-	localClientTable := make(map[NodeID]clientEntry)
+	// must not be read from the apply goroutine without synchronisation. It is
+	// bounded exactly like the event loop's copy and updated from the same
+	// sequence of entries, so the two hold the same contents, and so does every
+	// other replica's: whether a retry is deduplicated must not depend on which
+	// replica applies it.
+	localClientTable := newClientLRU(n.cfg.MaxClientTableSize)
 
 	// On restart from a snapshot: restore the state machine once before
 	// processing any committed entries. initialSnap is set once in New()
@@ -1142,7 +1281,7 @@ func (n *Node) applyLoop() {
 		_, r, err := n.cfg.Storage.LoadSnapshot(ctx)
 		if err == nil {
 			// Skip the framing header (meta and table already handled in New).
-			_, smReader, rerr := readWrappedSnapshot(r)
+			_, _, _, smReader, rerr := readWrappedSnapshot(r)
 			if rerr == nil {
 				if restoreErr := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, smReader); restoreErr != nil {
 					n.logger.Error("applyLoop: initial snapshot restore", "err", restoreErr)
@@ -1156,7 +1295,7 @@ func (n *Node) applyLoop() {
 		}
 		// Seed localClientTable from the snapshot's table so that entries
 		// already covered by the snapshot are not applied again on log replay.
-		maps.Copy(localClientTable, n.initialSnap.clientTable)
+		localClientTable.loadFrom(n.initialSnap.clientTable)
 		n.initialSnap = nil // release memory; event loop never reads this field
 	}
 
@@ -1189,7 +1328,7 @@ func (n *Node) applyLoop() {
 				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
 			}()
 
-			serr := writeWrappedSnapshot(pw, trig.clientTable, func(w io.Writer) error {
+			serr := writeWrappedSnapshot(pw, trig.clientTable, &trig.membership, func(w io.Writer) error {
 				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
 			})
 			_ = pw.Close() // signals EOF to SaveSnapshot
@@ -1201,8 +1340,9 @@ func (n *Node) applyLoop() {
 
 			select {
 			case n.snapshotResultCh <- snapshotResult{
-				meta: trig.meta,
-				err:  serr,
+				meta:       trig.meta,
+				membership: trig.membership,
+				err:        serr,
 			}:
 			case <-n.stopCh:
 				return
@@ -1257,7 +1397,7 @@ func (n *Node) applyLoop() {
 						// Malformed dedup header; apply as-is.
 						val, applyErr := n.cfg.StateMachine.Apply(ctx, entry)
 						ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
-					} else if cached, ok := localClientTable[clientID]; ok && seqNum == cached.seqNum {
+					} else if cached, ok := localClientTable.get(clientID); ok && seqNum == cached.seqNum {
 						// Exact duplicate: return the cached result without re-applying.
 						ar = applyResult{index: i, val: cached.result, cmd: entry.Command}
 					} else {
@@ -1269,7 +1409,7 @@ func (n *Node) applyLoop() {
 						// Update the local table immediately so subsequent entries
 						// in this batch see the up-to-date dedup state.
 						if applyErr == nil {
-							localClientTable[clientID] = clientEntry{seqNum: seqNum, result: val}
+							localClientTable.put(clientID, clientEntry{seqNum: seqNum, result: val})
 						}
 					}
 				default:
