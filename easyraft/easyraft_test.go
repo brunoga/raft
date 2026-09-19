@@ -3,7 +3,6 @@ package easyraft_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +20,7 @@ type Counter struct {
 }
 
 func TestEasyRaft_UDPDiscovery(t *testing.T) {
+	n1Addr, n2Addr := freePort(t), freePort(t)
 	tmpDir, err := os.MkdirTemp("", "easyraft-udp-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -33,21 +33,21 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 	// and exercises the AddServer path (peers are already members, so it's a
 	// harmless no-op after the first successful call).
 	peers := map[raft.NodeID]string{
-		"n1": "127.0.0.1:9092",
-		"n2": "127.0.0.1:9093",
+		"n1": n1Addr,
+		"n2": n2Addr,
 	}
 
 	// Node 1
 	d1, err := udpbroadcast.New(&udpbroadcast.Config{
 		NodeID: "n1",
-		Addr:   "127.0.0.1:9092",
+		Addr:   n1Addr,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	er1, err := easyraft.New[Counter](
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9092"),
+		easyraft.WithRaftAddr(n1Addr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(peers),
 		easyraft.WithDiscovery(d1, 200*time.Millisecond),
@@ -59,14 +59,14 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 	// Node 2
 	d2, err := udpbroadcast.New(&udpbroadcast.Config{
 		NodeID: "n2",
-		Addr:   "127.0.0.1:9093",
+		Addr:   n2Addr,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	er2, err := easyraft.New[Counter](
 		easyraft.WithID("n2"),
-		easyraft.WithRaftAddr("127.0.0.1:9093"),
+		easyraft.WithRaftAddr(n2Addr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
 		easyraft.WithPeers(peers),
 		easyraft.WithDiscovery(d2, 200*time.Millisecond),
@@ -113,6 +113,7 @@ ready:
 }
 
 func TestEasyRaft_Basic(t *testing.T) {
+	n1Addr := freePort(t)
 
 	tmpDir, err := os.MkdirTemp("", "easyraft-test-*")
 	if err != nil {
@@ -123,12 +124,12 @@ func TestEasyRaft_Basic(t *testing.T) {
 	}()
 
 	peers := map[raft.NodeID]string{
-		"n1": "127.0.0.1:9091",
+		"n1": n1Addr,
 	}
 
 	er, err := easyraft.New[Counter](
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9091"),
+		easyraft.WithRaftAddr(n1Addr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(peers),
 	)
@@ -202,6 +203,7 @@ func TestEasyRaft_Basic(t *testing.T) {
 }
 
 func TestEasyRaft_HTTP(t *testing.T) {
+	raftAddr, httpAddr := freePort(t), freePort(t)
 	tmpDir, err := os.MkdirTemp("", "easyraft-http-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -212,10 +214,10 @@ func TestEasyRaft_HTTP(t *testing.T) {
 
 	er, err := easyraft.New[Counter](
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9094"),
-		easyraft.WithHTTPAddr("127.0.0.1:8084"),
+		easyraft.WithRaftAddr(raftAddr),
+		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9094"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +233,7 @@ func TestEasyRaft_HTTP(t *testing.T) {
 	// Test HTTP Create (using /default/h1 instead of legacy /items/h1)
 	val := Counter{Value: 100}
 	b, _ := json.Marshal(val)
-	resp, err := http.Post("http://127.0.0.1:8084/default/h1", "application/json", strings.NewReader(string(b)))
+	resp, err := http.Post("http://"+httpAddr+"/default/h1", "application/json", strings.NewReader(string(b)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +243,7 @@ func TestEasyRaft_HTTP(t *testing.T) {
 	}
 
 	// Test HTTP Read
-	resp, err = http.Get("http://127.0.0.1:8084/default/h1")
+	resp, err = http.Get("http://" + httpAddr + "/default/h1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +260,7 @@ func TestEasyRaft_HTTP(t *testing.T) {
 	}
 
 	// Test HTTP Status
-	respStatus, err := http.Get("http://127.0.0.1:8084/status")
+	respStatus, err := http.Get("http://" + httpAddr + "/status")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,6 +271,7 @@ func TestEasyRaft_HTTP(t *testing.T) {
 }
 
 func TestStore_MultiCollection(t *testing.T) {
+	raftAddr := freePort(t)
 	tmpDir, err := os.MkdirTemp("", "store-multi-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -279,9 +282,9 @@ func TestStore_MultiCollection(t *testing.T) {
 
 	s, err := easyraft.NewStore(
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9095"),
+		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9095"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -318,6 +321,7 @@ func TestStore_MultiCollection(t *testing.T) {
 	}
 }
 func TestStore_Txn(t *testing.T) {
+	raftAddr := freePort(t)
 	tmpDir, err := os.MkdirTemp("", "store-txn-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -328,9 +332,9 @@ func TestStore_Txn(t *testing.T) {
 
 	s, err := easyraft.NewStore(
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9096"),
+		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9096"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -369,6 +373,7 @@ func TestStore_Txn(t *testing.T) {
 }
 
 func TestStore_Txn_Rollback(t *testing.T) {
+	raftAddr := freePort(t)
 	tmpDir, err := os.MkdirTemp("", "store-txn-rollback-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -377,9 +382,9 @@ func TestStore_Txn_Rollback(t *testing.T) {
 
 	s, err := easyraft.NewStore(
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9107"),
+		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9107"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -431,6 +436,7 @@ func TestStore_Txn_Rollback(t *testing.T) {
 }
 
 func TestStore_ProposeOnce(t *testing.T) {
+	raftAddr := freePort(t)
 	tmpDir, err := os.MkdirTemp("", "store-once-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -441,9 +447,9 @@ func TestStore_ProposeOnce(t *testing.T) {
 
 	s, err := easyraft.NewStore(
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9097"),
+		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9097"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -484,6 +490,7 @@ func TestStore_ProposeOnce(t *testing.T) {
 }
 
 func TestManager_MultiRaft(t *testing.T) {
+	raftAddr, httpAddr := freePort(t), freePort(t)
 	tmpDir, err := os.MkdirTemp("", "mgr-multi-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -494,9 +501,9 @@ func TestManager_MultiRaft(t *testing.T) {
 
 	mgr, err := easyraft.NewManager(
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9098"),
-		easyraft.WithHTTPAddr("127.0.0.1:8088"),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9098"}),
+		easyraft.WithRaftAddr(raftAddr),
+		easyraft.WithHTTPAddr(httpAddr),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -537,7 +544,7 @@ func TestManager_MultiRaft(t *testing.T) {
 	}
 
 	// Test HTTP routing for Multi-Raft
-	resp, err := http.Get("http://127.0.0.1:8088/groups/1/data/k1")
+	resp, err := http.Get("http://" + httpAddr + "/groups/1/data/k1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,6 +558,8 @@ func TestManager_MultiRaft(t *testing.T) {
 // cluster by posting to the seed's /join endpoint via WithJoinAddr, without
 // knowing any peer addresses upfront.
 func TestEasyRaft_Join(t *testing.T) {
+	n1RaftAddr, n1HTTPAddr := freePort(t), freePort(t)
+	n2RaftAddr := freePort(t)
 	tmpDir, err := os.MkdirTemp("", "easyraft-join-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -560,10 +569,10 @@ func TestEasyRaft_Join(t *testing.T) {
 	// --- n1: the existing single-node cluster with HTTP enabled ---
 	er1, err := easyraft.New[Counter](
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9099"),
-		easyraft.WithHTTPAddr("127.0.0.1:8089"),
+		easyraft.WithRaftAddr(n1RaftAddr),
+		easyraft.WithHTTPAddr(n1HTTPAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9099"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": n1RaftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -589,9 +598,9 @@ func TestEasyRaft_Join(t *testing.T) {
 	// --- n2: a new node that knows only the seed's HTTP address ---
 	er2, err := easyraft.New[Counter](
 		easyraft.WithID("n2"),
-		easyraft.WithRaftAddr("127.0.0.1:9100"),
+		easyraft.WithRaftAddr(n2RaftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
-		easyraft.WithJoinAddr("127.0.0.1:8089"),
+		easyraft.WithJoinAddr(n1HTTPAddr),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -616,6 +625,8 @@ func TestEasyRaft_Join(t *testing.T) {
 
 // TestEasyRaft_Members verifies GET /members returns the correct member list.
 func TestEasyRaft_Members(t *testing.T) {
+	n1RaftAddr, n1HTTPAddr := freePort(t), freePort(t)
+	n2RaftAddr, n2HTTPAddr := freePort(t), freePort(t)
 	tmpDir, err := os.MkdirTemp("", "easyraft-members-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -623,14 +634,14 @@ func TestEasyRaft_Members(t *testing.T) {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	peers := map[raft.NodeID]string{
-		"n1": "127.0.0.1:9101",
-		"n2": "127.0.0.1:9102",
+		"n1": n1RaftAddr,
+		"n2": n2RaftAddr,
 	}
 
 	er1, err := easyraft.New[Counter](
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9101"),
-		easyraft.WithHTTPAddr("127.0.0.1:8101"),
+		easyraft.WithRaftAddr(n1RaftAddr),
+		easyraft.WithHTTPAddr(n1HTTPAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(peers),
 	)
@@ -639,8 +650,8 @@ func TestEasyRaft_Members(t *testing.T) {
 	}
 	er2, err := easyraft.New[Counter](
 		easyraft.WithID("n2"),
-		easyraft.WithRaftAddr("127.0.0.1:9102"),
-		easyraft.WithHTTPAddr("127.0.0.1:8102"),
+		easyraft.WithRaftAddr(n2RaftAddr),
+		easyraft.WithHTTPAddr(n2HTTPAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
 		easyraft.WithPeers(peers),
 	)
@@ -672,7 +683,7 @@ func TestEasyRaft_Members(t *testing.T) {
 		t.Fatal("no leader elected")
 	}
 
-	resp, err := http.Get("http://127.0.0.1:8101/members")
+	resp, err := http.Get("http://" + n1HTTPAddr + "/members")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,6 +720,7 @@ func TestEasyRaft_Members(t *testing.T) {
 
 // TestEasyRaft_Batch verifies that POST /batch commits multiple operations atomically.
 func TestEasyRaft_Batch(t *testing.T) {
+	raftAddr, httpAddr := freePort(t), freePort(t)
 	tmpDir, err := os.MkdirTemp("", "easyraft-batch-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -717,10 +729,10 @@ func TestEasyRaft_Batch(t *testing.T) {
 
 	er, err := easyraft.New[Counter](
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr("127.0.0.1:9103"),
-		easyraft.WithHTTPAddr("127.0.0.1:8103"),
+		easyraft.WithRaftAddr(raftAddr),
+		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:9103"}),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -745,7 +757,7 @@ func TestEasyRaft_Batch(t *testing.T) {
 		{"op":"create","collection":"default","key":"a","value":{"value":1}},
 		{"op":"create","collection":"default","key":"b","value":{"value":2}}
 	]`)
-	resp, err := http.Post("http://127.0.0.1:8103/batch", "application/json", body)
+	resp, err := http.Post("http://"+httpAddr+"/batch", "application/json", body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,6 +786,7 @@ func TestEasyRaft_Batch(t *testing.T) {
 // TestEasyRaft_LeaveOnStop verifies that WithLeaveOnStop removes the node from
 // the cluster before shutdown so remaining nodes adjust their membership.
 func TestEasyRaft_LeaveOnStop(t *testing.T) {
+	n1Addr, n2Addr, n3Addr := freePort(t), freePort(t), freePort(t)
 	tmpDir, err := os.MkdirTemp("", "easyraft-leave-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -781,15 +794,15 @@ func TestEasyRaft_LeaveOnStop(t *testing.T) {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	peers := map[raft.NodeID]string{
-		"n1": "127.0.0.1:9104",
-		"n2": "127.0.0.1:9105",
-		"n3": "127.0.0.1:9106",
+		"n1": n1Addr,
+		"n2": n2Addr,
+		"n3": n3Addr,
 	}
 
-	makeNode := func(id string, raftPort int, leave bool) (*easyraft.EasyRaft[Counter], error) {
+	makeNode := func(id, raftAddr string, leave bool) (*easyraft.EasyRaft[Counter], error) {
 		opts := []easyraft.Option{
 			easyraft.WithID(raft.NodeID(id)),
-			easyraft.WithRaftAddr(fmt.Sprintf("127.0.0.1:%d", raftPort)),
+			easyraft.WithRaftAddr(raftAddr),
 			easyraft.WithDataDir(filepath.Join(tmpDir, id)),
 			easyraft.WithPeers(peers),
 		}
@@ -799,15 +812,15 @@ func TestEasyRaft_LeaveOnStop(t *testing.T) {
 		return easyraft.New[Counter](opts...)
 	}
 
-	er1, err := makeNode("n1", 9104, false)
+	er1, err := makeNode("n1", n1Addr, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	er2, err := makeNode("n2", 9105, false)
+	er2, err := makeNode("n2", n2Addr, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	er3, err := makeNode("n3", 9106, true) // n3 will leave gracefully
+	er3, err := makeNode("n3", n3Addr, true) // n3 will leave gracefully
 	if err != nil {
 		t.Fatal(err)
 	}
