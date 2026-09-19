@@ -135,8 +135,10 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 	}
 
 	// Raft §7: "The leader identifies its status by including its term and ID
-	// in the InstallSnapshot request."
-	n.leaderID = req.LeaderID
+	// in the InstallSnapshot request." Go through setLeaderID so that callers
+	// reading Leader() from outside the event loop see it too; when the term is
+	// unchanged, nothing else updates that view.
+	n.setLeaderID(req.LeaderID)
 	n.resetElectionTimeout()
 
 	// If the snapshot is old, discard it.
@@ -319,18 +321,18 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 
 	// The snapshot replaces every log entry up to its last-included index,
 	// including any config entries in that range, so the membership it carries
-	// becomes the new base. Entries that survive the truncation are replayed on
-	// top of it by rebuildMembership below.
+	// becomes the new base. Whatever survives the truncation is replayed on top
+	// of it below.
 	if r.hasMembership {
 		n.baseMembership = r.membership
 	}
 
-	if err := n.log.truncatePrefix(n.stopCtx, r.meta.LastIncludedIndex+1); err != nil {
-		n.logger.Error("snapshot install: truncatePrefix", "err", err)
+	if err := n.log.installSnapshot(n.stopCtx, r.meta); err != nil {
+		n.logger.Error("snapshot install: reset log", "err", err)
 		_ = r.smR.Close()
 		return
 	}
-	n.log.snapMeta = r.meta
+	n.atomicSnapshotIndex.Store(uint64(r.meta.LastIncludedIndex))
 	if r.hasMembership {
 		if err := n.rebuildMembership(n.stopCtx); err != nil {
 			n.logger.Error("snapshot install: rebuild membership", "err", err)

@@ -179,6 +179,40 @@ func (rl *raftLog) truncatePrefix(ctx context.Context, toIndex Index) error {
 	return nil
 }
 
+// installSnapshot makes meta this log's new base, keeping only the entries that
+// belong to the same history as the snapshot.
+//
+// Raft section 7: entries after the snapshot point may be retained only when
+// the log agrees with the snapshot at that point. If the entry there has a
+// different term, everything from the snapshot point onwards belongs to a
+// history the cluster abandoned, and keeping it would leave a log that starts
+// with the leader's state and continues with somebody else's.
+func (rl *raftLog) installSnapshot(ctx context.Context, meta SnapshotMeta) error {
+	agrees := false
+	if t, err := rl.termAt(ctx, meta.LastIncludedIndex); err == nil && t == meta.LastIncludedTerm {
+		agrees = true
+	}
+
+	switch {
+	case agrees:
+		if err := rl.truncatePrefix(ctx, meta.LastIncludedIndex+1); err != nil {
+			return err
+		}
+	case rl.first != 0:
+		if err := rl.truncateSuffix(ctx, rl.first); err != nil {
+			return err
+		}
+	}
+
+	rl.snapMeta = meta
+	if rl.last == 0 {
+		// Nothing survived: the snapshot boundary is now the end of the log.
+		rl.first = 0
+		rl.lastTerm = meta.LastIncludedTerm
+	}
+	return nil
+}
+
 // isUpToDate reports whether a candidate with (candidateLastIndex,
 // candidateLastTerm) has a log at least as up-to-date as ours (§5.4.1).
 func (rl *raftLog) isUpToDate(candidateLastIndex Index, candidateLastTerm Term) bool {
