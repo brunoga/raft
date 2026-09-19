@@ -354,11 +354,20 @@ func (n *Node) drainPending(err error) {
 	n.drainPendingReads(err)
 }
 
-// drainPendingReads rejects all pending ReadIndex futures.
+// drainPendingReads rejects all outstanding ReadIndex futures, both those
+// waiting on the round in flight and those waiting for the next one.
 func (n *Node) drainPendingReads(err error) {
 	for _, p := range n.pendingReads {
 		p.reject(err)
 	}
+	clear(n.pendingReads)
 	n.pendingReads = n.pendingReads[:0]
+
+	for _, p := range n.waitingReads {
+		p.reject(err)
+	}
+	clear(n.waitingReads)
+	n.waitingReads = n.waitingReads[:0]
+
 	n.readBatchAcks = nil
 }

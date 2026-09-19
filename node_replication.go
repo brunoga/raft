@@ -414,10 +414,7 @@ func (n *Node) maybeAdvanceCommit() {
 			if !n.leaderNopCommitted {
 				n.leaderNopCommitted = true
 				if len(n.pendingReads) > 0 {
-					n.readBatchGen++
-					n.readBatchAcks = make(map[NodeID]bool)
-					n.readBatchIndex = n.commitIndex
-					n.broadcastReadBarrier()
+					n.startReadBatch()
 				}
 			}
 			break
