@@ -107,16 +107,16 @@ func TestSaveSnapshot_DoesNotBlockLogOperations(t *testing.T) {
 	// against storage has to keep working.
 	progress := make(chan error, 1)
 	go func() {
-		if _, err := fs.GetLogEntry(ctx, 10); err != nil {
-			progress <- err
+		if _, readErr := fs.GetLogEntry(ctx, 10); readErr != nil {
+			progress <- readErr
 			return
 		}
-		if _, err := fs.LastIndex(); err != nil {
-			progress <- err
+		if _, readErr := fs.LastIndex(); readErr != nil {
+			progress <- readErr
 			return
 		}
-		if _, err := fs.GetLogEntries(ctx, 1, 5); err != nil {
-			progress <- err
+		if _, readErr := fs.GetLogEntries(ctx, 1, 5); readErr != nil {
+			progress <- readErr
 			return
 		}
 		progress <- fs.SaveHardState(ctx, raft.HardState{CurrentTerm: 3, VotedFor: "n1"})
@@ -177,8 +177,8 @@ func TestSaveSnapshot_ConcurrentWritersAreSerialised(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			meta := raft.SnapshotMeta{LastIncludedIndex: index, LastIncludedTerm: 1}
-			if err := fs.SaveSnapshot(ctx, meta, bytes.NewReader([]byte(body))); err != nil {
-				t.Errorf("SaveSnapshot(%d): %v", index, err)
+			if saveErr := fs.SaveSnapshot(ctx, meta, bytes.NewReader([]byte(body))); saveErr != nil {
+				t.Errorf("SaveSnapshot(%d): %v", index, saveErr)
 			}
 		}()
 	}
@@ -259,7 +259,7 @@ func TestSnapshot_DamageIsDetected(t *testing.T) {
 				if err != nil {
 					t.Fatalf("open snap: %v", err)
 				}
-				if _, err = f.Write([]byte("extra")); err != nil {
+				if _, err = f.WriteString("extra"); err != nil {
 					t.Fatalf("append to snap: %v", err)
 				}
 				if err = f.Close(); err != nil {

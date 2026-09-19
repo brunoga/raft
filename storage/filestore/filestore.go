@@ -536,25 +536,29 @@ func (fs *FileStore) openSegment(seqNum int, name string) (*segment, error) {
 		return s, nil
 	}
 
+	// A damaged or partially written index is recoverable: the segment opens
+	// and is marked for a full scan, which rebuilds what the index should have
+	// said. Returning the error instead would refuse to open a store that is
+	// perfectly repairable.
 	firstOffset, err := s.readIdxOffsetAt(0)
 	if err != nil {
 		s.needsScan = true
-		return s, nil
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
 	}
 	first, err := s.decodeEntryAt(firstOffset)
 	if err != nil {
 		s.needsScan = true
-		return s, nil
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
 	}
 	lastOffset, err := s.readIdxOffsetAt(numEntries - 1)
 	if err != nil {
 		s.needsScan = true
-		return s, nil
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
 	}
 	last, err := s.decodeEntryAt(lastOffset)
 	if err != nil {
 		s.needsScan = true
-		return s, nil
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
 	}
 	if last.Index != first.Index+raft.Index(numEntries)-1 {
 		// An index slot that was never durably written reads back as offset 0,
@@ -614,10 +618,10 @@ func (fs *FileStore) recoverSegments() error {
 	if dropped && len(fs.segs) > 0 {
 		// Pruning can promote a previously sealed segment to active. Validate
 		// the tail we are about to append to.
-		if err = fs.repairSegment(fs.segs[len(fs.segs)-1]); err != nil {
+		if err := fs.repairSegment(fs.segs[len(fs.segs)-1]); err != nil {
 			return err
 		}
-		if _, err = fs.pruneSegments(); err != nil {
+		if _, err := fs.pruneSegments(); err != nil {
 			return err
 		}
 	}
@@ -683,8 +687,8 @@ func (fs *FileStore) repairSegment(s *segment) error {
 			if err = s.idxF.Truncate(0); err != nil {
 				return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
 			}
-			if err = s.sync(); err != nil {
-				return err
+			if syncErr := s.sync(); syncErr != nil {
+				return syncErr
 			}
 		}
 		s.firstID, s.lastID, s.logSize, s.needsScan = 0, 0, 0, false
@@ -698,7 +702,7 @@ func (fs *FileStore) repairSegment(s *segment) error {
 		if err = s.idxF.Truncate(validCount * idxEntrySize); err != nil {
 			return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
 		}
-		if err = s.sync(); err != nil {
+		if err := s.sync(); err != nil {
 			return err
 		}
 	}
@@ -839,7 +843,7 @@ func (fs *FileStore) writeMeta(hs raft.HardState) error {
 // number of the slot it came from and whether the record was stored in the
 // legacy checksum-free layout (in which case the caller should migrate it).
 // Caller holds mu.
-func (fs *FileStore) readMeta() (raft.HardState, uint64, bool, error) {
+func (fs *FileStore) readMeta() (hs raft.HardState, seq uint64, legacy bool, err error) {
 	buf := make([]byte, metaFileSize)
 	n, err := fs.metaF.ReadAt(buf, 0)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -1111,7 +1115,7 @@ func (fs *FileStore) TruncateSuffix(_ context.Context, fromIndex raft.Index) err
 	if err = s.idxF.Truncate(numKeep * idxEntrySize); err != nil {
 		return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
 	}
-	if err = s.sync(); err != nil {
+	if err := s.sync(); err != nil {
 		return err
 	}
 	s.lastID = fromIndex - 1

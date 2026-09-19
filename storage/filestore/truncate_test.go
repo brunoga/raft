@@ -63,9 +63,9 @@ func TestTruncatePrefix_RewritesSegmentsLargerThanOneCopyChunk(t *testing.T) {
 		t.Helper()
 		assertBounds(t, fs, keepAt, count)
 		for i := raft.Index(keepAt); i <= count; i++ {
-			e, err := fs.GetLogEntry(ctx, i)
-			if err != nil {
-				t.Fatalf("%s: GetLogEntry(%d): %v", where, i, err)
+			e, readErr := fs.GetLogEntry(ctx, i)
+			if readErr != nil {
+				t.Fatalf("%s: GetLogEntry(%d): %v", where, i, readErr)
 			}
 			if e.Index != i {
 				t.Fatalf("%s: the slot for index %d holds entry %d", where, i, e.Index)
@@ -74,8 +74,8 @@ func TestTruncatePrefix_RewritesSegmentsLargerThanOneCopyChunk(t *testing.T) {
 				t.Fatalf("%s: entry %d came back with the wrong payload", where, i)
 			}
 		}
-		if _, err := fs.GetLogEntry(ctx, keepAt-1); !errors.Is(err, raft.ErrNotFound) {
-			t.Errorf("%s: GetLogEntry(%d) = %v, want ErrNotFound", where, keepAt-1, err)
+		if _, readErr := fs.GetLogEntry(ctx, keepAt-1); !errors.Is(readErr, raft.ErrNotFound) {
+			t.Errorf("%s: GetLogEntry(%d) = %v, want ErrNotFound", where, keepAt-1, readErr)
 		}
 	}
 
@@ -191,9 +191,9 @@ func TestTruncatePrefix_ConcurrentReadsStaySafe(t *testing.T) {
 				default:
 				}
 				for i := raft.Index(keepAt); i <= count; i++ {
-					e, err := fs.GetLogEntry(ctx, i)
-					if err != nil {
-						t.Errorf("GetLogEntry(%d) during truncation: %v", i, err)
+					e, readErr := fs.GetLogEntry(ctx, i)
+					if readErr != nil {
+						t.Errorf("GetLogEntry(%d) during truncation: %v", i, readErr)
 						return
 					}
 					if e.Index != i {
