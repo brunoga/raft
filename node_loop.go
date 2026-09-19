@@ -10,6 +10,13 @@ func (n *Node) run() {
 		select {
 		case <-n.stopCh:
 			n.drainPending(ErrStopped)
+			// Let storage finish what it has already been given, then
+			// release whatever that completed and fail the rest. Anything
+			// still waiting is answered either way, so no caller is left
+			// holding a request that will never come back.
+			n.writer.close()
+			n.handleWriteCompletions()
+			n.failDeferredWrites(ErrStopped)
 			// Drain any results that applyLoop already sent but the event loop
 			// has not yet processed. Without this, the clientTable and
 			// pendingConfigIndex updates for applied entries are lost, and
@@ -67,6 +74,9 @@ func (n *Node) run() {
 
 		case sr := <-n.snapshotResultCh:
 			n.handleSnapshotResult(&sr)
+
+		case <-n.writer.completions():
+			n.handleWriteCompletions()
 		}
 
 		// One announcement per turn, after the whole transition has been
@@ -175,8 +185,8 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 		r, err := n.handleRequestVote(req)
 		resp = rpcResponse{resp: r, err: err}
 	case *AppendEntriesRequest:
-		r, err := n.handleAppendEntries(req)
-		resp = rpcResponse{resp: r, err: err}
+		n.handleAppendEntries(req, env.respCh)
+		return // the acknowledgement waits for the log write
 	case *InstallSnapshotRequest:
 		r, err := n.handleInstallSnapshot(req)
 		resp = rpcResponse{resp: r, err: err}
@@ -225,6 +235,13 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		return
 	}
 
+	// The leader holds entries in memory until storage has written them.
+	// Accepting more while that backlog is at its limit would turn a slow disk
+	// into an unbounded one, so the budget is spent across this batch and
+	// whatever is already waiting.
+	limit := n.unstableLimit()
+	backlog := n.log.unstableSize()
+
 	entries := make([]LogEntry, 0, len(props))
 	for _, prop := range props {
 		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
@@ -257,6 +274,19 @@ func (n *Node) handleProposals(props []proposeMsg) {
 			}
 		}
 
+		// Checked last, so that a proposal answered from the dedup table or
+		// refused for another reason is not turned away for a backlog it was
+		// never going to add to. A backlog of nothing always accepts, whatever
+		// the command's size: an oversized command is refused by
+		// checkProposalSize, and refusing one here instead would be a stall
+		// with no error to explain it.
+		if limit > 0 && backlog > 0 && backlog+len(prop.cmd) > limit {
+			p := promise[[]byte]{ch: prop.respCh}
+			p.reject(ErrWriteBacklogFull)
+			n.reportProposal(prop.submitted, false)
+			continue
+		}
+
 		idx := n.log.lastLogIndex() + Index(len(entries)) + 1
 		entry := LogEntry{Index: idx, Term: n.currentTerm, Command: prop.cmd}
 		entries = append(entries, entry)
@@ -267,29 +297,38 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		if isConfigEntry(prop.cmd) {
 			n.pendingConfigIndex = idx
 		}
+		backlog += len(prop.cmd)
 	}
 
 	if len(entries) > 0 {
-		if err := n.appendEntries(n.stopCtx, entries); err != nil {
+		// The entries are in the log now and go out to followers now. They are
+		// not counted towards a commit quorum until the write lands, which is
+		// what maybeAdvanceCommit consults the durable point for; so this
+		// overlaps the leader's own fsync with the round trip to its followers
+		// instead of placing one after the other.
+		seq := n.log.append(entries)
+		indices := make([]Index, len(entries))
+		for i := range entries {
+			indices[i] = entries[i].Index
+		}
+		n.afterWrite(seq, nil, func(err error) {
 			// A leader that cannot write its own log cannot make progress, and
 			// entries it believes it appended may or may not be there.
-			n.fail(err, "append proposed entries")
-			// Fail all in-flight entries in this batch.
-			for _, entry := range entries {
-				if p, ok := n.pending[entry.Index]; ok {
+			for _, idx := range indices {
+				if p, ok := n.pending[idx]; ok {
 					p.promise.reject(fmt.Errorf("propose: append: %w", err))
 					n.reportProposal(p.submitted, false)
-					delete(n.pending, entry.Index)
+					delete(n.pending, idx)
 				}
-				if n.pendingConfigIndex == entry.Index {
+				if n.pendingConfigIndex == idx {
 					n.pendingConfigIndex = 0
 				}
 			}
-			return
-		}
+		})
 		n.replicateToFollowers()
-		// For single-node clusters (no peers) the entry is immediately replicated
-		// on a majority (self), so try to advance commitIndex right away.
+		// For single-node clusters (no peers) the entry is replicated on a
+		// majority as soon as it is durable; nothing can be committed here
+		// yet, but the call is harmless and keeps the path uniform.
 		n.maybeAdvanceCommit()
 	}
 }
@@ -347,12 +386,27 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 
 // ---- Commit notification and proposal draining -----------------------------
 
-// notifyApply sends the current commitIndex to the apply goroutine,
+// notifyApply sends the applicable commit index to the apply goroutine,
 // dropping the send if the goroutine is busy (the channel is size-1;
 // the goroutine will read the latest value when it next wakes).
+//
+// What is applicable is not the commit index but the part of it that is on
+// disk. A follower learns its commit index from the leader and may hold the
+// entries it covers in memory only; the apply loop reads entries back from
+// storage, so being told about them early would have it apply whatever storage
+// happens to hold at those indices -- nothing, or entries from a history this
+// node has already discarded. The rest follows when the write lands, because
+// every write completion calls this again.
 func (n *Node) notifyApply() {
+	applicable := n.commitIndex
+	if stable := n.log.stableIndex(); stable < applicable {
+		applicable = stable
+	}
+	if applicable == 0 {
+		return
+	}
 	select {
-	case n.commitNotifyCh <- n.commitIndex:
+	case n.commitNotifyCh <- applicable:
 	default:
 		// Channel already has a value; drain the stale index and replace it
 		// with the latest so the apply goroutine always wakes to the current
@@ -365,7 +419,7 @@ func (n *Node) notifyApply() {
 		case <-n.commitNotifyCh:
 		default:
 		}
-		n.commitNotifyCh <- n.commitIndex
+		n.commitNotifyCh <- applicable
 	}
 }
 

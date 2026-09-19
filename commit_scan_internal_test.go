@@ -36,7 +36,6 @@ func (c *countingLogStorage) GetLogEntries(ctx context.Context, lo, hi Index) ([
 // below can never be committed by replica count, so there is nothing to test
 // there.
 func TestMaybeAdvanceCommit_DoesNotReadTheLogFromStorage(t *testing.T) {
-	ctx := context.Background()
 	store := &countingLogStorage{}
 
 	cfg := DefaultConfig()
@@ -64,9 +63,8 @@ func TestMaybeAdvanceCommit_DoesNotReadTheLogFromStorage(t *testing.T) {
 	for i := range backlog {
 		entries = append(entries, LogEntry{Index: Index(i + 1), Term: 7, Command: []byte("x")})
 	}
-	if err := node.log.append(ctx, entries); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	node.log.append(entries)
+	node.flushWrites(t)
 	node.currentTerm = 7
 	node.setState(Leader)
 	node.termStartIndex = 1
@@ -93,7 +91,6 @@ func TestMaybeAdvanceCommit_DoesNotReadTheLogFromStorage(t *testing.T) {
 // TestMaybeAdvanceCommit_StillCommitsOnQuorum is the guard on the other side:
 // bounding the scan must not stop it finding the highest committable index.
 func TestMaybeAdvanceCommit_StillCommitsOnQuorum(t *testing.T) {
-	ctx := context.Background()
 	store := &countingLogStorage{}
 
 	cfg := DefaultConfig()
@@ -118,9 +115,8 @@ func TestMaybeAdvanceCommit_StillCommitsOnQuorum(t *testing.T) {
 		{Index: 5, Term: 7, Command: []byte("x")},
 		{Index: 6, Term: 7, Command: []byte("x")},
 	}
-	if err := node.log.append(ctx, entries); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	node.log.append(entries)
+	node.flushWrites(t)
 	node.currentTerm = 7
 	node.setState(Leader)
 	node.termStartIndex = 3
@@ -142,7 +138,6 @@ func TestMaybeAdvanceCommit_StillCommitsOnQuorum(t *testing.T) {
 // on replica count alone, however widely it is replicated (Raft 5.4.2, the
 // Figure 8 case).
 func TestMaybeAdvanceCommit_WillNotCommitAnEarlierTermByCount(t *testing.T) {
-	ctx := context.Background()
 	store := &countingLogStorage{}
 
 	cfg := DefaultConfig()
@@ -163,9 +158,8 @@ func TestMaybeAdvanceCommit_WillNotCommitAnEarlierTermByCount(t *testing.T) {
 		{Index: 2, Term: 6, Command: []byte("old")},
 		{Index: 3, Term: 7, Command: nil}, // this leader's no-op
 	}
-	if err := node.log.append(ctx, entries); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	node.log.append(entries)
+	node.flushWrites(t)
 	node.currentTerm = 7
 	node.setState(Leader)
 	node.termStartIndex = 3

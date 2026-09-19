@@ -119,7 +119,10 @@ func (n *Node) rebuildMembership(ctx context.Context) error {
 	const batch = 1024
 	for lo := first; lo <= last; lo += batch {
 		hi := min(lo+batch, last+1)
-		entries, err := n.cfg.Storage.GetLogEntries(ctx, lo, hi)
+		// Through the log: a rebuild triggered by a truncation runs while the
+		// entries that replaced the discarded ones are still only in memory,
+		// and a config change among them is as binding as any other.
+		entries, err := n.log.entries(ctx, lo, hi)
 		if err != nil {
 			return err
 		}
@@ -328,16 +331,18 @@ func (n *Node) appendFinaliseEntry(newPeers []PeerConfig, includeSelf, selfVoter
 		Term:    n.currentTerm,
 		Command: encodeFinaliseConfigEntry(allNew),
 	}
-	if err := n.log.appendOne(n.stopCtx, entry); err != nil {
-		n.logger.Error("appendFinaliseEntry: append", "err", err)
-		return
-	}
-	// NOTE (false positive — intentional): pendingConfigIndex is set only after
-	// a successful append. If the append fails, we must not block future config
-	// changes with a stale pendingConfigIndex that refers to an entry that was
-	// never written. The caller will retry on the next becomeLeader invocation
-	// if the node wins a subsequent election.
+	seq := n.log.appendOne(entry)
+	// pendingConfigIndex is cleared again if the write fails, so that a failed
+	// finalise entry does not block future config changes behind an index that
+	// was never written. In practice a failed write stops the node, and the
+	// retry comes from whichever node wins the next election.
 	n.pendingConfigIndex = idx
+	n.afterWrite(seq, nil, func(err error) {
+		n.logger.Error("appendFinaliseEntry: append", "err", err)
+		if n.pendingConfigIndex == idx {
+			n.pendingConfigIndex = 0
+		}
+	})
 	n.replicateToFollowers()
 	n.maybeAdvanceCommit()
 }
