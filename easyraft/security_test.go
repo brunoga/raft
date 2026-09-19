@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,20 +26,44 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// handedOut records every address freePort has returned in this process.
+var handedOut sync.Map
+
 // freePort reserves and releases a loopback port, returning the address. The
 // small race between release and reuse is acceptable in tests and avoids the
-// fixed-port collisions that make suites order-dependent.
+// fixed-port collisions that make suites order-dependent and stop a package
+// from being run twice at once.
+//
+// A port the kernel hands out twice would reintroduce exactly the collision
+// this is here to prevent, so an address already returned is not returned
+// again: the duplicate listener is held open while another is opened, which
+// stops the kernel from offering the same port a third time, and is closed
+// once a distinct address has been found.
 func freePort(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+	var held []net.Listener
+	defer func() {
+		for _, ln := range held {
+			_ = ln.Close()
+		}
+	}()
+	for range 16 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve port: %v", err)
+		}
+		addr := ln.Addr().String()
+		if _, dup := handedOut.LoadOrStore(addr, struct{}{}); dup {
+			held = append(held, ln)
+			continue
+		}
+		if err := ln.Close(); err != nil {
+			t.Fatalf("release port: %v", err)
+		}
+		return addr
 	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatalf("release port: %v", err)
-	}
-	return addr
+	t.Fatal("freePort: no unused loopback port after 16 attempts")
+	return ""
 }
 
 // TestHTTPAuth_GuardsEveryRoute pins the invariant that the authorization hook
@@ -323,7 +348,7 @@ func TestManager_SharedPrometheusRegistryAcrossGroups(t *testing.T) {
 // address to dial.
 func TestManager_StaticPeersAreReportedWithTheirRaftAddress(t *testing.T) {
 	httpAddr := freePort(t)
-	peerAddr := "127.0.0.1:7999"
+	peerAddr := refusedAddr(t)
 
 	mgr, err := easyraft.NewManager(
 		easyraft.WithID("n1"),
