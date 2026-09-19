@@ -1,173 +1,23 @@
 package raft_test
 
-// Linearizability tests using the Porcupine checker.
+// Coarse-grained chaos tests: a cluster is repeatedly disrupted and must stay
+// available and converge.
 //
-// Strategy:
-//  1. Run a cluster with real-time ticks.
-//  2. Fire concurrent goroutines that propose key=value writes and record
-//     the (call time, return time, input, output) of every operation.
-//  3. Feed the history to Porcupine with a register model for each key.
-//  4. Fail the test if the history is not linearizable.
+// These check liveness and eventual agreement on a value, which is a useful
+// smoke test but is not a safety argument — a run that elected two leaders in
+// one term and truncated a committed entry could still converge and pass. The
+// safety properties are asserted continuously by TestSimChaos in
+// simchaos_test.go, and end-to-end consistency by TestSimLinearizability in
+// simlinearizability_test.go.
 
 import (
-	"context"
 	"fmt"
 	"math/rand/v2"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/anishathalye/porcupine"
-
 	"github.com/brunoga/raft"
 )
-
-// ---- Porcupine model for a single-key register -----------------------------
-
-// registerOp encodes a write (set) or read (get).
-type registerOp struct {
-	write bool
-	value int // value to write (write) or expected value (read)
-}
-
-// registerResult is the value observed by the operation.
-type registerResult struct {
-	value int
-	ok    bool // false if the op returned an error (treated as unknown)
-}
-
-// registerModel is a Porcupine model for an integer register that supports
-// write(v) → ok and read() → v.
-var registerModel = porcupine.Model{
-	// Initial state: register holds 0.
-	Init: func() interface{} { return 0 },
-
-	// Step: returns (ok, nextState).
-	// A write always succeeds and updates the register.
-	// A read succeeds iff the observed value equals the current state.
-	Step: func(state, input, output interface{}) (bool, interface{}) {
-		op := input.(registerOp)
-		res := output.(registerResult)
-
-		if !res.ok {
-			// Error result: we don't know what happened; allow any transition.
-			return true, state
-		}
-
-		if op.write {
-			// Write succeeded; new state is the written value.
-			return true, op.value
-		}
-		// Read: valid iff res.value == current state.
-		return res.value == state.(int), state
-	},
-
-	DescribeOperation: func(input, output interface{}) string {
-		op := input.(registerOp)
-		res := output.(registerResult)
-		if op.write {
-			return fmt.Sprintf("write(%d) → ok=%v", op.value, res.ok)
-		}
-		return fmt.Sprintf("read() → %d ok=%v", res.value, res.ok)
-	},
-}
-
-// ---- Linearizability test --------------------------------------------------
-
-func TestLinearizability_ConcurrentWrites(t *testing.T) {
-	if testing.Short() {
-		t.Skip("linearizability test skipped in short mode")
-	}
-
-	const (
-		numClients   = 5
-		opsPerClient = 8
-	)
-
-	c := newCluster(t, 3)
-	leaderIdx := c.WaitLeader(electionTimeout)
-	leader := c.nodes[leaderIdx]
-
-	// Tick in the background so the cluster stays live without concurrent Tick
-	// calls interfering with proposal goroutines.
-	stopTick := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				c.Tick()
-			case <-stopTick:
-				return
-			}
-		}
-	}()
-	defer close(stopTick)
-
-	type event struct {
-		clientID   int
-		start, end time.Time
-		op         registerOp
-		result     registerResult
-	}
-
-	var mu sync.Mutex
-	var events []event
-	var wg sync.WaitGroup
-
-	for cl := range numClients {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			// Each goroutine gets its own RNG to avoid data races.
-			rng := rand.New(rand.NewPCG(uint64(clientID), 0))
-			for op := range opsPerClient {
-				val := clientID*1000 + op
-				cmd := fmt.Appendf(nil, "x=%d", val)
-
-				ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
-				start := time.Now()
-				_, err := leader.Propose(ctx, cmd)
-				end := time.Now()
-				cancel()
-				result := registerResult{value: val, ok: err == nil}
-
-				mu.Lock()
-				events = append(events, event{
-					clientID: clientID,
-					start:    start,
-					end:      end,
-					op:       registerOp{write: true, value: val},
-					result:   result,
-				})
-				mu.Unlock()
-
-				time.Sleep(time.Duration(rng.IntN(3)) * time.Millisecond)
-				_ = op
-			}
-		}(cl)
-	}
-
-	wg.Wait()
-
-	// Build Porcupine history.
-	history := make([]porcupine.Operation, len(events))
-	for i, e := range events {
-		history[i] = porcupine.Operation{
-			ClientId: e.clientID,
-			Input:    e.op,
-			Call:     e.start.UnixNano(),
-			Output:   e.result,
-			Return:   e.end.UnixNano(),
-		}
-	}
-
-	ok := porcupine.CheckOperations(registerModel, history)
-	if !ok {
-		t.Error("history is not linearizable")
-	}
-}
 
 // ---- Chaos / fault-injection tests -----------------------------------------
 
