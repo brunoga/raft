@@ -124,8 +124,10 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 	}
 
 	// Raft §7: "The leader identifies its status by including its term and ID
-	// in the InstallSnapshot request."
-	n.leaderID = req.LeaderID
+	// in the InstallSnapshot request." Go through setLeaderID so that callers
+	// reading Leader() from outside the event loop see it too; when the term is
+	// unchanged, nothing else updates that view.
+	n.setLeaderID(req.LeaderID)
 	n.resetElectionTimeout()
 
 	// If the snapshot is old, discard it.
@@ -300,12 +302,12 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 
 	n.clientTable.loadFrom(r.table)
 
-	if err := n.log.truncatePrefix(n.stopCtx, r.meta.LastIncludedIndex+1); err != nil {
-		n.logger.Error("snapshot install: truncatePrefix", "err", err)
+	if err := n.log.installSnapshot(n.stopCtx, r.meta); err != nil {
+		n.logger.Error("snapshot install: reset log", "err", err)
 		_ = r.smR.Close()
 		return
 	}
-	n.log.snapMeta = r.meta
+	n.atomicSnapshotIndex.Store(uint64(r.meta.LastIncludedIndex))
 
 	// Preemptively advance lastApplied to the snapshot boundary. This
 	// prevents duplicate snapInstallResult messages — which arise when
