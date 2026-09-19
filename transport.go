@@ -121,6 +121,18 @@ type Transport interface {
 	Close() error
 }
 
+// MessageSizeLimiter is an optional interface a Transport may implement to
+// report the largest message it can carry, in bytes.
+//
+// The node uses it to refuse a proposal that could never be replicated. A
+// transport that cannot answer usefully should not implement this; the limit
+// can be stated directly with Config.MaxProposalBytes instead.
+type MessageSizeLimiter interface {
+	// MaxMessageBytes returns the maximum size of a single RPC payload. A
+	// value of zero or less means the transport imposes no limit of its own.
+	MaxMessageBytes() int
+}
+
 // Handler is the server-side RPC dispatcher. The Raft node implements this
 // interface and registers itself with the Transport.
 type Handler interface {

@@ -705,6 +705,9 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	if err := n.checkRunning(); err != nil {
 		return nil, err
 	}
+	if err := n.checkProposalSize(len(cmd)); err != nil {
+		return nil, err
+	}
 
 	respCh := make(chan result[[]byte], 1)
 	msg := proposeMsg{cmd: cmd, respCh: respCh, submitted: n.now()}
@@ -1295,6 +1298,50 @@ func (n *Node) reportProposal(submitted time.Time, ok bool) {
 		return
 	}
 	pm.ProposalCompleted(n.cfg.ID, n.now().Sub(submitted), ok)
+}
+
+// proposalLimit returns the largest command this node will accept, or 0 when
+// no limit applies. Config.MaxProposalBytes wins; otherwise the transport is
+// asked, leaving headroom for the framing that surrounds the command on the
+// wire.
+func (n *Node) proposalLimit() int {
+	if n.cfg.MaxProposalBytes > 0 {
+		return n.cfg.MaxProposalBytes
+	}
+	limiter, ok := n.cfg.Transport.(MessageSizeLimiter)
+	if !ok {
+		return 0
+	}
+	limit := limiter.MaxMessageBytes()
+	if limit <= 0 {
+		return 0
+	}
+	// The command is not the whole message: the request carries the term, the
+	// leader ID, the previous-log fields and each entry's own header, and the
+	// transport adds its framing on top. Reserve a slice of the budget for all
+	// of that rather than accepting a command that only just fits on paper.
+	reserved := limit / 16
+	if reserved < proposalFramingReserve {
+		reserved = proposalFramingReserve
+	}
+	if reserved >= limit {
+		return 0
+	}
+	return limit - reserved
+}
+
+// proposalFramingReserve is the minimum headroom left for request and entry
+// framing when deriving a proposal limit from the transport.
+const proposalFramingReserve = 4096
+
+// checkProposalSize reports whether a command of this size can be replicated.
+func (n *Node) checkProposalSize(size int) error {
+	limit := n.proposalLimit()
+	if limit > 0 && size > limit {
+		return fmt.Errorf("%w: %d bytes exceeds the %d the transport can carry",
+			ErrProposalTooLarge, size, limit)
+	}
+	return nil
 }
 
 // trailingLogs returns how many entries to retain behind the snapshot point,
