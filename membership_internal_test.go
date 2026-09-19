@@ -175,7 +175,7 @@ func TestMembership_RebuildReplaysEveryConfigEntry(t *testing.T) {
 // through the snapshot framing, including the joint configuration a snapshot
 // can legitimately be taken during.
 func TestSnapshotFraming_RoundTripsMembership(t *testing.T) {
-	table := map[NodeID]clientEntry{"c1": {seqNum: 7, result: []byte("r")}}
+	table := []clientRecord{{id: "c1", ce: clientEntry{seqNum: 7, result: []byte("r")}}}
 
 	tests := []struct {
 		name string
@@ -231,8 +231,8 @@ func TestSnapshotFraming_RoundTripsMembership(t *testing.T) {
 				!slices.Equal(gotMS.new, tt.ms.new) {
 				t.Errorf("membership round-trip = %+v, want %+v", gotMS, tt.ms)
 			}
-			if got := gotTable["c1"].seqNum; got != 7 {
-				t.Errorf("client table seqNum = %d, want 7", got)
+			if len(gotTable) != 1 || gotTable[0].id != "c1" || gotTable[0].ce.seqNum != 7 {
+				t.Errorf("client table round-trip = %+v, want one entry c1 with seqNum 7", gotTable)
 			}
 			smData, err := io.ReadAll(smReader)
 			if err != nil {
@@ -250,7 +250,7 @@ func TestSnapshotFraming_RoundTripsMembership(t *testing.T) {
 // reports that it carries no membership so the caller keeps its own rather than
 // adopting an empty cluster.
 func TestSnapshotFraming_ReadsSnapshotWithoutMembershipSection(t *testing.T) {
-	tableBytes := encodeClientTable(map[NodeID]clientEntry{"c1": {seqNum: 3}})
+	tableBytes := encodeClientTable([]clientRecord{{id: "c1", ce: clientEntry{seqNum: 3}}})
 
 	var buf bytes.Buffer
 	var hdr [12]byte
@@ -267,8 +267,8 @@ func TestSnapshotFraming_ReadsSnapshotWithoutMembershipSection(t *testing.T) {
 	if hasMS {
 		t.Errorf("reported a membership section (%+v) for a snapshot that has none", ms)
 	}
-	if got := table["c1"].seqNum; got != 3 {
-		t.Errorf("client table seqNum = %d, want 3", got)
+	if len(table) != 1 || table[0].id != "c1" || table[0].ce.seqNum != 3 {
+		t.Errorf("client table = %+v, want one entry c1 with seqNum 3", table)
 	}
 	smData, err := io.ReadAll(smReader)
 	if err != nil {

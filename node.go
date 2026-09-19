@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -1127,7 +1126,7 @@ func (n *Node) tickerLoop() {
 // for the same snapshot index) can push two restores onto restoreSnapshotCh;
 // if the second fires after log entries beyond the snapshot have already been
 // applied, skipping it prevents overwriting the newer SM state.
-func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current map[NodeID]clientEntry) map[NodeID]clientEntry {
+func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastApplied *Index, current *clientLRU) *clientLRU {
 	defer func() { _ = si.r.Close() }()
 	if si.meta.LastIncludedIndex <= *localLastApplied {
 		// Stale restore: the SM already reflects a more recent state.
@@ -1142,8 +1141,8 @@ func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastAp
 	case n.applyAdvancedCh <- struct{}{}:
 	default:
 	}
-	newTable := make(map[NodeID]clientEntry, len(si.clientTable))
-	maps.Copy(newTable, si.clientTable)
+	newTable := newClientLRU(n.cfg.MaxClientTableSize)
+	newTable.loadFrom(si.clientTable)
 	return newTable
 }
 
@@ -1172,8 +1171,12 @@ func (n *Node) applyLoop() {
 	//
 	// Keeping a separate copy here (rather than reading n.clientTable) is
 	// necessary because n.clientTable is owned by the event-loop goroutine and
-	// must not be read from the apply goroutine without synchronisation.
-	localClientTable := make(map[NodeID]clientEntry)
+	// must not be read from the apply goroutine without synchronisation. It is
+	// bounded exactly like the event loop's copy and updated from the same
+	// sequence of entries, so the two hold the same contents, and so does every
+	// other replica's: whether a retry is deduplicated must not depend on which
+	// replica applies it.
+	localClientTable := newClientLRU(n.cfg.MaxClientTableSize)
 
 	// On restart from a snapshot: restore the state machine once before
 	// processing any committed entries. initialSnap is set once in New()
@@ -1196,7 +1199,7 @@ func (n *Node) applyLoop() {
 		}
 		// Seed localClientTable from the snapshot's table so that entries
 		// already covered by the snapshot are not applied again on log replay.
-		maps.Copy(localClientTable, n.initialSnap.clientTable)
+		localClientTable.loadFrom(n.initialSnap.clientTable)
 		n.initialSnap = nil // release memory; event loop never reads this field
 	}
 
@@ -1298,7 +1301,7 @@ func (n *Node) applyLoop() {
 						// Malformed dedup header; apply as-is.
 						val, applyErr := n.cfg.StateMachine.Apply(ctx, entry)
 						ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
-					} else if cached, ok := localClientTable[clientID]; ok && seqNum == cached.seqNum {
+					} else if cached, ok := localClientTable.get(clientID); ok && seqNum == cached.seqNum {
 						// Exact duplicate: return the cached result without re-applying.
 						ar = applyResult{index: i, val: cached.result, cmd: entry.Command}
 					} else {
@@ -1310,7 +1313,7 @@ func (n *Node) applyLoop() {
 						// Update the local table immediately so subsequent entries
 						// in this batch see the up-to-date dedup state.
 						if applyErr == nil {
-							localClientTable[clientID] = clientEntry{seqNum: seqNum, result: val}
+							localClientTable.put(clientID, clientEntry{seqNum: seqNum, result: val})
 						}
 					}
 				default:

@@ -16,9 +16,9 @@ type raftLog struct {
 	snapMeta SnapshotMeta // metadata of the last installed snapshot
 
 	// snapClientTable holds the client dedup table loaded from the snapshot
-	// during initialisation. It is consumed by Node.New() to seed n.clientTable
-	// and then cleared.
-	snapClientTable map[NodeID]clientEntry
+	// during initialisation, in eviction order. It is consumed by Node.New() to
+	// seed n.clientTable and then cleared.
+	snapClientTable []clientRecord
 
 	// snapMembership is the cluster membership recorded in that snapshot, and
 	// hasSnapMembership reports whether the snapshot carried one at all —

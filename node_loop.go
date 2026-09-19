@@ -299,9 +299,14 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 		}
 	}
 
-	// Update the client dedup table for ProposeOnce entries. The LRU evicts
-	// the least-recently-used client automatically on put() when over cap.
-	if isDedupCmd(ar.cmd) {
+	// Record the outcome of a ProposeOnce entry so a retry gets the same answer.
+	//
+	// Only a successful apply is recorded. Caching a failure as though it were
+	// a result would answer the retry with a nil error and a nil result, so a
+	// caller whose command the state machine rejected would be told it
+	// succeeded. A failed command left unrecorded is simply re-run, which is
+	// the correct outcome for a command that never took effect.
+	if isDedupCmd(ar.cmd) && ar.err == nil {
 		if clientID, seqNum, _, err := decodeDedupCmd(ar.cmd); err == nil {
 			if cached, ok := n.clientTable.get(clientID); !ok || seqNum >= cached.seqNum {
 				n.clientTable.put(clientID, clientEntry{seqNum: seqNum, result: ar.val})
