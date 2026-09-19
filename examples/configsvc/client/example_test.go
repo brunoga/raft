@@ -38,7 +38,9 @@ func Example() {
 
 	events, err := c.Watch(watchCtx, "db.host")
 	if err != nil {
-		log.Fatalf("failed to watch: %v", err)
+		// Return rather than log.Fatal so that the deferred cancel still runs.
+		log.Printf("failed to watch: %v", err)
+		return
 	}
 
 	go func() {

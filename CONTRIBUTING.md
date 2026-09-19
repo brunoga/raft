@@ -5,9 +5,11 @@ Thank you for your interest in contributing to this project!
 ## Development Setup
 
 1.  Ensure you have Go 1.26+ installed.
-2.  Install `golangci-lint`:
+2.  Install `golangci-lint`. Use the same pinned version CI does — see the
+    `Run golangci-lint` step in `.github/workflows/ci.yml` — so that local runs
+    and CI agree:
     ```bash
-    go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
     ```
 
 ## Running Tests and Linting

@@ -132,7 +132,7 @@ func TestIDSM_AllocBatch(t *testing.T) {
 
 	raw := mustApply(t, sm, domainCmd{Op: opAlloc, Domain: "batch", Count: 100})
 	var r allocResult
-	json.Unmarshal(raw, &r)
+	mustDecode(t, raw, &r)
 	if r.Start != 1 || r.Count != 100 {
 		t.Errorf("alloc(100) = {%d, %d}, want {1, 100}", r.Start, r.Count)
 	}
@@ -143,8 +143,8 @@ func TestIDSM_AllocSequentialRangesAreContiguous(t *testing.T) {
 	mustApply(t, sm, domainCmd{Op: opCreate, Domain: "seq"})
 
 	var r1, r2 allocResult
-	json.Unmarshal(mustApply(t, sm, domainCmd{Op: opAlloc, Domain: "seq", Count: 10}), &r1)
-	json.Unmarshal(mustApply(t, sm, domainCmd{Op: opAlloc, Domain: "seq", Count: 5}), &r2)
+	mustDecode(t, mustApply(t, sm, domainCmd{Op: opAlloc, Domain: "seq", Count: 10}), &r1)
+	mustDecode(t, mustApply(t, sm, domainCmd{Op: opAlloc, Domain: "seq", Count: 5}), &r2)
 
 	if r1.Start+r1.Count != r2.Start {
 		t.Errorf("ranges not contiguous: [%d,%d) then [%d,%d)",

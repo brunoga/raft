@@ -90,7 +90,17 @@ func shardForKey(key string, numShards uint64) uint64 {
 	return uint64(h.Sum32())%numShards + 1
 }
 
+// main keeps the process-exit decision in one place so that every resource
+// acquired by run — the signal context, the transport, the shard manager — is
+// released through its deferred cleanup before we exit.
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "shardkv: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var (
 		id              = flag.String("id", "", "this physical node's unique ID (required)")
 		numShards       = flag.Uint64("shards", 4, "number of Raft shard groups (same on every node)")
@@ -104,13 +114,11 @@ func main() {
 	flag.Parse()
 
 	if *id == "" || *dataDir == "" {
-		fmt.Fprintln(os.Stderr, "shardkv: --id and --data-dir are required")
 		flag.Usage()
-		os.Exit(1)
+		return errors.New("--id and --data-dir are required")
 	}
 	if *numShards == 0 {
-		fmt.Fprintln(os.Stderr, "shardkv: --shards must be > 0")
-		os.Exit(1)
+		return errors.New("--shards must be > 0")
 	}
 
 	// Parse --peer flags into a physID → peerInfo map.
@@ -118,8 +126,7 @@ func main() {
 	for _, p := range peers {
 		parts := strings.SplitN(p, "=", 2)
 		if len(parts) != 2 {
-			fmt.Fprintf(os.Stderr, "shardkv: invalid --peer %q (want physID=raftAddr[,httpAddr])\n", p)
-			os.Exit(1)
+			return fmt.Errorf("invalid --peer %q (want physID=raftAddr[,httpAddr])", p)
 		}
 		physID := parts[0]
 		addrs := strings.SplitN(parts[1], ",", 2)
@@ -136,8 +143,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "shardkv: mkdir %s: %v\n", *dataDir, err)
-		os.Exit(1)
+		return fmt.Errorf("mkdir %s: %w", *dataDir, err)
 	}
 
 	// One gRPC transport for all shards on this physical node.
@@ -148,13 +154,12 @@ func main() {
 	//      O(G×P) to O(P) per tick interval.
 	tr, err := grpctransport.Listen(*raftAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "shardkv: grpctransport.Listen: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("grpctransport.Listen: %w", err)
 	}
-	defer tr.Close()
+	defer func() { _ = tr.Close() }()
 
 	mgr := raft.NewManager()
-	defer mgr.Close()
+	defer func() { _ = mgr.Close() }()
 
 	// nodeHTTPAddr maps each peer shard NodeID to that peer's HTTP address,
 	// used to build 307 redirects when a write lands on a follower.
@@ -186,13 +191,11 @@ func main() {
 	for gid := uint64(1); gid <= *numShards; gid++ {
 		shardDir := fmt.Sprintf("%s/shards/%d", *dataDir, gid)
 		if err := os.MkdirAll(shardDir, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "shardkv: mkdir %s: %v\n", shardDir, err)
-			os.Exit(1)
+			return fmt.Errorf("mkdir %s: %w", shardDir, err)
 		}
 		store, err := filestore.Open(shardDir)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "shardkv: filestore.Open(%s): %v\n", shardDir, err)
-			os.Exit(1)
+			return fmt.Errorf("filestore.Open(%s): %w", shardDir, err)
 		}
 
 		peerIDs := make([]raft.PeerConfig, 0, len(peerMap))
@@ -216,12 +219,10 @@ func main() {
 
 		node, err := raft.New(&cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "shardkv: raft.New(shard %d): %v\n", gid, err)
-			os.Exit(1)
+			return fmt.Errorf("raft.New(shard %d): %w", gid, err)
 		}
 		if err := mgr.AddAndStart(gid, node); err != nil {
-			fmt.Fprintf(os.Stderr, "shardkv: mgr.AddAndStart(shard %d): %v\n", gid, err)
-			os.Exit(1)
+			return fmt.Errorf("mgr.AddAndStart(shard %d): %w", gid, err)
 		}
 	}
 
@@ -273,7 +274,11 @@ func main() {
 	slog.Info("shardkv: shutting down")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(shutCtx) //nolint:errcheck // best-effort shutdown
+	// Best-effort shutdown: the process is going away either way, so a failure
+	// here is not actionable.
+	_ = srv.Shutdown(shutCtx)
+
+	return nil
 }
 
 // buildMux constructs the HTTP handler for one physical shardkv node. It is
@@ -352,7 +357,9 @@ func buildMux(
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprint(w, v)
+		// The response is already committed; a write error here is not
+		// actionable beyond what the HTTP stack already reports.
+		_, _ = fmt.Fprint(w, v)
 	})
 
 	// DELETE /keys/{key}

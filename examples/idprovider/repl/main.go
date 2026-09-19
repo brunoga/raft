@@ -170,7 +170,6 @@ func main() {
 	}
 }
 
-
 func printDomains(domains map[string]uint64) {
 
 	if len(domains) == 0 {

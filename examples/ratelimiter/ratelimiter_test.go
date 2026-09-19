@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,11 +12,7 @@ import (
 )
 
 func BenchmarkRateLimiter(b *testing.B) {
-	tmpDir, err := os.MkdirTemp("", "ratelimit-bench-*")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := b.TempDir()
 
 	// Setup a 3-node cluster for realistic consensus overhead.
 	ids := []raft.NodeID{"n1", "n2", "n3"}
