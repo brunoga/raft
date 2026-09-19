@@ -30,6 +30,7 @@ package prommetrics
 import (
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -51,6 +52,10 @@ type Metrics struct {
 	commitsTotal   *prometheus.CounterVec // total commits advanced
 	snapshotsTotal *prometheus.CounterVec // total snapshots taken
 	snapshotBytes  *prometheus.CounterVec // total snapshot bytes written
+	snapshotIndex  *prometheus.GaugeVec   // last index covered by a snapshot
+
+	proposalLatency *prometheus.HistogramVec // submission to applied, by outcome
+	proposalsTotal  *prometheus.CounterVec   // total proposals, by outcome
 }
 
 // New returns a Metrics instance whose series carry an empty "group" label.
@@ -76,6 +81,10 @@ func NewForGroup(reg prometheus.Registerer, groupID uint64) *Metrics {
 // commonLabels is the label set shared by every metric in this package.
 // "group" comes first so a series reads group-then-node.
 var commonLabels = []string{"group", "node"}
+
+// outcomeLabels extends commonLabels with whether the operation succeeded, so
+// that a rise in failures is visible without a second metric.
+var outcomeLabels = []string{"group", "node", "outcome"}
 
 // transitionLabels extends commonLabels with the from/to states.
 var transitionLabels = []string{"group", "node", "from", "to"}
@@ -125,6 +134,31 @@ func newMetrics(reg prometheus.Registerer, group string) *Metrics {
 			Name:      "snapshot_bytes_total",
 			Help:      "Total bytes written across all snapshots.",
 		}, commonLabels)),
+
+		snapshotIndex: registerOrGet(reg, prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "raft",
+			Name:      "snapshot_index",
+			Help:      "Last log index covered by the most recent snapshot.",
+		}, commonLabels)),
+
+		// Buckets span a fast local commit (a millisecond) to a cluster in
+		// trouble (tens of seconds), since the interesting question is usually
+		// which end of that range the tail has moved to.
+		proposalLatency: registerOrGet(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "raft",
+			Name:      "proposal_duration_seconds",
+			Help:      "Time from a proposal being submitted to its entry being applied.",
+			Buckets: []float64{
+				0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+				0.25, 0.5, 1, 2.5, 5, 10, 30,
+			},
+		}, outcomeLabels)),
+
+		proposalsTotal: registerOrGet(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "raft",
+			Name:      "proposals_total",
+			Help:      "Total proposals resolved, labelled by outcome.",
+		}, outcomeLabels)),
 	}
 }
 
@@ -173,6 +207,16 @@ func (m *Metrics) SnapshotTaken(id raft.NodeID, lastIncludedIndex raft.Index, si
 	node := string(id)
 	m.snapshotsTotal.WithLabelValues(m.group, node).Inc()
 	m.snapshotBytes.WithLabelValues(m.group, node).Add(float64(sizeBytes))
-	// Re-use the commit gauge to track how far the snapshot covers.
-	_ = lastIncludedIndex
+	m.snapshotIndex.WithLabelValues(m.group, node).Set(float64(lastIncludedIndex))
+}
+
+// ProposalCompleted implements raft.ProposalMetrics.
+func (m *Metrics) ProposalCompleted(id raft.NodeID, latency time.Duration, ok bool) {
+	node := string(id)
+	outcome := "ok"
+	if !ok {
+		outcome = "failed"
+	}
+	m.proposalLatency.WithLabelValues(m.group, node, outcome).Observe(latency.Seconds())
+	m.proposalsTotal.WithLabelValues(m.group, node, outcome).Inc()
 }

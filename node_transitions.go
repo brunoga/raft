@@ -41,7 +41,8 @@ func (n *Node) applyFollowerTransition(leaderID NodeID) {
 	// Committed entries are already resolved by handleApplyResult before
 	// step-down triggers, so draining here only affects uncommitted proposals.
 	for idx, p := range n.pending {
-		p.reject(&NotLeaderError{Leader: n.leaderID})
+		p.promise.reject(&NotLeaderError{Leader: n.leaderID})
+		n.reportProposal(p.submitted, false)
 		delete(n.pending, idx)
 	}
 	n.drainPendingReads(&NotLeaderError{Leader: n.leaderID})
