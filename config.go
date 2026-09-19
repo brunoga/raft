@@ -273,6 +273,19 @@ type Config struct {
 	// without relying on wall-clock timing.
 	Clock Clock
 
+	// OnFatal is an optional callback invoked once, from its own goroutine, when
+	// this node stops because a durable write failed. The error it receives is
+	// the same one FatalError reports, and it matches ErrNodeFailed.
+	//
+	// A node in this state has already stopped; the callback exists so that a
+	// process running many groups can raise an alarm, or tear down and rebuild
+	// the affected group, rather than discovering the failure by noticing that
+	// one group has gone quiet. Do not call Stop on the node from here: it has
+	// stopped itself.
+	//
+	// Default: nil (the failure is logged at error level and nothing else).
+	OnFatal func(error)
+
 	// PreferredLeader is an optional node ID that should hold leadership
 	// whenever possible. When a node that is not the preferred leader wins an
 	// election, it will automatically initiate a leadership transfer to the

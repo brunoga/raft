@@ -46,6 +46,10 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 		if err != nil {
 			// Entry doesn't exist — append from here onward.
 			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
+				// Acknowledging entries that are not durable would let the
+				// leader count this node towards a commit quorum for entries
+				// that can still vanish.
+				n.fail(appendErr, "append replicated entries")
 				return resp, appendErr
 			}
 			break
@@ -53,6 +57,8 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 		if existingTerm != e.Term {
 			// Conflict: truncate and replace.
 			if truncErr := n.log.truncateSuffix(n.stopCtx, e.Index); truncErr != nil {
+				// The log may still hold entries the leader has overwritten.
+				n.fail(truncErr, "truncate conflicting log suffix")
 				return resp, truncErr
 			}
 			// The membership in effect may have come from an entry that was
@@ -64,6 +70,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 				}
 			}
 			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
+				n.fail(appendErr, "append replicated entries")
 				return resp, appendErr
 			}
 			break

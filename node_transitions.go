@@ -11,7 +11,9 @@ import "time"
 func (n *Node) becomeFollower(term Term, leaderID NodeID) {
 	if term > n.currentTerm {
 		if err := n.saveTerm(term, ""); err != nil {
-			n.logger.Error("becomeFollower: saveTerm", "err", err)
+			// saveTerm has already stopped the node: it cannot step down to a
+			// term it may not remember after a restart. Do not transition.
+			return
 		}
 	}
 	n.applyFollowerTransition(leaderID)
@@ -104,7 +106,9 @@ func (n *Node) becomeCandidate() {
 	prev := n.state
 	newTerm := n.currentTerm + 1
 	if err := n.saveTerm(newTerm, n.cfg.ID); err != nil {
-		n.logger.Error("becomeCandidate: saveTerm", "err", err)
+		// saveTerm has already stopped the node: standing for election in a
+		// term whose vote may not survive a restart is how one term ends up
+		// with two leaders.
 		return
 	}
 	n.setState(Candidate)

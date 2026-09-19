@@ -292,6 +292,68 @@ type Node struct {
 	// handler is the Handler wrapper registered with the Transport. Created
 	// once in New() so Handler() always returns the same value.
 	handler *nodeHandler
+
+	// fatalErr holds the first durable-write failure this node hit, if any.
+	// Setting it stops the node; it is read by FatalError and reported in
+	// place of ErrStopped by every operation afterwards.
+	fatalErr atomic.Value // stores error
+}
+
+// fail stops the node because a write Raft's safety argument depends on did not
+// reach stable storage. Only the first failure is recorded. Event-loop only.
+//
+// Continuing is not an option: a node that acts on a term, vote or log entry
+// that may not survive a restart can vote twice in one term, or acknowledge
+// entries a leader then counts towards a commit quorum although they are not
+// durable. Stopping keeps the failure local to this node, where the rest of the
+// cluster treats it as an ordinary unreachable peer.
+func (n *Node) fail(err error, op string) {
+	wrapped := fmt.Errorf("%w: %s: %w", ErrNodeFailed, op, err)
+	if !n.fatalErr.CompareAndSwap(nil, wrapped) {
+		return // already failing; keep the first error
+	}
+	n.logger.Error("fatal: durable write failed; stopping this node",
+		"op", op, "err", err)
+	if n.cfg.OnFatal != nil {
+		go n.cfg.OnFatal(wrapped)
+	}
+	// Stop from a separate goroutine: Stop waits for the event loop to exit,
+	// and fail is called from inside it.
+	go n.Stop()
+}
+
+// FatalError returns the durable-write failure that stopped this node, or nil
+// if it is running or was stopped normally. Safe for concurrent use.
+func (n *Node) FatalError() error {
+	if v := n.fatalErr.Load(); v != nil {
+		return v.(error)
+	}
+	return nil
+}
+
+// checkRunning reports why an operation cannot proceed, or nil if the node is
+// running. A node that stopped because of a durable-write failure reports that
+// failure rather than a plain shutdown, so a caller can tell "this node is
+// broken" from "this node was asked to stop".
+func (n *Node) checkRunning() error {
+	if err := n.FatalError(); err != nil {
+		return err
+	}
+	select {
+	case <-n.stopCh:
+		return ErrStopped
+	default:
+	}
+	return nil
+}
+
+// stoppedErr is what operations report once the node is no longer running:
+// the failure that stopped it if there was one, ErrStopped otherwise.
+func (n *Node) stoppedErr() error {
+	if err := n.FatalError(); err != nil {
+		return err
+	}
+	return ErrStopped
 }
 
 // New creates a Node from cfg, loads persisted state, and caches the log
@@ -456,12 +518,10 @@ func (n *Node) Tick() {
 // returns ctx.Err(). It does not set the deadline on outbound Raft RPCs —
 // use [Config.RPCTimeout] for that.
 func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
-	// Non-blocking pre-check: if stopCh is already closed, return immediately
-	// rather than racing with a buffered proposeCh.
-	select {
-	case <-n.stopCh:
-		return nil, ErrStopped
-	default:
+	// Non-blocking pre-check: if the node is stopped or broken, return
+	// immediately rather than racing with a buffered proposeCh.
+	if err := n.checkRunning(); err != nil {
+		return nil, err
 	}
 
 	respCh := make(chan result[[]byte], 1)
@@ -471,7 +531,7 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.stopCh:
-		return nil, ErrStopped
+		return nil, n.stoppedErr()
 	}
 	select {
 	case r := <-respCh:
@@ -479,7 +539,7 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-n.stopCh:
-		return nil, ErrStopped
+		return nil, n.stoppedErr()
 	}
 }
 
@@ -579,10 +639,8 @@ func (n *Node) ProposeOnce(ctx context.Context, clientID NodeID, seqNum uint64, 
 //
 // Returns ErrStopped if the node has been stopped.
 func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
-	select {
-	case <-n.stopCh:
-		return 0, ErrStopped
-	default:
+	if err := n.checkRunning(); err != nil {
+		return 0, err
 	}
 
 	// Fast path: if we are a follower and we know the leader, forward the RPC.
@@ -613,7 +671,7 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 	select {
 	case r := <-respCh:
@@ -627,7 +685,7 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 }
 
@@ -639,10 +697,8 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 // If called on a follower, it behaves exactly like ReadIndex (forwarding to the
 // leader), as followers do not hold read leases.
 func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
-	select {
-	case <-n.stopCh:
-		return 0, ErrStopped
-	default:
+	if err := n.checkRunning(); err != nil {
+		return 0, err
 	}
 
 	if n.State() != Leader {
@@ -659,7 +715,7 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 	select {
 	case r := <-respCh:
@@ -673,7 +729,7 @@ func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	case <-n.stopCh:
-		return 0, ErrStopped
+		return 0, n.stoppedErr()
 	}
 }
 
@@ -689,7 +745,7 @@ func (n *Node) waitApplied(ctx context.Context, index Index) (Index, error) {
 		case <-ctx.Done():
 			return last, ctx.Err()
 		case <-n.stopCh:
-			return last, ErrStopped
+			return last, n.stoppedErr()
 		case <-n.applyAdvancedCh:
 			// Re-check LastApplied on next iteration.
 		}
@@ -743,10 +799,8 @@ func (n *Node) ReadStale() Index {
 // proposals and send a TimeoutNow RPC to target once it is sufficiently
 // caught-up. The caller may poll State() to observe the step-down.
 func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
-	select {
-	case <-n.stopCh:
-		return ErrStopped
-	default:
+	if err := n.checkRunning(); err != nil {
+		return err
 	}
 
 	respCh := make(chan error, 1)
@@ -756,7 +810,7 @@ func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-n.stopCh:
-		return ErrStopped
+		return n.stoppedErr()
 	}
 	select {
 	case err := <-respCh:
@@ -764,7 +818,7 @@ func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-n.stopCh:
-		return ErrStopped
+		return n.stoppedErr()
 	}
 }
 
@@ -885,6 +939,11 @@ func (n *Node) setCommitIndex(idx Index) {
 // event-loop goroutine and waits for the response. The type parameter R is
 // the expected concrete response type.
 func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
+	if err := n.checkRunning(); err != nil {
+		var zero R
+		return zero, err
+	}
+
 	respCh := make(chan rpcResponse, 1)
 	env := rpcEnvelope{req: req, respCh: respCh}
 
@@ -895,7 +954,7 @@ func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
 		return zero, ctx.Err()
 	case <-n.stopCh:
 		var zero R
-		return zero, ErrStopped
+		return zero, n.stoppedErr()
 	}
 
 	select {
@@ -915,7 +974,7 @@ func dispatchRPC[R any](ctx context.Context, n *Node, req any) (R, error) {
 		return zero, ctx.Err()
 	case <-n.stopCh:
 		var zero R
-		return zero, ErrStopped
+		return zero, n.stoppedErr()
 	}
 }
 
@@ -965,6 +1024,7 @@ func (n *Node) saveTerm(term Term, votedFor NodeID) error {
 		CurrentTerm: term,
 		VotedFor:    votedFor,
 	}); err != nil {
+		n.fail(err, "persist term and vote")
 		return fmt.Errorf("saveTerm: %w", err)
 	}
 	n.currentTerm = term
