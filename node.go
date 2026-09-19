@@ -163,6 +163,18 @@ type Node struct {
 	// is counted implicitly when evaluating quorum.
 	quorumAcks map[NodeID]bool
 
+	// termStartIndex is the index of the no-op this node appended when it
+	// became leader, and so the first index in its own term. Zero when not
+	// leading.
+	//
+	// Everything at or above it was appended by this node in the current term:
+	// a leader only ever appends its own entries, and one that accepts an
+	// AppendEntries has already stepped down. Everything below it is from an
+	// earlier term and can never be committed by replica count (Raft 5.4.2).
+	// That makes it the exact lower bound for the commit scan, and removes the
+	// need to read each entry's term back from storage.
+	termStartIndex Index
+
 	// --- Leadership transfer state (leader only) ----------------------------
 	transferTarget  NodeID // non-empty while a transfer is in progress
 	transferElapsed int    // ticks since transfer was initiated
