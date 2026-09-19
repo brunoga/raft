@@ -10,9 +10,18 @@ import (
 
 // ---- LRU client table ---------------------------------------------------------
 
-// clientLRU is an O(1) LRU cache for the client dedup table.
-// The front of the list is the most-recently-used entry; the back is evicted
-// when the table exceeds cap (0 = unlimited).
+// clientLRU is an O(1) bounded table of per-client results, evicting the
+// least-recently-UPDATED entry when it exceeds cap (0 = unlimited).
+//
+// Recency here means the order in which entries were written, never the order
+// in which they were read. That distinction is a correctness requirement, not a
+// preference: every replica builds this table by applying the same log entries
+// in the same order, so as long as only writes reorder it, every replica evicts
+// the same entry at the same point and they all agree on which requests they
+// have already seen. If a lookup reordered the table, the leader — the only
+// node that serves lookups — would drift from its followers, and a client retry
+// would then be re-executed on some replicas and skipped on others, diverging
+// their state machines with nothing to detect it.
 type clientLRU struct {
 	l   *list.List
 	m   map[NodeID]*list.Element
@@ -32,15 +41,18 @@ func newClientLRU(maxSize int) *clientLRU {
 	}
 }
 
-// get returns the entry for id and moves it to MRU position. O(1).
+// get returns the entry for id. It does not change eviction order; see the
+// type comment for why that matters. O(1).
 func (c *clientLRU) get(id NodeID) (clientEntry, bool) {
 	e, ok := c.m[id]
 	if !ok {
 		return clientEntry{}, false
 	}
-	c.l.MoveToFront(e)
 	return e.Value.(*lruItem).ce, true
 }
+
+// len returns the number of entries currently held.
+func (c *clientLRU) len() int { return c.l.Len() }
 
 // put inserts or updates id and evicts the LRU entry if over cap. O(1).
 func (c *clientLRU) put(id NodeID, ce clientEntry) {
@@ -60,23 +72,39 @@ func (c *clientLRU) put(id NodeID, ce clientEntry) {
 	}
 }
 
-// toMap returns a plain map snapshot of the current table. O(n).
-func (c *clientLRU) toMap() map[NodeID]clientEntry {
-	result := make(map[NodeID]clientEntry, c.l.Len())
+// clientRecord is one table entry in eviction order. The table is carried
+// between goroutines and into snapshots as a slice rather than a map because
+// the order is part of the state: rebuilt in a different order, two replicas
+// would go on to evict different entries.
+type clientRecord struct {
+	id NodeID
+	ce clientEntry
+}
+
+// records returns the table contents ordered most-recently-updated first. O(n).
+func (c *clientLRU) records() []clientRecord {
+	result := make([]clientRecord, 0, c.l.Len())
 	for e := c.l.Front(); e != nil; e = e.Next() {
 		item := e.Value.(*lruItem)
-		result[item.id] = item.ce
+		result = append(result, clientRecord{id: item.id, ce: item.ce})
 	}
 	return result
 }
 
-// loadFrom replaces the LRU contents with the entries from m. O(n).
-func (c *clientLRU) loadFrom(m map[NodeID]clientEntry) {
+// loadFrom replaces the table contents with records, which must be ordered
+// most-recently-updated first. Entries beyond cap are dropped from the tail,
+// which is where the oldest entries are. O(n).
+func (c *clientLRU) loadFrom(records []clientRecord) {
 	c.l = list.New()
-	c.m = make(map[NodeID]*list.Element, len(m))
-	for id, ce := range m {
-		elem := c.l.PushBack(&lruItem{id: id, ce: ce})
-		c.m[id] = elem
+	c.m = make(map[NodeID]*list.Element, len(records))
+	for _, r := range records {
+		if c.cap > 0 && c.l.Len() >= c.cap {
+			break
+		}
+		if _, dup := c.m[r.id]; dup {
+			continue
+		}
+		c.m[r.id] = c.l.PushBack(&lruItem{id: r.id, ce: r.ce})
 	}
 }
 
@@ -144,25 +172,40 @@ type clientEntry struct {
 
 // ---- Snapshot framing ---------------------------------------------------------
 //
-// When taking a snapshot, the event loop wraps the state-machine data with the
-// client dedup table so that both can be restored atomically on restart or after
-// an InstallSnapshot RPC.
+// A snapshot replaces the log prefix it covers, so everything that prefix
+// carried has to be inside it. That is the state machine, the client dedup
+// table, and the cluster membership agreed by the config entries the snapshot
+// subsumes. The event loop wraps all three so they are restored atomically on
+// restart or after an InstallSnapshot RPC.
 //
 // Wire format:
-//   [8-byte snapFrameMagic][4-byte tableLen][table bytes][smData bytes]
+//
+//	[8-byte snapFrameMagicV2][4-byte tableLen][4-byte membershipLen]
+//	[table bytes][membership bytes][smData bytes]
 //
 // Table format:
-//   [4-byte N] repeated N times: [2-byte idLen][id][8-byte seqNum][4-byte resLen][res]
+//
+//	[4-byte N] repeated N times: [2-byte idLen][id][8-byte seqNum][4-byte resLen][res]
+//
+// snapFrameMagicV1 is the original layout, which had no membership section. It
+// is still read so that a node can start on a snapshot written by an older
+// build; such a snapshot yields no membership and the node falls back to the
+// peer list supplied in its Config.
+const (
+	snapFrameMagicV1 uint64 = 0xCAFEDEAD_BEEFD00D
+	snapFrameMagicV2 uint64 = 0xCAFEDEAD_BEEFD00E
+)
 
-const snapFrameMagic uint64 = 0xCAFEDEAD_BEEFD00D
-
-// writeWrappedSnapshot writes the client dedup table followed by the
-// state-machine data (via smSnapshot func) to w.
-func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, smSnapshot func(io.Writer) error) error {
+// writeWrappedSnapshot writes the client dedup table and the cluster
+// membership, followed by the state-machine data (via smSnapshot), to w.
+func writeWrappedSnapshot(w io.Writer, table []clientRecord, ms *membershipState, smSnapshot func(io.Writer) error) error {
 	tableBytes := encodeClientTable(table)
-	var hdr [12]byte
-	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagic)
-	binary.LittleEndian.PutUint32(hdr[8:], uint32(len(tableBytes)))
+	membershipBytes := encodeMembership(ms)
+
+	var hdr [16]byte
+	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagicV2)
+	binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(tableBytes)))
+	binary.LittleEndian.PutUint32(hdr[12:], uint32(len(membershipBytes)))
 
 	if _, err := w.Write(hdr[:]); err != nil {
 		return fmt.Errorf("write snap header: %w", err)
@@ -170,54 +213,86 @@ func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, smSnapshot 
 	if _, err := w.Write(tableBytes); err != nil {
 		return fmt.Errorf("write snap table: %w", err)
 	}
+	if _, err := w.Write(membershipBytes); err != nil {
+		return fmt.Errorf("write snap membership: %w", err)
+	}
 	if err := smSnapshot(w); err != nil {
 		return fmt.Errorf("write snap sm data: %w", err)
 	}
 	return nil
 }
 
-// readWrappedSnapshot reads the client table from r and returns it along with
-// a reader for the remaining state-machine data.
-func readWrappedSnapshot(r io.Reader) (table map[NodeID]clientEntry, smDataReader io.Reader, err error) {
-	var hdr [12]byte
-	if _, readErr := io.ReadFull(r, hdr[:]); readErr != nil {
+// readWrappedSnapshot reads the client table and membership from r and returns
+// them along with a reader positioned at the state-machine data.
+//
+// hasMembership is false for a snapshot written before the membership section
+// existed; the caller must then keep whatever membership it already has rather
+// than treating the zero value as an empty cluster.
+func readWrappedSnapshot(r io.Reader) (table []clientRecord, ms membershipState, hasMembership bool, smDataReader io.Reader, err error) {
+	var hdr [16]byte
+
+	// The two layouts share a leading magic and table length; only V2 has the
+	// membership length, so read the common prefix first.
+	if _, readErr := io.ReadFull(r, hdr[:12]); readErr != nil {
 		if readErr == io.EOF {
-			return nil, nil, fmt.Errorf("read snap header: empty file")
+			return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: empty file")
 		}
-		return nil, nil, fmt.Errorf("read snap header: %w", readErr)
+		return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: %w", readErr)
 	}
 
-	if binary.LittleEndian.Uint64(hdr[:8]) != snapFrameMagic {
-		// Legacy snapshot or different format: the entire reader is SM data.
-		// We return a multi-reader that puts back the header bytes.
-		return make(map[NodeID]clientEntry), io.MultiReader(bytes.NewReader(hdr[:]), r), nil
+	magic := binary.LittleEndian.Uint64(hdr[:8])
+	if magic != snapFrameMagicV1 && magic != snapFrameMagicV2 {
+		// A snapshot from a different producer entirely: treat the whole
+		// reader as state-machine data, putting back the bytes consumed.
+		return nil, membershipState{}, false,
+			io.MultiReader(bytes.NewReader(hdr[:12]), r), nil
 	}
 
-	tableLen := int(binary.LittleEndian.Uint32(hdr[8:]))
+	membershipLen := 0
+	if magic == snapFrameMagicV2 {
+		if _, readErr := io.ReadFull(r, hdr[12:]); readErr != nil {
+			return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: %w", readErr)
+		}
+		membershipLen = int(binary.LittleEndian.Uint32(hdr[12:]))
+	}
+
+	tableLen := int(binary.LittleEndian.Uint32(hdr[8:12]))
 	tableBytes := make([]byte, tableLen)
 	if _, readErr := io.ReadFull(r, tableBytes); readErr != nil {
-		return nil, nil, fmt.Errorf("read snap table: %w", readErr)
+		return nil, membershipState{}, false, nil, fmt.Errorf("read snap table: %w", readErr)
 	}
-
 	table, err = decodeClientTable(tableBytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("decode snap table: %w", err)
+		return nil, membershipState{}, false, nil, fmt.Errorf("decode snap table: %w", err)
 	}
 
-	return table, r, nil
+	if membershipLen > 0 {
+		membershipBytes := make([]byte, membershipLen)
+		if _, readErr := io.ReadFull(r, membershipBytes); readErr != nil {
+			return nil, membershipState{}, false, nil, fmt.Errorf("read snap membership: %w", readErr)
+		}
+		decoded, ok := decodeMembership(membershipBytes)
+		if !ok {
+			return nil, membershipState{}, false, nil, fmt.Errorf("decode snap membership: malformed")
+		}
+		ms, hasMembership = decoded, true
+	}
+
+	return table, ms, hasMembership, r, nil
 }
 
-func encodeClientTable(table map[NodeID]clientEntry) []byte {
+func encodeClientTable(table []clientRecord) []byte {
 	// Pre-compute size.
 	size := 4 // N
-	for id, e := range table {
-		size += 2 + len(id) + 8 + 4 + len(e.result)
+	for _, r := range table {
+		size += 2 + len(r.id) + 8 + 4 + len(r.ce.result)
 	}
 	buf := make([]byte, size)
 	off := 0
 	binary.LittleEndian.PutUint32(buf[off:], uint32(len(table)))
 	off += 4
-	for id, e := range table {
+	for _, rec := range table {
+		id, e := rec.id, rec.ce
 		idBytes := []byte(id)
 		binary.LittleEndian.PutUint16(buf[off:], uint16(len(idBytes)))
 		off += 2
@@ -233,13 +308,13 @@ func encodeClientTable(table map[NodeID]clientEntry) []byte {
 	return buf[:off]
 }
 
-func decodeClientTable(buf []byte) (map[NodeID]clientEntry, error) {
+func decodeClientTable(buf []byte) ([]clientRecord, error) {
 	if len(buf) < 4 {
 		return nil, fmt.Errorf("client table: buf too short")
 	}
 	n := int(binary.LittleEndian.Uint32(buf))
 	buf = buf[4:]
-	table := make(map[NodeID]clientEntry, n)
+	table := make([]clientRecord, 0, min(n, 4096))
 	for i := range n {
 		if len(buf) < 2 {
 			return nil, fmt.Errorf("client table: entry %d: truncated idLen", i)
@@ -249,8 +324,9 @@ func decodeClientTable(buf []byte) (map[NodeID]clientEntry, error) {
 		if len(buf) < idLen+12 {
 			return nil, fmt.Errorf("client table: entry %d: truncated id+seq+resLen", i)
 		}
-		id := NodeID(make([]byte, idLen))
-		copy([]byte(id), buf[:idLen])
+		// NodeID is a string type, so this conversion copies; the bytes are not
+		// aliased to buf.
+		id := NodeID(buf[:idLen])
 		buf = buf[idLen:]
 		seqNum := binary.LittleEndian.Uint64(buf)
 		buf = buf[8:]
@@ -265,7 +341,7 @@ func decodeClientTable(buf []byte) (map[NodeID]clientEntry, error) {
 			copy(result, buf[:resLen])
 		}
 		buf = buf[resLen:]
-		table[id] = clientEntry{seqNum: seqNum, result: result}
+		table = append(table, clientRecord{id: id, ce: clientEntry{seqNum: seqNum, result: result}})
 	}
 	return table, nil
 }
