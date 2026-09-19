@@ -170,14 +170,12 @@ func (n *Node) becomeLeader() {
 		Term:    n.currentTerm,
 		Command: nil,
 	}
-	if err := n.log.appendOne(n.stopCtx, noop); err != nil {
-		// If we can't write to storage, we cannot commit anything as leader
-		// and leaderNopCommitted would never become true, permanently stalling
-		// all reads and proposals. Step down so another node can be elected.
-		n.logger.Error("becomeLeader: append noop failed, stepping down", "err", err)
-		n.applyFollowerTransition("")
-		return
-	}
+	// The no-op is in the log from here on, so replication can carry it
+	// straight away. It cannot be committed until it is on disk, which
+	// maybeAdvanceCommit enforces by counting this node's own log only as far
+	// as its durable point; a write that never lands stops this node
+	// altogether rather than leaving it leading without being able to commit.
+	n.log.appendOne(noop)
 
 	n.termStartIndex = noop.Index
 	n.broadcastHeartbeat()

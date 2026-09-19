@@ -144,10 +144,11 @@ Each `*Node` runs the following persistent goroutines:
 | Apply loop | 1 | Delivers committed entries to `StateMachine.Apply`, manages snapshots |
 | Ticker | 0 or 1 | Fires `Tick()` at `TickInterval`; absent when `TickInterval == 0` |
 | Heartbeat pump | P (one per peer) | Keeps heartbeat RPCs off the event loop; size-1 channel drops redundant sends |
+| Storage writer | 1 | Carries out every mutating `Storage` call, in order, off the event loop; started on the node's first write |
 
-**Budget at scale**: with G groups and P peers per group, each physical node runs approximately `G × (2 + P)` persistent goroutines. At G = 1,000 and P = 3, that is ~5,000 goroutines — well within Go's scheduler capacity. `Manager.RunTicker` adds one additional goroutine and a pool of `min(GOMAXPROCS, G)` workers to fan-out `Tick()` across all groups in parallel.
+**Budget at scale**: with G groups and P peers per group, each physical node runs approximately `G × (3 + P)` persistent goroutines. At G = 1,000 and P = 3, that is ~6,000 goroutines — well within Go's scheduler capacity. `Manager.RunTicker` adds one additional goroutine and a pool of `min(GOMAXPROCS, G)` workers to fan-out `Tick()` across all groups in parallel.
 
-**Practical ceiling**: Go's M:N scheduler handles 10,000+ goroutines without issue on modern hardware. Goroutine overhead typically becomes noticeable beyond ~1,000 groups per node (~5,000 goroutines at P=3). In practice, disk I/O — not goroutines — is the binding constraint at common group counts; see [Caveats](#caveats-and-known-limitations) for details.
+**Practical ceiling**: Go's M:N scheduler handles 10,000+ goroutines without issue on modern hardware. Goroutine overhead typically becomes noticeable beyond ~1,000 groups per node (~6,000 goroutines at P=3). In practice, disk I/O — not goroutines — is the binding constraint at common group counts; see [Caveats](#caveats-and-known-limitations) for details.
 
 ---
 
@@ -494,6 +495,7 @@ cfg.Transport = tr                          // required
 | `MaxLogEntriesPerRPC` | `64` | Maximum entries per AppendEntries RPC. |
 | `MaxBytesPerRPC` | `1 MiB` | Maximum total payload per AppendEntries RPC. A count limit alone says nothing about message size. `0` means no byte limit. |
 | `MaxInflightRPCs` | `4` | Per-peer pipeline depth (concurrent unacknowledged AppendEntries RPCs). |
+| `MaxUnstableLogBytes` | `64 MiB` | Log entries a leader will hold in memory waiting on storage. Past it, `Propose` returns `ErrWriteBacklogFull`. This is the backpressure that replaces waiting for the disk. |
 | `SnapshotThreshold` | `10000` | Entries past the last snapshot that trigger an automatic snapshot. `0` disables auto-snapshots. |
 | `TrailingLogs` | `1024` | Entries retained behind the snapshot point, so a slightly-behind follower catches up from the log instead of needing a full state transfer. Capped at `SnapshotThreshold-1` in use. |
 | `SnapshotChunkSize` | `1 MiB` | Maximum bytes per InstallSnapshot chunk. Leave room for framing: a chunk sized at exactly the transport's message limit does not fit. `0` sends snapshots as a single RPC. |
@@ -956,7 +958,11 @@ and its README for a fuller discussion of the trade-offs.
 
 **Practical group counts**: at 10–200 groups per node the implementation runs comfortably within both goroutine and I/O budgets on typical SSD hardware. Beyond ~500 actively-writing groups, disk throughput becomes the binding constraint rather than CPU or goroutines.
 
-**fsync amplification (filestore)**: `filestore` issues an `fsync` after every mutating operation on each group's storage. Under write load, G simultaneously-active groups can issue G fsyncs within a single tick window. On a fast NVMe device (≈200 µs per fsync), 500 concurrent fsyncs consume roughly 100 ms of disk time — enough to trigger election timeouts in groups that are waiting on their own storage. Mitigation options:
+**fsync amplification (filestore)**: `filestore` issues an `fsync` after every mutating operation on each group's storage. Under write load, G simultaneously-active groups can issue G fsyncs within a single tick window. On a fast NVMe device (≈200 µs per fsync), 500 concurrent fsyncs consume roughly 100 ms of disk time.
+
+What that costs has changed. Log writes are carried out by each group's own storage-writer goroutine rather than on its event loop, so a group waiting on its own storage still counts election ticks, still answers heartbeats and vote requests, and still replicates the entries it has accepted. A disk backlog now delays *commits* — entries are not counted towards a quorum until they are written — instead of making a healthy group look dead to its peers and triggering elections it would then lose. A leader whose storage falls far enough behind refuses proposals with `ErrWriteBacklogFull` rather than growing its backlog without limit; see `MaxUnstableLogBytes`.
+
+Disk throughput is still the binding constraint on write rate, and these remain the ways to spend less of it:
 
 - **Stagger write load**: spread groups so that only a fraction are actively receiving proposals at any instant. Read-heavy or idle groups do not amplify fsyncs.
 - **Use a shared-WAL storage backend**: the `Storage` interface is intentionally narrow (`SaveLog`, `SaveSnapshot`, `LoadLog`, `LoadSnapshot`). A production system at very high group counts should replace `filestore` with an implementation that batches writes from multiple groups into a single shared WAL and issues one `fsync` per batch. `filestore` is the reference implementation for correctness and single-group deployments, not for a 1,000-group write-heavy cluster.

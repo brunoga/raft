@@ -105,6 +105,15 @@ type Node struct {
 	// --- Log ----------------------------------------------------------------
 	log *raftLog
 
+	// writer owns every mutating call into Storage. The event loop queues work
+	// on it and never waits for it; see storage_writer.go.
+	writer *storageWriter
+	// deferredWrites holds work that must not happen until a queued storage
+	// write has completed, in the order the writes were queued. Anything that
+	// tells another node, or this node's own commit accounting, that something
+	// is on disk belongs here.
+	deferredWrites []deferredWrite
+
 	// --- Timing (in ticks) --------------------------------------------------
 	electionElapsed  int
 	heartbeatElapsed int
@@ -566,13 +575,18 @@ func New(cfg *Config) (*Node, error) {
 			"trailingLogs", cfg.TrailingLogs, "snapshotThreshold", cfg.SnapshotThreshold)
 	}
 
-	rl, err := newRaftLog(cfg.Storage)
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	writer := newStorageWriter(cfg.Storage)
+
+	rl, err := newRaftLog(cfg.Storage, writer)
 	if err != nil {
+		stopCancel()
 		return nil, fmt.Errorf("raft.New: %w", err)
 	}
 
 	hs, err := cfg.Storage.LoadHardState(context.Background())
 	if err != nil {
+		stopCancel()
 		return nil, fmt.Errorf("raft.New: load hard state: %w", err)
 	}
 
@@ -583,6 +597,7 @@ func New(cfg *Config) (*Node, error) {
 		votedFor:    hs.VotedFor,
 		state:       Follower,
 		log:         rl,
+		writer:      writer,
 		// lastApplied is volatile; seed it from the snapshot boundary so the
 		// apply loop does not re-apply already-snapshotted entries.
 		lastApplied:       rl.snapMeta.LastIncludedIndex,
@@ -608,7 +623,7 @@ func New(cfg *Config) (*Node, error) {
 		clientTable:       newClientLRU(cfg.MaxClientTableSize),
 		rng:               rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
-	n.stopCtx, n.stopCancel = context.WithCancel(context.Background())
+	n.stopCtx, n.stopCancel = stopCtx, stopCancel
 	n.handler = &nodeHandler{n: n}
 
 	// If a snapshot exists, seed initialSnap so applyLoop can restore the
@@ -637,6 +652,7 @@ func New(cfg *Config) (*Node, error) {
 	}
 	rl.snapMembership = membershipState{}
 	if err := n.rebuildMembership(context.Background()); err != nil {
+		stopCancel()
 		return nil, fmt.Errorf("raft.New: recover membership: %w", err)
 	}
 
@@ -1242,12 +1258,26 @@ func (n *Node) Term() Term {
 // Must be called from the event-loop goroutine only.
 func (n *Node) saveTerm(term Term, votedFor NodeID) error {
 	started := n.now()
-	err := n.cfg.Storage.SaveHardState(n.stopCtx, HardState{
-		CurrentTerm: term,
-		VotedFor:    votedFor,
+	// Through the writer, and waited on. The write itself is still synchronous
+	// -- a node may not act on a term or a vote it has not persisted, and the
+	// deferral that would let it queue this one and carry on has to hold back
+	// every message carrying the new term, which is a separate piece of work.
+	// Going through the queue rather than round it keeps storage seeing one
+	// goroutine, and keeps this write ordered against the log writes around it.
+	err := n.writer.writeSync(&writeOp{
+		seq:          n.log.nextWriteSeq(),
+		kind:         writeHardState,
+		hs:           HardState{CurrentTerm: term, VotedFor: votedFor},
+		durableAfter: n.log.queuedDurable,
 	})
 	n.reportStorageWriteSince("hardstate", started, err)
 	if err != nil {
+		if errors.Is(err, ErrStopped) {
+			// The node is already shutting down and the writer has closed.
+			// Reporting that as a storage failure would leave FatalError
+			// claiming a disk problem on a node that stopped normally.
+			return err
+		}
 		n.fail(err, "persist term and vote")
 		return fmt.Errorf("saveTerm: %w", err)
 	}
@@ -1362,13 +1392,102 @@ func (n *Node) reportStorageWriteSince(op string, started time.Time, err error) 
 	n.reportStorageWrite(op, n.now().Sub(started), err)
 }
 
-// appendEntries writes entries to the log and reports what the write cost.
-// Every append the event loop waits on goes through here.
-func (n *Node) appendEntries(ctx context.Context, entries []LogEntry) error {
-	started := n.now()
-	err := n.log.append(ctx, entries)
-	n.reportStorageWriteSince("append", started, err)
-	return err
+// deferredWrite is work that must not happen until a queued storage write has
+// completed: an acknowledgement to a leader, a promise resolved for a client,
+// anything whose meaning is "this is on disk".
+//
+// Deferring is the whole of what makes an asynchronous write safe. The entry
+// enters the log immediately and is replicated and counted towards the vote
+// gate straight away, because the in-memory log is what this node will act on
+// for as long as it is running. What waits is every statement made to somebody
+// else, because a statement survives a crash and the entry might not.
+type deferredWrite struct {
+	seq  uint64
+	run  func()
+	fail func(error)
+}
+
+// afterWrite registers work to run once the write with this sequence number
+// has completed, or to be failed if it does not. Either may be nil.
+//
+// A seq of 0 means there was no write to wait for -- an append of no entries --
+// and the work runs immediately.
+func (n *Node) afterWrite(seq uint64, run func(), fail func(error)) {
+	if seq == 0 {
+		if run != nil {
+			run()
+		}
+		return
+	}
+	n.deferredWrites = append(n.deferredWrites, deferredWrite{seq: seq, run: run, fail: fail})
+}
+
+// handleWriteCompletions collects everything the storage writer has finished,
+// advances the durable point, and releases the work that was waiting on it.
+func (n *Node) handleWriteCompletions() {
+	done := n.writer.takeDone()
+	if len(done) == 0 {
+		return
+	}
+	for i := range done {
+		d := &done[i]
+		n.reportStorageWrite(d.kind.String(), d.took, d.err)
+		if d.err != nil {
+			// The log is no longer trustworthy: an append or truncation that
+			// failed leaves storage in a state this node cannot describe.
+			// Everything waiting on a write fails with it, so no caller is
+			// left holding a request that will never be answered.
+			n.fail(d.err, "durable "+d.kind.String())
+			n.failDeferredWrites(d.err)
+			continue
+		}
+		n.log.stabilize(*d)
+		n.runDeferredWrites(d.seq)
+	}
+	n.onDurableAdvanced()
+}
+
+// runDeferredWrites releases the work waiting on writes up to and including
+// seq. Writes complete in the order they were queued, so the waiting work is
+// already in that order too.
+func (n *Node) runDeferredWrites(seq uint64) {
+	i := 0
+	for ; i < len(n.deferredWrites); i++ {
+		if n.deferredWrites[i].seq > seq {
+			break
+		}
+		if r := n.deferredWrites[i].run; r != nil {
+			r()
+		}
+	}
+	n.deferredWrites = n.deferredWrites[i:]
+	if len(n.deferredWrites) == 0 {
+		n.deferredWrites = nil
+	}
+}
+
+// failDeferredWrites reports err to everything still waiting on a write.
+func (n *Node) failDeferredWrites(err error) {
+	for i := range n.deferredWrites {
+		if f := n.deferredWrites[i].fail; f != nil {
+			f(err)
+		}
+	}
+	n.deferredWrites = nil
+}
+
+// onDurableAdvanced reacts to the durable point having moved.
+//
+// Two things depend on it and nothing else does. The apply loop reads entries
+// back from storage, so it may only be told about a commit index that is
+// actually there. And a leader counts its own log towards a commit quorum only
+// as far as the disk has got, so an append landing can be what finally makes
+// an entry committed even though no peer said anything.
+func (n *Node) onDurableAdvanced() {
+	n.notifyApply()
+	if n.state == Leader {
+		n.maybeAdvanceCommit()
+	}
 }
 
 // reportProposal tells a ProposalMetrics implementation how a proposal ended.
@@ -1382,6 +1501,20 @@ func (n *Node) reportProposal(submitted time.Time, ok bool) {
 		return
 	}
 	pm.ProposalCompleted(n.cfg.ID, n.now().Sub(submitted), ok)
+}
+
+// defaultMaxUnstableLogBytes is the backlog limit used when Config leaves
+// MaxUnstableLogBytes at zero, so that a configuration written before the
+// field existed still has a bound.
+const defaultMaxUnstableLogBytes = 64 << 20
+
+// unstableLimit returns the byte limit on log entries held in memory awaiting
+// a write.
+func (n *Node) unstableLimit() int {
+	if n.cfg.MaxUnstableLogBytes > 0 {
+		return n.cfg.MaxUnstableLogBytes
+	}
+	return defaultMaxUnstableLogBytes
 }
 
 // proposalLimit returns the largest command this node will accept, or 0 when

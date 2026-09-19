@@ -4,11 +4,38 @@ import "context"
 
 // ---- Replication --------------------------------------------------------------
 
-func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+// handleAppendEntries processes one AppendEntries request and answers it on
+// respCh, which may happen after this function has returned.
+//
+// The answer is the single most consequential message a follower sends. A
+// leader that receives it counts this node towards the quorum that commits the
+// entries, and a committed entry is applied and never revisited, so the answer
+// means "these entries will survive my crash" and nothing weaker. That is why
+// it waits for the write: the entries go into the log and become visible to
+// everything this node does immediately, but the acknowledgement is held back
+// until the storage write behind them has completed.
+//
+// A node that crashes in that window comes back without the entries and
+// without having acknowledged them, which is indistinguishable from never
+// having received the request -- the case Raft already handles by retrying.
+func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcResponse) {
 	resp := &AppendEntriesResponse{Term: n.currentTerm}
+	// The response channel holds exactly one value and the caller reads it
+	// once. Answering twice would block the event loop on the second send,
+	// which is a far worse failure than the bug that caused it, so the guard
+	// is here rather than in an argument about why it cannot happen.
+	answered := false
+	reply := func(err error) {
+		if respCh == nil || answered {
+			return
+		}
+		answered = true
+		respCh <- rpcResponse{resp: resp, err: err}
+	}
 
 	if req.Term < n.currentTerm {
-		return resp, nil
+		reply(nil)
+		return
 	}
 	// Valid leader contact — reset election timer.
 	n.becomeFollower(req.Term, req.LeaderID)
@@ -36,43 +63,44 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 					resp.ConflictIndex--
 				}
 			}
-			return resp, nil
+			reply(nil)
+			return
 		}
 	}
 
-	// Append new entries, truncating any conflicting suffix first.
+	// Append new entries, truncating any conflicting suffix first. writeSeq is
+	// the write the acknowledgement waits on; it stays 0 for a heartbeat or a
+	// request whose entries this node already has, which needs no write and so
+	// can be answered at once.
+	var writeSeq uint64
 	for i, e := range req.Entries {
 		existingTerm, err := n.log.termAt(n.stopCtx, e.Index)
 		if err != nil {
 			// Entry doesn't exist — append from here onward.
-			if appendErr := n.appendEntries(n.stopCtx, req.Entries[i:]); appendErr != nil {
-				// Acknowledging entries that are not durable would let the
-				// leader count this node towards a commit quorum for entries
-				// that can still vanish.
-				n.fail(appendErr, "append replicated entries")
-				return resp, appendErr
-			}
+			writeSeq = n.log.append(req.Entries[i:])
 			break
 		}
 		if existingTerm != e.Term {
-			// Conflict: truncate and replace.
+			// Conflict: truncate and replace. Both operations are queued, and
+			// the writer runs them in the order they were queued, so storage
+			// can never end up with the new entries written behind the removal
+			// of the old ones.
 			if truncErr := n.log.truncateSuffix(n.stopCtx, e.Index); truncErr != nil {
 				// The log may still hold entries the leader has overwritten.
 				n.fail(truncErr, "truncate conflicting log suffix")
-				return resp, truncErr
+				reply(truncErr)
+				return
 			}
 			// The membership in effect may have come from an entry that was
 			// just discarded. Recompute it from the snapshot base and what is
 			// left of the log before adopting anything new.
 			if n.configIndex >= e.Index {
 				if rebuildErr := n.rebuildMembership(n.stopCtx); rebuildErr != nil {
-					return resp, rebuildErr
+					reply(rebuildErr)
+					return
 				}
 			}
-			if appendErr := n.appendEntries(n.stopCtx, req.Entries[i:]); appendErr != nil {
-				n.fail(appendErr, "append replicated entries")
-				return resp, appendErr
-			}
+			writeSeq = n.log.append(req.Entries[i:])
 			break
 		}
 	}
@@ -95,7 +123,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 	}
 
 	resp.Success = true
-	return resp, nil
+	n.afterWrite(writeSeq, func() { reply(nil) }, reply)
 }
 
 // broadcastHeartbeat sends empty AppendEntries to all peers.
@@ -169,9 +197,12 @@ func (n *Node) replicateToPeer(peer NodeID) {
 	var entries []LogEntry
 	if n.log.lastLogIndex() >= nextIdx {
 		var err error
-		entries, err = n.cfg.Storage.GetLogEntries(n.stopCtx, nextIdx, n.log.lastLogIndex()+1)
+		// Through the log, not straight from storage: the entries a leader
+		// most wants to send are the ones it has just appended, which are the
+		// ones least likely to be on disk yet.
+		entries, err = n.log.entries(n.stopCtx, nextIdx, n.log.lastLogIndex()+1)
 		if err != nil {
-			n.logger.Error("replicateToPeer: GetLogEntries", "peer", peer, "err", err)
+			n.logger.Error("replicateToPeer: read log entries", "peer", peer, "err", err)
 			return
 		}
 		// Cap at MaxLogEntriesPerRPC.
@@ -428,7 +459,13 @@ func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, sel
 //	N=2 (2 peers, no self): total/2 = 1, count > 1 means count >= 2  ✓
 func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf, selfVoter bool) bool {
 	count := 0
-	if includeSelf && selfVoter {
+	// Self counts only as far as its own storage has got. A leader's log is
+	// one of the replicas the quorum is drawn from, and it is no more entitled
+	// than a follower is to vouch for an entry it has not written: committing
+	// on a quorum that includes an entry living only in this leader's memory
+	// would apply it everywhere, and then lose it here if the machine died
+	// before the write landed.
+	if includeSelf && selfVoter && idx <= n.log.stableIndex() {
 		count = 1
 	}
 	for _, p := range members {

@@ -463,10 +463,7 @@ func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 			keepFrom -= trailing
 		}
 	}
-	if err := n.log.truncatePrefix(n.stopCtx, keepFrom); err != nil {
-		n.logger.Error("snapshot: truncatePrefix", "err", err)
-		return
-	}
+	n.log.truncatePrefix(keepFrom)
 	n.log.snapMeta = sr.meta
 	n.baseMembership = sr.membership
 	n.atomicSnapshotIndex.Store(uint64(sr.meta.LastIncludedIndex))

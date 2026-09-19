@@ -129,6 +129,27 @@ type Config struct {
 	// Default: 0 (ask the transport).
 	MaxProposalBytes int
 
+	// MaxUnstableLogBytes caps the total size of log entries a leader will
+	// hold in memory waiting to be written to storage. Beyond it, Propose and
+	// ProposeOnce are refused with ErrWriteBacklogFull until the writes catch
+	// up.
+	//
+	// This is the backpressure that replaces waiting for the disk. Appends do
+	// not block the event loop, so without a limit a leader whose storage has
+	// stalled would keep accepting proposals it cannot write and grow its
+	// backlog until the process runs out of memory -- trading a node that is
+	// slow for one that dies, and taking the cluster's leader with it. Refusing
+	// the proposal hands the decision to the caller, which can retry, shed the
+	// request, or fail it, and leaves the node healthy enough to be given away
+	// to a peer with a working disk.
+	//
+	// A follower is not throttled this way and does not need to be: its
+	// backlog is bounded by what its leader will send before it acknowledges,
+	// which MaxInflightRPCs and MaxBytesPerRPC already limit.
+	//
+	// Default: 64 MiB.
+	MaxUnstableLogBytes int
+
 	// SnapshotThreshold is the number of log entries after which the leader
 	// automatically requests a snapshot from the state machine:
 	//   trigger when  lastApplied − lastSnapshotIndex >= SnapshotThreshold
@@ -391,7 +412,8 @@ func DefaultConfig() Config {
 		MaxInflightRPCs:     4,
 		CheckQuorum:         true,
 		MaxClientTableSize:  100_000,
-		SnapshotChunkSize:   1 << 20, // 1 MiB
+		MaxUnstableLogBytes: 64 << 20, // 64 MiB
+		SnapshotChunkSize:   1 << 20,  // 1 MiB
 		TickInterval:        10 * time.Millisecond,
 	}
 }

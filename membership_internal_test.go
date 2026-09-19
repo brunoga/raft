@@ -115,9 +115,8 @@ func TestMembership_TruncationRevertsToPreviousConfiguration(t *testing.T) {
 		{Index: 1, Term: 1, Command: []byte("x")},
 		addB,
 	}
-	if err := node.log.append(ctx, entries); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	node.log.append(entries)
+	node.flushWrites(t)
 	node.applyConfigChange(addB.Command, addB.Index)
 
 	if got := memberIDs(node.cfg.Peers); !slices.Equal(got, []string{"a", "b"}) {
@@ -131,6 +130,7 @@ func TestMembership_TruncationRevertsToPreviousConfiguration(t *testing.T) {
 	if err := node.log.truncateSuffix(ctx, 2); err != nil {
 		t.Fatalf("truncateSuffix: %v", err)
 	}
+	node.flushWrites(t)
 	if node.configIndex >= 2 {
 		if err := node.rebuildMembership(ctx); err != nil {
 			t.Fatalf("rebuildMembership: %v", err)
@@ -156,9 +156,8 @@ func TestMembership_RebuildReplaysEveryConfigEntry(t *testing.T) {
 		{Index: 3, Term: 1, Command: encodeConfigEntry(configOpAdd, PeerConfig{ID: "b", Voter: true})},
 		{Index: 4, Term: 1, Command: encodeConfigEntry(configOpRemove, PeerConfig{ID: "a"})},
 	}
-	if err := node.log.append(ctx, entries); err != nil {
-		t.Fatalf("append: %v", err)
-	}
+	node.log.append(entries)
+	node.flushWrites(t)
 	if err := node.rebuildMembership(ctx); err != nil {
 		t.Fatalf("rebuildMembership: %v", err)
 	}
