@@ -120,7 +120,7 @@ func TestSimChaos(t *testing.T) {
 			for i := range iters {
 				seed := base + uint64(i)
 				t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
-					runChaosIteration(t, p, seed)
+					runChaosIteration(t, &p, seed)
 				})
 			}
 		})
@@ -129,11 +129,11 @@ func TestSimChaos(t *testing.T) {
 
 // runChaosIteration builds a cluster, beats on it, and then checks that what
 // survived is consistent.
-func runChaosIteration(t *testing.T, p chaosProfile, seed uint64) {
+func runChaosIteration(t *testing.T, p *chaosProfile, seed uint64) {
 	cfg := defaultSimConfig(seed)
 	cfg.nodes = p.nodes
 	cfg.policy = p.policy
-	c := newSimCluster(t, cfg)
+	c := newSimCluster(t, &cfg)
 
 	if c.waitLeader(5*time.Second) < 0 {
 		t.Fatalf("no leader after startup\n%s", c.diagnostics())
@@ -193,7 +193,7 @@ func runChaosIteration(t *testing.T, p chaosProfile, seed uint64) {
 // injectFault picks and applies one fault, returning the function that undoes
 // it. Only one fault is in flight at a time, which keeps a quorum available and
 // keeps the failures that do turn up attributable.
-func injectFault(c *simCluster, rng *rand.Rand, p chaosProfile) func() {
+func injectFault(c *simCluster, rng *rand.Rand, p *chaosProfile) func() {
 	n := len(c.nodes)
 
 	kinds := []string{"isolate", "minority"}
@@ -271,7 +271,7 @@ func (c *simCluster) awaitConvergence(t *testing.T, committed map[string]string,
 
 // converged reports whether every node holds every acknowledged write and no
 // two nodes disagree about any key.
-func (c *simCluster) converged(committed map[string]string) (bool, string) {
+func (c *simCluster) converged(committed map[string]string) (ok bool, reason string) {
 	for key, want := range committed {
 		for i, sn := range c.nodes {
 			if _, running := sn.get(); !running {

@@ -323,7 +323,7 @@ func runLinearizabilityIteration(t *testing.T, seed uint64) {
 	cfg := defaultSimConfig(seed)
 	cfg.nodes = 5
 	cfg.policy = simnet.Flaky()
-	c := newSimCluster(t, cfg)
+	c := newSimCluster(t, &cfg)
 	if c.waitLeader(5*time.Second) < 0 {
 		t.Fatalf("no leader after startup\n%s", c.diagnostics())
 	}
@@ -367,7 +367,7 @@ func runLinearizabilityIteration(t *testing.T, seed uint64) {
 				return
 			case <-time.After(time.Duration(10+rng.IntN(40)) * time.Millisecond):
 			}
-			undo := injectFault(c, rng, profile)
+			undo := injectFault(c, rng, &profile)
 			select {
 			case <-stopFaults:
 				undo()

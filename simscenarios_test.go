@@ -12,6 +12,7 @@ package raft_test
 // their content — and then asserts the one thing that must be true.
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -192,7 +193,7 @@ func newFigure8Cluster(t *testing.T) (*simCluster, *term4Block) {
 		}
 		return true
 	}
-	return newSimCluster(t, cfg), block
+	return newSimCluster(t, &cfg), block
 }
 
 // logsAgreeAt reports whether every listed member holds the same entry at idx.
@@ -208,7 +209,7 @@ func (c *simCluster) logsAgreeAt(idx raft.Index, members []int) bool {
 			want, first = e, false
 			continue
 		}
-		if e.Term != want.Term || string(e.Command) != string(want.Command) {
+		if e.Term != want.Term || !bytes.Equal(e.Command, want.Command) {
 			return false
 		}
 	}
@@ -255,7 +256,7 @@ func TestFollowerCommitIndexFromHeartbeat(t *testing.T) {
 		}
 		seedLog(t, store, hs)
 	}
-	c := newSimCluster(t, cfg)
+	c := newSimCluster(t, &cfg)
 
 	// Withhold every entry-carrying message to s2, so the only thing it ever
 	// receives from the leader is a heartbeat.
@@ -334,7 +335,7 @@ func TestSnapshotBoundary_ConflictingTailIsRepaired(t *testing.T) {
 	cfg := defaultSimConfig(simSeed(t))
 	cfg.nodes = 5
 	cfg.snapshotThreshold = 8
-	c := newSimCluster(t, cfg)
+	c := newSimCluster(t, &cfg)
 
 	c.electLeader(0, scenarioTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), scenarioTimeout)
@@ -411,7 +412,7 @@ func TestSnapshotBoundary_ConflictingTailIsRepaired(t *testing.T) {
 func TestLeadershipTransferDuringConfigChange(t *testing.T) {
 	cfg := defaultSimConfig(simSeed(t))
 	cfg.nodes = 5
-	c := newSimCluster(t, cfg)
+	c := newSimCluster(t, &cfg)
 
 	c.electLeader(0, scenarioTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), scenarioTimeout)
@@ -577,7 +578,7 @@ func TestVoteDeniedToStaleCandidate(t *testing.T) {
 func TestStaleNodeCannotStealLeadership(t *testing.T) {
 	cfg := defaultSimConfig(simSeed(t))
 	cfg.nodes = 5
-	c := newSimCluster(t, cfg)
+	c := newSimCluster(t, &cfg)
 
 	c.electLeader(0, scenarioTimeout)
 	c.net.Isolate(c.ids[4])
@@ -678,8 +679,8 @@ func TestVoteSurvivesRestartWithinTerm(t *testing.T) {
 			// Power cut: the node goes away, the storage keeps only what it had
 			// made durable, and a new node starts on it.
 			n.Stop()
-			if err := store.Crash(context.Background()); err != nil {
-				t.Fatalf("store.Crash: %v", err)
+			if crashErr := store.Crash(context.Background()); crashErr != nil {
+				t.Fatalf("store.Crash: %v", crashErr)
 			}
 			n = build()
 			defer n.Stop()
@@ -755,7 +756,7 @@ func TestLeaseReadUnderClockSkew(t *testing.T) {
 				}
 				rc.Clock = simnet.NewSkewClock(rate, 0)
 			}
-			c := newSimCluster(t, cfg)
+			c := newSimCluster(t, &cfg)
 			c.electLeader(0, scenarioTimeout)
 
 			ctx, cancel := context.WithTimeout(context.Background(), scenarioTimeout)
@@ -882,12 +883,12 @@ func TestStorageFailure_ProposalIsNotAcknowledged(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scenarioTimeout)
 	defer cancel()
-	if _, err := n.Propose(ctx, encodePut("disk", "healthy")); err != nil {
-		t.Fatalf("write on a healthy disk: %v", err)
+	if _, proposeErr := n.Propose(ctx, encodePut("disk", "healthy")); proposeErr != nil {
+		t.Fatalf("write on a healthy disk: %v", proposeErr)
 	}
 
 	store.FailWrites()
-	if _, err := n.Propose(ctx, encodePut("disk", "failed")); err == nil {
+	if _, proposeErr := n.Propose(ctx, encodePut("disk", "failed")); proposeErr == nil {
 		t.Errorf("Propose succeeded while every storage write was failing; " +
 			"the entry cannot be on stable storage, so the client must not be told it is")
 	}

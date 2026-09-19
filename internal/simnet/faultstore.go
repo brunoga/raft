@@ -131,9 +131,9 @@ func (f *FaultStore) Crash(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failErr = nil
-	last, err := f.inner.LastIndex()
-	if err != nil {
-		return err
+	last, lastErr := f.inner.LastIndex()
+	if lastErr != nil {
+		return lastErr
 	}
 	if last > f.durableLast {
 		if err := f.inner.TruncateSuffix(ctx, f.durableLast+1); err != nil {

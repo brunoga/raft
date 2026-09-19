@@ -212,11 +212,11 @@ type simCluster struct {
 
 // newSimCluster builds and starts a cluster. Everything is torn down and the
 // final invariant sweep is run through t.Cleanup.
-func newSimCluster(t testing.TB, cfg simConfig) *simCluster {
+func newSimCluster(t testing.TB, cfg *simConfig) *simCluster {
 	t.Helper()
 	c := &simCluster{
 		t:        t,
-		cfg:      cfg,
+		cfg:      *cfg,
 		net:      simnet.New(cfg.seed),
 		seed:     cfg.seed,
 		stopTick: make(chan struct{}),
