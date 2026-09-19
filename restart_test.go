@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,40 @@ import (
 	"github.com/brunoga/raft/storage/memstore"
 	"github.com/brunoga/raft/transport/memtransport"
 )
+
+// tickWhile drives the given nodes in the background until the returned stop
+// function is called.
+//
+// Tests that propose without ticking rely on every replication RPC succeeding
+// first time: a single dropped or timed-out RPC is only retried on the next
+// heartbeat, and a node that is never ticked never sends one. That makes such a
+// test a race between the RPC and its own deadline, which is fine on a fast
+// machine and flaky on a busy one.
+func tickWhile(nodes ...*raft.Node) (stop func()) {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			for _, n := range nodes {
+				n.Tick()
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-finished
+		})
+	}
+}
 
 // counterSM is a state machine that counts distinct Apply calls.
 // It is used to detect whether ProposeOnce duplicate entries are incorrectly
@@ -422,12 +457,15 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	propCtx, propCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer propCancel()
 	leader := nodes[leaderIdx]
+	stopTicking := tickWhile(nodes[leaderIdx], nodes[(leaderIdx+2)%3])
 	for i := 1; i <= 5; i++ {
 		cmd := []byte(fmt.Sprintf("x%d=y%d", i, i))
 		if _, err := leader.Propose(propCtx, cmd); err != nil {
+			stopTicking()
 			t.Fatalf("Propose %d: %v", i, err)
 		}
 	}
+	stopTicking()
 
 	// Restart the stopped follower from its persistent store.
 	_ = stores[followerIdx].Close()
@@ -725,12 +763,15 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 	defer propCancel()
 	leader := nodes[leaderIdx]
 	const numEntries = 10
+	stopTicking := tickWhile(nodes[leaderIdx], nodes[(leaderIdx+2)%3])
 	for i := 1; i <= numEntries; i++ {
 		cmd := []byte(fmt.Sprintf("k%d=v%d", i, i))
 		if _, err := leader.Propose(propCtx, cmd); err != nil {
+			stopTicking()
 			t.Fatalf("Propose %d: %v", i, err)
 		}
 	}
+	stopTicking()
 
 	// Wait for a snapshot to be taken and the log to be compacted on the leader.
 	// We poll SnapshotIndex() which is updated atomically only after truncatePrefix

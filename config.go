@@ -92,6 +92,25 @@ type Config struct {
 	// Default: 64.
 	MaxLogEntriesPerRPC int
 
+	// MaxBytesPerRPC caps the total size of the entry payloads in a single
+	// AppendEntries RPC. It complements MaxLogEntriesPerRPC, which caps their
+	// number: a count alone says nothing about the size of the message, and
+	// MaxLogEntriesPerRPC entries of a megabyte each is a message no transport
+	// will carry.
+	//
+	// That matters because there is no smaller batch to fall back on. A leader
+	// whose message is rejected for being too large re-sends the same batch,
+	// and the follower behind it never catches up again.
+	//
+	// A single entry larger than this budget is still sent, on its own:
+	// refusing to send it would stall replication permanently, and the
+	// transport may well accept it.
+	//
+	// Set to 0 for no byte limit (the count limit still applies).
+	//
+	// Default: 1 MiB.
+	MaxBytesPerRPC uint64
+
 	// SnapshotThreshold is the number of log entries after which the leader
 	// automatically requests a snapshot from the state machine:
 	//   trigger when  lastApplied − lastSnapshotIndex >= SnapshotThreshold
@@ -103,6 +122,30 @@ type Config struct {
 	//
 	// Default: 10 000.
 	SnapshotThreshold uint64
+
+	// TrailingLogs is the number of log entries retained behind the snapshot
+	// point when the log is compacted.
+	//
+	// Compaction that keeps nothing behind the snapshot point makes a full
+	// state transfer the only way to catch up a follower that was even one
+	// entry behind at that instant, and with automatic snapshots that instant
+	// comes round again and again. Retaining a tail lets those followers catch
+	// up from the log instead, which on a large state machine is the difference
+	// between shipping a few entries and shipping the whole thing.
+	//
+	// Size it to cover how far a healthy follower can fall behind: a brief
+	// pause, a garbage collection, a slow disk. The cost is disk space for that
+	// many entries.
+	//
+	// A value at or above SnapshotThreshold would leave compaction with nothing
+	// to reclaim, so it is capped at SnapshotThreshold-1 in use; New logs a
+	// warning when that cap applies. Lowering SnapshotThreshold without
+	// lowering this therefore still works, it just retains less.
+	//
+	// Set to 0 to retain nothing.
+	//
+	// Default: 1024.
+	TrailingLogs uint64
 
 	// SnapshotSemaphore is an optional semaphore used to limit the number of
 	// concurrent snapshots across multiple Raft nodes on a single physical
@@ -138,13 +181,24 @@ type Config struct {
 	// MaxClientTableSize caps the number of entries in the client dedup table
 	// used by ProposeOnce. Each entry records the latest (seqNum, result) pair
 	// for one client NodeID. When the table would exceed this size, the entry
-	// with the smallest seqNum (least recently active client) is evicted.
+	// written longest ago is evicted. Eviction order depends only on the order
+	// entries were written, which is the order of the log, so every replica
+	// evicts the same entry at the same point.
 	//
-	// In long-running clusters with many ephemeral client IDs the table grows
-	// without bound if this is zero, consuming memory indefinitely.
-	// DefaultConfig sets this to 100_000, which comfortably covers typical
-	// client populations while bounding the per-node overhead to a few tens
-	// of MiB.
+	// MUST be the same on every node in a group. A node with a smaller table
+	// forgets requests its peers still remember, so a client retry is
+	// re-executed there and skipped elsewhere, and the replicas diverge.
+	//
+	// Eviction is a real limit on the exactly-once guarantee: a client that
+	// retries a request after its entry has been evicted has that request
+	// executed a second time. Size the table so that it comfortably outlives
+	// the retry window of the slowest client.
+	//
+	// The bound is on entry count, not bytes; each entry also retains the
+	// result the state machine returned, so a state machine with large results
+	// needs a smaller table. In long-running clusters with many ephemeral
+	// client IDs the table grows without bound if this is zero, consuming
+	// memory indefinitely. DefaultConfig sets this to 100_000.
 	//
 	// Set to 0 to disable eviction (not recommended in production).
 	//
@@ -156,14 +210,19 @@ type Config struct {
 	// leader splits it into sequential chunks and sends them in order; the
 	// follower reassembles the chunks before applying.
 	//
-	// Chunking prevents large snapshots from exceeding gRPC's
-	// MaxCallRecvMsgSize (default 4 MiB) and bounds the peak heap allocation
-	// per RPC to roughly SnapshotChunkSize bytes on both sender and receiver.
+	// Chunking bounds the peak heap allocation per RPC to roughly
+	// SnapshotChunkSize bytes on both sender and receiver, and keeps each
+	// message inside whatever limit the transport enforces.
 	//
-	// Set to 0 to send the entire snapshot in a single RPC (the original
-	// behaviour, suitable only when snapshots are known to be small).
+	// Leave room for framing when choosing this: a chunk sized at exactly the
+	// transport's message limit does not fit, because the request carries its
+	// other fields too. The default is deliberately well below gRPC's own
+	// default limit of 4 MiB for that reason.
 	//
-	// Default: 4 MiB.
+	// Set to 0 to send the entire snapshot in a single RPC, which is suitable
+	// only when snapshots are known to be small.
+	//
+	// Default: 1 MiB.
 	SnapshotChunkSize int
 
 	// RPCTimeout is the per-RPC deadline applied to every outbound Raft RPC
@@ -262,6 +321,19 @@ type Config struct {
 	// without relying on wall-clock timing.
 	Clock Clock
 
+	// OnFatal is an optional callback invoked once, from its own goroutine, when
+	// this node stops because a durable write failed. The error it receives is
+	// the same one FatalError reports, and it matches ErrNodeFailed.
+	//
+	// A node in this state has already stopped; the callback exists so that a
+	// process running many groups can raise an alarm, or tear down and rebuild
+	// the affected group, rather than discovering the failure by noticing that
+	// one group has gone quiet. Do not call Stop on the node from here: it has
+	// stopped itself.
+	//
+	// Default: nil (the failure is logged at error level and nothing else).
+	OnFatal func(error)
+
 	// PreferredLeader is an optional node ID that should hold leadership
 	// whenever possible. When a node that is not the preferred leader wins an
 	// election, it will automatically initiate a leadership transfer to the
@@ -295,11 +367,13 @@ func DefaultConfig() Config {
 		ElectionTimeoutMax:  300 * time.Millisecond,
 		HeartbeatInterval:   50 * time.Millisecond,
 		MaxLogEntriesPerRPC: 64,
+		MaxBytesPerRPC:      1 << 20, // 1 MiB
 		SnapshotThreshold:   10_000,
+		TrailingLogs:        1024,
 		MaxInflightRPCs:     4,
 		CheckQuorum:         true,
 		MaxClientTableSize:  100_000,
-		SnapshotChunkSize:   4 * 1024 * 1024, // 4 MiB
+		SnapshotChunkSize:   1 << 20, // 1 MiB
 		TickInterval:        10 * time.Millisecond,
 	}
 }
@@ -307,7 +381,7 @@ func DefaultConfig() Config {
 // Validate returns an error if the configuration is invalid or inconsistent.
 // It checks:
 //   - ID, Storage, StateMachine, Transport are non-nil/non-empty
-//   - ElectionTimeoutMin ≤ ElectionTimeoutMax
+//   - ElectionTimeoutMin < ElectionTimeoutMax
 //   - ElectionTimeoutMin ≥ 2 × HeartbeatInterval
 //   - MaxLogEntriesPerRPC and MaxInflightRPCs are positive
 func (c *Config) Validate() error {
@@ -326,8 +400,13 @@ func (c *Config) Validate() error {
 	if c.ElectionTimeoutMin <= 0 || c.ElectionTimeoutMax <= 0 {
 		return errors.New("raft: election timeout values must be positive")
 	}
-	if c.ElectionTimeoutMin > c.ElectionTimeoutMax {
-		return errors.New("raft: ElectionTimeoutMin must be <= ElectionTimeoutMax")
+	if c.ElectionTimeoutMin >= c.ElectionTimeoutMax {
+		// Equal bounds leave no randomness in the election timeout. Every
+		// follower then times out at the same moment, splits the vote, and
+		// splits it again on the next attempt: the cluster can stay leaderless
+		// for a long time with nothing obviously wrong.
+		return errors.New("raft: ElectionTimeoutMax must be greater than ElectionTimeoutMin, " +
+			"otherwise elections have no randomised spread and split votes repeat")
 	}
 	if c.HeartbeatInterval <= 0 {
 		return errors.New("raft: HeartbeatInterval must be positive")
@@ -340,6 +419,18 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInflightRPCs <= 0 {
 		return errors.New("raft: MaxInflightRPCs must be positive")
+	}
+	if c.MaxClientTableSize < 0 {
+		return errors.New("raft: MaxClientTableSize must not be negative (use 0 for unlimited)")
+	}
+	if c.SnapshotChunkSize < 0 {
+		return errors.New("raft: SnapshotChunkSize must not be negative (use 0 to send whole snapshots)")
+	}
+	if c.RPCTimeout < 0 {
+		return errors.New("raft: RPCTimeout must not be negative")
+	}
+	if c.TickInterval < 0 {
+		return errors.New("raft: TickInterval must not be negative (use 0 to drive ticks manually)")
 	}
 	// When TickInterval drives the clock, the timing fields must resolve to at
 	// least one tick each. If TickInterval is larger than HeartbeatInterval,

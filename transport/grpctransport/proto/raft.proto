@@ -122,10 +122,29 @@ message HeartbeatEntry {
 }
 
 // HeartbeatResult is the per-group response to a HeartbeatEntry.
+//
+// A result reports one of two outcomes:
+//
+//   - A Raft-level answer: error_code is OK (0) and term/success/conflict_index/
+//     conflict_term mirror the fields of AppendEntriesResponse exactly. A
+//     success=false result is a genuine log mismatch and the conflict hints
+//     must be honoured by the leader's fast-backup logic.
+//   - A dispatch failure: error_code is a non-zero gRPC status code (the group
+//     is not registered on the receiver, its handler returned an error, or the
+//     RPC context was cancelled before the entry could be dispatched). The
+//     remaining fields are unset and the sender turns the result into a Go
+//     error so the leader treats the heartbeat as dropped rather than as a log
+//     mismatch.
 message HeartbeatResult {
-  uint64 group_id = 1;
-  uint64 term     = 2;
-  bool   success  = 3;
+  uint64 group_id       = 1;
+  uint64 term           = 2;
+  bool   success        = 3;
+  uint64 conflict_index = 4;
+  uint64 conflict_term  = 5;
+  // error_code is a google.rpc.Code value; 0 (OK) means the entry was
+  // dispatched and term/success/conflict_* carry the Raft-level answer.
+  uint32 error_code     = 6;
+  string error_message  = 7;
 }
 
 message BatchedHeartbeatRequest {

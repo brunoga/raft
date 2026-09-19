@@ -77,7 +77,8 @@ func (e *EasyRaft[T]) Mutate(ctx context.Context, key, name string, args []byte)
 }
 
 // CreateOnce inserts a new item with exactly-once semantics.
-// See [Collection.CreateOnce] for the (clientID, seqNum) contract.
+// See [Collection.CreateOnce] for the (clientID, seqNum) contract, and
+// [EasyRaft.Exactly] for the same guarantee with named fields.
 func (e *EasyRaft[T]) CreateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
 	return e.collection.CreateOnce(ctx, clientID, seqNum, key, value)
 }
@@ -98,6 +99,19 @@ func (e *EasyRaft[T]) DeleteOnce(ctx context.Context, clientID raft.NodeID, seqN
 // See [Collection.CreateOnce] for the (clientID, seqNum) contract.
 func (e *EasyRaft[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key, name string, args []byte) ([]byte, error) {
 	return e.collection.MutateOnce(ctx, clientID, seqNum, key, name, args)
+}
+
+// Exactly returns a view of the default collection whose writes are
+// deduplicated under id. It is the named-field alternative to the *Once
+// methods, whose positional (clientID, seqNum) pair sits before the key and is
+// easy to transpose:
+//
+//	id := session.Next()
+//	err := er.Exactly(id).Create(ctx, "alice", Counter{})
+//
+// See [Session] for allocating identities, and [Collection.Exactly].
+func (e *EasyRaft[T]) Exactly(id OnceID) ExactlyOnce[T] {
+	return e.collection.Exactly(id)
 }
 
 // Read returns an item by key with linearizable consistency.
@@ -125,6 +139,14 @@ func (e *EasyRaft[T]) List(ctx context.Context) (map[string]T, error) {
 // and a deleted flag. Call before [EasyRaft.Start].
 func (e *EasyRaft[T]) OnChange(fn func(key string, value *T, deleted bool)) {
 	e.collection.OnChange(fn)
+}
+
+// OnChangeEvent registers fn to receive the full [ChangeEvent] for every
+// committed write to the default collection, including its sequence number and
+// any gap marker reporting dropped events. Call before [EasyRaft.Start].
+// See [Collection.OnChangeEvent].
+func (e *EasyRaft[T]) OnChangeEvent(fn func(ChangeEvent[T])) {
+	e.collection.OnChangeEvent(fn)
 }
 
 // Ready blocks until this node has a known leader and has applied at least one
@@ -166,4 +188,10 @@ func (e *EasyRaft[T]) RemoveServer(ctx context.Context, id raft.NodeID) error {
 // node steps down or the context expires.
 func (e *EasyRaft[T]) TransferLeadership(ctx context.Context, to raft.NodeID) error {
 	return e.store.TransferLeadership(ctx, to)
+}
+
+// Leave removes this node from the cluster membership, forwarding the request
+// to the leader when this node is a follower. See [Store.Leave].
+func (e *EasyRaft[T]) Leave(ctx context.Context) error {
+	return e.store.Leave(ctx)
 }
