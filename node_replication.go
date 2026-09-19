@@ -150,6 +150,7 @@ func (n *Node) replicateToPeer(peer NodeID) {
 		if len(entries) > n.cfg.MaxLogEntriesPerRPC {
 			entries = entries[:n.cfg.MaxLogEntriesPerRPC]
 		}
+		entries = capByBytes(entries, n.cfg.MaxBytesPerRPC)
 	}
 
 	req := &AppendEntriesRequest{
@@ -193,6 +194,27 @@ func (n *Node) replicateToPeer(peer NodeID) {
 		case <-n.stopCtx.Done():
 		}
 	}(peer, req)
+}
+
+// capByBytes trims entries so their payloads fit within budget, always keeping
+// at least one. An entry larger than the whole budget travels on its own:
+// refusing to send it would stall replication for good, and the transport may
+// still accept it.
+func capByBytes(entries []LogEntry, budget uint64) []LogEntry {
+	if budget == 0 || len(entries) == 0 {
+		return entries
+	}
+	var total uint64
+	for i, e := range entries {
+		total += uint64(len(e.Command))
+		if total > budget {
+			if i == 0 {
+				return entries[:1]
+			}
+			return entries[:i]
+		}
+	}
+	return entries
 }
 
 // appendResult carries the outcome of an AppendEntries RPC back to the event loop.

@@ -417,6 +417,10 @@ func (n *Node) Tick() {
 // Returns ErrNotLeader if this node is not the leader, or ErrStopped if the
 // node has been stopped.
 //
+// cmd is retained, not copied: it is written to the log, sent to followers, and
+// handed to StateMachine.Apply. The caller must not modify it after this call,
+// including after it returns, since a snapshot may still read it.
+//
 // ctx controls the caller-side wait: cancelling it unblocks Propose and
 // returns ctx.Err(). It does not set the deadline on outbound Raft RPCs —
 // use [Config.RPCTimeout] for that.
@@ -522,6 +526,9 @@ func (n *Node) Leader() NodeID {
 // The caller is responsible for choosing seqNums correctly: a new, never-seen
 // seqNum triggers a normal propose; the same seqNum retried after a timeout
 // returns the cached result idempotently.
+//
+// As with Propose, cmd is retained rather than copied and must not be modified
+// after this call.
 func (n *Node) ProposeOnce(ctx context.Context, clientID NodeID, seqNum uint64, cmd []byte) ([]byte, error) {
 	return n.Propose(ctx, encodeDedupCmd(clientID, seqNum, cmd))
 }
