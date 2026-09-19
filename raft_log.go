@@ -16,9 +16,17 @@ type raftLog struct {
 	snapMeta SnapshotMeta // metadata of the last installed snapshot
 
 	// snapClientTable holds the client dedup table loaded from the snapshot
-	// during initialisation. It is consumed by Node.New() to seed n.clientTable
-	// and then cleared.
-	snapClientTable map[NodeID]clientEntry
+	// during initialisation, in eviction order. It is consumed by Node.New() to
+	// seed n.clientTable and then cleared.
+	snapClientTable []clientRecord
+
+	// snapMembership is the cluster membership recorded in that snapshot, and
+	// hasSnapMembership reports whether the snapshot carried one at all —
+	// snapshots written before the membership section existed do not, and an
+	// empty membership must not be mistaken for an empty cluster. Both are
+	// consumed by Node.New() and then cleared.
+	snapMembership    membershipState
+	hasSnapMembership bool
 
 	// cached positions; 0 means "no entries in storage"
 	first    Index
@@ -42,11 +50,13 @@ func newRaftLog(s Storage) (*raftLog, error) {
 		defer func() { _ = r.Close() }()
 		rl.snapMeta = meta
 		// Read the framing header to extract the client dedup table.
-		table, _, parseErr := readWrappedSnapshot(r)
+		table, ms, hasMS, _, parseErr := readWrappedSnapshot(r)
 		if parseErr != nil {
 			return nil, fmt.Errorf("raftLog: read snapshot framing: %w", parseErr)
 		}
 		rl.snapClientTable = table
+		rl.snapMembership = ms
+		rl.hasSnapMembership = hasMS
 	} else if loadErr != ErrNoSnapshot {
 		return nil, fmt.Errorf("raftLog: load snapshot: %w", loadErr)
 	}
