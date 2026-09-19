@@ -135,7 +135,7 @@ type membershipState struct {
 }
 
 // encodeMembership serialises a membershipState.
-func encodeMembership(ms membershipState) []byte {
+func encodeMembership(ms *membershipState) []byte {
 	if ms.joint {
 		b := []byte{membershipKindJoint}
 		b = appendPeerList(b, ms.old)

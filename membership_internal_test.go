@@ -118,7 +118,7 @@ func TestMembership_TruncationRevertsToPreviousConfiguration(t *testing.T) {
 	if err := node.log.append(ctx, entries); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	node.adoptConfigEntries(entries)
+	node.applyConfigChange(addB.Command, addB.Index)
 
 	if got := memberIDs(node.cfg.Peers); !slices.Equal(got, []string{"a", "b"}) {
 		t.Fatalf("peers after adopting the change = %v, want [a b]", got)
@@ -210,7 +210,7 @@ func TestSnapshotFraming_RoundTripsMembership(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			err := writeWrappedSnapshot(&buf, table, tt.ms, func(w io.Writer) error {
+			err := writeWrappedSnapshot(&buf, table, &tt.ms, func(w io.Writer) error {
 				_, werr := w.Write([]byte("machine-state"))
 				return werr
 			})
@@ -292,7 +292,7 @@ func TestMembership_SelfRoleRoundTrips(t *testing.T) {
 
 	fresh := newMembershipTestNode(t, &memLogStorage{}, nil)
 	fresh.cfg.ID = "self"
-	fresh.restoreMembership(ms)
+	fresh.restoreMembership(&ms)
 
 	if fresh.cfg.Voter {
 		t.Error("witness came back from its own membership record as a voter")

@@ -1,6 +1,7 @@
 package raft_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -144,7 +145,7 @@ func TestProposeOnce_SuccessfulResultIsCached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	if string(first) != string(second) {
+	if !bytes.Equal(first, second) {
 		t.Errorf("retry returned %q, want the cached %q", second, first)
 	}
 	if got := sm.count("accept-me"); got != 1 {
