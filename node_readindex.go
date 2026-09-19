@@ -157,10 +157,12 @@ func (n *Node) broadcastReadBarrier() {
 			select {
 			case n.rpcCh <- rpcEnvelope{
 				req: &appendResult{
-					peer:    p,
-					req:     r,
-					success: resp.Success,
-					term:    resp.Term,
+					peer:          p,
+					req:           r,
+					success:       resp.Success,
+					term:          resp.Term,
+					conflictIndex: resp.ConflictIndex,
+					conflictTerm:  resp.ConflictTerm,
 				},
 			}:
 			case <-n.stopCh:
