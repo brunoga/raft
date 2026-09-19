@@ -844,11 +844,30 @@ func (x *HeartbeatEntry) GetReadBarrier() uint64 {
 }
 
 // HeartbeatResult is the per-group response to a HeartbeatEntry.
+//
+// A result reports one of two outcomes:
+//
+//   - A Raft-level answer: error_code is OK (0) and term/success/conflict_index/
+//     conflict_term mirror the fields of AppendEntriesResponse exactly. A
+//     success=false result is a genuine log mismatch and the conflict hints
+//     must be honoured by the leader's fast-backup logic.
+//   - A dispatch failure: error_code is a non-zero gRPC status code (the group
+//     is not registered on the receiver, its handler returned an error, or the
+//     RPC context was cancelled before the entry could be dispatched). The
+//     remaining fields are unset and the sender turns the result into a Go
+//     error so the leader treats the heartbeat as dropped rather than as a log
+//     mismatch.
 type HeartbeatResult struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	GroupId       uint64                 `protobuf:"varint,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
 	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
 	Success       bool                   `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	ConflictIndex uint64                 `protobuf:"varint,4,opt,name=conflict_index,json=conflictIndex,proto3" json:"conflict_index,omitempty"`
+	ConflictTerm  uint64                 `protobuf:"varint,5,opt,name=conflict_term,json=conflictTerm,proto3" json:"conflict_term,omitempty"`
+	// error_code is a google.rpc.Code value; 0 (OK) means the entry was
+	// dispatched and term/success/conflict_* carry the Raft-level answer.
+	ErrorCode     uint32 `protobuf:"varint,6,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ErrorMessage  string `protobuf:"bytes,7,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -902,6 +921,34 @@ func (x *HeartbeatResult) GetSuccess() bool {
 		return x.Success
 	}
 	return false
+}
+
+func (x *HeartbeatResult) GetConflictIndex() uint64 {
+	if x != nil {
+		return x.ConflictIndex
+	}
+	return 0
+}
+
+func (x *HeartbeatResult) GetConflictTerm() uint64 {
+	if x != nil {
+		return x.ConflictTerm
+	}
+	return 0
+}
+
+func (x *HeartbeatResult) GetErrorCode() uint32 {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return 0
+}
+
+func (x *HeartbeatResult) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
 }
 
 type BatchedHeartbeatRequest struct {
@@ -1057,11 +1104,16 @@ const file_raft_proto_rawDesc = "" +
 	"\x0eprev_log_index\x18\x04 \x01(\x04R\fprevLogIndex\x12\"\n" +
 	"\rprev_log_term\x18\x05 \x01(\x04R\vprevLogTerm\x12#\n" +
 	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\x12!\n" +
-	"\fread_barrier\x18\a \x01(\x04R\vreadBarrier\"Z\n" +
+	"\fread_barrier\x18\a \x01(\x04R\vreadBarrier\"\xea\x01\n" +
 	"\x0fHeartbeatResult\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\x04R\agroupId\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x03 \x01(\bR\asuccess\"I\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\x12%\n" +
+	"\x0econflict_index\x18\x04 \x01(\x04R\rconflictIndex\x12#\n" +
+	"\rconflict_term\x18\x05 \x01(\x04R\fconflictTerm\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\x06 \x01(\rR\terrorCode\x12#\n" +
+	"\rerror_message\x18\a \x01(\tR\ferrorMessage\"I\n" +
 	"\x17BatchedHeartbeatRequest\x12.\n" +
 	"\aentries\x18\x01 \x03(\v2\x14.raft.HeartbeatEntryR\aentries\"K\n" +
 	"\x18BatchedHeartbeatResponse\x12/\n" +

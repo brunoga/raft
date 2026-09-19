@@ -390,7 +390,7 @@ func buildMux(
 			Term        uint64 `json:"term"`
 			LastApplied uint64 `json:"last_applied"`
 		}
-		statuses := mgr.StatusAll()
+		statuses := mgr.StatusAll(r.Context())
 		out := make([]shardStatus, 0, len(statuses))
 		for _, s := range statuses {
 			out = append(out, shardStatus{

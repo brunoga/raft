@@ -25,10 +25,36 @@ type Balancer interface {
 // of leaders hosted by any single physical node. On each call it moves leaders
 // from the most-loaded node to the least-loaded until all counts differ by at
 // most 1.
-type LeastLeadersBalancer struct{}
+//
+// A replica is only considered as a destination if it votes and is close enough
+// to the leader to take over: a non-voter cannot be elected at all, and a
+// replica that is far behind would have to catch up before it could serve
+// anything, turning a rebalance into an outage for that group.
+type LeastLeadersBalancer struct {
+	// MaxLag is how far behind the current leader a replica may be and still be
+	// considered as a destination, in log entries. Zero means the default of
+	// 1024.
+	MaxLag Index
+}
+
+// defaultBalancerMaxLag is the lag tolerated by LeastLeadersBalancer when
+// MaxLag is not set.
+const defaultBalancerMaxLag Index = 1024
+
+// eligibleTarget reports whether candidate can take leadership of a group
+// currently led by leader.
+func eligibleTarget(leader, candidate GroupStatus, maxLag Index) bool {
+	if candidate.NodeID == leader.NodeID || !candidate.Voter {
+		return false
+	}
+	if maxLag == 0 {
+		maxLag = defaultBalancerMaxLag
+	}
+	return candidate.LastApplied+maxLag >= leader.LastApplied
+}
 
 // Plan implements Balancer.
-func (LeastLeadersBalancer) Plan(view map[NodeID][]GroupStatus) []Transfer {
+func (b LeastLeadersBalancer) Plan(view map[NodeID][]GroupStatus) []Transfer {
 	if len(view) < 2 {
 		return nil
 	}
@@ -85,11 +111,11 @@ func (LeastLeadersBalancer) Plan(view map[NodeID][]GroupStatus) []Transfer {
 		moved := false
 		for i, leader := range busiest.leaders {
 			for _, candidate := range byGroup[leader.GroupID] {
-				if candidate.NodeID == leader.NodeID {
-					continue // same replica
-				}
 				if nodeToPhys[candidate.NodeID] != leastBusy.id {
 					continue // not on leastBusy
+				}
+				if !eligibleTarget(leader, candidate, b.MaxLag) {
+					continue
 				}
 				transfers = append(transfers, Transfer{
 					GroupID: leader.GroupID,

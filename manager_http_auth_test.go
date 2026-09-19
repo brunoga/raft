@@ -65,7 +65,7 @@ func TestManagerHandler_AuthorizedRequestIsServed(t *testing.T) {
 
 	handler := mgr.Handler(raft.WithRequestAuthorizer(raft.BearerTokenAuthorizer("s3cret")))
 
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequest(http.MethodGet, "/status", http.NoBody)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -89,7 +89,7 @@ func TestManagerHandler_RefusalDoesNotLeakTheReason(t *testing.T) {
 		return errors.New("token expired at 12:04 for user alice from 10.0.0.7")
 	}))
 
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequest(http.MethodGet, "/status", http.NoBody)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -109,7 +109,7 @@ func TestManagerHandler_WithoutAuthorizerStillServes(t *testing.T) {
 
 	handler := mgr.Handler(raft.WithInsecureHandlerAcknowledged())
 
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req := httptest.NewRequest(http.MethodGet, "/status", http.NoBody)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 

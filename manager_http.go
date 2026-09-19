@@ -120,8 +120,8 @@ func (c *handlerConfig) guard(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (m *Manager) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	statuses := m.StatusAll()
+func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
+	statuses := m.StatusAll(r.Context())
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(statuses); err != nil {
 		slog.Error("manager HTTP: status encode failed", "err", err)

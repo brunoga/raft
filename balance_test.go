@@ -18,12 +18,12 @@ import (
 func TestLeastLeadersBalancer_AlreadyBalanced(t *testing.T) {
 	view := map[raft.NodeID][]raft.GroupStatus{
 		"phys0": {
-			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader},
-			{GroupID: 2, NodeID: "g2-p0", State: raft.Follower},
+			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
+			{GroupID: 2, NodeID: "g2-p0", State: raft.Follower, Voter: true},
 		},
 		"phys1": {
-			{GroupID: 1, NodeID: "g1-p1", State: raft.Follower},
-			{GroupID: 2, NodeID: "g2-p1", State: raft.Leader},
+			{GroupID: 1, NodeID: "g1-p1", State: raft.Follower, Voter: true},
+			{GroupID: 2, NodeID: "g2-p1", State: raft.Leader, Voter: true},
 		},
 	}
 
@@ -40,14 +40,14 @@ func TestLeastLeadersBalancer_Rebalance(t *testing.T) {
 	// Expected: 1 transfer (phys0→2, phys1→1; difference is 1).
 	view := map[raft.NodeID][]raft.GroupStatus{
 		"phys0": {
-			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader},
-			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader},
-			{GroupID: 3, NodeID: "g3-p0", State: raft.Leader},
+			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
+			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader, Voter: true},
+			{GroupID: 3, NodeID: "g3-p0", State: raft.Leader, Voter: true},
 		},
 		"phys1": {
-			{GroupID: 1, NodeID: "g1-p1", State: raft.Follower},
-			{GroupID: 2, NodeID: "g2-p1", State: raft.Follower},
-			{GroupID: 3, NodeID: "g3-p1", State: raft.Follower},
+			{GroupID: 1, NodeID: "g1-p1", State: raft.Follower, Voter: true},
+			{GroupID: 2, NodeID: "g2-p1", State: raft.Follower, Voter: true},
+			{GroupID: 3, NodeID: "g3-p1", State: raft.Follower, Voter: true},
 		},
 	}
 
@@ -87,6 +87,7 @@ func TestLeastLeadersBalancer_ThreeNodes(t *testing.T) {
 				GroupID: uint64(g + 1),
 				NodeID:  raft.NodeID(fmt.Sprintf("g%d-p%d", g+1, p)),
 				State:   state,
+				Voter:   true,
 			}
 		}
 		view[physID] = statuses
@@ -124,8 +125,8 @@ func TestLeastLeadersBalancer_ThreeNodes(t *testing.T) {
 func TestLeastLeadersBalancer_SingleNode(t *testing.T) {
 	view := map[raft.NodeID][]raft.GroupStatus{
 		"phys0": {
-			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader},
-			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader},
+			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
+			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader, Voter: true},
 		},
 	}
 	plan := raft.LeastLeadersBalancer{}.Plan(view)

@@ -164,7 +164,7 @@ func (n *Node) electionWon() bool {
 		return hasMajorityAck(n.receivedVoteSet, n.cfg.Peers, true, n.cfg.Voter)
 	}
 	// Joint consensus: both C_old and C_new must independently have a majority.
-	return hasMajorityAck(n.receivedVoteSet, n.jointOld, true, true) &&
+	return hasMajorityAck(n.receivedVoteSet, n.jointOld, true, n.jointSelfVoterOld) &&
 		hasMajorityAck(n.receivedVoteSet, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 }
 
