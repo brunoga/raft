@@ -127,6 +127,22 @@ type Node struct {
 	// jointSelfVoter is true if this node is a voter in the new configuration
 	// during joint consensus.
 	jointSelfVoter bool
+	// jointSelfVoterOld is this node's voting role in C_old, captured when the
+	// joint configuration was adopted. Quorum checks against C_old need it
+	// because cfg.Voter may already describe the new role.
+	jointSelfVoterOld bool
+
+	// --- Membership provenance ----------------------------------------------
+	// baseMembership is the membership recorded in the snapshot this node
+	// started from, or the bootstrap membership from Config when there is no
+	// snapshot. It is the base that config entries in the log are replayed on
+	// top of by rebuildMembership.
+	baseMembership membershipState
+	// configIndex is the log index of the config entry that established the
+	// membership currently in effect, or the snapshot index when it came from
+	// the snapshot base. A truncation at or below it invalidates the
+	// membership and forces a rebuild.
+	configIndex Index
 
 	// --- Check-quorum state (leader only) -----------------------------------
 	// leaderQuorumElapsed counts ticks since quorumAcks was last reset.
@@ -352,15 +368,30 @@ func New(cfg *Config) (*Node, error) {
 		rl.snapClientTable = nil // release reference
 	}
 
+	// Recover the membership. Config.Peers is only a bootstrap value: it
+	// applies when this node has no snapshot membership and no config entry in
+	// its log. Anything the cluster has since agreed takes precedence, because
+	// membership is replicated state and a node that forgets it can vote under
+	// the wrong quorum rules.
+	if rl.hasSnapMembership {
+		n.baseMembership = rl.snapMembership
+	} else {
+		n.baseMembership = membershipState{
+			members: withSelf(cfg.Peers, cfg.ID, true, cfg.Voter),
+		}
+	}
+	rl.snapMembership = membershipState{}
+	if err := n.rebuildMembership(context.Background()); err != nil {
+		return nil, fmt.Errorf("raft.New: recover membership: %w", err)
+	}
+
 	// Initialise atomic mirrors so external readers never see a nil value.
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
-	initPeers := make([]PeerConfig, len(cfg.Peers))
-	copy(initPeers, cfg.Peers)
-	n.atomicPeers.Store(initPeers)
+	n.storePeers()
 	n.resetElectionTimeout()
 
 	// Register with the transport so we can receive inbound RPCs.
@@ -830,7 +861,14 @@ func (n *Node) setLeaderID(id NodeID) {
 }
 
 // setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
+//
+// commitIndex is monotonic: an entry, once committed, stays committed. A
+// request that would move it backwards (a reordered or delayed RPC carrying an
+// older LeaderCommit) is ignored rather than trusted.
 func (n *Node) setCommitIndex(idx Index) {
+	if idx <= n.commitIndex {
+		return
+	}
 	n.commitIndex = idx
 	n.atomicCommitIndex.Store(uint64(idx))
 }
@@ -1049,10 +1087,12 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 		}
 		select {
 		case n.rpcCh <- rpcEnvelope{req: &appendResult{
-			peer:    peer,
-			term:    resp.Term,
-			success: resp.Success,
-			req:     req,
+			peer:          peer,
+			term:          resp.Term,
+			success:       resp.Success,
+			req:           req,
+			conflictIndex: resp.ConflictIndex,
+			conflictTerm:  resp.ConflictTerm,
 		}}:
 		case <-stop:
 			return
@@ -1142,7 +1182,7 @@ func (n *Node) applyLoop() {
 		_, r, err := n.cfg.Storage.LoadSnapshot(ctx)
 		if err == nil {
 			// Skip the framing header (meta and table already handled in New).
-			_, smReader, rerr := readWrappedSnapshot(r)
+			_, _, _, smReader, rerr := readWrappedSnapshot(r)
 			if rerr == nil {
 				if restoreErr := n.cfg.StateMachine.Restore(ctx, n.initialSnap.meta, smReader); restoreErr != nil {
 					n.logger.Error("applyLoop: initial snapshot restore", "err", restoreErr)
@@ -1189,7 +1229,7 @@ func (n *Node) applyLoop() {
 				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
 			}()
 
-			serr := writeWrappedSnapshot(pw, trig.clientTable, func(w io.Writer) error {
+			serr := writeWrappedSnapshot(pw, trig.clientTable, &trig.membership, func(w io.Writer) error {
 				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
 			})
 			_ = pw.Close() // signals EOF to SaveSnapshot
@@ -1201,8 +1241,9 @@ func (n *Node) applyLoop() {
 
 			select {
 			case n.snapshotResultCh <- snapshotResult{
-				meta: trig.meta,
-				err:  serr,
+				meta:       trig.meta,
+				membership: trig.membership,
+				err:        serr,
 			}:
 			case <-n.stopCh:
 				return

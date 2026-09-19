@@ -21,10 +21,14 @@ type partialSnapshot struct {
 // snapInstallResult is posted by runSnapshotInstall to the event loop when the
 // streaming snapshot install from a leader completes (successfully or not).
 type snapInstallResult struct {
-	meta  SnapshotMeta
-	table map[NodeID]clientEntry
-	smR   io.ReadCloser // positioned past framing header, at SM data; nil on error
-	err   error
+	meta       SnapshotMeta
+	table      map[NodeID]clientEntry
+	membership membershipState
+	// hasMembership is false for a snapshot written before the membership
+	// section existed; the receiver then keeps the membership it already has.
+	hasMembership bool
+	smR           io.ReadCloser // positioned past framing header, at SM data; nil on error
+	err           error
 }
 
 // chunkReader implements io.Reader by draining a channel of byte slices.
@@ -81,13 +85,20 @@ type snapshotTrigger struct {
 	// clientTable is a deep copy of n.clientTable at trigger time, consistent
 	// with the SM state at meta.LastIncludedIndex.
 	clientTable map[NodeID]clientEntry
+	// membership is the cluster membership as of meta.LastIncludedIndex. The
+	// snapshot replaces the log prefix that carried the config entries, so it
+	// has to carry the membership they established.
+	membership membershipState
 }
 
 // snapshotResult is delivered from applyLoop to the event loop once the
 // snapshot has been taken and saved to storage.
 type snapshotResult struct {
 	meta SnapshotMeta
-	err  error
+	// membership is the membership written into the snapshot; it becomes the
+	// new base once the log prefix it covers is truncated away.
+	membership membershipState
+	err        error
 }
 
 // snapshotInstall is sent from the event loop to the apply goroutine when an
@@ -265,7 +276,7 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 		return
 	}
 
-	table, _, parseErr := readWrappedSnapshot(r)
+	table, ms, hasMS, _, parseErr := readWrappedSnapshot(r)
 	if parseErr != nil {
 		_ = r.Close()
 		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf("snapshot install: unwrap: %w", parseErr)})
@@ -274,7 +285,13 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 	// r is now positioned past the framing header, at the SM data. The event
 	// loop forwards it to the apply goroutine for StateMachine.Restore; the
 	// apply goroutine closes r when done.
-	sendResult(&snapInstallResult{meta: meta, table: table, smR: r})
+	sendResult(&snapInstallResult{
+		meta:          meta,
+		table:         table,
+		membership:    ms,
+		hasMembership: hasMS,
+		smR:           r,
+	})
 }
 
 // handleSnapInstallResult is called when runSnapshotInstall reports completion.
@@ -300,12 +317,25 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 
 	n.clientTable.loadFrom(r.table)
 
+	// The snapshot replaces every log entry up to its last-included index,
+	// including any config entries in that range, so the membership it carries
+	// becomes the new base. Entries that survive the truncation are replayed on
+	// top of it by rebuildMembership below.
+	if r.hasMembership {
+		n.baseMembership = r.membership
+	}
+
 	if err := n.log.truncatePrefix(n.stopCtx, r.meta.LastIncludedIndex+1); err != nil {
 		n.logger.Error("snapshot install: truncatePrefix", "err", err)
 		_ = r.smR.Close()
 		return
 	}
 	n.log.snapMeta = r.meta
+	if r.hasMembership {
+		if err := n.rebuildMembership(n.stopCtx); err != nil {
+			n.logger.Error("snapshot install: rebuild membership", "err", err)
+		}
+	}
 
 	// Preemptively advance lastApplied to the snapshot boundary. This
 	// prevents duplicate snapInstallResult messages — which arise when
@@ -388,12 +418,16 @@ func (n *Node) maybeSnapshot() {
 
 	// Signal applyLoop to take the snapshot. The channel is size-1 and
 	// snapshotting prevents re-entry, so this send never blocks.
-	n.snapshotTriggerCh <- snapshotTrigger{meta: meta, clientTable: tableSnapshot}
+	n.snapshotTriggerCh <- snapshotTrigger{
+		meta:        meta,
+		clientTable: tableSnapshot,
+		membership:  n.currentMembership(),
+	}
 }
 
 // handleSnapshotResult is called when the snapshot goroutine completes. It
 // persists the snapshot and truncates the log prefix.
-func (n *Node) handleSnapshotResult(sr snapshotResult) {
+func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 	defer func() {
 		n.snapshotting = false
 		if n.cfg.SnapshotSemaphore != nil {
@@ -411,6 +445,7 @@ func (n *Node) handleSnapshotResult(sr snapshotResult) {
 		return
 	}
 	n.log.snapMeta = sr.meta
+	n.baseMembership = sr.membership
 	n.atomicSnapshotIndex.Store(uint64(sr.meta.LastIncludedIndex))
 	n.logger.Info("snapshot saved", "index", sr.meta.LastIncludedIndex, "term", sr.meta.LastIncludedTerm)
 	if n.cfg.Metrics != nil {

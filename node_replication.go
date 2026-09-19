@@ -55,6 +55,14 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 			if truncErr := n.log.truncateSuffix(n.stopCtx, e.Index); truncErr != nil {
 				return resp, truncErr
 			}
+			// The membership in effect may have come from an entry that was
+			// just discarded. Recompute it from the snapshot base and what is
+			// left of the log before adopting anything new.
+			if n.configIndex >= e.Index {
+				if rebuildErr := n.rebuildMembership(n.stopCtx); rebuildErr != nil {
+					return resp, rebuildErr
+				}
+			}
 			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
 				return resp, appendErr
 			}
@@ -62,10 +70,20 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 		}
 	}
 
-	// Advance commitIndex.
-	if req.LeaderCommit > n.commitIndex {
-		n.setCommitIndex(min(req.LeaderCommit, n.log.lastLogIndex()))
-
+	// Advance commitIndex, but never past the last index this request actually
+	// covers. The leader's LeaderCommit refers to ITS log; it says nothing about
+	// entries this follower holds beyond the range the request establishes as
+	// matching. Clamping to our own last index instead would commit whatever
+	// uncommitted suffix we still carry from a previous leader — entries the
+	// current leader is about to overwrite — and applying those violates State
+	// Machine Safety, permanently, because an applied index is never revisited.
+	//
+	// PrevLogIndex + len(Entries) is exactly the range the leader has vouched
+	// for: the prefix matched the PrevLog check above, and the entries are the
+	// leader's own.
+	lastCovered := req.PrevLogIndex + Index(len(req.Entries))
+	if newCommit := min(req.LeaderCommit, lastCovered); newCommit > n.commitIndex {
+		n.setCommitIndex(newCommit)
 		n.notifyApply()
 	}
 
@@ -233,9 +251,26 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		return
 	}
 	if !r.success {
+		// A rejection with no conflict hint at all is not a log mismatch: a
+		// follower that genuinely disagrees always reports where. An empty hint
+		// means the response was synthesised somewhere between the peer and
+		// here — a transport that reported a routing or handler failure as a
+		// failed append, for instance. Treating it as a mismatch would drive
+		// nextIndex to 1, which is at or below the snapshot boundary on any
+		// leader that has ever compacted, so the leader would ship its entire
+		// state machine to a follower that may be perfectly up to date. Leave
+		// the peer's progress alone and let the next heartbeat retry.
+		if r.conflictIndex == 0 && r.conflictTerm == 0 {
+			n.logger.Warn("append rejected without a conflict hint; ignoring",
+				"peer", r.peer, "term", r.term)
+			return
+		}
+
 		// Back-track nextIndex using conflict hints.
 		if r.conflictTerm != 0 {
-			// Find last entry with conflictTerm in our log.
+			// Find the last entry with conflictTerm in our log. Terms never
+			// decrease with index, so the scan can stop as soon as it passes
+			// below conflictTerm: no earlier entry can match.
 			newNext := r.conflictIndex
 			for i := n.log.lastLogIndex(); i >= n.log.first; i-- {
 				t, err := n.log.termAt(n.stopCtx, i)
@@ -244,6 +279,9 @@ func (n *Node) handleAppendResult(r *appendResult) {
 				}
 				if t == r.conflictTerm {
 					newNext = i + 1
+					break
+				}
+				if t < r.conflictTerm {
 					break
 				}
 			}
@@ -297,7 +335,7 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		if n.jointOld == nil {
 			confirmed = hasMajorityAck(n.readBatchAcks, n.cfg.Peers, true, n.cfg.Voter)
 		} else {
-			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true, true) &&
+			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true, n.jointSelfVoterOld) &&
 				hasMajorityAck(n.readBatchAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 		if confirmed {
@@ -356,9 +394,9 @@ func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, sel
 //	N=4 (3 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
 //	N=5 (4 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
 //	N=2 (2 peers, no self): total/2 = 1, count > 1 means count >= 2  ✓
-func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf bool) bool {
+func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf, selfVoter bool) bool {
 	count := 0
-	if includeSelf && n.cfg.Voter {
+	if includeSelf && selfVoter {
 		count = 1
 	}
 	for _, p := range members {
@@ -372,7 +410,7 @@ func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf
 			total++
 		}
 	}
-	if includeSelf && n.cfg.Voter {
+	if includeSelf && selfVoter {
 		total++
 	}
 	return count > total/2
@@ -392,15 +430,15 @@ func (n *Node) maybeAdvanceCommit() {
 		var committed bool
 		if n.jointOld == nil {
 			// Normal single-config majority. Self is always a member.
-			committed = n.replicatedOnMajority(idx, n.cfg.Peers, true)
+			committed = n.replicatedOnMajority(idx, n.cfg.Peers, true, n.cfg.Voter)
 		} else {
 			// Joint consensus: both C_old and C_new must independently have a
 			// majority (Raft §6). jointOld and jointNew never include self.
 			// Self is always in C_old (it is the leader); for C_new it is
 			// only counted when jointIncludeSelf is true (i.e. self is
 			// retained in the new membership).
-			committed = n.replicatedOnMajority(idx, n.jointOld, true) &&
-				n.replicatedOnMajority(idx, n.jointNew, n.jointIncludeSelf)
+			committed = n.replicatedOnMajority(idx, n.jointOld, true, n.jointSelfVoterOld) &&
+				n.replicatedOnMajority(idx, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 		if committed {
 			n.setCommitIndex(idx)
