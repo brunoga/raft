@@ -66,8 +66,12 @@ func (n *Node) run() {
 			n.handleApplyResult(&ar)
 
 		case sr := <-n.snapshotResultCh:
-			n.handleSnapshotResult(sr)
+			n.handleSnapshotResult(&sr)
 		}
+
+		// One announcement per turn, after the whole transition has been
+		// applied. See announceLeadership.
+		n.announceLeadership()
 	}
 }
 
@@ -144,7 +148,7 @@ func (n *Node) tick() {
 				if n.jointOld == nil {
 					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
 				} else {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, true) &&
+					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, n.jointSelfVoterOld) &&
 						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 				}
 				if !hasQuorum {
@@ -190,6 +194,8 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 		n.handleInstallSnapshotResult(req)
 	case *snapInstallResult:
 		n.handleSnapInstallResult(req)
+	case *progressRequest:
+		resp = rpcResponse{resp: n.replicationProgress()}
 	default:
 		resp = rpcResponse{err: fmt.Errorf("raft: unknown RPC type %T", req)}
 	}
@@ -206,6 +212,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		for _, prop := range props {
 			p := promise[[]byte]{ch: prop.respCh}
 			p.reject(&NotLeaderError{Leader: n.leaderID})
+			n.reportProposal(prop.submitted, false)
 		}
 		return
 	}
@@ -213,6 +220,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		for _, prop := range props {
 			p := promise[[]byte]{ch: prop.respCh}
 			p.reject(ErrLeadershipTransferInProgress)
+			n.reportProposal(prop.submitted, false)
 		}
 		return
 	}
@@ -222,6 +230,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
 			p := promise[[]byte]{ch: prop.respCh}
 			p.reject(ErrConfigChangeInProgress)
+			n.reportProposal(prop.submitted, false)
 			continue
 		}
 
@@ -233,12 +242,14 @@ func (n *Node) handleProposals(props []proposeMsg) {
 					if seqNum < cached.seqNum {
 						p := promise[[]byte]{ch: prop.respCh}
 						p.reject(ErrObsoleteSeqNum)
+						n.reportProposal(prop.submitted, false)
 						continue
 					}
 					if seqNum == cached.seqNum {
 						// Exact duplicate — return the cached result without re-appending.
 						p := promise[[]byte]{ch: prop.respCh}
 						p.resolve(cached.result)
+						n.reportProposal(prop.submitted, true)
 						continue
 					}
 					// seqNum > cached.seqNum — new request; fall through to normal propose.
@@ -249,7 +260,10 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		idx := n.log.lastLogIndex() + Index(len(entries)) + 1
 		entry := LogEntry{Index: idx, Term: n.currentTerm, Command: prop.cmd}
 		entries = append(entries, entry)
-		n.pending[idx] = promise[[]byte]{ch: prop.respCh}
+		n.pending[idx] = pendingProposal{
+			promise:   promise[[]byte]{ch: prop.respCh},
+			submitted: prop.submitted,
+		}
 		if isConfigEntry(prop.cmd) {
 			n.pendingConfigIndex = idx
 		}
@@ -257,10 +271,14 @@ func (n *Node) handleProposals(props []proposeMsg) {
 
 	if len(entries) > 0 {
 		if err := n.log.append(n.stopCtx, entries); err != nil {
+			// A leader that cannot write its own log cannot make progress, and
+			// entries it believes it appended may or may not be there.
+			n.fail(err, "append proposed entries")
 			// Fail all in-flight entries in this batch.
 			for _, entry := range entries {
 				if p, ok := n.pending[entry.Index]; ok {
-					p.reject(fmt.Errorf("propose: append: %w", err))
+					p.promise.reject(fmt.Errorf("propose: append: %w", err))
+					n.reportProposal(p.submitted, false)
 					delete(n.pending, entry.Index)
 				}
 				if n.pendingConfigIndex == entry.Index {
@@ -293,15 +311,20 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 
 	// Apply config changes to Raft's own peer list.
 	if ar.configCmd != nil {
-		n.applyConfigChange(ar.configCmd)
+		n.applyConfigChange(ar.configCmd, ar.index)
 		if n.pendingConfigIndex == ar.index {
 			n.pendingConfigIndex = 0
 		}
 	}
 
-	// Update the client dedup table for ProposeOnce entries. The LRU evicts
-	// the least-recently-used client automatically on put() when over cap.
-	if isDedupCmd(ar.cmd) {
+	// Record the outcome of a ProposeOnce entry so a retry gets the same answer.
+	//
+	// Only a successful apply is recorded. Caching a failure as though it were
+	// a result would answer the retry with a nil error and a nil result, so a
+	// caller whose command the state machine rejected would be told it
+	// succeeded. A failed command left unrecorded is simply re-run, which is
+	// the correct outcome for a command that never took effect.
+	if isDedupCmd(ar.cmd) && ar.err == nil {
 		if clientID, seqNum, _, err := decodeDedupCmd(ar.cmd); err == nil {
 			if cached, ok := n.clientTable.get(clientID); !ok || seqNum >= cached.seqNum {
 				n.clientTable.put(clientID, clientEntry{seqNum: seqNum, result: ar.val})
@@ -312,10 +335,11 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 	p, ok := n.pending[ar.index]
 	if ok {
 		if ar.err != nil {
-			p.reject(ar.err)
+			p.promise.reject(ar.err)
 		} else {
-			p.resolve(ar.val)
+			p.promise.resolve(ar.val)
 		}
+		n.reportProposal(p.submitted, ar.err == nil)
 		delete(n.pending, ar.index)
 	}
 	n.maybeSnapshot()
@@ -348,17 +372,27 @@ func (n *Node) notifyApply() {
 // drainPending rejects all in-flight proposals with the given error.
 func (n *Node) drainPending(err error) {
 	for idx, p := range n.pending {
-		p.reject(err)
+		p.promise.reject(err)
+		n.reportProposal(p.submitted, false)
 		delete(n.pending, idx)
 	}
 	n.drainPendingReads(err)
 }
 
-// drainPendingReads rejects all pending ReadIndex futures.
+// drainPendingReads rejects all outstanding ReadIndex futures, both those
+// waiting on the round in flight and those waiting for the next one.
 func (n *Node) drainPendingReads(err error) {
 	for _, p := range n.pendingReads {
 		p.reject(err)
 	}
+	clear(n.pendingReads)
 	n.pendingReads = n.pendingReads[:0]
+
+	for _, p := range n.waitingReads {
+		p.reject(err)
+	}
+	clear(n.waitingReads)
+	n.waitingReads = n.waitingReads[:0]
+
 	n.readBatchAcks = nil
 }
