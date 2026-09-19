@@ -22,7 +22,7 @@ type partialSnapshot struct {
 // streaming snapshot install from a leader completes (successfully or not).
 type snapInstallResult struct {
 	meta       SnapshotMeta
-	table      map[NodeID]clientEntry
+	table      []clientRecord
 	membership membershipState
 	// hasMembership is false for a snapshot written before the membership
 	// section existed; the receiver then keeps the membership it already has.
@@ -82,9 +82,9 @@ func drainChunks(ch <-chan []byte) {
 // the same state machine.
 type snapshotTrigger struct {
 	meta SnapshotMeta
-	// clientTable is a deep copy of n.clientTable at trigger time, consistent
-	// with the SM state at meta.LastIncludedIndex.
-	clientTable map[NodeID]clientEntry
+	// clientTable is a copy of n.clientTable at trigger time, in eviction
+	// order, consistent with the SM state at meta.LastIncludedIndex.
+	clientTable []clientRecord
 	// membership is the cluster membership as of meta.LastIncludedIndex. The
 	// snapshot replaces the log prefix that carried the config entries, so it
 	// has to carry the membership they established.
@@ -107,7 +107,7 @@ type snapshotResult struct {
 type snapshotInstall struct {
 	meta        SnapshotMeta
 	r           io.ReadCloser
-	clientTable map[NodeID]clientEntry
+	clientTable []clientRecord
 }
 
 // installSnapshotResult is delivered from sendSnapshotToPeer's background
@@ -414,7 +414,7 @@ func (n *Node) maybeSnapshot() {
 	// Capture the client table at trigger time so that the snapshot wraps
 	// table state consistent with the SM state at snapAt. applyLoop will
 	// forward this table through snapshotResult to handleSnapshotResult.
-	tableSnapshot := n.clientTable.toMap()
+	tableSnapshot := n.clientTable.records()
 
 	// Signal applyLoop to take the snapshot. The channel is size-1 and
 	// snapshotting prevents re-entry, so this send never blocks.
