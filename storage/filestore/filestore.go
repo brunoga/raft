@@ -3,29 +3,39 @@
 //
 // Layout under the data directory:
 //
-//	meta              — fixed-size hard state record (term + votedFor)
-//	seg-NNNNN.log     — append-only binary log segment
-//	seg-NNNNN.idx     — dense array of uint64 byte offsets, one per log entry
+//	meta              — hard state (term + votedFor) in two checksummed slots
+//	seg-NNNNNNNNNN.log — append-only binary log segment
+//	seg-NNNNNNNNNN.idx — dense array of uint64 byte offsets, one per log entry
 //	snap              — latest snapshot (written atomically via snap.tmp → snap)
 //
-// Segments are numbered sequentially from 00000. When the active segment's
-// log file reaches SegmentSize bytes a new segment is created. Old segments
-// are sealed (immutable) and can be dropped wholesale during prefix truncation,
+// Segments are numbered sequentially from 0. When the active segment's log
+// file reaches SegmentSize bytes a new segment is created. Old segments are
+// sealed (immutable) and can be dropped wholesale during prefix truncation,
 // avoiding the expensive in-place compaction for all but the newest segment.
+// Segment file names written by older releases used a narrower zero-padded
+// sequence number; any width is still recognised on open.
 //
-// Every mutating operation fsyncs before returning so that Raft safety
-// invariants hold across crashes.
+// Every mutating operation fsyncs before returning — and fsyncs the containing
+// directory whenever a file is created, renamed or unlinked — so that Raft
+// safety invariants hold across crashes.
 //
-// On open, the tail of the last (active) segment is scanned for partial
-// writes; any corrupt entries are truncated and the index file is rebuilt
-// to match. Sealed segments are trusted to be complete.
+// On open, the tail of the active segment is walked and validated: the index
+// file is a dense array in which slot i must hold the entry with index
+// firstID+i at a strictly increasing byte offset, and every entry's checksum
+// must verify. The first violation marks the end of the durable data and
+// everything after it is truncated away. Segments that do not chain
+// contiguously onto their predecessor are discarded, because a gap can only
+// mean that the log beyond it was already discarded but its files outlived a
+// crash.
 package filestore
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
 	"os"
@@ -39,10 +49,22 @@ import (
 )
 
 const (
-	// metaSize is the fixed on-disk size of the hard-state record:
-	//   term:8 + votedForLen:2 + votedFor:256 = 266 bytes
+	// votedForMaxLen bounds the node ID stored in the hard-state record.
 	votedForMaxLen = 256
-	metaSize       = 8 + 2 + votedForMaxLen // 266
+
+	// Hard-state record (one slot):
+	//   crc32:4 | seq:8 | term:8 | votedForLen:2 | votedFor:256 = 278 bytes
+	//
+	// Two slots are written alternately so that a torn write always leaves the
+	// previous record intact. The slot with the highest sequence number whose
+	// checksum verifies is the current one.
+	metaRecordSize = 4 + 8 + 8 + 2 + votedForMaxLen // 278
+	metaSlots      = 2
+	metaFileSize   = metaRecordSize * metaSlots // 556
+
+	// legacyMetaSize is the size of the pre-checksum hard-state record written
+	// by older releases: term:8 | votedForLen:2 | votedFor:256.
+	legacyMetaSize = 8 + 2 + votedForMaxLen // 266
 
 	// Log entry wire format:
 	//   crc32:4 | index:8 | term:8 | dataLen:4 | data[dataLen]
@@ -53,6 +75,36 @@ const (
 
 	// defaultSegmentSize is the log-file size threshold for rotation.
 	defaultSegmentSize = 64 * 1024 * 1024 // 64 MiB
+
+	// copyChunkSize bounds the amount of memory used when a segment is
+	// rewritten during prefix truncation. Without it the whole kept tail of a
+	// segment (up to the segment size) would be buffered at once.
+	copyChunkSize = 1 << 20 // 1 MiB
+
+	// segNamePrefix and segNameFormat control segment file naming. The width
+	// is wide enough that the sequence number cannot realistically wrap the
+	// field; names written with a narrower width by older releases are still
+	// recognised because the number is parsed rather than matched positionally.
+	segNamePrefix = "seg-"
+	segNameFormat = segNamePrefix + "%010d"
+)
+
+// Snapshot file format:
+//
+//	magic:4 "RSNP" | version:4 | lastIncludedIndex:8 | lastIncludedTerm:8
+//	body[dataLen]
+//	dataLen:8 | crc32:4
+//
+// Older releases wrote a bare 16-byte header (index + term) followed by the
+// raw body with no length and no checksum. Such files are still readable but
+// cannot be verified.
+var snapMagic = [4]byte{'R', 'S', 'N', 'P'}
+
+const (
+	snapVersion          = 1
+	snapHeaderSize       = 4 + 4 + 8 + 8 // 24
+	snapTrailerSize      = 8 + 4         // 12
+	legacySnapHeaderSize = 8 + 8         // 16
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -62,12 +114,18 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 // segment manages one log+index file pair. Byte offsets stored in the .idx
 // file are relative to byte 0 of that segment's .log file.
 type segment struct {
-	seqNum  int // creation sequence (used to derive file names)
+	seqNum  int    // creation sequence (ordering key)
+	name    string // file base name without extension, e.g. "seg-0000000007"
 	logF    *os.File
 	idxF    *os.File
 	firstID raft.Index // raft index of the first entry; 0 = empty
 	lastID  raft.Index // raft index of the last entry; 0 = empty
 	logSize int64      // current byte size of logF
+
+	// needsScan is set when the cheap consistency check performed while
+	// opening the segment failed. Such a segment must be walked entry by
+	// entry before its contents can be trusted.
+	needsScan bool
 }
 
 // contains reports whether this segment holds the entry at index.
@@ -77,6 +135,14 @@ func (s *segment) contains(index raft.Index) bool {
 
 // writeEntry appends one entry to the segment. Caller holds FileStore.mu.
 func (s *segment) writeEntry(e raft.LogEntry) error {
+	// The index file is addressed by e.Index-s.firstID. Index is unsigned, so
+	// an entry that precedes the segment would silently wrap to a huge slot
+	// (and a negative file offset once converted). Reject it instead.
+	if s.firstID == 0 || e.Index < s.firstID {
+		return fmt.Errorf("filestore: seg%05d: entry index %d precedes segment first index %d",
+			s.seqNum, e.Index, s.firstID)
+	}
+
 	header, payload := encodeEntry(e)
 	offset := s.logSize
 
@@ -102,9 +168,6 @@ func (s *segment) writeEntry(e raft.LogEntry) error {
 		return fmt.Errorf("filestore: write seg%05d idx: %w", s.seqNum, err)
 	}
 
-	if s.firstID == 0 {
-		s.firstID = e.Index
-	}
 	s.lastID = e.Index
 	return nil
 }
@@ -130,6 +193,11 @@ func (s *segment) readIdxOffset(index raft.Index) (int64, error) {
 // decodeEntryAt reads and verifies the log entry at the given segment-local
 // byte offset.
 func (s *segment) decodeEntryAt(offset int64) (raft.LogEntry, error) {
+	if offset < 0 {
+		return raft.LogEntry{}, fmt.Errorf("filestore: seg%05d: negative entry offset %d",
+			s.seqNum, offset)
+	}
+
 	var hdr [entryHeaderSize]byte
 	if _, err := s.logF.ReadAt(hdr[:], offset); err != nil {
 		return raft.LogEntry{}, fmt.Errorf("filestore: read seg%05d entry header at %d: %w",
@@ -212,11 +280,13 @@ func (s *segment) close() error {
 		if err := s.logF.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		s.logF = nil
 	}
 	if s.idxF != nil {
 		if err := s.idxF.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		s.idxF = nil
 	}
 	return errors.Join(errs...)
 }
@@ -228,12 +298,20 @@ type FileStore struct {
 	mu      sync.Mutex
 	dir     string
 	metaF   *os.File
+	hsSeq   uint64 // sequence number of the newest hard-state record on disk
 	segs    []*segment
 	segSize int64
+
+	// snapMu serialises snapshot writers. It is deliberately separate from mu:
+	// snapshot data is streamed from a reader the caller controls (on a
+	// follower, one InstallSnapshot chunk at a time, delivered by the Raft
+	// loop), so the store-wide lock must not be held while it is copied.
+	snapMu sync.Mutex
 }
 
 // Open opens (or creates) a FileStore rooted at dir using the default 64 MiB
-// segment size. It performs crash recovery on the active segment's tail.
+// segment size. It performs crash recovery on the log and validates the
+// hard-state record.
 func Open(dir string) (*FileStore, error) {
 	return openWith(dir, defaultSegmentSize)
 }
@@ -260,9 +338,28 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 		return nil, fmt.Errorf("filestore: recover truncations: %w", err)
 	}
 
-	metaF, err := openFile(filepath.Join(dir, "meta"))
+	// A snapshot that was still being written when the process died is
+	// worthless; the committed snapshot (if any) is under its final name.
+	if err := os.Remove(filepath.Join(dir, "snap.tmp")); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("filestore: remove stale snap.tmp: %w", err)
+	}
+
+	metaPath := filepath.Join(dir, "meta")
+	_, statErr := os.Stat(metaPath)
+	metaIsNew := errors.Is(statErr, os.ErrNotExist)
+
+	metaF, err := openFile(metaPath)
 	if err != nil {
 		return nil, err
+	}
+	if metaIsNew {
+		// A newly created file's directory entry is not durable until the
+		// directory itself is fsynced.
+		if err = syncDir(dir); err != nil {
+			_ = metaF.Close()
+			return nil, err
+		}
 	}
 
 	fs := &FileStore{
@@ -271,14 +368,34 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 		segSize: segSize,
 	}
 
-	if err := fs.loadSegments(); err != nil {
+	if err = fs.loadSegments(); err != nil {
 		_ = metaF.Close()
 		return nil, fmt.Errorf("filestore: load segments: %w", err)
 	}
 
-	if err := fs.recoverLast(); err != nil {
+	if err = fs.recoverSegments(); err != nil {
 		_ = fs.closeAll()
 		return nil, fmt.Errorf("filestore: recovery: %w", err)
+	}
+
+	// Validate the hard-state record up front. A record that exists but cannot
+	// be authenticated must never be reported as "nothing saved yet": doing so
+	// would resurrect a lower term or forget a vote already granted.
+	hs, seq, legacy, err := fs.readMeta()
+	if err != nil {
+		_ = fs.closeAll()
+		return nil, err
+	}
+	fs.hsSeq = seq
+	if legacy {
+		// Migrate to the checksummed two-slot layout. Sequence 1 is skipped so
+		// that the first record lands in slot 1, leaving the legacy bytes in
+		// slot 0 untouched until the new record is durable.
+		fs.hsSeq = 1
+		if err = fs.writeMeta(hs); err != nil {
+			_ = fs.closeAll()
+			return nil, fmt.Errorf("filestore: migrate meta: %w", err)
+		}
 	}
 
 	return fs, nil
@@ -297,14 +414,18 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 //   - Only .log.tmp exists: partial write before .idx.tmp was created;
 //     original files are untouched. Discard the .log.tmp.
 func recoverPendingTruncations(dir string) error {
-	idxTmps, err := filepath.Glob(filepath.Join(dir, "seg-?????.idx.tmp"))
+	idxTmps, err := filepath.Glob(filepath.Join(dir, segNamePrefix+"*.idx.tmp"))
 	if err != nil {
 		return err
 	}
+	renamed := false
 	for _, idxTmp := range idxTmps {
-		base := filepath.Base(idxTmp) // "seg-NNNNN.idx.tmp"
-		seqStr := strings.TrimPrefix(strings.TrimSuffix(base, ".idx.tmp"), "seg-")
-		logTmp := filepath.Join(dir, "seg-"+seqStr+".log.tmp")
+		base := filepath.Base(idxTmp) // "seg-NNNN.idx.tmp"
+		name := strings.TrimSuffix(base, ".idx.tmp")
+		if _, ok := parseSegSeq(name); !ok {
+			continue // not one of ours
+		}
+		logTmp := filepath.Join(dir, name+".log.tmp")
 
 		if _, statErr := os.Stat(logTmp); statErr == nil {
 			// Both tmps exist — crash before the first rename; discard both.
@@ -312,48 +433,64 @@ func recoverPendingTruncations(dir string) error {
 			_ = os.Remove(logTmp)
 		} else if errors.Is(statErr, os.ErrNotExist) {
 			// Only .idx.tmp exists — log was already renamed; finish the idx rename.
-			finalIdx := filepath.Join(dir, "seg-"+seqStr+".idx")
+			finalIdx := filepath.Join(dir, name+".idx")
 			if renErr := os.Rename(idxTmp, finalIdx); renErr != nil {
 				return fmt.Errorf("filestore: recover: rename %s → %s: %w", idxTmp, finalIdx, renErr)
 			}
+			renamed = true
 		} else {
 			return fmt.Errorf("filestore: recover: stat %s: %w", logTmp, statErr)
 		}
 	}
 
 	// Discard any orphaned .log.tmp files (no matching .idx.tmp).
-	logTmps, err := filepath.Glob(filepath.Join(dir, "seg-?????.log.tmp"))
+	logTmps, err := filepath.Glob(filepath.Join(dir, segNamePrefix+"*.log.tmp"))
 	if err != nil {
 		return err
 	}
 	for _, logTmp := range logTmps {
+		if _, ok := parseSegSeq(strings.TrimSuffix(filepath.Base(logTmp), ".log.tmp")); !ok {
+			continue
+		}
 		_ = os.Remove(logTmp)
 	}
 
+	if renamed {
+		return syncDir(dir)
+	}
 	return nil
 }
 
-// loadSegments discovers all segment files in dir and opens them.
-// Sealed (non-last) segments have firstID/lastID read directly from their
-// file content without a full CRC scan.
+// loadSegments discovers all segment files in dir and opens them, ordered by
+// sequence number. Sealed (non-last) segments have firstID/lastID read from
+// their index file without a full checksum scan.
 func (fs *FileStore) loadSegments() error {
-	pattern := filepath.Join(fs.dir, "seg-?????.log")
-	logFiles, err := filepath.Glob(pattern)
+	logFiles, err := filepath.Glob(filepath.Join(fs.dir, segNamePrefix+"*.log"))
 	if err != nil {
 		return err
 	}
-	sort.Strings(logFiles) // lexicographic == ascending seqNum (zero-padded)
 
+	type found struct {
+		name string
+		seq  int
+	}
+	discovered := make([]found, 0, len(logFiles))
 	for _, logPath := range logFiles {
-		base := filepath.Base(logPath)
-		// "seg-NNNNN.log" → extract NNNNN
-		seqStr := strings.TrimPrefix(strings.TrimSuffix(base, ".log"), "seg-")
-		seqNum, err := strconv.Atoi(seqStr)
-		if err != nil {
-			return fmt.Errorf("filestore: unexpected segment filename %q: %w", base, err)
+		name := strings.TrimSuffix(filepath.Base(logPath), ".log")
+		seq, ok := parseSegSeq(name)
+		if !ok {
+			// Some other file that happens to share the prefix. Leave it alone
+			// rather than failing the whole open.
+			continue
 		}
+		discovered = append(discovered, found{name: name, seq: seq})
+	}
+	// Sort numerically: names written with different zero-padding widths do not
+	// order correctly lexicographically.
+	sort.Slice(discovered, func(i, j int) bool { return discovered[i].seq < discovered[j].seq })
 
-		s, err := fs.openSegment(seqNum)
+	for _, f := range discovered {
+		s, err := fs.openSegment(f.seq, f.name)
 		if err != nil {
 			return err
 		}
@@ -362,39 +499,35 @@ func (fs *FileStore) loadSegments() error {
 	return nil
 }
 
-// openSegment opens the log+idx files for the given sequence number and reads
-// firstID/lastID from the file content. On success the segment is appended to
-// fs.segs.
-func (fs *FileStore) openSegment(seqNum int) (*segment, error) {
-	logF, err := openFile(fs.segLogPath(seqNum))
+// openSegment opens the log+idx files for a discovered segment and derives
+// firstID/lastID from the index file. The index file is a dense array, so the
+// last slot must hold the entry with index firstID+numEntries-1; if it does
+// not, or if either end fails to decode, the segment is flagged for a full
+// validating scan instead of being trusted.
+func (fs *FileStore) openSegment(seqNum int, name string) (*segment, error) {
+	logF, err := openFile(fs.logPath(name))
 	if err != nil {
 		return nil, err
 	}
-	idxF, err := openFile(fs.segIdxPath(seqNum))
+	idxF, err := openFile(fs.idxPath(name))
 	if err != nil {
 		_ = logF.Close()
 		return nil, err
 	}
+
+	s := &segment{seqNum: seqNum, name: name, logF: logF, idxF: idxF}
 
 	logStat, err := logF.Stat()
 	if err != nil {
-		_ = logF.Close()
-		_ = idxF.Close()
+		_ = s.close()
 		return nil, fmt.Errorf("filestore: stat seg%05d log: %w", seqNum, err)
 	}
+	s.logSize = logStat.Size()
 
 	idxStat, err := idxF.Stat()
 	if err != nil {
-		_ = logF.Close()
-		_ = idxF.Close()
+		_ = s.close()
 		return nil, fmt.Errorf("filestore: stat seg%05d idx: %w", seqNum, err)
-	}
-
-	s := &segment{
-		seqNum:  seqNum,
-		logF:    logF,
-		idxF:    idxF,
-		logSize: logStat.Size(),
 	}
 
 	numEntries := idxStat.Size() / idxEntrySize
@@ -403,179 +536,399 @@ func (fs *FileStore) openSegment(seqNum int) (*segment, error) {
 		return s, nil
 	}
 
-	// Read first entry to get firstID.
+	// A damaged or partially written index is recoverable: the segment opens
+	// and is marked for a full scan, which rebuilds what the index should have
+	// said. Returning the error instead would refuse to open a store that is
+	// perfectly repairable.
 	firstOffset, err := s.readIdxOffsetAt(0)
 	if err != nil {
-		_ = s.close()
-		return nil, err
+		s.needsScan = true
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
 	}
 	first, err := s.decodeEntryAt(firstOffset)
 	if err != nil {
-		_ = s.close()
-		return nil, err
+		s.needsScan = true
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
 	}
-	s.firstID = first.Index
-
-	// Read last entry to get lastID. For the active (last) segment this may
-	// fail if the tail is corrupt — recoverLast() will repair it afterward.
-	// For sealed segments it always succeeds because they were synced before
-	// the next segment was created.
 	lastOffset, err := s.readIdxOffsetAt(numEntries - 1)
-	if err == nil {
-		if last, decErr := s.decodeEntryAt(lastOffset); decErr == nil {
-			s.lastID = last.Index
-		}
-		// If decodeEntryAt fails, lastID stays 0; recoverLast will fix it.
+	if err != nil {
+		s.needsScan = true
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
+	}
+	last, err := s.decodeEntryAt(lastOffset)
+	if err != nil {
+		s.needsScan = true
+		return s, nil //nolint:nilerr // damaged index: repair by scanning
+	}
+	if last.Index != first.Index+raft.Index(numEntries)-1 {
+		// An index slot that was never durably written reads back as offset 0,
+		// which decodes as the segment's first entry with a perfectly valid
+		// checksum. The dense-array invariant is what catches that.
+		s.needsScan = true
+		return s, nil
 	}
 
+	s.firstID = first.Index
+	s.lastID = last.Index
 	return s, nil
 }
 
 // createSegment creates new log+idx files for seqNum and returns an empty
-// segment.
+// segment. The directory is fsynced so the new names survive a crash.
 func (fs *FileStore) createSegment(seqNum int) (*segment, error) {
-	logF, err := openFile(fs.segLogPath(seqNum))
+	name := fmt.Sprintf(segNameFormat, seqNum)
+	logF, err := openFile(fs.logPath(name))
 	if err != nil {
 		return nil, err
 	}
-	idxF, err := openFile(fs.segIdxPath(seqNum))
+	idxF, err := openFile(fs.idxPath(name))
 	if err != nil {
 		_ = logF.Close()
 		return nil, err
 	}
-	return &segment{seqNum: seqNum, logF: logF, idxF: idxF}, nil
+	// fsync(fd) does not make a new directory entry durable; the directory
+	// itself has to be fsynced before anything is written into the segment.
+	if err = syncDir(fs.dir); err != nil {
+		_ = logF.Close()
+		_ = idxF.Close()
+		return nil, err
+	}
+	return &segment{seqNum: seqNum, name: name, logF: logF, idxF: idxF}, nil
 }
 
-// recoverLast performs crash recovery on the last (active) segment. It walks
-// every entry, verifies CRCs, and truncates any corrupt tail. Sealed segments
-// (all but the last) are assumed complete. If the last segment is empty after
-// recovery it is removed.
-func (fs *FileStore) recoverLast() error {
-	if len(fs.segs) == 0 {
-		return nil
-	}
-	s := fs.segs[len(fs.segs)-1]
+// ---- Recovery --------------------------------------------------------------
 
+// recoverSegments brings the on-disk log back to a state the Raft engine can
+// trust: the active segment's tail is validated and any partial write beyond
+// the last durable entry is truncated away, then segments that hold nothing or
+// that do not chain contiguously onto their predecessor are removed.
+func (fs *FileStore) recoverSegments() error {
+	for i, s := range fs.segs {
+		if i == len(fs.segs)-1 || s.needsScan {
+			if err := fs.repairSegment(s); err != nil {
+				return err
+			}
+		}
+	}
+
+	dropped, err := fs.pruneSegments()
+	if err != nil {
+		return err
+	}
+	if dropped && len(fs.segs) > 0 {
+		// Pruning can promote a previously sealed segment to active. Validate
+		// the tail we are about to append to.
+		if err := fs.repairSegment(fs.segs[len(fs.segs)-1]); err != nil {
+			return err
+		}
+		if _, err := fs.pruneSegments(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// repairSegment walks a segment's index array and truncates it back to the
+// last durable entry.
+//
+// Three invariants are checked for slot i, in addition to the entry checksum:
+// the slot's byte offset must be strictly greater than the previous slot's,
+// the decoded entry index must equal firstID+i, and the log file must not
+// extend past the last indexed entry. The first violation is the true durable
+// tail: an index slot that was allocated but never written reads back as
+// offset 0, which otherwise decodes as a perfectly valid copy of the first
+// entry and would silently hide every entry after it.
+func (fs *FileStore) repairSegment(s *segment) error {
 	idxStat, err := s.idxF.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("filestore: stat seg%05d idx: %w", s.seqNum, err)
+	}
+	logStat, err := s.logF.Stat()
+	if err != nil {
+		return fmt.Errorf("filestore: stat seg%05d log: %w", s.seqNum, err)
 	}
 	numEntries := idxStat.Size() / idxEntrySize
-	if numEntries == 0 {
-		// Empty segment (possibly from a rotation-then-crash). Remove it.
-		_ = s.close()
-		_ = os.Remove(fs.segLogPath(s.seqNum))
-		_ = os.Remove(fs.segIdxPath(s.seqNum))
-		fs.segs = fs.segs[:len(fs.segs)-1]
-		return nil
-	}
 
-	// Walk all entries, verify CRC; find the last valid one.
-	lastValid := int64(-1)
-	var offset int64
+	var (
+		validCount int64
+		firstID    raft.Index
+		lastID     raft.Index
+		logEnd     int64
+	)
+	prevOffset := int64(-1)
 	for i := int64(0); i < numEntries; i++ {
-		offset, err = s.readIdxOffsetAt(i)
-		if err != nil {
+		offset, offErr := s.readIdxOffsetAt(i)
+		if offErr != nil {
 			break
 		}
-		if _, err = s.decodeEntryAt(offset); err != nil {
+		if offset <= prevOffset {
+			break // offsets in a dense, append-only index strictly increase
+		}
+		e, decErr := s.decodeEntryAt(offset)
+		if decErr != nil {
 			break
 		}
-		lastValid = i
+		if i == 0 {
+			firstID = e.Index
+		} else if e.Index != firstID+raft.Index(i) {
+			break // slot i does not hold the entry it is supposed to
+		}
+		prevOffset = offset
+		lastID = e.Index
+		validCount = i + 1
+		logEnd = offset + int64(entryHeaderSize) + int64(len(e.Command))
 	}
 
-	if lastValid == numEntries-1 {
-		// All entries valid. firstID/lastID are already correct from openSegment.
+	if validCount == 0 {
+		if logStat.Size() != 0 || idxStat.Size() != 0 {
+			if err = s.logF.Truncate(0); err != nil {
+				return fmt.Errorf("filestore: truncate seg%05d log: %w", s.seqNum, err)
+			}
+			if err = s.idxF.Truncate(0); err != nil {
+				return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
+			}
+			if syncErr := s.sync(); syncErr != nil {
+				return syncErr
+			}
+		}
+		s.firstID, s.lastID, s.logSize, s.needsScan = 0, 0, 0, false
 		return nil
 	}
 
-	// Truncate to lastValid+1 entries.
-	validCount := lastValid + 1
-	if validCount <= 0 {
-		// Nothing valid — wipe both files and remove the segment.
-		_ = s.logF.Truncate(0)
-		_ = s.idxF.Truncate(0)
-		_ = s.close()
-		_ = os.Remove(fs.segLogPath(s.seqNum))
-		_ = os.Remove(fs.segIdxPath(s.seqNum))
-		fs.segs = fs.segs[:len(fs.segs)-1]
-		return nil
+	if validCount != numEntries || logStat.Size() != logEnd {
+		if err = s.logF.Truncate(logEnd); err != nil {
+			return fmt.Errorf("filestore: truncate seg%05d log: %w", s.seqNum, err)
+		}
+		if err = s.idxF.Truncate(validCount * idxEntrySize); err != nil {
+			return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
+		}
+		if err := s.sync(); err != nil {
+			return err
+		}
 	}
 
-	// Find where the good log data ends.
-	goodLogEnd, err := s.readIdxOffsetAt(validCount - 1)
-	if err != nil {
-		return err
-	}
-	last, err := s.decodeEntryAt(goodLogEnd)
-	if err != nil {
-		return err
-	}
-	goodLogEnd += int64(entryHeaderSize) + int64(len(last.Command))
-
-	_ = s.logF.Truncate(goodLogEnd)
-	_ = s.idxF.Truncate(validCount * idxEntrySize)
-
-	// Reload firstID/lastID from the file.
-	firstOffset, err := s.readIdxOffsetAt(0)
-	if err != nil {
-		return err
-	}
-	first, err := s.decodeEntryAt(firstOffset)
-	if err != nil {
-		return err
-	}
-	s.firstID = first.Index
-	s.lastID = last.Index
-	s.logSize = goodLogEnd
+	s.firstID = firstID
+	s.lastID = lastID
+	s.logSize = logEnd
+	s.needsScan = false
 	return nil
+}
+
+// unlinkSegment closes one segment and removes its files, and does not return
+// until the removal is durable.
+//
+// Segments are always unlinked one at a time and in a deliberate order: a
+// suffix truncation works from the tail inwards, a prefix truncation from the
+// head outwards. Unlinks in a directory are not ordered with respect to one
+// another unless the directory is fsynced between them, so removing a run of
+// segments in one batch lets a crash leave a hole in the *middle* of the log —
+// say segment 0 and segment 2 present with segment 1 gone. Recovery cannot
+// safely resolve that: after an interrupted suffix truncation the live entries
+// are the run before the hole, after an interrupted prefix truncation they are
+// the run after it, and nothing on disk distinguishes the two. Making each
+// unlink durable in order means the surviving segments are always a contiguous
+// run, which is what lets pruneSegments simply keep the leading one.
+//
+// The index file is removed before the log file: a segment whose index is gone
+// reads back as empty, which is the state recovery handles most simply.
+func (fs *FileStore) unlinkSegment(s *segment) error {
+	if err := s.close(); err != nil {
+		return err
+	}
+	for _, p := range []string{fs.idxPath(s.name), fs.logPath(s.name)} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("filestore: remove %s: %w", p, err)
+		}
+	}
+	return syncDir(fs.dir)
+}
+
+// pruneSegments removes segments that hold no entries and every segment from
+// the first one that does not start exactly one index past the end of its
+// predecessor. Such a gap can only mean that the entries beyond it were
+// discarded (by a suffix truncation) but their files outlived the crash;
+// reporting them as present would resurrect entries the engine believes gone.
+// It reports whether anything was removed.
+func (fs *FileStore) pruneSegments() (bool, error) {
+	var keep, drop []*segment
+	for i := 0; i < len(fs.segs); i++ {
+		s := fs.segs[i]
+		if s.firstID == 0 {
+			drop = append(drop, s)
+			continue
+		}
+		if len(keep) > 0 && s.firstID != keep[len(keep)-1].lastID+1 {
+			drop = append(drop, fs.segs[i:]...)
+			break
+		}
+		keep = append(keep, s)
+	}
+	if len(drop) == 0 {
+		return false, nil
+	}
+
+	var errs []error
+	for _, s := range drop {
+		if err := s.close(); err != nil {
+			errs = append(errs, err)
+		}
+		for _, p := range []string{fs.logPath(s.name), fs.idxPath(s.name)} {
+			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("filestore: remove %s: %w", p, err))
+			}
+		}
+	}
+	fs.segs = keep
+	if err := errors.Join(errs...); err != nil {
+		return true, err
+	}
+	return true, syncDir(fs.dir)
 }
 
 // ---- Hard state ------------------------------------------------------------
 
+// SaveHardState durably persists currentTerm and votedFor. The record is
+// checksummed and written to one of two slots chosen by an increasing
+// sequence number, so a torn or interrupted write can never destroy the
+// previously persisted state.
 func (fs *FileStore) SaveHardState(_ context.Context, hs raft.HardState) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	return fs.writeMeta(hs)
+}
 
+// LoadHardState returns the last durably saved hard state. It returns a
+// zero-value HardState only when nothing has ever been saved; a record that
+// exists but fails verification is reported as an error.
+func (fs *FileStore) LoadHardState(_ context.Context) (raft.HardState, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	hs, _, _, err := fs.readMeta()
+	if err != nil {
+		return raft.HardState{}, err
+	}
+	return hs, nil
+}
+
+// writeMeta writes hs into the next hard-state slot and fsyncs. Caller holds mu.
+func (fs *FileStore) writeMeta(hs raft.HardState) error {
 	voted := []byte(hs.VotedFor)
 	if len(voted) > votedForMaxLen {
 		return fmt.Errorf("filestore: VotedFor too long (%d > %d)", len(voted), votedForMaxLen)
 	}
 
-	var buf [metaSize]byte
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(hs.CurrentTerm))
-	binary.LittleEndian.PutUint16(buf[8:10], uint16(len(voted)))
-	copy(buf[10:10+votedForMaxLen], voted)
+	seq := fs.hsSeq + 1
 
-	if _, err := fs.metaF.WriteAt(buf[:], 0); err != nil {
-		return fmt.Errorf("filestore: write meta: %w", err)
+	var rec [metaRecordSize]byte
+	binary.LittleEndian.PutUint64(rec[4:12], seq)
+	binary.LittleEndian.PutUint64(rec[12:20], uint64(hs.CurrentTerm))
+	binary.LittleEndian.PutUint16(rec[20:22], uint16(len(voted)))
+	copy(rec[22:22+votedForMaxLen], voted)
+	binary.LittleEndian.PutUint32(rec[0:4], crc32.Checksum(rec[4:], crcTable))
+
+	slot := int64((seq - 1) % metaSlots)
+	if _, err := fs.metaF.WriteAt(rec[:], slot*metaRecordSize); err != nil {
+		return fmt.Errorf("filestore: write meta slot %d: %w", slot, err)
 	}
-	return fs.metaF.Sync()
+	if err := fs.metaF.Sync(); err != nil {
+		return fmt.Errorf("filestore: sync meta: %w", err)
+	}
+
+	fs.hsSeq = seq
+	return nil
 }
 
-func (fs *FileStore) LoadHardState(_ context.Context) (raft.HardState, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+// readMeta reads the hard-state record. It returns the state, the sequence
+// number of the slot it came from and whether the record was stored in the
+// legacy checksum-free layout (in which case the caller should migrate it).
+// Caller holds mu.
+func (fs *FileStore) readMeta() (hs raft.HardState, seq uint64, legacy bool, err error) {
+	buf := make([]byte, metaFileSize)
+	n, err := fs.metaF.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return raft.HardState{}, 0, false, fmt.Errorf("filestore: read meta: %w", err)
+	}
+	buf = buf[:n]
+	if n == 0 {
+		return raft.HardState{}, 0, false, nil // nothing saved yet
+	}
 
-	var buf [metaSize]byte
-	n, err := fs.metaF.ReadAt(buf[:], 0)
-	if err == io.EOF && n == 0 {
-		return raft.HardState{}, nil
+	var (
+		bestHS  raft.HardState
+		bestSeq uint64
+		found   bool
+	)
+	for slot := 0; slot < metaSlots; slot++ {
+		off := slot * metaRecordSize
+		if off+metaRecordSize > n {
+			break
+		}
+		hs, seq, ok := decodeMetaRecord(buf[off : off+metaRecordSize])
+		if !ok {
+			continue
+		}
+		if !found || seq > bestSeq {
+			bestHS, bestSeq, found = hs, seq, true
+		}
 	}
-	if err != nil && err != io.EOF {
-		return raft.HardState{}, fmt.Errorf("filestore: read meta: %w", err)
-	}
-	if n < metaSize {
-		return raft.HardState{}, nil
+	if found {
+		return bestHS, bestSeq, false, nil
 	}
 
-	term := raft.Term(binary.LittleEndian.Uint64(buf[0:8]))
-	vlen := binary.LittleEndian.Uint16(buf[8:10])
-	if int(vlen) > votedForMaxLen {
-		return raft.HardState{}, fmt.Errorf("filestore: corrupt meta: votedForLen=%d", vlen)
+	// No slot verified. A file written by an older release holds a single
+	// checksum-free record of exactly legacyMetaSize bytes.
+	if n == legacyMetaSize {
+		if hs, ok := decodeLegacyMetaRecord(buf); ok {
+			return hs, 0, true, nil
+		}
 	}
-	votedFor := raft.NodeID(buf[10 : 10+vlen])
-	return raft.HardState{CurrentTerm: term, VotedFor: votedFor}, nil
+
+	return raft.HardState{}, 0, false, fmt.Errorf(
+		"filestore: hard state is corrupt or truncated (%d bytes on disk, no slot verifies)", n)
+}
+
+// decodeMetaRecord verifies and decodes one hard-state slot.
+func decodeMetaRecord(rec []byte) (raft.HardState, uint64, bool) {
+	stored := binary.LittleEndian.Uint32(rec[0:4])
+	if crc32.Checksum(rec[4:], crcTable) != stored {
+		return raft.HardState{}, 0, false
+	}
+	seq := binary.LittleEndian.Uint64(rec[4:12])
+	if seq == 0 {
+		return raft.HardState{}, 0, false // slot never written
+	}
+	vlen := int(binary.LittleEndian.Uint16(rec[20:22]))
+	if vlen > votedForMaxLen {
+		return raft.HardState{}, 0, false
+	}
+	return raft.HardState{
+		CurrentTerm: raft.Term(binary.LittleEndian.Uint64(rec[12:20])),
+		VotedFor:    raft.NodeID(rec[22 : 22+vlen]),
+	}, seq, true
+}
+
+// decodeLegacyMetaRecord decodes the pre-checksum hard-state layout. It rejects
+// anything that does not look exactly like one: the length field must be in
+// range and, because the writer always copied into a zeroed buffer, every byte
+// past the node ID must be zero.
+func decodeLegacyMetaRecord(rec []byte) (raft.HardState, bool) {
+	if len(rec) != legacyMetaSize {
+		return raft.HardState{}, false
+	}
+	vlen := int(binary.LittleEndian.Uint16(rec[8:10]))
+	if vlen > votedForMaxLen {
+		return raft.HardState{}, false
+	}
+	for _, b := range rec[10+vlen:] {
+		if b != 0 {
+			return raft.HardState{}, false
+		}
+	}
+	return raft.HardState{
+		CurrentTerm: raft.Term(binary.LittleEndian.Uint64(rec[0:8])),
+		VotedFor:    raft.NodeID(rec[10 : 10+vlen]),
+	}, true
 }
 
 // ---- Log -------------------------------------------------------------------
@@ -696,132 +1049,81 @@ func (fs *FileStore) LastIndex() (raft.Index, error) {
 	return active.lastID, nil
 }
 
+// TruncateSuffix deletes all entries with index >= fromIndex and fsyncs.
+//
+// Crash safety depends on the order of the two on-disk steps. The segments
+// that are discarded whole are unlinked and the directory is fsynced *before*
+// the surviving boundary segment is shortened. A crash at any point therefore
+// leaves either the original log (the truncation was never acknowledged, so
+// keeping it is legal) or a log that has already lost the discarded suffix —
+// never a shortened boundary segment still followed by segments that were
+// supposed to be gone, which recovery would happily report as live entries.
 func (fs *FileStore) TruncateSuffix(_ context.Context, fromIndex raft.Index) error {
-	// pathPair holds the log and index file paths of a segment to be deleted.
-	type pathPair struct{ log, idx string }
-
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
 	if len(fs.segs) == 0 {
-		fs.mu.Unlock()
 		return nil
 	}
 	last := fs.activeSeg()
 	if last.lastID != 0 && fromIndex > last.lastID {
-		fs.mu.Unlock()
 		return nil
 	}
 	first := fs.segs[0]
 	if first.firstID != 0 && fromIndex < first.firstID {
-		fs.mu.Unlock()
 		return fmt.Errorf("%w: TruncateSuffix(%d) < firstIndex(%d)",
 			raft.ErrCompacted, fromIndex, first.firstID)
 	}
 
 	boundIdx := fs.findSegIdx(fromIndex)
 	if boundIdx < 0 {
-		fs.mu.Unlock()
 		return nil
 	}
 
-	// Safety: mark all later segments for deletion BEFORE touching the boundary.
-	// Close their handles and remove them from fs.segs now (under lock) so no
-	// concurrent reader can access them; the actual os.Remove calls happen after
-	// we release the lock so other goroutines (e.g. SaveSnapshot) are not blocked
-	// during potentially slow filesystem operations.
-	var toDelete []pathPair
-	for i := len(fs.segs) - 1; i > boundIdx; i-- {
-		s := fs.segs[i]
-		if err := s.close(); err != nil {
-			fs.mu.Unlock()
+	// If nothing of the boundary segment survives it is discarded whole, which
+	// makes it part of the same unlink step as the segments after it.
+	dropFrom := boundIdx + 1
+	if fromIndex <= fs.segs[boundIdx].firstID {
+		dropFrom = boundIdx
+	}
+
+	drop := fs.segs[dropFrom:]
+	fs.segs = fs.segs[:dropFrom]
+
+	// Unlink from the tail inwards, one segment at a time, so that a crash can
+	// only ever leave a contiguous run of segments behind. See unlinkSegment.
+	for i := len(drop) - 1; i >= 0; i-- {
+		if err := fs.unlinkSegment(drop[i]); err != nil {
 			return err
 		}
-		toDelete = append(toDelete, pathPair{fs.segLogPath(s.seqNum), fs.segIdxPath(s.seqNum)})
 	}
-	fs.segs = fs.segs[:boundIdx+1]
 
-	// Truncate the boundary segment (file-level ops; must stay under lock since
-	// the open *os.File is shared with concurrent readers via the mutex).
+	if dropFrom == boundIdx {
+		return nil // boundary segment was discarded whole
+	}
+
+	// Partial truncation within the boundary segment.
 	s := fs.segs[boundIdx]
-	var boundaryPath *pathPair // set only when the entire boundary seg is removed
-	if s.firstID == 0 || fromIndex <= s.firstID {
-		// Zero-out and sync the entire boundary segment before removing it, so
-		// that a crash after the delete but before syncDir leaves the file
-		// content invalid, preventing accidental re-use on recovery.
-		if err := s.logF.Truncate(0); err != nil {
-			fs.mu.Unlock()
-			return fmt.Errorf("filestore: truncate seg%05d log: %w", s.seqNum, err)
-		}
-		if err := s.idxF.Truncate(0); err != nil {
-			fs.mu.Unlock()
-			return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
-		}
-		if err := s.sync(); err != nil {
-			fs.mu.Unlock()
-			return err
-		}
-		if err := s.close(); err != nil {
-			fs.mu.Unlock()
-			return err
-		}
-		p := pathPair{fs.segLogPath(s.seqNum), fs.segIdxPath(s.seqNum)}
-		boundaryPath = &p
-		fs.segs = fs.segs[:boundIdx]
-	} else {
-		// Partial truncation within the boundary segment.
-		logOffset, err := s.readIdxOffset(fromIndex)
-		if err != nil {
-			fs.mu.Unlock()
-			return err
-		}
-		if err := s.logF.Truncate(logOffset); err != nil {
-			fs.mu.Unlock()
-			return fmt.Errorf("filestore: truncate seg%05d log: %w", s.seqNum, err)
-		}
-		numKeep := int64(fromIndex - s.firstID)
-		if err := s.idxF.Truncate(numKeep * idxEntrySize); err != nil {
-			fs.mu.Unlock()
-			return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
-		}
-		if err := s.sync(); err != nil {
-			fs.mu.Unlock()
-			return err
-		}
-		s.lastID = fromIndex - 1
-		s.logSize = logOffset
+	logOffset, err := s.readIdxOffset(fromIndex)
+	if err != nil {
+		return err
 	}
-
-	// All in-memory state updated. Release the lock before slow filesystem ops.
-	fs.mu.Unlock()
-
-	// Remove files outside the lock. Crash safety: the files were zeroed/synced
-	// (or never written to) before we dropped the lock, so recovery will not
-	// mistake them for valid data even if os.Remove hasn't run yet.
-	for _, p := range toDelete {
-		if err := os.Remove(p.log); err != nil {
-			return fmt.Errorf("filestore: remove seg log: %w", err)
-		}
-		if err := os.Remove(p.idx); err != nil {
-			return fmt.Errorf("filestore: remove seg idx: %w", err)
-		}
+	if err = s.logF.Truncate(logOffset); err != nil {
+		return fmt.Errorf("filestore: truncate seg%05d log: %w", s.seqNum, err)
 	}
-	if boundaryPath != nil {
-		if err := os.Remove(boundaryPath.log); err != nil {
-			return fmt.Errorf("filestore: remove seg log: %w", err)
-		}
-		if err := os.Remove(boundaryPath.idx); err != nil {
-			return fmt.Errorf("filestore: remove seg idx: %w", err)
-		}
+	numKeep := int64(fromIndex - s.firstID)
+	if err = s.idxF.Truncate(numKeep * idxEntrySize); err != nil {
+		return fmt.Errorf("filestore: truncate seg%05d idx: %w", s.seqNum, err)
 	}
-	if len(toDelete) > 0 || boundaryPath != nil {
-		return syncDir(fs.dir)
+	if err := s.sync(); err != nil {
+		return err
 	}
+	s.lastID = fromIndex - 1
+	s.logSize = logOffset
 	return nil
 }
 
 func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error {
-	type pathPair struct{ log, idx string }
-
 	fs.mu.Lock()
 
 	if len(fs.segs) == 0 || fs.segs[0].firstID == 0 {
@@ -839,18 +1141,14 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	}
 
 	// Phase 1: drop complete leading segments where lastID < toIndex.
-	// Close handles and collect paths under the lock; remove files after unlock.
-	var toDelete []pathPair
+	// Detach them under the lock; unlink them after it is released.
+	var toDelete []*segment
 	for len(fs.segs) > 1 { // always keep at least one segment
 		s := fs.segs[0]
 		if s.lastID == 0 || s.lastID >= toIndex {
 			break
 		}
-		if err := s.close(); err != nil {
-			fs.mu.Unlock()
-			return err
-		}
-		toDelete = append(toDelete, pathPair{fs.segLogPath(s.seqNum), fs.segIdxPath(s.seqNum)})
+		toDelete = append(toDelete, s)
 		fs.segs = fs.segs[1:]
 	}
 
@@ -867,17 +1165,10 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	// All in-memory state updated. Release lock before slow filesystem ops.
 	fs.mu.Unlock()
 
-	// Remove whole-segment files outside the lock.
-	for _, p := range toDelete {
-		if err := os.Remove(p.log); err != nil {
-			return fmt.Errorf("filestore: remove seg log: %w", err)
-		}
-		if err := os.Remove(p.idx); err != nil {
-			return fmt.Errorf("filestore: remove seg idx: %w", err)
-		}
-	}
-	if len(toDelete) > 0 {
-		if err := syncDir(fs.dir); err != nil {
+	// Unlink from the head outwards, one segment at a time, so that a crash can
+	// only ever leave a contiguous run of segments behind. See unlinkSegment.
+	for _, s := range toDelete {
+		if err := fs.unlinkSegment(s); err != nil {
 			return err
 		}
 	}
@@ -885,154 +1176,133 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	if phase2seg == nil {
 		return nil
 	}
+	return fs.rewriteBoundarySegment(phase2seg, toIndex)
+}
 
-	// Phase 2: crash-safe rewrite of the boundary segment using tmp+rename.
-	//
-	// We write the kept content to seg-NNNNN.log.tmp and seg-NNNNN.idx.tmp,
-	// then rename log.tmp → log (the commit point), then idx.tmp → idx.
-	// recoverPendingTruncations (called by Open) detects which rename(s)
-	// completed and finishes or rolls back the operation accordingly.
-	//
-	// Re-acquire lock because we are reading and replacing shared file handles.
+// rewriteBoundarySegment performs TruncatePrefix Phase 2: the crash-safe
+// rewrite of the segment that straddles toIndex, using tmp files and rename.
+//
+// The kept content is copied in bounded chunks through private read-only
+// handles with the store lock released, so neither the peak memory nor the
+// time the Raft loop can be blocked scales with the segment size. The lock is
+// retaken to commit, and the segment is re-checked first: if anything moved
+// while it was released the rewrite is abandoned rather than committed on top
+// of stale content.
+func (fs *FileStore) rewriteBoundarySegment(seg *segment, toIndex raft.Index) error {
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 
-	seg := phase2seg
-	numDrop := int(toIndex - seg.firstID)
-	numKeep := int(seg.lastID-toIndex) + 1
+	if len(fs.segs) == 0 || fs.segs[0] != seg || seg.firstID == 0 || seg.firstID >= toIndex {
+		fs.mu.Unlock()
+		return nil
+	}
+
+	numDrop := int64(toIndex - seg.firstID)
+	numKeep := int64(seg.lastID-toIndex) + 1
 	if numKeep <= 0 {
-		// Wipe the segment entirely (shouldn't happen if phase 1 ran correctly,
-		// but guard against edge cases). Zeroing both files in-place is safe
-		// here because an empty segment is indistinguishable from a freshly
-		// created one; recovery never needs to distinguish the two.
+		// Nothing survives. Zeroing both files in place is safe because an
+		// empty segment is indistinguishable from a freshly created one.
+		defer fs.mu.Unlock()
 		if err := seg.logF.Truncate(0); err != nil {
 			return fmt.Errorf("filestore: truncate seg%05d log: %w", seg.seqNum, err)
-		}
-		if err := seg.logF.Sync(); err != nil {
-			return err
 		}
 		if err := seg.idxF.Truncate(0); err != nil {
 			return fmt.Errorf("filestore: truncate seg%05d idx: %w", seg.seqNum, err)
 		}
-		if err := seg.idxF.Sync(); err != nil {
+		if err := seg.sync(); err != nil {
 			return err
 		}
-		seg.firstID = 0
-		seg.lastID = 0
-		seg.logSize = 0
+		seg.firstID, seg.lastID, seg.logSize = 0, 0, 0
 		return nil
 	}
 
-	// Find the byte offset of the first kept log entry.
-	firstKeptOffset, err := seg.readIdxOffsetAt(int64(numDrop))
+	firstKeptOffset, err := seg.readIdxOffsetAt(numDrop)
 	if err != nil {
+		fs.mu.Unlock()
 		return fmt.Errorf("filestore: read first-kept offset in seg%05d: %w", seg.seqNum, err)
 	}
-
-	// Read the kept portion of the log.
-	logStat, err := seg.logF.Stat()
-	if err != nil {
-		return fmt.Errorf("filestore: stat seg%05d log: %w", seg.seqNum, err)
+	keepLogSize := seg.logSize - firstKeptOffset
+	if keepLogSize < 0 {
+		fs.mu.Unlock()
+		return fmt.Errorf("filestore: seg%05d: kept region starts past end of log", seg.seqNum)
 	}
-	keepLogSize := logStat.Size() - firstKeptOffset
-	keepLogBuf := make([]byte, keepLogSize)
-	if _, err = seg.logF.ReadAt(keepLogBuf, firstKeptOffset); err != nil {
-		return fmt.Errorf("filestore: read kept log in seg%05d: %w", seg.seqNum, err)
-	}
+	name := seg.name
+	seqNum := seg.seqNum
+	origFirst, origLast := seg.firstID, seg.lastID
 
-	// Read and adjust the kept index entries (offsets become relative to new byte 0).
-	keepIdxBuf := make([]byte, int64(numKeep)*idxEntrySize)
-	if _, err = seg.idxF.ReadAt(keepIdxBuf, int64(numDrop)*idxEntrySize); err != nil {
-		return fmt.Errorf("filestore: read idx for prefix truncate in seg%05d: %w", seg.seqNum, err)
-	}
-	for i := range numKeep {
-		off := int64(binary.LittleEndian.Uint64(keepIdxBuf[i*idxEntrySize:]))
-		off -= firstKeptOffset
-		binary.LittleEndian.PutUint64(keepIdxBuf[i*idxEntrySize:], uint64(off))
-	}
+	fs.mu.Unlock()
 
-	// Write kept log content to .log.tmp.
-	logTmpPath := fs.segLogPath(seg.seqNum) + ".tmp"
-	idxTmpPath := fs.segIdxPath(seg.seqNum) + ".tmp"
-
+	logTmpPath := fs.logPath(name) + ".tmp"
+	idxTmpPath := fs.idxPath(name) + ".tmp"
 	cleanup := func() {
 		_ = os.Remove(logTmpPath)
 		_ = os.Remove(idxTmpPath)
 	}
 
-	logTmpF, err := os.OpenFile(logTmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	// Private read handles: the originals are untouched until the rename, so
+	// reading them without the store lock is safe.
+	srcLog, err := os.Open(fs.logPath(name))
 	if err != nil {
-		return fmt.Errorf("filestore: create log.tmp in seg%05d: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: open seg%05d log for rewrite: %w", seqNum, err)
 	}
-	if _, err = logTmpF.Write(keepLogBuf); err != nil {
-		_ = logTmpF.Close()
-		cleanup()
-		return fmt.Errorf("filestore: write log.tmp in seg%05d: %w", seg.seqNum, err)
+	defer func() { _ = srcLog.Close() }()
+	srcIdx, err := os.Open(fs.idxPath(name))
+	if err != nil {
+		return fmt.Errorf("filestore: open seg%05d idx for rewrite: %w", seqNum, err)
 	}
-	if err = logTmpF.Sync(); err != nil {
-		_ = logTmpF.Close()
+	defer func() { _ = srcIdx.Close() }()
+
+	if err = writeTmpFile(logTmpPath, func(dst *os.File) error {
+		return copyFileRange(dst, srcLog, firstKeptOffset, keepLogSize)
+	}); err != nil {
 		cleanup()
-		return fmt.Errorf("filestore: sync log.tmp in seg%05d: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: write log.tmp in seg%05d: %w", seqNum, err)
 	}
-	if err = logTmpF.Close(); err != nil {
+	if err = writeTmpFile(idxTmpPath, func(dst *os.File) error {
+		return copyRebasedIdx(dst, srcIdx, numDrop, numKeep, firstKeptOffset)
+	}); err != nil {
 		cleanup()
-		return fmt.Errorf("filestore: close log.tmp in seg%05d: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: write idx.tmp in seg%05d: %w", seqNum, err)
 	}
 
-	// Write adjusted index to .idx.tmp.
-	idxTmpF, err := os.OpenFile(idxTmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if len(fs.segs) == 0 || fs.segs[0] != seg ||
+		seg.firstID != origFirst || seg.lastID != origLast {
+		// Another operation changed this segment while the lock was released.
+		// Committing would publish stale content, so discard the rewrite; the
+		// entries it would have dropped simply stay until the next compaction.
 		cleanup()
-		return fmt.Errorf("filestore: create idx.tmp in seg%05d: %w", seg.seqNum, err)
-	}
-	if _, err = idxTmpF.Write(keepIdxBuf); err != nil {
-		_ = idxTmpF.Close()
-		cleanup()
-		return fmt.Errorf("filestore: write idx.tmp in seg%05d: %w", seg.seqNum, err)
-	}
-	if err = idxTmpF.Sync(); err != nil {
-		_ = idxTmpF.Close()
-		cleanup()
-		return fmt.Errorf("filestore: sync idx.tmp in seg%05d: %w", seg.seqNum, err)
-	}
-	if err = idxTmpF.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("filestore: close idx.tmp in seg%05d: %w", seg.seqNum, err)
+		return nil
 	}
 
 	// Close the existing open handles before renaming over the files.
-	if err = seg.logF.Close(); err != nil {
+	if err = seg.close(); err != nil {
 		cleanup()
-		return fmt.Errorf("filestore: close seg%05d log: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: close seg%05d before rewrite: %w", seqNum, err)
 	}
-	seg.logF = nil
-	if err = seg.idxF.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("filestore: close seg%05d idx: %w", seg.seqNum, err)
-	}
-	seg.idxF = nil
 
 	// Atomic rename: log first (the commit point), then idx.
 	// recoverPendingTruncations detects a crash between the two renames and
 	// completes the idx rename on the next Open.
-	if err = os.Rename(logTmpPath, fs.segLogPath(seg.seqNum)); err != nil {
-		return fmt.Errorf("filestore: rename log.tmp in seg%05d: %w", seg.seqNum, err)
+	if err = os.Rename(logTmpPath, fs.logPath(name)); err != nil {
+		return fmt.Errorf("filestore: rename log.tmp in seg%05d: %w", seqNum, err)
 	}
-	if err = os.Rename(idxTmpPath, fs.segIdxPath(seg.seqNum)); err != nil {
+	if err = os.Rename(idxTmpPath, fs.idxPath(name)); err != nil {
 		// idx.tmp still exists; recoverPendingTruncations will finish this.
-		return fmt.Errorf("filestore: rename idx.tmp in seg%05d: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: rename idx.tmp in seg%05d: %w", seqNum, err)
 	}
 
 	// Reopen the now-replaced files and update in-memory state.
-	seg.logF, err = openFile(fs.segLogPath(seg.seqNum))
+	seg.logF, err = openFile(fs.logPath(name))
 	if err != nil {
-		return fmt.Errorf("filestore: reopen seg%05d log after truncate: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: reopen seg%05d log after truncate: %w", seqNum, err)
 	}
-	seg.idxF, err = openFile(fs.segIdxPath(seg.seqNum))
+	seg.idxF, err = openFile(fs.idxPath(name))
 	if err != nil {
 		_ = seg.logF.Close()
 		seg.logF = nil
-		return fmt.Errorf("filestore: reopen seg%05d idx after truncate: %w", seg.seqNum, err)
+		return fmt.Errorf("filestore: reopen seg%05d idx after truncate: %w", seqNum, err)
 	}
 
 	seg.firstID = toIndex
@@ -1041,11 +1311,92 @@ func (fs *FileStore) TruncatePrefix(_ context.Context, toIndex raft.Index) error
 	return syncDir(fs.dir)
 }
 
+// writeTmpFile creates path, hands it to fill, then fsyncs and closes it.
+// The file is left behind only on success; every error path removes it.
+func writeTmpFile(path string, fill func(*os.File) error) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err = fill(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+// copyFileRange copies n bytes starting at srcOff from src to offset 0 of dst
+// using a fixed-size buffer, so peak memory does not scale with n.
+func copyFileRange(dst, src *os.File, srcOff, n int64) error {
+	if n == 0 {
+		return nil
+	}
+	buf := make([]byte, min(int64(copyChunkSize), n))
+	for done := int64(0); done < n; {
+		chunk := min(int64(len(buf)), n-done)
+		if _, err := src.ReadAt(buf[:chunk], srcOff+done); err != nil {
+			return err
+		}
+		if _, err := dst.WriteAt(buf[:chunk], done); err != nil {
+			return err
+		}
+		done += chunk
+	}
+	return nil
+}
+
+// copyRebasedIdx copies numKeep index slots starting at slot numDrop, shifting
+// every byte offset down by base so it is relative to the new byte 0.
+func copyRebasedIdx(dst, src *os.File, numDrop, numKeep, base int64) error {
+	const slotsPerChunk = copyChunkSize / idxEntrySize
+	buf := make([]byte, min(int64(slotsPerChunk), numKeep)*idxEntrySize)
+	for done := int64(0); done < numKeep; {
+		slots := min(int64(len(buf)/idxEntrySize), numKeep-done)
+		b := buf[:slots*idxEntrySize]
+		if _, err := src.ReadAt(b, (numDrop+done)*idxEntrySize); err != nil {
+			return err
+		}
+		for i := int64(0); i < slots; i++ {
+			off := int64(binary.LittleEndian.Uint64(b[i*idxEntrySize:])) - base
+			if off < 0 {
+				return fmt.Errorf("filestore: index slot %d has offset before the kept region",
+					numDrop+done+i)
+			}
+			binary.LittleEndian.PutUint64(b[i*idxEntrySize:], uint64(off))
+		}
+		if _, err := dst.WriteAt(b, done*idxEntrySize); err != nil {
+			return err
+		}
+		done += slots
+	}
+	return nil
+}
+
 // ---- Snapshot --------------------------------------------------------------
 
+// SaveSnapshot durably stores a snapshot and its metadata. The body is framed
+// with its length and a CRC32 so that a later truncation or bit flip is
+// detected on load.
+//
+// The store-wide lock is deliberately not held while the data is copied: the
+// reader is supplied by the caller and, on a follower installing a snapshot,
+// is fed one InstallSnapshot chunk at a time by the Raft loop. Blocking that
+// loop on the storage lock would stall heartbeats on a leader and deadlock a
+// follower. Concurrent snapshot writers are serialised by a dedicated lock,
+// and the store-wide lock is taken only for the rename.
 func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, r io.Reader) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	fs.snapMu.Lock()
+	defer fs.snapMu.Unlock()
 
 	tmpPath := filepath.Join(fs.dir, "snap.tmp")
 	snapPath := filepath.Join(fs.dir, "snap")
@@ -1054,60 +1405,167 @@ func (fs *FileStore) SaveSnapshot(_ context.Context, meta raft.SnapshotMeta, r i
 	if err != nil {
 		return fmt.Errorf("filestore: create snap.tmp: %w", err)
 	}
-
-	var hdr [16]byte
-	binary.LittleEndian.PutUint64(hdr[0:8], uint64(meta.LastIncludedIndex))
-	binary.LittleEndian.PutUint64(hdr[8:16], uint64(meta.LastIncludedTerm))
-
-	if _, err = f.Write(hdr[:]); err != nil {
+	// Never leave a partial snap.tmp behind: it would be mistaken for work in
+	// progress and waste space until the next open.
+	fail := func(err error) error {
 		_ = f.Close()
-		return fmt.Errorf("filestore: write snap header: %w", err)
+		_ = os.Remove(tmpPath)
+		return err
 	}
 
-	if _, err = io.Copy(f, r); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("filestore: write snap data: %w", err)
+	var hdr [snapHeaderSize]byte
+	copy(hdr[0:4], snapMagic[:])
+	binary.LittleEndian.PutUint32(hdr[4:8], snapVersion)
+	binary.LittleEndian.PutUint64(hdr[8:16], uint64(meta.LastIncludedIndex))
+	binary.LittleEndian.PutUint64(hdr[16:24], uint64(meta.LastIncludedTerm))
+	if _, err = f.Write(hdr[:]); err != nil {
+		return fail(fmt.Errorf("filestore: write snap header: %w", err))
+	}
+
+	h := crc32.New(crcTable)
+	n, err := io.Copy(io.MultiWriter(f, h), r)
+	if err != nil {
+		return fail(fmt.Errorf("filestore: write snap data: %w", err))
+	}
+
+	var trailer [snapTrailerSize]byte
+	binary.LittleEndian.PutUint64(trailer[0:8], uint64(n))
+	binary.LittleEndian.PutUint32(trailer[8:12], h.Sum32())
+	if _, err = f.Write(trailer[:]); err != nil {
+		return fail(fmt.Errorf("filestore: write snap trailer: %w", err))
 	}
 
 	if err = f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("filestore: sync snap.tmp: %w", err)
+		return fail(fmt.Errorf("filestore: sync snap.tmp: %w", err))
 	}
 	if err = f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("filestore: close snap.tmp: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, snapPath); err != nil {
+	// Only the rename and the directory fsync touch state shared with the log.
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if err = os.Rename(tmpPath, snapPath); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("filestore: rename snap: %w", err)
 	}
 	return syncDir(fs.dir)
 }
 
+// LoadSnapshot returns the most recently saved snapshot. The returned reader
+// verifies the body length and checksum as it is consumed and fails the final
+// Read if either disagrees with what was stored.
 func (fs *FileStore) LoadSnapshot(_ context.Context) (raft.SnapshotMeta, io.ReadCloser, error) {
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
+	f, err := os.Open(filepath.Join(fs.dir, "snap"))
+	fs.mu.Unlock()
 
-	snapPath := filepath.Join(fs.dir, "snap")
-	f, err := os.Open(snapPath)
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		return raft.SnapshotMeta{}, nil, raft.ErrNoSnapshot
 	}
 	if err != nil {
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: open snap: %w", err)
 	}
 
-	var hdr [16]byte
-	if _, err = io.ReadFull(f, hdr[:]); err != nil {
+	meta, rc, err := openSnapshotReader(f)
+	if err != nil {
 		_ = f.Close()
+		return raft.SnapshotMeta{}, nil, err
+	}
+	return meta, rc, nil
+}
+
+// openSnapshotReader parses the snapshot header and returns a reader over the
+// body. Ownership of f passes to the returned reader on success.
+func openSnapshotReader(f *os.File) (raft.SnapshotMeta, io.ReadCloser, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: stat snap: %w", err)
+	}
+	size := st.Size()
+
+	var hdr [snapHeaderSize]byte
+	if _, err = io.ReadFull(f, hdr[:legacySnapHeaderSize]); err != nil {
+		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap header: %w", err)
+	}
+
+	if !bytes.Equal(hdr[0:4], snapMagic[:]) ||
+		binary.LittleEndian.Uint32(hdr[4:8]) != snapVersion {
+		// Pre-framing layout: a bare 16-byte header followed by the raw body.
+		// There is nothing to verify, so hand the body over as-is.
+		return raft.SnapshotMeta{
+			LastIncludedIndex: raft.Index(binary.LittleEndian.Uint64(hdr[0:8])),
+			LastIncludedTerm:  raft.Term(binary.LittleEndian.Uint64(hdr[8:16])),
+		}, f, nil
+	}
+
+	if _, err = io.ReadFull(f, hdr[legacySnapHeaderSize:]); err != nil {
 		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap header: %w", err)
 	}
 	meta := raft.SnapshotMeta{
-		LastIncludedIndex: raft.Index(binary.LittleEndian.Uint64(hdr[0:8])),
-		LastIncludedTerm:  raft.Term(binary.LittleEndian.Uint64(hdr[8:16])),
+		LastIncludedIndex: raft.Index(binary.LittleEndian.Uint64(hdr[8:16])),
+		LastIncludedTerm:  raft.Term(binary.LittleEndian.Uint64(hdr[16:24])),
 	}
 
-	return meta, f, nil
+	bodyLen := size - snapHeaderSize - snapTrailerSize
+	if bodyLen < 0 {
+		return raft.SnapshotMeta{}, nil, fmt.Errorf(
+			"filestore: snapshot is truncated (%d bytes, smaller than its framing)", size)
+	}
+
+	var trailer [snapTrailerSize]byte
+	if _, err = f.ReadAt(trailer[:], size-snapTrailerSize); err != nil {
+		return raft.SnapshotMeta{}, nil, fmt.Errorf("filestore: read snap trailer: %w", err)
+	}
+	storedLen := int64(binary.LittleEndian.Uint64(trailer[0:8]))
+	if storedLen != bodyLen {
+		return raft.SnapshotMeta{}, nil, fmt.Errorf(
+			"filestore: snapshot length mismatch (trailer says %d body bytes, file holds %d)",
+			storedLen, bodyLen)
+	}
+
+	return meta, &snapshotReader{
+		f:         f,
+		body:      io.LimitReader(f, bodyLen),
+		h:         crc32.New(crcTable),
+		want:      binary.LittleEndian.Uint32(trailer[8:12]),
+		remaining: bodyLen,
+	}, nil
 }
+
+// snapshotReader streams a snapshot body while checksumming it, so verification
+// costs no extra memory and no second pass over the data.
+type snapshotReader struct {
+	f         *os.File
+	body      io.Reader
+	h         hash.Hash32
+	want      uint32
+	remaining int64
+	checked   bool
+}
+
+func (s *snapshotReader) Read(p []byte) (int, error) {
+	n, err := s.body.Read(p)
+	if n > 0 {
+		s.h.Write(p[:n])
+		s.remaining -= int64(n)
+	}
+	if errors.Is(err, io.EOF) && !s.checked {
+		s.checked = true
+		if s.remaining != 0 {
+			return n, fmt.Errorf("filestore: snapshot body is short by %d bytes", s.remaining)
+		}
+		if got := s.h.Sum32(); got != s.want {
+			return n, fmt.Errorf(
+				"filestore: snapshot checksum mismatch (stored %08x, computed %08x)", s.want, got)
+		}
+	}
+	return n, err
+}
+
+func (s *snapshotReader) Close() error { return s.f.Close() }
 
 // ---- Lifecycle -------------------------------------------------------------
 
@@ -1124,6 +1582,7 @@ func (fs *FileStore) closeAll() error {
 		if err := fs.metaF.Close(); err != nil {
 			errs = append(errs, err)
 		}
+		fs.metaF = nil
 	}
 	for _, s := range fs.segs {
 		if err := s.close(); err != nil {
@@ -1154,19 +1613,37 @@ func (fs *FileStore) findSeg(index raft.Index) *segment {
 
 // findSegIdx returns the position in fs.segs of the segment containing index,
 // or -1 if not found.
+//
+// Segments are ordered by index range, so a binary search applies — but an
+// empty segment carries no range at all, and probing one yields no ordering
+// information. Treating it as "search to the left" would drop every segment to
+// its right, so the probe steps to the nearest non-empty neighbour instead.
 func (fs *FileStore) findSegIdx(index raft.Index) int {
-	// Binary search: find largest i such that segs[i].firstID <= index.
 	lo, hi := 0, len(fs.segs)-1
 	for lo <= hi {
 		mid := (lo + hi) / 2
+		if fs.segs[mid].firstID == 0 {
+			j := mid + 1
+			for j <= hi && fs.segs[j].firstID == 0 {
+				j++
+			}
+			if j > hi {
+				j = mid - 1
+				for j >= lo && fs.segs[j].firstID == 0 {
+					j--
+				}
+				if j < lo {
+					return -1 // every segment in the window is empty
+				}
+			}
+			mid = j
+		}
+
 		s := fs.segs[mid]
 		switch {
-		case s.lastID != 0 && s.lastID < index:
+		case s.lastID < index:
 			lo = mid + 1
 		case s.firstID > index:
-			hi = mid - 1
-		case s.firstID == 0:
-			// Empty segment — shouldn't contain anything.
 			hi = mid - 1
 		default:
 			return mid
@@ -1175,14 +1652,34 @@ func (fs *FileStore) findSegIdx(index raft.Index) int {
 	return -1
 }
 
-// segLogPath returns the path of the log file for a given sequence number.
-func (fs *FileStore) segLogPath(seqNum int) string {
-	return filepath.Join(fs.dir, fmt.Sprintf("seg-%05d.log", seqNum))
+// logPath returns the path of the log file for a segment base name.
+func (fs *FileStore) logPath(name string) string {
+	return filepath.Join(fs.dir, name+".log")
 }
 
-// segIdxPath returns the path of the index file for a given sequence number.
-func (fs *FileStore) segIdxPath(seqNum int) string {
-	return filepath.Join(fs.dir, fmt.Sprintf("seg-%05d.idx", seqNum))
+// idxPath returns the path of the index file for a segment base name.
+func (fs *FileStore) idxPath(name string) string {
+	return filepath.Join(fs.dir, name+".idx")
+}
+
+// parseSegSeq extracts the sequence number from a segment base name such as
+// "seg-0000000042". Any number of digits is accepted so that files written
+// with a narrower padding width by an older release remain readable.
+func parseSegSeq(name string) (int, bool) {
+	digits, ok := strings.CutPrefix(name, segNamePrefix)
+	if !ok || digits == "" {
+		return 0, false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, false
+		}
+	}
+	seq, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return int(seq), true
 }
 
 // openFile opens the file at path for read/write, creating it if needed.
@@ -1194,7 +1691,8 @@ func openFile(path string) (*os.File, error) {
 	return f, nil
 }
 
-// syncDir fsyncs the directory itself to make rename/unlink operations durable.
+// syncDir fsyncs the directory itself to make create/rename/unlink operations
+// durable. An fsync on a file descriptor does not cover its directory entry.
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -1202,7 +1700,10 @@ func syncDir(dir string) error {
 	}
 	err = d.Sync()
 	_ = d.Close()
-	return err
+	if err != nil {
+		return fmt.Errorf("filestore: sync dir: %w", err)
+	}
+	return nil
 }
 
 // encodeEntry serialises a LogEntry into (header, payload).

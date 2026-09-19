@@ -316,7 +316,7 @@ func (w *Watcher[T]) ServeSSEFunc(rw http.ResponseWriter, r *http.Request, key s
 // the event stream picks up exactly where the snapshot left off. It returns
 // the snapshot, the sequence number it is anchored to, and any error from the
 // snapshot function — in which case sub is not registered.
-func (w *Watcher[T]) subscribeWithSnapshot(sub *subscription[T], snapshot func() (map[string]T, error)) (map[string]T, uint64, error) {
+func (w *Watcher[T]) subscribeWithSnapshot(sub *subscription[T], snapshot func() (map[string]T, error)) (values map[string]T, anchoredAt uint64, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

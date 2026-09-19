@@ -74,7 +74,7 @@ func (m *Manager) logger() *slog.Logger {
 // newStoreShell builds a Store with every internal structure initialised but
 // no Raft node yet. Both [NewStore] and [Manager.AddStore] go through it so
 // the two construction paths cannot drift apart.
-func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg Config) *Store {
+func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg *Config) *Store {
 	return &Store{
 		collections:     make(map[string]map[string]json.RawMessage),
 		mutations:       make(map[string]map[string]mutationFunc),
@@ -83,7 +83,7 @@ func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg Confi
 		notifyCh:        make(chan changeEvent, notifyQueueDepth),
 		pendingGaps:     make(map[string]struct{}),
 		discoveredAddrs: make(map[raft.NodeID]string),
-		cfg:             cfg,
+		cfg:             *cfg,
 		stopCtx:         stopCtx,
 		cancel:          cancel,
 	}
@@ -120,7 +120,7 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 
 	// We don't call initRaft here because it needs the shared transport.
 	// We'll initialize all stores in Manager.Start.
-	s := newStoreShell(stopCtx, cancel, mergedCfg)
+	s := newStoreShell(stopCtx, cancel, &mergedCfg)
 	s.cfg.ID = m.cfg.ID // NodeID is shared across all groups; GroupID comes from the argument.
 
 	m.stores[groupID] = s
@@ -273,7 +273,10 @@ func (m *Manager) GroupIDs() []uint64 {
 // The snapshot is taken from the Manager's own registry rather than the
 // underlying raft.Manager, so the two cannot disagree about which groups this
 // node owns.
-func (m *Manager) StatusAll() []raft.GroupStatus {
+// ctx is accepted so that this satisfies raft.NodeProvider, whose StatusAll
+// may reach a node over a network; this implementation is local and returns
+// immediately.
+func (m *Manager) StatusAll(_ context.Context) []raft.GroupStatus {
 	m.mu.RLock()
 	groups := make([]managedGroup, 0, len(m.stores))
 	for groupID, s := range m.stores {
