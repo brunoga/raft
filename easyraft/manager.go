@@ -208,8 +208,12 @@ func (m *Manager) GroupIDs() []uint64 {
 
 // StatusAll returns a point-in-time snapshot of every registered group's
 // Raft state. The slice order is not guaranteed.
-func (m *Manager) StatusAll() []raft.GroupStatus {
-	return m.mgr.StatusAll()
+//
+// ctx is accepted so that this satisfies raft.NodeProvider, whose StatusAll
+// may reach a node over a network; this implementation is local and returns
+// immediately.
+func (m *Manager) StatusAll(ctx context.Context) []raft.GroupStatus {
+	return m.mgr.StatusAll(ctx)
 }
 
 // RemoveStore stops and unregisters the Store for groupID, closing its

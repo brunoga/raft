@@ -42,6 +42,11 @@ var (
 	// be restarted once its storage is healthy.
 	ErrNodeFailed = errors.New("raft: node stopped after a durable write failed")
 
+	// ErrManagerStopping is returned by Manager.Add while StopAll is in
+	// progress. A node added at that moment would not be stopped and nothing
+	// would track it. Retry once StopAll has returned.
+	ErrManagerStopping = errors.New("raft: manager is stopping")
+
 	// ErrLeaseExpired is returned by ReadIndexLease when the leader does not
 	// currently hold a valid clock-based read lease. The caller should fall back
 	// to ReadIndex (which performs a heartbeat round-trip) or retry after the
