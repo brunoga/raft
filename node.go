@@ -272,6 +272,139 @@ type Node struct {
 	// handler is the Handler wrapper registered with the Transport. Created
 	// once in New() so Handler() always returns the same value.
 	handler *nodeHandler
+
+	// --- Leadership observers ------------------------------------------------
+	// watchers holds the subscriptions created by LeadershipChanges. The event
+	// loop announces through them; the mutex is held only for the length of a
+	// non-blocking send, so it never delays consensus work.
+	watchersMu   sync.Mutex
+	watchers     map[uint64]chan LeadershipChange
+	nextWatcher  uint64
+	lastAnnounce LeadershipChange
+	announced    bool
+}
+
+// LeadershipChange reports this node's leadership status at a moment in time.
+type LeadershipChange struct {
+	// IsLeader is true when this node is the leader.
+	IsLeader bool
+	// Leader is the node this node believes is the leader, empty when it does
+	// not know. When IsLeader is true it is this node's own ID.
+	Leader NodeID
+	// Term is the term the node was in when the change happened.
+	Term Term
+}
+
+// LeadershipChanges returns a channel reporting every change in this node's
+// leadership, and a function that ends the subscription.
+//
+// Applications need this to start and stop work that only the leader should do:
+// driving a scheduler, running a compaction, accepting writes. Polling State in
+// a loop answers the question late and cannot tell a brief leadership change
+// from no change at all.
+//
+// The channel is coalescing rather than lossless: a consumer that falls behind
+// sees the most recent status, never a stale one. That is the right trade for
+// this signal, since acting on an out-of-date leadership status is worse than
+// missing an intermediate step, but it does mean a consumer cannot count
+// transitions. The channel is closed when the node stops.
+//
+// The returned stop function may be called more than once and must be called to
+// release the subscription. It never blocks.
+//
+//	changes, stop := node.LeadershipChanges()
+//	defer stop()
+//	for change := range changes {
+//		if change.IsLeader {
+//			go startLeaderWork()
+//		} else {
+//			stopLeaderWork()
+//		}
+//	}
+func (n *Node) LeadershipChanges() (<-chan LeadershipChange, func()) {
+	ch := make(chan LeadershipChange, 1)
+
+	n.watchersMu.Lock()
+	select {
+	case <-n.stopCh:
+		// Already stopped: hand back a closed channel so a range over it ends
+		// immediately rather than blocking for ever.
+		n.watchersMu.Unlock()
+		close(ch)
+		return ch, func() {}
+	default:
+	}
+	if n.watchers == nil {
+		n.watchers = make(map[uint64]chan LeadershipChange)
+	}
+	n.nextWatcher++
+	id := n.nextWatcher
+	n.watchers[id] = ch
+	// Deliver the current status immediately, so a subscriber does not have to
+	// wait for the next change to learn where it stands.
+	ch <- LeadershipChange{
+		IsLeader: n.State() == Leader,
+		Leader:   n.Leader(),
+		Term:     n.Term(),
+	}
+	n.watchersMu.Unlock()
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			n.watchersMu.Lock()
+			defer n.watchersMu.Unlock()
+			if existing, ok := n.watchers[id]; ok {
+				delete(n.watchers, id)
+				close(existing)
+			}
+		})
+	}
+}
+
+// announceLeadership tells subscribers about the node's current leadership,
+// skipping the announcement when nothing they care about has changed.
+// Event-loop only.
+func (n *Node) announceLeadership() {
+	change := LeadershipChange{
+		IsLeader: n.state == Leader,
+		Leader:   n.leaderID,
+		Term:     n.currentTerm,
+	}
+
+	n.watchersMu.Lock()
+	defer n.watchersMu.Unlock()
+	if n.announced && n.lastAnnounce == change {
+		return
+	}
+	n.lastAnnounce, n.announced = change, true
+
+	for _, ch := range n.watchers {
+		// Coalescing send: replace an undelivered status rather than block the
+		// event loop or leave the subscriber holding a stale one.
+		select {
+		case ch <- change:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- change:
+			default:
+			}
+		}
+	}
+}
+
+// closeWatchers ends every subscription. Called once during shutdown.
+func (n *Node) closeWatchers() {
+	n.watchersMu.Lock()
+	defer n.watchersMu.Unlock()
+	for id, ch := range n.watchers {
+		delete(n.watchers, id)
+		close(ch)
+	}
 }
 
 // New creates a Node from cfg, loads persisted state, and caches the log
@@ -395,6 +528,7 @@ func (n *Node) Stop() {
 		// cancelled their contexts, so they exit quickly; we just need to be sure
 		// they have released all references before we return.
 		n.snapshotInstallWg.Wait()
+		n.closeWatchers()
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
 	})
@@ -821,12 +955,14 @@ func (n *Node) ReconfigureCluster(ctx context.Context, newMembers []PeerConfig) 
 func (n *Node) setState(s State) {
 	n.state = s
 	n.atomicState.Store(uint32(s))
+	n.announceLeadership()
 }
 
 // setLeaderID updates n.leaderID and its atomic mirror. Event-loop only.
 func (n *Node) setLeaderID(id NodeID) {
 	n.leaderID = id
 	n.atomicLeader.Store(string(id))
+	n.announceLeadership()
 }
 
 // setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
