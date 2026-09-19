@@ -293,6 +293,21 @@ type Node struct {
 	// once in New() so Handler() always returns the same value.
 	handler *nodeHandler
 
+	// --- Leadership observers ------------------------------------------------
+	// watchers holds the subscriptions created by LeadershipChanges. The event
+	// loop announces through them; the mutex is held only for the length of a
+	// non-blocking send, so it never delays consensus work.
+	watchersMu  sync.Mutex
+	watchers    map[uint64]chan LeadershipChange
+	nextWatcher uint64
+	// leadership is the last announced status, published as one value so that
+	// a reader can never see a half-applied transition -- a node claiming
+	// leadership with no leader recorded yet, say. Written by the event loop
+	// only, read by subscribers.
+	leadership atomic.Value // stores LeadershipChange
+	// leadershipDirty is set when a transition changes state or leader, and
+	// cleared when the event loop announces the result at the end of its turn.
+	leadershipDirty bool
 	// fatalErr holds the first durable-write failure this node hit, if any.
 	// Setting it stops the node; it is read by FatalError and reported in
 	// place of ErrStopped by every operation afterwards.
@@ -354,6 +369,146 @@ func (n *Node) stoppedErr() error {
 		return err
 	}
 	return ErrStopped
+}
+
+// LeadershipChange reports this node's leadership status at a moment in time.
+type LeadershipChange struct {
+	// IsLeader is true when this node is the leader.
+	IsLeader bool
+	// Leader is the node this node believes is the leader, empty when it does
+	// not know. When IsLeader is true it is this node's own ID.
+	Leader NodeID
+	// Term is the term the node was in when the change happened.
+	Term Term
+}
+
+// LeadershipChanges returns a channel reporting every change in this node's
+// leadership, and a function that ends the subscription.
+//
+// Applications need this to start and stop work that only the leader should do:
+// driving a scheduler, running a compaction, accepting writes. Polling State in
+// a loop answers the question late and cannot tell a brief leadership change
+// from no change at all.
+//
+// The channel is coalescing rather than lossless: a consumer that falls behind
+// sees the most recent status, never a stale one. That is the right trade for
+// this signal, since acting on an out-of-date leadership status is worse than
+// missing an intermediate step, but it does mean a consumer cannot count
+// transitions. The channel is closed when the node stops.
+//
+// The returned stop function may be called more than once and must be called to
+// release the subscription. It never blocks.
+//
+//	changes, stop := node.LeadershipChanges()
+//	defer stop()
+//	for change := range changes {
+//		if change.IsLeader {
+//			go startLeaderWork()
+//		} else {
+//			stopLeaderWork()
+//		}
+//	}
+func (n *Node) LeadershipChanges() (changes <-chan LeadershipChange, stop func()) {
+	ch := make(chan LeadershipChange, 1)
+
+	n.watchersMu.Lock()
+	select {
+	case <-n.stopCh:
+		// Already stopped: hand back a closed channel so a range over it ends
+		// immediately rather than blocking for ever.
+		n.watchersMu.Unlock()
+		close(ch)
+		return ch, func() {}
+	default:
+	}
+	if n.watchers == nil {
+		n.watchers = make(map[uint64]chan LeadershipChange)
+	}
+	n.nextWatcher++
+	id := n.nextWatcher
+	n.watchers[id] = ch
+	// Deliver the current status immediately, so a subscriber does not have to
+	// wait for the next change to learn where it stands. It comes from the
+	// single published value rather than from the individual mirrors, which
+	// could be read either side of a transition.
+	ch <- n.currentLeadership()
+	n.watchersMu.Unlock()
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			n.watchersMu.Lock()
+			defer n.watchersMu.Unlock()
+			if existing, ok := n.watchers[id]; ok {
+				delete(n.watchers, id)
+				close(existing)
+			}
+		})
+	}
+}
+
+// currentLeadership returns the last published status. Safe for concurrent use.
+func (n *Node) currentLeadership() LeadershipChange {
+	if v := n.leadership.Load(); v != nil {
+		return v.(LeadershipChange)
+	}
+	return LeadershipChange{}
+}
+
+// announceLeadership publishes the node's leadership and tells subscribers,
+// unless nothing they care about has changed. Event-loop only.
+//
+// It runs at the end of an event-loop turn rather than from each field write,
+// because a single transition writes several fields: becoming leader sets the
+// role first and the leader ID second, and announcing in between would hand
+// subscribers a node that claims leadership with no leader recorded. Waiting
+// until the turn ends means every announcement describes a state the node was
+// actually in.
+func (n *Node) announceLeadership() {
+	if !n.leadershipDirty {
+		return
+	}
+	n.leadershipDirty = false
+
+	change := LeadershipChange{
+		IsLeader: n.state == Leader,
+		Leader:   n.leaderID,
+		Term:     n.currentTerm,
+	}
+
+	n.watchersMu.Lock()
+	defer n.watchersMu.Unlock()
+	if n.currentLeadership() == change {
+		return
+	}
+	n.leadership.Store(change)
+
+	for _, ch := range n.watchers {
+		// Coalescing send: replace an undelivered status rather than block the
+		// event loop or leave the subscriber holding a stale one.
+		select {
+		case ch <- change:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- change:
+			default:
+			}
+		}
+	}
+}
+
+// closeWatchers ends every subscription. Called once during shutdown.
+func (n *Node) closeWatchers() {
+	n.watchersMu.Lock()
+	defer n.watchersMu.Unlock()
+	for id, ch := range n.watchers {
+		delete(n.watchers, id)
+		close(ch)
+	}
 }
 
 // New creates a Node from cfg, loads persisted state, and caches the log
@@ -460,6 +615,7 @@ func New(cfg *Config) (*Node, error) {
 	// Initialise atomic mirrors so external readers never see a nil value.
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
+	n.leadership.Store(LeadershipChange{Term: n.currentTerm})
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
@@ -498,6 +654,7 @@ func (n *Node) Stop() {
 		// cancelled their contexts, so they exit quickly; we just need to be sure
 		// they have released all references before we return.
 		n.snapshotInstallWg.Wait()
+		n.closeWatchers()
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
 	})
@@ -929,12 +1086,18 @@ func (n *Node) ReconfigureCluster(ctx context.Context, newMembers []PeerConfig) 
 // setState updates n.state and its atomic mirror atomically from the caller's
 // perspective. Must only be called from the event-loop goroutine.
 func (n *Node) setState(s State) {
+	if n.state != s {
+		n.leadershipDirty = true
+	}
 	n.state = s
 	n.atomicState.Store(uint32(s))
 }
 
 // setLeaderID updates n.leaderID and its atomic mirror. Event-loop only.
 func (n *Node) setLeaderID(id NodeID) {
+	if n.leaderID != id {
+		n.leadershipDirty = true
+	}
 	n.leaderID = id
 	n.atomicLeader.Store(string(id))
 }
@@ -1047,6 +1210,9 @@ func (n *Node) saveTerm(term Term, votedFor NodeID) error {
 	}); err != nil {
 		n.fail(err, "persist term and vote")
 		return fmt.Errorf("saveTerm: %w", err)
+	}
+	if n.currentTerm != term {
+		n.leadershipDirty = true
 	}
 	n.currentTerm = term
 	n.votedFor = votedFor
