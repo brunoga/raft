@@ -37,7 +37,7 @@ func NewHTTPNodeProvider(baseURL string, client *http.Client) *HTTPNodeProvider 
 // decoding the JSON response. Returns nil on any error (the BalanceController
 // skips nodes with empty status).
 func (p *HTTPNodeProvider) StatusAll(ctx context.Context) []GroupStatus {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/status", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/status", http.NoBody)
 	if err != nil {
 		return nil
 	}
