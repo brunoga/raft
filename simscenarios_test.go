@@ -895,21 +895,47 @@ func TestStorageFailure_ProposalIsNotAcknowledged(t *testing.T) {
 		t.Errorf("state machine holds %q after a failed write, want %q", got, "healthy")
 	}
 
+	// Recovery is a restart, not a resumption. A node that could not complete a
+	// durable write has no way to know what it did and did not write, so the
+	// contract is that it stops and comes back on storage that works. Asserting
+	// in-place recovery here would pin an implementation detail rather than the
+	// guarantee, which is that nothing acknowledged is ever lost.
 	store.AllowWrites()
+	n.Stop()
+
+	restartedSM := newSimKV("solo", nil)
+	restartCfg := cfg
+	restartCfg.StateMachine = restartedSM
+	restartCfg.Transport = net.NewTransport("solo")
+	restarted, err := raft.New(&restartCfg)
+	if err != nil {
+		t.Fatalf("raft.New after recovery: %v", err)
+	}
+	restarted.Start()
+	defer restarted.Stop()
+
 	deadline = time.Now().Add(scenarioTimeout)
-	for time.Now().Before(deadline) {
-		if n.State() == raft.Leader {
-			break
-		}
-		n.Tick()
+	for time.Now().Before(deadline) && restarted.State() != raft.Leader {
+		restarted.Tick()
 		time.Sleep(time.Millisecond)
 	}
+	if restarted.State() != raft.Leader {
+		t.Fatalf("the sole voter did not elect itself after restarting on a healthy disk")
+	}
+
+	// The write that failed must not have survived, and the one before it must.
+	if got := restartedSM.Get("disk"); got != "healthy" {
+		t.Errorf("state machine holds %q after restarting, want %q: a write that was "+
+			"never acknowledged came back, or one that was acknowledged was lost",
+			got, "healthy")
+	}
+
 	rctx, rcancel := context.WithTimeout(context.Background(), scenarioTimeout)
 	defer rcancel()
-	if _, err := n.Propose(rctx, encodePut("disk", "recovered")); err != nil {
-		t.Errorf("Propose after the disk recovered: %v", err)
+	if _, err := restarted.Propose(rctx, encodePut("disk", "recovered")); err != nil {
+		t.Errorf("Propose after restarting on a healthy disk: %v", err)
 	}
-	if got := sm.Get("disk"); got != "recovered" {
+	if got := restartedSM.Get("disk"); got != "recovered" {
 		t.Errorf("state machine holds %q after recovery, want %q", got, "recovered")
 	}
 }
