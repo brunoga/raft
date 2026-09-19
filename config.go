@@ -307,7 +307,7 @@ func DefaultConfig() Config {
 // Validate returns an error if the configuration is invalid or inconsistent.
 // It checks:
 //   - ID, Storage, StateMachine, Transport are non-nil/non-empty
-//   - ElectionTimeoutMin ≤ ElectionTimeoutMax
+//   - ElectionTimeoutMin < ElectionTimeoutMax
 //   - ElectionTimeoutMin ≥ 2 × HeartbeatInterval
 //   - MaxLogEntriesPerRPC and MaxInflightRPCs are positive
 func (c *Config) Validate() error {
@@ -326,8 +326,13 @@ func (c *Config) Validate() error {
 	if c.ElectionTimeoutMin <= 0 || c.ElectionTimeoutMax <= 0 {
 		return errors.New("raft: election timeout values must be positive")
 	}
-	if c.ElectionTimeoutMin > c.ElectionTimeoutMax {
-		return errors.New("raft: ElectionTimeoutMin must be <= ElectionTimeoutMax")
+	if c.ElectionTimeoutMin >= c.ElectionTimeoutMax {
+		// Equal bounds leave no randomness in the election timeout. Every
+		// follower then times out at the same moment, splits the vote, and
+		// splits it again on the next attempt: the cluster can stay leaderless
+		// for a long time with nothing obviously wrong.
+		return errors.New("raft: ElectionTimeoutMax must be greater than ElectionTimeoutMin, " +
+			"otherwise elections have no randomised spread and split votes repeat")
 	}
 	if c.HeartbeatInterval <= 0 {
 		return errors.New("raft: HeartbeatInterval must be positive")
@@ -340,6 +345,18 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInflightRPCs <= 0 {
 		return errors.New("raft: MaxInflightRPCs must be positive")
+	}
+	if c.MaxClientTableSize < 0 {
+		return errors.New("raft: MaxClientTableSize must not be negative (use 0 for unlimited)")
+	}
+	if c.SnapshotChunkSize < 0 {
+		return errors.New("raft: SnapshotChunkSize must not be negative (use 0 to send whole snapshots)")
+	}
+	if c.RPCTimeout < 0 {
+		return errors.New("raft: RPCTimeout must not be negative")
+	}
+	if c.TickInterval < 0 {
+		return errors.New("raft: TickInterval must not be negative (use 0 to drive ticks manually)")
 	}
 	// When TickInterval drives the clock, the timing fields must resolve to at
 	// least one tick each. If TickInterval is larger than HeartbeatInterval,
