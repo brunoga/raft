@@ -55,6 +55,17 @@ var (
 	// of the cluster.
 	ErrNotMember = errors.New("raft: node is not a member of this cluster")
 
+	// ErrProposalTooLarge is returned by Propose and ProposeOnce for a command
+	// that could never be replicated, because the resulting log entry would
+	// exceed the largest message the transport can carry.
+	//
+	// The alternative to refusing it is worse: the entry is durable in the
+	// leader's log, the transport rejects every attempt to send it, and the
+	// leader retries the identical message for ever. The entry never commits,
+	// so every later proposal queues behind it and the group stops making
+	// progress, with nothing in the API having reported a problem.
+	ErrProposalTooLarge = errors.New("raft: proposal is too large to replicate")
+
 	// ErrLeaseExpired is returned by ReadIndexLease when the leader does not
 	// currently hold a valid clock-based read lease. The caller should fall back
 	// to ReadIndex (which performs a heartbeat round-trip) or retry after the

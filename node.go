@@ -163,6 +163,18 @@ type Node struct {
 	// is counted implicitly when evaluating quorum.
 	quorumAcks map[NodeID]bool
 
+	// termStartIndex is the index of the no-op this node appended when it
+	// became leader, and so the first index in its own term. Zero when not
+	// leading.
+	//
+	// Everything at or above it was appended by this node in the current term:
+	// a leader only ever appends its own entries, and one that accepts an
+	// AppendEntries has already stepped down. Everything below it is from an
+	// earlier term and can never be committed by replica count (Raft 5.4.2).
+	// That makes it the exact lower bound for the commit scan, and removes the
+	// need to read each entry's term back from storage.
+	termStartIndex Index
+
 	// --- Leadership transfer state (leader only) ----------------------------
 	transferTarget  NodeID // non-empty while a transfer is in progress
 	transferElapsed int    // ticks since transfer was initiated
@@ -703,6 +715,9 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	// Non-blocking pre-check: if the node is stopped or broken, return
 	// immediately rather than racing with a buffered proposeCh.
 	if err := n.checkRunning(); err != nil {
+		return nil, err
+	}
+	if err := n.checkProposalSize(len(cmd)); err != nil {
 		return nil, err
 	}
 
@@ -1295,6 +1310,50 @@ func (n *Node) reportProposal(submitted time.Time, ok bool) {
 		return
 	}
 	pm.ProposalCompleted(n.cfg.ID, n.now().Sub(submitted), ok)
+}
+
+// proposalLimit returns the largest command this node will accept, or 0 when
+// no limit applies. Config.MaxProposalBytes wins; otherwise the transport is
+// asked, leaving headroom for the framing that surrounds the command on the
+// wire.
+func (n *Node) proposalLimit() int {
+	if n.cfg.MaxProposalBytes > 0 {
+		return n.cfg.MaxProposalBytes
+	}
+	limiter, ok := n.cfg.Transport.(MessageSizeLimiter)
+	if !ok {
+		return 0
+	}
+	limit := limiter.MaxMessageBytes()
+	if limit <= 0 {
+		return 0
+	}
+	// The command is not the whole message: the request carries the term, the
+	// leader ID, the previous-log fields and each entry's own header, and the
+	// transport adds its framing on top. Reserve a slice of the budget for all
+	// of that rather than accepting a command that only just fits on paper.
+	reserved := limit / 16
+	if reserved < proposalFramingReserve {
+		reserved = proposalFramingReserve
+	}
+	if reserved >= limit {
+		return 0
+	}
+	return limit - reserved
+}
+
+// proposalFramingReserve is the minimum headroom left for request and entry
+// framing when deriving a proposal limit from the transport.
+const proposalFramingReserve = 4096
+
+// checkProposalSize reports whether a command of this size can be replicated.
+func (n *Node) checkProposalSize(size int) error {
+	limit := n.proposalLimit()
+	if limit > 0 && size > limit {
+		return fmt.Errorf("%w: %d bytes exceeds the %d the transport can carry",
+			ErrProposalTooLarge, size, limit)
+	}
+	return nil
 }
 
 // trailingLogs returns how many entries to retain behind the snapshot point,
