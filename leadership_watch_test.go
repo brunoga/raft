@@ -213,3 +213,64 @@ func TestLeadershipChanges_StopEndsTheSubscription(t *testing.T) {
 		}
 	}
 }
+
+// TestLeadershipChanges_NeverReportsAHalfAppliedTransition asserts that every
+// status a subscriber sees describes a state the node was actually in.
+//
+// Becoming leader writes two things: the role, and this node's own ID as the
+// leader. Announcing between those writes hands the application a node that
+// claims leadership with no leader recorded — which is not a state Raft has,
+// and a caller that redirects clients to the reported leader would send them
+// nowhere.
+func TestLeadershipChanges_NeverReportsAHalfAppliedTransition(t *testing.T) {
+	net := memtransport.NewNetwork()
+	node := watchNode(t, "n1", net, nil)
+	t.Cleanup(node.Stop)
+
+	changes, stop := node.LeadershipChanges()
+	defer stop()
+
+	inspected := make(chan struct{})
+	go func() {
+		defer close(inspected)
+		for change := range changes {
+			if change.IsLeader && change.Leader != "n1" {
+				t.Errorf("status claims leadership but records the leader as %q: %+v",
+					change.Leader, change)
+			}
+			if !change.IsLeader && change.Leader == "n1" {
+				t.Errorf("status records this node as leader but does not claim leadership: %+v",
+					change)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for node.State() != raft.Leader {
+		if time.Now().After(deadline) {
+			t.Fatal("node never became leader")
+		}
+		node.Tick()
+		time.Sleep(time.Millisecond)
+	}
+	// Churn through several terms so the transition is observed repeatedly.
+	for range 5 {
+		if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+			Term:     node.Term() + 1,
+			LeaderID: "n2",
+		}); err != nil {
+			t.Fatalf("HandleAppendEntries: %v", err)
+		}
+		deadline = time.Now().Add(3 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				t.Fatal("node never regained leadership")
+			}
+			node.Tick()
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	stop()
+	<-inspected
+}

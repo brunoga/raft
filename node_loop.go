@@ -68,6 +68,10 @@ func (n *Node) run() {
 		case sr := <-n.snapshotResultCh:
 			n.handleSnapshotResult(sr)
 		}
+
+		// One announcement per turn, after the whole transition has been
+		// applied. See announceLeadership.
+		n.announceLeadership()
 	}
 }
 

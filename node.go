@@ -277,11 +277,17 @@ type Node struct {
 	// watchers holds the subscriptions created by LeadershipChanges. The event
 	// loop announces through them; the mutex is held only for the length of a
 	// non-blocking send, so it never delays consensus work.
-	watchersMu   sync.Mutex
-	watchers     map[uint64]chan LeadershipChange
-	nextWatcher  uint64
-	lastAnnounce LeadershipChange
-	announced    bool
+	watchersMu  sync.Mutex
+	watchers    map[uint64]chan LeadershipChange
+	nextWatcher uint64
+	// leadership is the last announced status, published as one value so that
+	// a reader can never see a half-applied transition -- a node claiming
+	// leadership with no leader recorded yet, say. Written by the event loop
+	// only, read by subscribers.
+	leadership atomic.Value // stores LeadershipChange
+	// leadershipDirty is set when a transition changes state or leader, and
+	// cleared when the event loop announces the result at the end of its turn.
+	leadershipDirty bool
 }
 
 // LeadershipChange reports this node's leadership status at a moment in time.
@@ -341,12 +347,10 @@ func (n *Node) LeadershipChanges() (<-chan LeadershipChange, func()) {
 	id := n.nextWatcher
 	n.watchers[id] = ch
 	// Deliver the current status immediately, so a subscriber does not have to
-	// wait for the next change to learn where it stands.
-	ch <- LeadershipChange{
-		IsLeader: n.State() == Leader,
-		Leader:   n.Leader(),
-		Term:     n.Term(),
-	}
+	// wait for the next change to learn where it stands. It comes from the
+	// single published value rather than from the individual mirrors, which
+	// could be read either side of a transition.
+	ch <- n.currentLeadership()
 	n.watchersMu.Unlock()
 
 	var once sync.Once
@@ -362,10 +366,29 @@ func (n *Node) LeadershipChanges() (<-chan LeadershipChange, func()) {
 	}
 }
 
-// announceLeadership tells subscribers about the node's current leadership,
-// skipping the announcement when nothing they care about has changed.
-// Event-loop only.
+// currentLeadership returns the last published status. Safe for concurrent use.
+func (n *Node) currentLeadership() LeadershipChange {
+	if v := n.leadership.Load(); v != nil {
+		return v.(LeadershipChange)
+	}
+	return LeadershipChange{}
+}
+
+// announceLeadership publishes the node's leadership and tells subscribers,
+// unless nothing they care about has changed. Event-loop only.
+//
+// It runs at the end of an event-loop turn rather than from each field write,
+// because a single transition writes several fields: becoming leader sets the
+// role first and the leader ID second, and announcing in between would hand
+// subscribers a node that claims leadership with no leader recorded. Waiting
+// until the turn ends means every announcement describes a state the node was
+// actually in.
 func (n *Node) announceLeadership() {
+	if !n.leadershipDirty {
+		return
+	}
+	n.leadershipDirty = false
+
 	change := LeadershipChange{
 		IsLeader: n.state == Leader,
 		Leader:   n.leaderID,
@@ -374,10 +397,10 @@ func (n *Node) announceLeadership() {
 
 	n.watchersMu.Lock()
 	defer n.watchersMu.Unlock()
-	if n.announced && n.lastAnnounce == change {
+	if n.currentLeadership() == change {
 		return
 	}
-	n.lastAnnounce, n.announced = change, true
+	n.leadership.Store(change)
 
 	for _, ch := range n.watchers {
 		// Coalescing send: replace an undelivered status rather than block the
@@ -488,6 +511,7 @@ func New(cfg *Config) (*Node, error) {
 	// Initialise atomic mirrors so external readers never see a nil value.
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
+	n.leadership.Store(LeadershipChange{Term: n.currentTerm})
 	n.atomicTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
@@ -953,16 +977,20 @@ func (n *Node) ReconfigureCluster(ctx context.Context, newMembers []PeerConfig) 
 // setState updates n.state and its atomic mirror atomically from the caller's
 // perspective. Must only be called from the event-loop goroutine.
 func (n *Node) setState(s State) {
+	if n.state != s {
+		n.leadershipDirty = true
+	}
 	n.state = s
 	n.atomicState.Store(uint32(s))
-	n.announceLeadership()
 }
 
 // setLeaderID updates n.leaderID and its atomic mirror. Event-loop only.
 func (n *Node) setLeaderID(id NodeID) {
+	if n.leaderID != id {
+		n.leadershipDirty = true
+	}
 	n.leaderID = id
 	n.atomicLeader.Store(string(id))
-	n.announceLeadership()
 }
 
 // setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
@@ -1060,6 +1088,9 @@ func (n *Node) saveTerm(term Term, votedFor NodeID) error {
 		VotedFor:    votedFor,
 	}); err != nil {
 		return fmt.Errorf("saveTerm: %w", err)
+	}
+	if n.currentTerm != term {
+		n.leadershipDirty = true
 	}
 	n.currentTerm = term
 	n.votedFor = votedFor
