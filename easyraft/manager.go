@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/brunoga/raft"
@@ -33,6 +35,12 @@ type Manager struct {
 	stopCtx    context.Context
 }
 
+// managedGroup pairs a group ID with its store for iteration outside the lock.
+type managedGroup struct {
+	id    uint64
+	store *Store
+}
+
 // NewManager creates a new EasyRaft manager.
 func NewManager(opts ...Option) (*Manager, error) {
 	var c Config
@@ -52,6 +60,33 @@ func NewManager(opts ...Option) (*Manager, error) {
 		stopCtx: ctx,
 		cancel:  cancel,
 	}, nil
+}
+
+// logger returns the configured logger, or slog.Default() so failures are
+// reported rather than dropped.
+func (m *Manager) logger() *slog.Logger {
+	if m.cfg.Logger != nil {
+		return m.cfg.Logger
+	}
+	return slog.Default()
+}
+
+// newStoreShell builds a Store with every internal structure initialised but
+// no Raft node yet. Both [NewStore] and [Manager.AddStore] go through it so
+// the two construction paths cannot drift apart.
+func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg Config) *Store {
+	return &Store{
+		collections:     make(map[string]map[string]json.RawMessage),
+		mutations:       make(map[string]map[string]mutationFunc),
+		raftPeers:       make(map[raft.NodeID]raftPeerInfo),
+		onChangeFns:     make(map[string]func(rawChangeEvent)),
+		notifyCh:        make(chan changeEvent, notifyQueueDepth),
+		pendingGaps:     make(map[string]struct{}),
+		discoveredAddrs: make(map[raft.NodeID]string),
+		cfg:             cfg,
+		stopCtx:         stopCtx,
+		cancel:          cancel,
+	}
 }
 
 // AddStore creates a Store for the given Raft group ID and registers it with
@@ -85,16 +120,7 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 
 	// We don't call initRaft here because it needs the shared transport.
 	// We'll initialize all stores in Manager.Start.
-	s := &Store{
-		collections: make(map[string]map[string]json.RawMessage),
-		mutations:   make(map[string]map[string]mutationFunc),
-		raftPeers:   make(map[raft.NodeID]raftPeerInfo),
-		onChangeFns: make(map[string]func(string, json.RawMessage, bool)),
-		notifyCh:    make(chan changeEvent, 1024),
-		cfg:         mergedCfg,
-		stopCtx:     stopCtx,
-		cancel:      cancel,
-	}
+	s := newStoreShell(stopCtx, cancel, mergedCfg)
 	s.cfg.ID = m.cfg.ID // NodeID is shared across all groups; GroupID comes from the argument.
 
 	m.stores[groupID] = s
@@ -107,14 +133,35 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 //
 // If Start returns an error, all partially-initialised resources (nodes,
 // goroutines, transport) are cleaned up; the caller does not need to call Stop.
+//
+// The Manager lock is not held while groups join their clusters, so
+// [Manager.GetStore] and the HTTP handlers stay responsive even when a join
+// spends its full retry budget waiting for a seed to come up.
 func (m *Manager) Start() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 1. Shared Transport
 	if m.cfg.RaftAddr == "" {
+		m.mu.Unlock()
 		return fmt.Errorf("easyraft: WithRaftAddr is required")
 	}
+	groups := make([]managedGroup, 0, len(m.stores))
+	for groupID, s := range m.stores {
+		groups = append(groups, managedGroup{id: groupID, store: s})
+	}
+	m.mu.Unlock()
+
+	// Start groups in a stable order so a failure is reproducible.
+	slices.SortFunc(groups, func(a, b managedGroup) int {
+		switch {
+		case a.id < b.id:
+			return -1
+		case a.id > b.id:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	// 1. Shared Transport
 	var trOpts []grpctransport.Option
 	if m.cfg.TLS != nil {
 		trOpts = append(trOpts, grpctransport.WithTLSConfig(m.cfg.TLS))
@@ -123,45 +170,51 @@ func (m *Manager) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen grpc: %w", err)
 	}
+	m.mu.Lock()
 	m.transport = tr
+	m.mu.Unlock()
 	tr.SetGroupLookup(m.mgr.Lookup)
 
 	// cleanup tears down all resources initialised so far; called on any error.
 	cleanup := func() {
 		m.cancel()      // cancels all per-store derived contexts (dispatchChanges)
 		m.mgr.StopAll() // stops any Raft nodes that were started
-		for _, s := range m.stores {
-			if s.storage != nil {
-				if c, ok := s.storage.(interface{ Close() error }); ok {
+		for _, g := range groups {
+			if g.store.storage != nil {
+				if c, ok := g.store.storage.(interface{ Close() error }); ok {
 					_ = c.Close()
 				}
 			}
 		}
 		_ = tr.Close()
+		m.mu.Lock()
 		m.transport = nil
+		m.mu.Unlock()
 	}
 
 	// 2. Initialize and Start all Stores
-	for groupID, s := range m.stores {
-		if err := s.initRaftForManager(groupID, tr); err != nil {
+	for _, g := range groups {
+		if err := g.store.initRaftForManager(g.id, tr); err != nil {
 			cleanup()
-			return fmt.Errorf("init store %d: %w", groupID, err)
+			return fmt.Errorf("init store %d: %w", g.id, err)
 		}
-		if err := m.mgr.Add(groupID, s.node); err != nil {
+		if err := m.mgr.Add(g.id, g.store.node); err != nil {
 			cleanup()
-			return fmt.Errorf("register store %d: %w", groupID, err)
+			return fmt.Errorf("register store %d: %w", g.id, err)
 		}
 		// Join an existing cluster before starting the event loop, if configured.
-		if len(s.cfg.JoinAddrs) > 0 {
-			if err := s.joinCluster(s.stopCtx); err != nil && s.cfg.Logger != nil {
-				s.cfg.Logger.Warn("easyraft: cluster join failed", "err", err)
+		// This can retry for up to 30 seconds, which is exactly why the Manager
+		// lock is not held here.
+		if len(g.store.cfg.JoinAddrs) > 0 {
+			if err := g.store.joinCluster(g.store.stopCtx); err != nil {
+				g.store.logger().Warn("easyraft: cluster join failed", "group", g.id, "err", err)
 			}
 		}
-		s.node.Start()
-		go s.dispatchChanges()
+		g.store.node.Start()
+		go g.store.dispatchChanges()
 		// Advertise this node's HTTP address so the cluster can redirect clients.
-		if s.cfg.HTTPAddr != "" {
-			go s.advertiseMetadata()
+		if g.store.cfg.HTTPAddr != "" {
+			go g.store.advertiseMetadata()
 		}
 	}
 
@@ -179,12 +232,19 @@ func (m *Manager) Start() error {
 // Stop shuts down all stores, the shared HTTP server, and the shared transport.
 func (m *Manager) Stop() {
 	m.cancel()
-	if m.httpServer != nil {
-		_ = m.httpServer.Shutdown(context.Background())
+
+	m.mu.Lock()
+	httpServer := m.httpServer
+	transport := m.transport
+	m.transport = nil
+	m.mu.Unlock()
+
+	if httpServer != nil {
+		_ = httpServer.Shutdown(context.Background())
 	}
 	m.mgr.StopAll()
-	if m.transport != nil {
-		_ = m.transport.Close()
+	if transport != nil {
+		_ = transport.Close()
 	}
 }
 
@@ -207,9 +267,41 @@ func (m *Manager) GroupIDs() []uint64 {
 }
 
 // StatusAll returns a point-in-time snapshot of every registered group's
-// Raft state. The slice order is not guaranteed.
+// Raft state, ordered by group ID. Groups that have been added but not yet
+// started are omitted.
+//
+// The snapshot is taken from the Manager's own registry rather than the
+// underlying raft.Manager, so the two cannot disagree about which groups this
+// node owns.
 func (m *Manager) StatusAll() []raft.GroupStatus {
-	return m.mgr.StatusAll()
+	m.mu.RLock()
+	groups := make([]managedGroup, 0, len(m.stores))
+	for groupID, s := range m.stores {
+		groups = append(groups, managedGroup{id: groupID, store: s})
+	}
+	m.mu.RUnlock()
+
+	slices.SortFunc(groups, func(a, b managedGroup) int {
+		switch {
+		case a.id < b.id:
+			return -1
+		case a.id > b.id:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	out := make([]raft.GroupStatus, 0, len(groups))
+	for _, g := range groups {
+		if g.store.node == nil {
+			continue
+		}
+		status := g.store.node.Status()
+		status.GroupID = g.id
+		out = append(out, status)
+	}
+	return out
 }
 
 // RemoveStore stops and unregisters the Store for groupID, closing its
@@ -293,16 +385,23 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	}
 	s.storage = st
 
-	// Peer setup for this group
+	// Peer setup for this group. Recording each peer in raftPeers is what lets
+	// GET /members and the join response report a Raft address for statically
+	// configured peers — without it a joiner has no way to dial them.
 	var peerConfigs []raft.PeerConfig
+	adder, hasAdder := tr.(peerAdder)
+	s.mu.Lock()
 	for id, addr := range s.cfg.Peers {
-		if id != s.cfg.ID {
-			if adder, ok := tr.(interface{ AddPeer(raft.NodeID, string) }); ok {
-				adder.AddPeer(id, addr)
-			}
-			peerConfigs = append(peerConfigs, raft.PeerConfig{ID: id, Voter: true})
+		if id == s.cfg.ID {
+			continue
 		}
+		if hasAdder {
+			adder.AddPeer(id, addr)
+		}
+		peerConfigs = append(peerConfigs, raft.PeerConfig{ID: id, Voter: true})
+		s.raftPeers[id] = raftPeerInfo{addr: addr, voter: true}
 	}
+	s.mu.Unlock()
 
 	// Raft Config
 	rCfg := raft.DefaultConfig()
@@ -322,8 +421,10 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 		rCfg.SnapshotThreshold = 1000
 	}
 
+	// Every group shares the caller's registry, so the collectors are
+	// registered once and each group's series carry its own "group" label.
 	if s.cfg.PromRegisterer != nil {
-		rCfg.Metrics = prommetrics.New(s.cfg.PromRegisterer)
+		rCfg.Metrics = prommetrics.NewForGroup(s.cfg.PromRegisterer, groupID)
 	}
 
 	node, err := raft.New(&rCfg)
@@ -332,6 +433,7 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	}
 
 	s.node = node
+	s.reader = node
 	s.transport = tr
 
 	// Discovery: wire both transport connectivity and Raft membership, using

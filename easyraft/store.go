@@ -40,7 +40,17 @@
 //
 // seqNum must increase monotonically per clientID. Use the *Once variants
 // whenever retrying a write on ErrNotLeader or context timeout to avoid
-// duplicate application.
+// duplicate application. [Collection.Exactly] offers the same guarantee with
+// named fields instead of positional arguments; see [Session] and [OnceID].
+//
+// # Security
+//
+// The HTTP API enabled by [WithHTTPAddr] can add and remove cluster members.
+// Protect it with [WithHTTPAuth] or [WithBearerTokenAuth], and bind it to an
+// interface untrusted clients cannot reach. Peer discovery is only as
+// trustworthy as its source, which is why discovered peers join as non-voting
+// learners unless [WithDiscoveryAsVoter] says otherwise. See the package
+// README for the full picture.
 //
 // # Getting started
 //
@@ -57,16 +67,21 @@
 package easyraft
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/brunoga/raft"
@@ -103,6 +118,20 @@ var (
 //	if errors.As(err, &nle) { ... nle.Leader ... }
 type NotLeaderError = raft.NotLeaderError
 
+// metadataCollection holds one entry per node: its advertised HTTP address.
+// It is written only by advertiseMetadata and is never reachable over HTTP —
+// its contents decide where leader redirects point.
+const metadataCollection = "__easyraft_metadata__"
+
+// notifyQueueDepth is how many change events may be in flight between Apply
+// and the dispatcher before events start being dropped (and a gap reported).
+const notifyQueueDepth = 1024
+
+// collectionQueueDepth is the per-collection backlog held for a single
+// OnChange handler. Each collection gets its own queue and goroutine so a slow
+// handler delays only its own collection.
+const collectionQueueDepth = 256
+
 type opType string
 
 const (
@@ -115,12 +144,29 @@ const (
 )
 
 // changeEvent is an internal notification emitted after each successful write
-// and delivered to [Store.OnChange] callbacks outside the state-machine lock.
+// and delivered to change handlers outside the state-machine lock.
 type changeEvent struct {
 	collection string
 	key        string
 	value      json.RawMessage // nil when deleted
 	deleted    bool
+
+	// seq is the store-wide, monotonically increasing number of this event.
+	seq uint64
+
+	// gap marks a synthetic event reporting that one or more real events for
+	// this collection were dropped because a queue was full. The receiver must
+	// resynchronise from the collection's current state.
+	gap bool
+}
+
+// rawChangeEvent is the untyped form handed to per-collection handlers.
+type rawChangeEvent struct {
+	Seq     uint64
+	Key     string
+	Value   json.RawMessage
+	Deleted bool
+	Gap     bool
 }
 
 type command struct {
@@ -139,6 +185,14 @@ type raftPeerInfo struct {
 	voter bool
 }
 
+// readIndexer is the subset of [raft.Node] used to establish read
+// linearizability. Having it as an interface keeps the fallback policy
+// testable without a running cluster.
+type readIndexer interface {
+	ReadIndex(ctx context.Context) (raft.Index, error)
+	ReadIndexLease(ctx context.Context) (raft.Index, error)
+}
+
 // Store is a Raft-replicated key-value store that can hold multiple typed
 // collections. Each Store owns exactly one Raft node, one gRPC transport, and
 // one persistent storage directory.
@@ -155,6 +209,10 @@ type Store struct {
 	mutations   map[string]map[string]mutationFunc
 	node        *raft.Node
 
+	// reader establishes read linearizability. It is the Raft node in
+	// production and is overridable in tests.
+	reader readIndexer
+
 	// raftPeers maps known peer IDs to their Raft gRPC address and voter
 	// status. Seeded from cfg.Peers at init; updated by handleJoin, discovery,
 	// AddServer, and RemoveServer. Protected by mu. Used to serve GET /members
@@ -163,29 +221,52 @@ type Store struct {
 
 	// onChangeFns holds per-collection callbacks registered via OnChange.
 	// Protected by mu. Each key is a collection name; values are called
-	// outside the lock by the notification dispatcher.
-	onChangeFns map[string]func(key string, value json.RawMessage, deleted bool)
+	// outside the lock by that collection's dispatcher goroutine.
+	onChangeFns map[string]func(rawChangeEvent)
 
 	// notifyCh carries change events from Apply (state-machine goroutine) to
 	// the notification dispatcher (started by Start). Buffered so Apply never
-	// blocks; events are dropped if the dispatcher falls behind.
+	// blocks; a full queue produces a gap event rather than silent loss.
 	notifyCh chan changeEvent
+
+	// eventSeq numbers every change event this store emits, so a consumer can
+	// tell contiguous delivery from a gap.
+	eventSeq atomic.Uint64
+
+	// gapMu guards pendingGaps, the set of collections owed a gap marker
+	// because notifyCh was full when one of their events was produced.
+	gapMu       sync.Mutex
+	pendingGaps map[string]struct{}
 
 	// pendingEvents accumulates events during a single applyCommand call.
 	// Reset at the start of each Apply; only accessed under mu.
 	pendingEvents []changeEvent
 
-	cfg        Config
-	cancel     context.CancelFunc
-	stopCtx    context.Context
-	httpServer *http.Server
-	transport  raft.Transport
-	storage    raft.Storage
+	// discoveredAddrs remembers the address discovery last reported for each
+	// peer, so a changed address can be reported instead of applied silently.
+	discoveredAddrs map[raft.NodeID]string
+
+	// started records that the Raft event loop was launched. Node.Stop waits
+	// for goroutines that only Node.Start creates, so Stop must not call it on
+	// a store that was constructed but never started.
+	started atomic.Bool
+
+	cfg          Config
+	cancel       context.CancelFunc
+	stopCtx      context.Context
+	httpListener net.Listener
+	httpServer   *http.Server
+	transport    raft.Transport
+	storage      raft.Storage
 }
 
 // NewStore creates a Store that can manage multiple typed collections.
 // [WithID], [WithRaftAddr], and [WithDataDir] are required; all other options
 // are optional. Call [Store.Start] after registering collections.
+//
+// The Raft and (when configured) HTTP listeners are bound here, so an address
+// that is malformed or already in use is reported as an error rather than
+// failing later inside a background goroutine.
 func NewStore(opts ...Option) (*Store, error) {
 	var c Config
 	for _, o := range opts {
@@ -201,21 +282,53 @@ func NewStore(opts ...Option) (*Store, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
-		collections: make(map[string]map[string]json.RawMessage),
-		mutations:   make(map[string]map[string]mutationFunc),
-		raftPeers:   make(map[raft.NodeID]raftPeerInfo),
-		onChangeFns: make(map[string]func(string, json.RawMessage, bool)),
-		notifyCh:    make(chan changeEvent, 1024),
-		cfg:         c,
-		cancel:      cancel,
-		stopCtx:     ctx,
+		collections:     make(map[string]map[string]json.RawMessage),
+		mutations:       make(map[string]map[string]mutationFunc),
+		raftPeers:       make(map[raft.NodeID]raftPeerInfo),
+		onChangeFns:     make(map[string]func(rawChangeEvent)),
+		notifyCh:        make(chan changeEvent, notifyQueueDepth),
+		pendingGaps:     make(map[string]struct{}),
+		discoveredAddrs: make(map[raft.NodeID]string),
+		cfg:             c,
+		cancel:          cancel,
+		stopCtx:         ctx,
 	}
 
 	if err := s.initRaft(); err != nil {
+		cancel()
+		return nil, err
+	}
+	if err := s.initHTTP(); err != nil {
+		cancel()
+		s.closeAfterFailedInit()
 		return nil, err
 	}
 
 	return s, nil
+}
+
+// closeAfterFailedInit releases the resources acquired before a later step of
+// construction failed, so a caller that only sees an error leaks nothing.
+//
+// The Raft node is deliberately not stopped: it has not been started, and
+// Node.Stop waits for goroutines that Node.Start would have created. Closing
+// the transport and the storage releases everything the node actually holds.
+func (s *Store) closeAfterFailedInit() {
+	if closer, ok := s.transport.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	if closer, ok := s.storage.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+// logger returns the configured logger, or slog.Default() so that problems are
+// reported somewhere rather than dropped when no logger was supplied.
+func (s *Store) logger() *slog.Logger {
+	if s.cfg.Logger != nil {
+		return s.cfg.Logger
+	}
+	return slog.Default()
 }
 
 // TxnResults is the ordered result set returned by [Store.Txn]. Each element
@@ -429,6 +542,7 @@ func (s *Store) initRaft() error {
 	}
 
 	s.node = node
+	s.reader = node
 	return nil
 }
 
@@ -441,15 +555,19 @@ type peerAdder interface {
 // startDiscovery launches the background goroutines that keep the transport
 // peer table and Raft membership in sync with the discovery output.
 // It uses s.stopCtx so everything is torn down cleanly on Store.Stop.
+//
+// Discovered peers are added as non-voting learners by default: a discovery
+// announcement is a network-level claim, and honouring it as a voter would let
+// that claim change the cluster's quorum. [WithDiscoveryAsVoter] opts out.
 func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
+	logger := s.logger()
+
 	// Some Discovery implementations (e.g. udpbroadcast) need their own Run loop
 	// to receive incoming peer announcements.
 	if runner, ok := s.cfg.Discovery.(interface{ Run(context.Context) error }); ok {
 		go func() {
 			if err := runner.Run(s.stopCtx); err != nil && !errors.Is(err, context.Canceled) {
-				if s.cfg.Logger != nil {
-					s.cfg.Logger.Error("discovery runner failed", "err", err)
-				}
+				logger.Error("easyraft: discovery runner failed", "err", err)
 			}
 		}()
 	}
@@ -458,6 +576,7 @@ func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
+	voter := s.cfg.DiscoveryAsVoter
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -473,26 +592,27 @@ func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 
 		for {
 			peers, err := s.cfg.Discovery.Discover(s.stopCtx)
-			if err != nil && !errors.Is(err, context.Canceled) && s.cfg.Logger != nil {
-				s.cfg.Logger.Warn("discovery: Discover failed", "err", err)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("easyraft: discovery lookup failed", "err", err)
 			}
 			for _, p := range peers {
 				if p.ID == s.cfg.ID {
 					continue
 				}
-				tr.AddPeer(p.ID, p.Addr)
+				s.applyDiscoveredAddr(tr, p.ID, p.Addr)
 				if _, seen := knownMembers[p.ID]; seen {
 					continue
 				}
 				addCtx, cancel := context.WithTimeout(s.stopCtx, 5*time.Second)
-				if err := node.AddServer(addCtx, raft.PeerConfig{ID: p.ID, Voter: true}); err != nil {
-					if s.cfg.Logger != nil {
-						s.cfg.Logger.Warn("discovery: AddServer failed (will retry)", "peer", p.ID, "err", err)
-					}
+				if err := node.AddServer(addCtx, s.discoveredPeerConfig(p.ID)); err != nil {
+					logger.Warn("easyraft: discovery AddServer failed (will retry)",
+						"peer", p.ID, "err", err)
 				} else {
+					logger.Info("easyraft: added discovered peer",
+						"peer", p.ID, "addr", p.Addr, "voter", voter)
 					knownMembers[p.ID] = struct{}{}
 					s.mu.Lock()
-					s.raftPeers[p.ID] = raftPeerInfo{addr: p.Addr, voter: true}
+					s.raftPeers[p.ID] = raftPeerInfo{addr: p.Addr, voter: voter}
 					s.mu.Unlock()
 				}
 				cancel()
@@ -507,8 +627,45 @@ func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 	}()
 }
 
+// discoveredPeerConfig is the membership entry used when discovery introduces
+// a peer. It is a learner unless [WithDiscoveryAsVoter] was set: a discovery
+// announcement is a claim made over the network, and honouring it as a voter
+// would let that claim change the cluster's quorum.
+func (s *Store) discoveredPeerConfig(id raft.NodeID) raft.PeerConfig {
+	return raft.PeerConfig{ID: id, Voter: s.cfg.DiscoveryAsVoter}
+}
+
+// applyDiscoveredAddr registers addr for id with the transport.
+//
+// A statically configured peer ([WithPeers]) is authoritative: discovery never
+// repoints it, because doing so would redirect that member's Raft traffic to
+// whoever made the announcement. An address change for a peer discovery itself
+// introduced is applied — a restarted container legitimately moves — but it is
+// always logged, never silent.
+func (s *Store) applyDiscoveredAddr(tr peerAdder, id raft.NodeID, addr string) {
+	if static, ok := s.cfg.Peers[id]; ok {
+		if static != addr {
+			s.logger().Warn("easyraft: ignoring discovery address for a statically configured peer",
+				"peer", id, "configured", static, "announced", addr)
+		}
+		return
+	}
+
+	s.mu.Lock()
+	previous, known := s.discoveredAddrs[id]
+	s.discoveredAddrs[id] = addr
+	s.mu.Unlock()
+
+	if known && previous != addr {
+		s.logger().Warn("easyraft: discovered peer changed address; Raft traffic for it will follow",
+			"peer", id, "from", previous, "to", addr)
+	}
+	tr.AddPeer(id, addr)
+}
+
 // Start launches the Raft event loop, begins advertising this node's HTTP
-// address to the cluster (if WithHTTPAddr was set), and starts the HTTP server.
+// address to the cluster (if WithHTTPAddr was set), and starts serving the
+// HTTP API on the listener bound by [NewStore].
 // Register all collections and mutations before calling Start.
 //
 // If [WithJoinAddr] was set, Start contacts the seed nodes to join the cluster
@@ -516,13 +673,14 @@ func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 // the node will still start and may be added via discovery or a manual retry.
 func (s *Store) Start() {
 	if len(s.cfg.JoinAddrs) > 0 {
-		if err := s.joinCluster(s.stopCtx); err != nil && s.cfg.Logger != nil {
-			s.cfg.Logger.Warn("easyraft: cluster join failed", "err", err)
+		if err := s.joinCluster(s.stopCtx); err != nil {
+			s.logger().Warn("easyraft: cluster join failed", "err", err)
 		}
 	}
 
 	if s.node != nil {
 		s.node.Start()
+		s.started.Store(true)
 	}
 
 	go s.dispatchChanges()
@@ -532,9 +690,7 @@ func (s *Store) Start() {
 		go s.advertiseMetadata()
 	}
 
-	if s.cfg.HTTPAddr != "" {
-		_ = s.serveHTTP()
-	}
+	s.serveHTTP()
 }
 
 func (s *Store) advertiseMetadata() {
@@ -550,7 +706,7 @@ func (s *Store) advertiseMetadata() {
 
 		b, _ := json.Marshal(s.cfg.HTTPAddr)
 		cmd := &command{
-			Collection: "__easyraft_metadata__",
+			Collection: metadataCollection,
 			Key:        string(s.cfg.ID),
 			Value:      b,
 		}
@@ -565,9 +721,7 @@ func (s *Store) advertiseMetadata() {
 		}
 
 		if err == nil {
-			if s.cfg.Logger != nil {
-				s.cfg.Logger.Info("easyraft: advertised HTTP address", "addr", s.cfg.HTTPAddr)
-			}
+			s.logger().Info("easyraft: advertised HTTP address", "addr", s.cfg.HTTPAddr)
 			return
 		}
 
@@ -609,24 +763,99 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 }
 
-// onChangeRaw registers fn to be called on this node whenever a committed
-// write modifies collection. fn receives the key, the new serialised value (nil
-// if the key was deleted), and a deleted flag. It is called outside the
-// state-machine lock, in a dedicated dispatcher goroutine, after every Apply
-// that touches the collection — including on followers and during log replay
-// after a restart or snapshot restore.
+// readIndex establishes that the local state machine is current enough to
+// serve a linearizable read.
+//
+// With [WithLeaseReads] it first tries the leader's clock-based lease, which
+// costs no network round-trip. An expired lease is not an error the caller
+// should see: it falls through to the quorum-confirmed path, which makes no
+// assumption about clock drift. Without the option, only the quorum path runs.
+func (s *Store) readIndex(ctx context.Context) error {
+	r := s.reader
+	if r == nil {
+		if s.node == nil {
+			return errors.New("easyraft: node not started")
+		}
+		r = s.node
+	}
+	return readIndexWithFallback(ctx, r, s.cfg.LeaseReads)
+}
+
+func readIndexWithFallback(ctx context.Context, r readIndexer, useLease bool) error {
+	if useLease {
+		_, err := r.ReadIndexLease(ctx)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, raft.ErrLeaseExpired) {
+			return err
+		}
+		// The lease lapsed — most likely a missed heartbeat round. Confirm the
+		// read with a quorum instead of failing the caller.
+	}
+	_, err := r.ReadIndex(ctx)
+	return err
+}
+
+// onChangeEventRaw registers fn to be called on this node whenever a committed
+// write modifies collection, or whenever events for it had to be dropped.
 //
 // Only one handler per collection is supported; a second call for the same
 // collection replaces the first. Call before Start.
-func (s *Store) onChangeRaw(collection string, fn func(key string, value json.RawMessage, deleted bool)) {
+func (s *Store) onChangeEventRaw(collection string, fn func(rawChangeEvent)) {
 	s.mu.Lock()
 	s.onChangeFns[collection] = fn
 	s.mu.Unlock()
 }
 
-// dispatchChanges reads changeEvents from notifyCh and calls the registered
-// OnChange handler for the affected collection. Runs until stopCtx is done.
+// collectionDispatcher owns one collection's handler goroutine and backlog.
+// Giving each collection its own queue means a handler that blocks delays only
+// the collection it was registered for.
+type collectionDispatcher struct {
+	ch chan changeEvent
+
+	// gapOwed records that an event for this collection was dropped and the
+	// handler still has to be told. Touched only by the routing goroutine.
+	gapOwed bool
+}
+
+// offer queues ev, emitting a gap marker first when one is owed. Neither send
+// blocks: a backlogged collection loses events and is told that it did.
+func (d *collectionDispatcher) offer(ev changeEvent) {
+	if d.gapOwed {
+		select {
+		case d.ch <- changeEvent{collection: ev.collection, seq: ev.seq, gap: true}:
+			d.gapOwed = false
+		default:
+			return // still backed up; the gap stays owed
+		}
+	}
+	select {
+	case d.ch <- ev:
+	default:
+		d.gapOwed = true
+	}
+}
+
+// dispatchChanges routes change events to per-collection dispatcher
+// goroutines, each of which runs that collection's OnChange handler. Giving
+// every collection its own queue and goroutine is what keeps one slow handler
+// from starving the rest.
+//
+// Only collections with a registered handler reach here, so the number of
+// dispatchers is bounded by the number of handlers, not by the number of
+// collection names a client can invent. Runs until stopCtx is done.
 func (s *Store) dispatchChanges() {
+	dispatchers := make(map[string]*collectionDispatcher)
+	var wg sync.WaitGroup
+
+	defer func() {
+		for _, d := range dispatchers {
+			close(d.ch)
+		}
+		wg.Wait()
+	}()
+
 	for {
 		select {
 		case <-s.stopCtx.Done():
@@ -639,12 +868,74 @@ func (s *Store) dispatchChanges() {
 				}
 			}
 		case ev := <-s.notifyCh:
-			s.mu.RLock()
-			fn := s.onChangeFns[ev.collection]
-			s.mu.RUnlock()
-			if fn != nil {
-				fn(ev.key, ev.value, ev.deleted)
+			d, ok := dispatchers[ev.collection]
+			if !ok {
+				d = &collectionDispatcher{ch: make(chan changeEvent, collectionQueueDepth)}
+				dispatchers[ev.collection] = d
+				wg.Add(1)
+				go func(collection string, d *collectionDispatcher) {
+					defer wg.Done()
+					s.runDispatcher(collection, d)
+				}(ev.collection, d)
 			}
+			d.offer(ev)
+		}
+	}
+}
+
+// runDispatcher calls the handler registered for collection for every event
+// queued to d, until d.ch is closed.
+func (s *Store) runDispatcher(collection string, d *collectionDispatcher) {
+	for ev := range d.ch {
+		s.mu.RLock()
+		fn := s.onChangeFns[collection]
+		s.mu.RUnlock()
+		if fn == nil {
+			continue
+		}
+		fn(rawChangeEvent{
+			Seq:     ev.seq,
+			Key:     ev.key,
+			Value:   ev.value,
+			Deleted: ev.deleted,
+			Gap:     ev.gap,
+		})
+	}
+}
+
+// enqueueEvent hands ev to the dispatcher. A full queue never blocks Apply;
+// instead the affected collection is recorded as owing a gap marker, which is
+// delivered as soon as there is room again.
+func (s *Store) enqueueEvent(ev changeEvent) {
+	s.flushGaps()
+	select {
+	case s.notifyCh <- ev:
+	default:
+		s.recordGap(ev.collection)
+	}
+}
+
+func (s *Store) recordGap(collection string) {
+	s.gapMu.Lock()
+	s.pendingGaps[collection] = struct{}{}
+	s.gapMu.Unlock()
+}
+
+// flushGaps tries to deliver one gap marker per collection that lost an event.
+// Markers that still do not fit remain pending for the next attempt.
+func (s *Store) flushGaps() {
+	s.gapMu.Lock()
+	defer s.gapMu.Unlock()
+	if len(s.pendingGaps) == 0 {
+		return
+	}
+	seq := s.eventSeq.Load()
+	for collection := range s.pendingGaps {
+		select {
+		case s.notifyCh <- changeEvent{collection: collection, seq: seq, gap: true}:
+			delete(s.pendingGaps, collection)
+		default:
+			return
 		}
 	}
 }
@@ -692,6 +983,9 @@ func (s *Store) joinCluster(ctx context.Context) error {
 				continue
 			}
 			httpReq.Header.Set("Content-Type", "application/json")
+			if s.cfg.HTTPCredential != "" {
+				httpReq.Header.Set("Authorization", s.cfg.HTTPCredential)
+			}
 
 			resp, err := client.Do(httpReq)
 			if err != nil {
@@ -726,16 +1020,12 @@ func (s *Store) joinCluster(ctx context.Context) error {
 			}
 			s.mu.Unlock()
 
-			if s.cfg.Logger != nil {
-				s.cfg.Logger.Info("easyraft: joined cluster", "seed", seed, "peers", len(joinResp.Peers))
-			}
+			s.logger().Info("easyraft: joined cluster", "seed", seed, "peers", len(joinResp.Peers))
 			return nil
 		}
 
 		// All seeds failed this round; wait and retry unless time is up.
-		if s.cfg.Logger != nil {
-			s.cfg.Logger.Debug("easyraft: join attempt failed, retrying", "err", lastErr)
-		}
+		s.logger().Debug("easyraft: join attempt failed, retrying", "err", lastErr)
 		select {
 		case <-joinCtx.Done():
 			if lastErr != nil {
@@ -773,15 +1063,21 @@ func (s *Store) Leader() raft.NodeID {
 
 // Stop cancels the store's context (terminating discovery goroutines), shuts
 // down the HTTP server, stops the Raft node, and closes persistent storage.
-// It is safe to call Stop more than once.
+// It is safe to call Stop more than once, and on a store that was created but
+// never started.
 //
-// If [WithLeaveOnStop] was set, Stop first calls RemoveServer(self) with a
-// 5-second timeout so the cluster adjusts its membership before this node
-// disappears. If the removal does not complete in time it is abandoned.
+// If [WithLeaveOnStop] was set, Stop first removes this node from the cluster
+// membership — see [Store.Leave] for how that is done on a follower. Failures
+// are logged; shutdown always proceeds.
 func (s *Store) Stop() {
-	if s.cfg.LeaveOnStop && s.node != nil {
+	running := s.started.Load()
+
+	if s.cfg.LeaveOnStop && running {
 		leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = s.node.RemoveServer(leaveCtx, s.cfg.ID)
+		if err := s.Leave(leaveCtx); err != nil {
+			s.logger().Warn("easyraft: graceful departure failed; shutting down anyway",
+				"node", s.cfg.ID, "err", err)
+		}
 		leaveCancel()
 	}
 
@@ -790,15 +1086,77 @@ func (s *Store) Stop() {
 	}
 	if s.httpServer != nil {
 		_ = s.httpServer.Shutdown(context.Background())
+	} else if s.httpListener != nil {
+		// Bound at construction but never served: release the port anyway.
+		_ = s.httpListener.Close()
 	}
-	if s.node != nil {
+	if running {
 		s.node.Stop()
+	} else if closer, ok := s.transport.(io.Closer); ok {
+		// Never started: the node holds nothing, but the transport is already
+		// listening and must be released.
+		_ = closer.Close()
 	}
 	if s.storage != nil {
 		if closer, ok := s.storage.(io.Closer); ok {
 			_ = closer.Close()
 		}
 	}
+}
+
+// Leave removes this node from the cluster membership.
+//
+// On the leader the membership change is proposed directly. A follower cannot
+// commit one, so the removal is forwarded to the leader's advertised HTTP API
+// instead, carrying the credential from [WithBearerTokenAuth] when one is
+// configured. If the leader is unknown, has not advertised an HTTP address, or
+// rejects the request, Leave returns an error describing which step failed —
+// the node is then still a member and an operator must remove it.
+//
+// [WithLeaveOnStop] calls Leave automatically during [Store.Stop].
+func (s *Store) Leave(ctx context.Context) error {
+	if s.node == nil {
+		return errors.New("easyraft: node not started")
+	}
+
+	err := s.node.RemoveServer(ctx, s.cfg.ID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrNotLeader) {
+		return fmt.Errorf("easyraft: remove self from cluster: %w", err)
+	}
+
+	leaderID := s.node.Leader()
+	if leaderID == "" {
+		return fmt.Errorf("easyraft: cannot leave: this node is not the leader and no leader is known")
+	}
+	target := s.leaderURL(leaderID, "/members/"+string(s.cfg.ID), "")
+	if target == "" {
+		return fmt.Errorf("easyraft: cannot leave: leader %s has not advertised a usable HTTP address", leaderID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, target, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("easyraft: build leave request: %w", err)
+	}
+	if s.cfg.HTTPCredential != "" {
+		req.Header.Set("Authorization", s.cfg.HTTPCredential)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("easyraft: forward leave request to leader %s: %w", leaderID, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("easyraft: leader %s rejected the leave request with status %d",
+			leaderID, resp.StatusCode)
+	}
+	s.logger().Info("easyraft: left cluster via leader", "leader", leaderID, "node", s.cfg.ID)
+	return nil
 }
 
 // Collection is a type-safe view into a named namespace within a [Store].
@@ -816,7 +1174,8 @@ func (s *Store) Stop() {
 //   - Exactly-once: [Collection.CreateOnce], [Collection.UpdateOnce],
 //     [Collection.DeleteOnce], [Collection.MutateOnce] — deduplicated by
 //     (clientID, seqNum); safe to retry after a network failure without
-//     risk of double-application.
+//     risk of double-application. [Collection.Exactly] wraps the same
+//     guarantee in named fields.
 //
 // [Collection.Upsert] has no *Once variant because it is already idempotent:
 // applying the same upsert twice produces the same final state.
@@ -831,7 +1190,7 @@ type Collection[T any] struct {
 // Collection names starting with "__" are reserved for internal use and will
 // panic if used.
 func AddCollection[T any](s *Store, name string) *Collection[T] {
-	if strings.HasPrefix(name, "__") {
+	if isReservedCollection(name) {
 		panic("easyraft: collection names starting with '__' are reserved")
 	}
 	return &Collection[T]{
@@ -950,17 +1309,49 @@ func (c *Collection[T]) Upsert(ctx context.Context, key string, value T) error {
 // after every committed write that touches this collection — on every replica,
 // including during log replay after a restart or snapshot restore.
 //
+// Each collection gets its own dispatcher goroutine, so a slow handler delays
+// only its own collection. If it falls far enough behind, events for that
+// collection are dropped; OnChange cannot report that. Use
+// [Collection.OnChangeEvent] when losing an event silently is not acceptable.
+//
 // Call before [Store.Start]. Only one handler per collection is supported.
 func (c *Collection[T]) OnChange(fn func(key string, value *T, deleted bool)) {
-	c.store.onChangeRaw(c.name, func(key string, raw json.RawMessage, deleted bool) {
-		if deleted {
-			fn(key, nil, true)
-			return
+	c.OnChangeEvent(func(ev ChangeEvent[T]) {
+		if ev.Gap {
+			return // reported only through OnChangeEvent
 		}
-		var v T
-		if err := json.Unmarshal(raw, &v); err == nil {
-			fn(key, &v, false)
+		fn(ev.Key, ev.Value, ev.Deleted)
+	})
+}
+
+// OnChangeEvent registers fn to receive the full [ChangeEvent] for every
+// committed write to this collection, including the event's Seq and any Gap
+// marker.
+//
+// Seq increases by one per event emitted by this store, so a handler that
+// tracks the last Seq it saw can detect a discontinuity. A Gap event reports
+// directly that events were dropped because the handler fell behind: its Key
+// and Value are empty, and the correct response is to re-read the collection
+// rather than to assume nothing was missed.
+//
+// Call before [Store.Start]. Only one handler per collection is supported; it
+// replaces any handler registered by [Collection.OnChange].
+func (c *Collection[T]) OnChangeEvent(fn func(ChangeEvent[T])) {
+	c.store.onChangeEventRaw(c.name, func(ev rawChangeEvent) {
+		out := ChangeEvent[T]{
+			Seq:     ev.Seq,
+			Key:     ev.Key,
+			Deleted: ev.Deleted,
+			Gap:     ev.Gap,
 		}
+		if !ev.Gap && !ev.Deleted {
+			var v T
+			if err := json.Unmarshal(ev.Value, &v); err != nil {
+				return
+			}
+			out.Value = &v
+		}
+		fn(out)
 	})
 }
 
@@ -968,45 +1359,23 @@ func (c *Collection[T]) OnChange(fn func(key string, value *T, deleted bool)) {
 // drops the response and the caller retries with the same (clientID, seqNum),
 // the cached result is returned without applying the command a second time.
 // seqNum must increase monotonically per clientID.
+//
+// [Collection.Exactly] takes the same identity as a named-field [OnceID],
+// which cannot be transposed.
 func (c *Collection[T]) CreateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
-	b, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("easyraft: encode value: %w", err)
-	}
-	_, err = c.store.proposeOnce(ctx, clientID, seqNum, &command{
-		Op:         opCreate,
-		Collection: c.name,
-		Key:        key,
-		Value:      b,
-	})
-	return err
+	return c.Exactly(OnceID{ClientID: clientID, SeqNum: seqNum}).Create(ctx, key, value)
 }
 
 // UpdateOnce replaces an existing item with exactly-once semantics.
 // See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) UpdateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string, value T) error {
-	b, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("easyraft: encode value: %w", err)
-	}
-	_, err = c.store.proposeOnce(ctx, clientID, seqNum, &command{
-		Op:         opUpdate,
-		Collection: c.name,
-		Key:        key,
-		Value:      b,
-	})
-	return err
+	return c.Exactly(OnceID{ClientID: clientID, SeqNum: seqNum}).Update(ctx, key, value)
 }
 
 // DeleteOnce removes an existing item with exactly-once semantics.
 // See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) DeleteOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key string) error {
-	_, err := c.store.proposeOnce(ctx, clientID, seqNum, &command{
-		Op:         opDelete,
-		Collection: c.name,
-		Key:        key,
-	})
-	return err
+	return c.Exactly(OnceID{ClientID: clientID, SeqNum: seqNum}).Delete(ctx, key)
 }
 
 // Mutate executes a named mutation registered with [Collection.RegisterMutation].
@@ -1028,26 +1397,21 @@ func (c *Collection[T]) Mutate(ctx context.Context, key, name string, args []byt
 // MutateOnce executes a registered mutation with exactly-once semantics.
 // See [Collection.CreateOnce] for the seqNum contract.
 func (c *Collection[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, seqNum uint64, key, name string, args []byte) ([]byte, error) {
-	return c.store.proposeOnce(ctx, clientID, seqNum, &command{
-		Op:         opMutate,
-		Collection: c.name,
-		Key:        key,
-		MutateName: name,
-		MutateArgs: args,
-	})
+	return c.Exactly(OnceID{ClientID: clientID, SeqNum: seqNum}).Mutate(ctx, key, name, args)
 }
 
-// Read returns an item by key with linearizable consistency. It performs a
-// ReadIndexLease round-trip to confirm the local state machine is up to date
-// before serving from the local map.
+// Read returns an item by key with linearizable consistency. It confirms the
+// local state machine is up to date before serving from the local map — with a
+// quorum heartbeat by default, or from the leader's read lease when
+// [WithLeaseReads] is set.
 // Returns [ErrKeyNotFound] if the key does not exist.
-// Returns [ErrNotLeader] if this node cannot establish a read lease.
+// Returns [ErrNotLeader] if this node cannot reach the leader.
 func (c *Collection[T]) Read(ctx context.Context, key string) (T, error) {
 	var empty T
 	if c.store.node == nil {
 		return empty, fmt.Errorf("easyraft: node not started")
 	}
-	if _, err := c.store.node.ReadIndexLease(ctx); err != nil {
+	if err := c.store.readIndex(ctx); err != nil {
 		return empty, fmt.Errorf("easyraft: read index: %w", err)
 	}
 	return c.ReadStale(key)
@@ -1084,7 +1448,11 @@ func (c *Collection[T]) ReadStale(key string) (T, error) {
 func (c *Collection[T]) ListStale() (map[string]T, error) {
 	c.store.mu.RLock()
 	defer c.store.mu.RUnlock()
+	return c.listLocked()
+}
 
+// listLocked decodes the whole collection. The caller must hold store.mu.
+func (c *Collection[T]) listLocked() (map[string]T, error) {
 	out := make(map[string]T)
 	coll := c.store.collections[c.name]
 	if coll == nil {
@@ -1102,48 +1470,43 @@ func (c *Collection[T]) ListStale() (map[string]T, error) {
 }
 
 // List returns all items in the collection with linearizable consistency.
-// It performs a ReadIndexLease round-trip before reading from local state.
+// It confirms the local state machine is current before reading — with a
+// quorum heartbeat by default, or from the leader's read lease when
+// [WithLeaseReads] is set.
 // Returns an empty map (not nil) if the collection has no items.
 func (c *Collection[T]) List(ctx context.Context) (map[string]T, error) {
 	if c.store.node == nil {
 		return nil, fmt.Errorf("easyraft: node not started")
 	}
-	if _, err := c.store.node.ReadIndexLease(ctx); err != nil {
+	if err := c.store.readIndex(ctx); err != nil {
 		return nil, fmt.Errorf("easyraft: read index: %w", err)
 	}
 
 	c.store.mu.RLock()
 	defer c.store.mu.RUnlock()
-
-	out := make(map[string]T)
-	coll := c.store.collections[c.name]
-	if coll == nil {
-		return out, nil
-	}
-
-	for k, raw := range coll {
-		var v T
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, fmt.Errorf("easyraft: decode key %q: %w", k, err)
-		}
-		out[k] = v
-	}
-	return out, nil
+	return c.listLocked()
 }
 
 // AddServer registers addr with the transport and adds id as a voting member
 // of the Raft cluster. This must be called on the leader; it returns
 // [ErrNotLeader] otherwise. Blocks until the membership change is committed.
+//
+// Use it to promote a learner — one added by [WithDiscovery] or
+// [WithJoinAsLearner] — once an operator has verified it.
 func (s *Store) AddServer(ctx context.Context, id raft.NodeID, addr string) error {
 	if s.node == nil {
 		return errors.New("easyraft: node not started")
 	}
-	if adder, ok := s.transport.(interface {
-		AddPeer(raft.NodeID, string)
-	}); ok {
+	if adder, ok := s.transport.(peerAdder); ok {
 		adder.AddPeer(id, addr)
 	}
-	return s.node.AddServer(ctx, raft.PeerConfig{ID: id, Voter: true})
+	if err := s.node.AddServer(ctx, raft.PeerConfig{ID: id, Voter: true}); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.raftPeers[id] = raftPeerInfo{addr: addr, voter: true}
+	s.mu.Unlock()
+	return nil
 }
 
 // RemoveServer removes id from the Raft cluster membership. Must be called on
@@ -1201,59 +1564,109 @@ func (s *Store) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
 
 	s.mu.Lock()
 	s.pendingEvents = s.pendingEvents[:0]
-	result, err := s.applyCommand(&cmd)
+	result, err := s.applyCommand(&cmd, nil)
+	// Drop events for collections nobody is listening to — the internal
+	// metadata collection, most of all — so they cannot take up queue room
+	// that a watched collection's events need, or spawn a dispatcher for a
+	// collection that will never have a handler.
+	events := s.pendingEvents[:0]
+	for _, ev := range s.pendingEvents {
+		if s.onChangeFns[ev.collection] != nil {
+			events = append(events, ev)
+		}
+	}
 	// Steal the pending events slice before releasing the lock so the
 	// dispatcher sees a consistent snapshot. Assign nil so the next Apply
 	// starts with a fresh allocation rather than aliasing this one.
-	events := s.pendingEvents
 	s.pendingEvents = nil
 	s.mu.Unlock()
 
-	for _, ev := range events {
-		select {
-		case s.notifyCh <- ev:
-		default: // drop if dispatcher is behind; watchers will miss this event
-		}
+	for i := range events {
+		events[i].seq = s.eventSeq.Add(1)
+		s.enqueueEvent(events[i])
 	}
 	return result, err
 }
 
-func (s *Store) applyCommand(cmd *command) ([]byte, error) {
+// undoEntry records one key's value before a batch touched it, so a failed
+// batch can be rolled back without copying whole collections.
+type undoEntry struct {
+	collection string
+	key        string
+	previous   json.RawMessage
+	existed    bool
+}
+
+// batchUndo is the rollback journal for one transaction. It grows with the
+// number of keys the transaction touches, not with the size of the collections
+// it touches.
+type batchUndo struct {
+	entries []undoEntry
+	// created lists collections the batch brought into existence, which must
+	// disappear again if it is rolled back.
+	created []string
+}
+
+// record captures the pre-batch value of key so it can be restored. Repeated
+// writes to the same key each append an entry; replaying the journal in
+// reverse therefore restores the earliest value.
+func (u *batchUndo) record(collection, key string, coll map[string]json.RawMessage) {
+	previous, existed := coll[key]
+	u.entries = append(u.entries, undoEntry{
+		collection: collection,
+		key:        key,
+		previous:   previous,
+		existed:    existed,
+	})
+}
+
+// rollback undoes every recorded mutation, most recent first.
+func (u *batchUndo) rollback(collections map[string]map[string]json.RawMessage) {
+	for i := len(u.entries) - 1; i >= 0; i-- {
+		e := u.entries[i]
+		coll := collections[e.collection]
+		if coll == nil {
+			continue
+		}
+		if e.existed {
+			coll[e.key] = e.previous
+		} else {
+			delete(coll, e.key)
+		}
+	}
+	for _, name := range u.created {
+		delete(collections, name)
+	}
+}
+
+// applyCommand applies cmd to the state machine. undo is non-nil while a batch
+// is in flight; each mutation then journals the single key it is about to
+// overwrite, which is what makes a rollback cost O(keys touched) rather than
+// O(collection size).
+func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 	if cmd.Op == opBatch {
-		// Snapshot every collection touched by the batch so we can roll back on
-		// failure.  json.RawMessage values are immutable []byte slices, so a
-		// shallow copy of the inner map is sufficient.
-		type collSnap struct {
-			entries map[string]json.RawMessage
-			existed bool
-		}
-		snapshots := make(map[string]collSnap, len(cmd.Batch))
-		for i := range cmd.Batch {
-			name := cmd.Batch[i].Collection
-			if _, seen := snapshots[name]; !seen {
-				coll := s.collections[name]
-				snap := collSnap{existed: coll != nil}
-				if coll != nil {
-					snap.entries = make(map[string]json.RawMessage, len(coll))
-					maps.Copy(snap.entries, coll)
+		// A nested batch shares the enclosing journal: the outermost batch owns
+		// the rollback.
+		if undo != nil {
+			results := make([]json.RawMessage, 0, len(cmd.Batch))
+			for i := range cmd.Batch {
+				res, err := s.applyCommand(&cmd.Batch[i], undo)
+				if err != nil {
+					return nil, err
 				}
-				snapshots[name] = snap
+				results = append(results, res)
 			}
+			return json.Marshal(results)
 		}
+
+		journal := &batchUndo{}
 		preBatchEventsLen := len(s.pendingEvents)
 
 		results := make([]json.RawMessage, 0, len(cmd.Batch))
 		for i := range cmd.Batch {
-			res, err := s.applyCommand(&cmd.Batch[i])
+			res, err := s.applyCommand(&cmd.Batch[i], journal)
 			if err != nil {
-				// Restore all touched collections to their pre-batch state.
-				for name, snap := range snapshots {
-					if !snap.existed {
-						delete(s.collections, name)
-					} else {
-						s.collections[name] = snap.entries
-					}
-				}
+				journal.rollback(s.collections)
 				// Discard any partial change events emitted during the batch.
 				s.pendingEvents = s.pendingEvents[:preBatchEventsLen]
 				return nil, err
@@ -1267,12 +1680,18 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 	if !exists {
 		coll = make(map[string]json.RawMessage)
 		s.collections[cmd.Collection] = coll
+		if undo != nil {
+			undo.created = append(undo.created, cmd.Collection)
+		}
 	}
 
 	switch cmd.Op {
 	case opCreate:
 		if _, ok := coll[cmd.Key]; ok {
 			return nil, ErrKeyExists
+		}
+		if undo != nil {
+			undo.record(cmd.Collection, cmd.Key, coll)
 		}
 		coll[cmd.Key] = cmd.Value
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
@@ -1282,11 +1701,17 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 		if _, ok := coll[cmd.Key]; !ok {
 			return nil, ErrKeyNotFound
 		}
+		if undo != nil {
+			undo.record(cmd.Collection, cmd.Key, coll)
+		}
 		coll[cmd.Key] = cmd.Value
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
 
 	case opUpsert:
+		if undo != nil {
+			undo.record(cmd.Collection, cmd.Key, coll)
+		}
 		coll[cmd.Key] = cmd.Value
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
@@ -1294,6 +1719,9 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 	case opDelete:
 		if _, ok := coll[cmd.Key]; !ok {
 			return nil, ErrKeyNotFound
+		}
+		if undo != nil {
+			undo.record(cmd.Collection, cmd.Key, coll)
 		}
 		delete(coll, cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, deleted: true})
@@ -1318,6 +1746,9 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		if undo != nil {
+			undo.record(cmd.Collection, cmd.Key, coll)
+		}
 		coll[cmd.Key] = newVal
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: newVal})
 		return resp, nil
@@ -1327,36 +1758,151 @@ func (s *Store) applyCommand(cmd *command) ([]byte, error) {
 	}
 }
 
+// Snapshot streams the whole store to w as a JSON object of collections.
+//
+// The encoding is written incrementally, so a snapshot costs one pass over the
+// state rather than a full in-memory copy plus a full encoded buffer. Keys are
+// emitted in sorted order, which keeps snapshots of identical state
+// byte-identical.
+//
+// The read lock is held for the whole pass, so local reads wait while a
+// snapshot is written; that is the price of not duplicating the state. Raft
+// calls Snapshot from the same goroutine that applies entries, so writes are
+// not additionally delayed by it.
 func (s *Store) Snapshot(_ context.Context, w io.Writer) error {
+	bw := bufio.NewWriterSize(w, 64<<10)
+
 	s.mu.RLock()
-	// Create a point-in-time copy of the collections map structure.
-	// Since values are json.RawMessage ([]byte), we only copy the slice headers.
-	// This is safe because we never mutate the bytes of a RawMessage in-place.
-	snap := make(map[string]map[string]json.RawMessage, len(s.collections))
-	for collName, items := range s.collections {
-		collCopy := make(map[string]json.RawMessage, len(items))
-		maps.Copy(collCopy, items)
-		snap[collName] = collCopy
-	}
+	err := streamCollections(bw, s.collections)
 	s.mu.RUnlock()
 
-	// Perform the expensive JSON encoding and I/O outside the lock.
-	return json.NewEncoder(w).Encode(snap)
+	if err != nil {
+		return fmt.Errorf("easyraft: snapshot encode: %w", err)
+	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("easyraft: snapshot flush: %w", err)
+	}
+	return nil
 }
 
+// streamCollections writes collections as a JSON object without materialising
+// an intermediate copy of the data.
+func streamCollections(w *bufio.Writer, collections map[string]map[string]json.RawMessage) error {
+	if _, err := w.WriteString("{"); err != nil {
+		return err
+	}
+	for i, name := range slices.Sorted(maps.Keys(collections)) {
+		if i > 0 {
+			if _, err := w.WriteString(","); err != nil {
+				return err
+			}
+		}
+		if err := writeJSONString(w, name); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(":{"); err != nil {
+			return err
+		}
+		items := collections[name]
+		for j, key := range slices.Sorted(maps.Keys(items)) {
+			if j > 0 {
+				if _, err := w.WriteString(","); err != nil {
+					return err
+				}
+			}
+			if err := writeJSONString(w, key); err != nil {
+				return err
+			}
+			if _, err := w.WriteString(":"); err != nil {
+				return err
+			}
+			value := items[key]
+			if len(value) == 0 {
+				value = json.RawMessage("null")
+			}
+			if _, err := w.Write(value); err != nil {
+				return err
+			}
+		}
+		if _, err := w.WriteString("}"); err != nil {
+			return err
+		}
+	}
+	_, err := w.WriteString("}\n")
+	return err
+}
+
+// writeJSONString writes s as a JSON string literal.
+func writeJSONString(w *bufio.Writer, s string) error {
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(encoded)
+	return err
+}
+
+// Restore replaces the state machine contents with the snapshot in r.
+//
+// The snapshot is decoded one collection at a time rather than as a single
+// value, so peak memory tracks the largest collection instead of the whole
+// store plus its encoded form.
 func (s *Store) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
-	var collections map[string]map[string]json.RawMessage
-	if err := json.NewDecoder(r).Decode(&collections); err != nil {
+	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
+
+	collections, err := decodeCollections(dec)
+	if err != nil {
 		return fmt.Errorf("easyraft: restore decode: %w", err)
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if collections == nil {
-		collections = make(map[string]map[string]json.RawMessage)
-	}
 	s.collections = collections
+	s.mu.Unlock()
 	return nil
+}
+
+// decodeCollections reads a snapshot body, tolerating both an empty stream and
+// an explicit JSON null (either of which means "no state").
+func decodeCollections(dec *json.Decoder) (map[string]map[string]json.RawMessage, error) {
+	collections := make(map[string]map[string]json.RawMessage)
+
+	tok, err := dec.Token()
+	if errors.Is(err, io.EOF) {
+		return collections, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if tok == nil {
+		return collections, nil // JSON null
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("expected a JSON object, found %v", tok)
+	}
+
+	for dec.More() {
+		nameTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := nameTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected a collection name, found %v", nameTok)
+		}
+		var items map[string]json.RawMessage
+		if err := dec.Decode(&items); err != nil {
+			return nil, fmt.Errorf("collection %q: %w", name, err)
+		}
+		if items == nil {
+			items = make(map[string]json.RawMessage)
+		}
+		collections[name] = items
+	}
+
+	if _, err := dec.Token(); err != nil { // closing brace
+		return nil, err
+	}
+	return collections, nil
 }
 
 // raftTickInterval returns the configured tick interval, falling back to the
@@ -1387,6 +1933,16 @@ func (s *Store) raftElectionTimeoutMax() time.Duration {
 		return s.cfg.ElectionTimeoutMax
 	}
 	return 2 * time.Second
+}
+
+// marshalValue encodes a collection value, wrapping the failure so the caller
+// sees which layer rejected it.
+func marshalValue(value any) (json.RawMessage, error) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("easyraft: encode value: %w", err)
+	}
+	return b, nil
 }
 
 // propose encodes a command and proposes it to the Raft node.

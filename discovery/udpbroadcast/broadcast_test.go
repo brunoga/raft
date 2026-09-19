@@ -7,7 +7,10 @@ package udpbroadcast
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net"
 	"sort"
 	"testing"
@@ -363,5 +366,235 @@ func TestRun_IgnoresMalformedPackets(t *testing.T) {
 	}
 	if len(peers) != 0 {
 		t.Errorf("expected 0 peers after malformed packets, got %+v", peers)
+	}
+}
+
+// ---- Announcement authentication --------------------------------------------
+
+// newTestBroadcast builds a UDPBroadcast without opening any socket, with a
+// clock the test controls.
+func newTestBroadcast(t *testing.T, cfg *Config, now func() time.Time) *UDPBroadcast {
+	t.Helper()
+	cfg.BroadcastAddr = "127.0.0.1:1"
+	cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	u, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if now != nil {
+		u.now = now
+	}
+	return u
+}
+
+// signedPacket builds a wire announcement signed with secret at time ts.
+func signedPacket(t *testing.T, secret []byte, id, addr string, ts int64, nonce string) []byte {
+	t.Helper()
+	ann := announcement{ID: id, Addr: addr}
+	if len(secret) > 0 {
+		ann.TS = ts
+		ann.Nonce = nonce
+		ann.MAC = base64.RawStdEncoding.EncodeToString(sign(secret, id, addr, ts, nonce))
+	}
+	b, err := json.Marshal(ann)
+	if err != nil {
+		t.Fatalf("marshal announcement: %v", err)
+	}
+	return b
+}
+
+// TestHandlePacket_SecretRejectsUnauthenticatedPeers pins the invariant that a
+// node configured with a shared secret accepts an announcement only when it is
+// correctly signed, fresh, and not a replay. Without this, any host able to put
+// a datagram on the wire can inject itself into the cluster.
+func TestHandlePacket_SecretRejectsUnauthenticatedPeers(t *testing.T) {
+	secret := []byte("cluster-shared-secret")
+	base := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name   string
+		packet func(t *testing.T) []byte
+		// replay, when set, is sent before packet so packet is a duplicate.
+		replay func(t *testing.T) []byte
+		accept bool
+	}{
+		{
+			name: "correctly signed announcement is accepted",
+			packet: func(t *testing.T) []byte {
+				return signedPacket(t, secret, "n2", "10.0.0.2:7001", base.Unix(), "nonce-ok")
+			},
+			accept: true,
+		},
+		{
+			name: "unsigned announcement is rejected",
+			packet: func(t *testing.T) []byte {
+				return signedPacket(t, nil, "n2", "10.0.0.2:7001", 0, "")
+			},
+		},
+		{
+			name: "announcement signed with the wrong secret is rejected",
+			packet: func(t *testing.T) []byte {
+				return signedPacket(t, []byte("not-the-secret"), "n2", "10.0.0.2:7001", base.Unix(), "nonce-bad")
+			},
+		},
+		{
+			name: "signature bound to a different address is rejected",
+			packet: func(t *testing.T) []byte {
+				// Sign one address, then rewrite the address field.
+				ann := announcement{ID: "n2", Addr: "10.0.0.2:7001", TS: base.Unix(), Nonce: "nonce-swap"}
+				ann.MAC = base64.RawStdEncoding.EncodeToString(
+					sign(secret, ann.ID, ann.Addr, ann.TS, ann.Nonce))
+				ann.Addr = "10.9.9.9:7001"
+				b, err := json.Marshal(ann)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				return b
+			},
+		},
+		{
+			name: "stale announcement outside the replay window is rejected",
+			packet: func(t *testing.T) []byte {
+				old := base.Add(-10 * time.Minute).Unix()
+				return signedPacket(t, secret, "n2", "10.0.0.2:7001", old, "nonce-stale")
+			},
+		},
+		{
+			name: "replayed announcement is rejected",
+			replay: func(t *testing.T) []byte {
+				return signedPacket(t, secret, "n2", "10.0.0.2:7001", base.Unix(), "nonce-replay")
+			},
+			packet: func(t *testing.T) []byte {
+				return signedPacket(t, secret, "n2", "10.0.0.2:7001", base.Unix(), "nonce-replay")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u := newTestBroadcast(t, &Config{
+				NodeID: "n1",
+				Addr:   "10.0.0.1:7001",
+				Secret: secret,
+			}, func() time.Time { return base })
+
+			if tt.replay != nil {
+				u.handlePacket(tt.replay(t))
+				// The first copy must have landed for the replay case to mean
+				// anything; drop it so the assertion below sees only the retry.
+				u.mu.Lock()
+				delete(u.peers, "n2")
+				u.mu.Unlock()
+			}
+
+			u.handlePacket(tt.packet(t))
+
+			peers, err := u.Discover(context.Background())
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if tt.accept && len(peers) != 1 {
+				t.Fatalf("expected the announcement to be accepted, got peers %+v", peers)
+			}
+			if !tt.accept && len(peers) != 0 {
+				t.Fatalf("expected the announcement to be rejected, got peers %+v", peers)
+			}
+		})
+	}
+}
+
+// TestHandlePacket_NoSecretAcceptsPlainAnnouncements keeps the trusted-network
+// deployment working unchanged.
+func TestHandlePacket_NoSecretAcceptsPlainAnnouncements(t *testing.T) {
+	u := newTestBroadcast(t, &Config{NodeID: "n1", Addr: "10.0.0.1:7001"}, nil)
+	u.handlePacket(signedPacket(t, nil, "n2", "10.0.0.2:7001", 0, ""))
+
+	peers, err := u.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(peers) != 1 || peers[0].Addr != "10.0.0.2:7001" {
+		t.Fatalf("expected n2 at 10.0.0.2:7001, got %+v", peers)
+	}
+}
+
+// TestRecordPeer_AddressRebindRequiresOptIn pins the invariant that an
+// announcement cannot silently repoint an existing member's address, which
+// would redirect that member's Raft traffic to the announcer.
+func TestRecordPeer_AddressRebindRequiresOptIn(t *testing.T) {
+	tests := []struct {
+		name     string
+		allow    bool
+		wantAddr string
+	}{
+		{name: "rebind refused by default", allow: false, wantAddr: "10.0.0.2:7001"},
+		{name: "rebind applied when opted in", allow: true, wantAddr: "10.6.6.6:7001"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u := newTestBroadcast(t, &Config{
+				NodeID:             "n1",
+				Addr:               "10.0.0.1:7001",
+				AllowAddressChange: tt.allow,
+			}, nil)
+
+			u.handlePacket(signedPacket(t, nil, "n2", "10.0.0.2:7001", 0, ""))
+			u.handlePacket(signedPacket(t, nil, "n2", "10.6.6.6:7001", 0, ""))
+
+			peers, err := u.Discover(context.Background())
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			if len(peers) != 1 {
+				t.Fatalf("expected exactly one peer, got %+v", peers)
+			}
+			if peers[0].Addr != tt.wantAddr {
+				t.Errorf("peer address = %q, want %q", peers[0].Addr, tt.wantAddr)
+			}
+		})
+	}
+}
+
+// TestEncodeAnnouncement_SignsWhenSecretConfigured checks the outbound side:
+// a node with a secret must produce announcements its peers will accept, and a
+// node without one must keep the original two-field wire format.
+func TestEncodeAnnouncement_SignsWhenSecretConfigured(t *testing.T) {
+	secret := []byte("cluster-shared-secret")
+
+	signer := newTestBroadcast(t, &Config{NodeID: "n2", Addr: "10.0.0.2:7001", Secret: secret}, nil)
+	pkt, err := signer.encodeAnnouncement()
+	if err != nil {
+		t.Fatalf("encodeAnnouncement: %v", err)
+	}
+	var ann announcement
+	if unmarshalErr := json.Unmarshal(pkt, &ann); unmarshalErr != nil {
+		t.Fatalf("unmarshal: %v", unmarshalErr)
+	}
+	if ann.MAC == "" || ann.Nonce == "" || ann.TS == 0 {
+		t.Fatalf("signed announcement is missing authentication fields: %+v", ann)
+	}
+
+	receiver := newTestBroadcast(t, &Config{NodeID: "n1", Addr: "10.0.0.1:7001", Secret: secret}, nil)
+	receiver.handlePacket(pkt)
+	peers, err := receiver.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("a peer's own signed announcement was rejected: %+v", peers)
+	}
+
+	plain := newTestBroadcast(t, &Config{NodeID: "n3", Addr: "10.0.0.3:7001"}, nil)
+	pkt, err = plain.encodeAnnouncement()
+	if err != nil {
+		t.Fatalf("encodeAnnouncement: %v", err)
+	}
+	ann = announcement{}
+	if unmarshalErr := json.Unmarshal(pkt, &ann); unmarshalErr != nil {
+		t.Fatalf("unmarshal: %v", unmarshalErr)
+	}
+	if ann.MAC != "" || ann.Nonce != "" || ann.TS != 0 {
+		t.Errorf("unauthenticated announcement carries authentication fields: %+v", ann)
 	}
 }
