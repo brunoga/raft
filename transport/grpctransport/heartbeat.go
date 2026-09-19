@@ -3,8 +3,12 @@ package grpctransport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/brunoga/raft"
 	pb "github.com/brunoga/raft/transport/grpctransport/raftpb"
@@ -25,36 +29,57 @@ const (
 	// enqueueing concurrently, the channel must absorb a full tick's worth of
 	// entries without blocking callers. Tune with WithHeartbeatChannelSize.
 	hbChanSizeDefault = 1024
+
+	// hbMinRPCTimeout floors the deadline derived from the callers' own
+	// deadlines, so a caller that is already nearly out of time cannot shrink
+	// the batch RPC to a deadline no round trip could ever meet.
+	hbMinRPCTimeout = 10 * time.Millisecond
 )
 
 // hbCall is one pending heartbeat enqueued by a Node goroutine.
 type hbCall struct {
 	entry  *pb.HeartbeatEntry
-	respCh chan hbResp // buffered(1); always written before read
+	ctx    context.Context // the calling Node's context; governs this entry's lifetime
+	respCh chan hbResp     // buffered(1); always written before read
 }
 
 // hbResp carries the result back to the waiting Node goroutine.
 type hbResp struct {
-	term    uint64
-	success bool
-	err     error
+	term          uint64
+	success       bool
+	conflictIndex uint64
+	conflictTerm  uint64
+	err           error
 }
 
 // peerBatcher collects heartbeat calls destined for one peer and periodically
 // flushes them as a single BatchHeartbeats RPC.
+//
+// A flush runs on its own goroutine, bounded by inflight, so that the run loop
+// can open the next collection window immediately. Serialising the flushes
+// would mean a peer whose event loop is wedged stalls every group's heartbeats
+// to that peer for as long as the stuck RPC lasts: the channel fills with
+// entries whose callers have long since timed out, and the next flush ships a
+// batch of heartbeats that are already stale.
 type peerBatcher struct {
-	peer    raft.NodeID
-	ch      chan hbCall
-	ctx     context.Context                // per-peer context; Done when removePeer cancels it
-	cancel  context.CancelFunc             // cancels this batcher's context (used by removePeer)
-	pending []hbCall                       // reused across flush cycles; owned by run goroutine only
-	results map[uint64]*pb.HeartbeatResult // reused across RPC cycles; owned by run goroutine only
+	peer     raft.NodeID
+	ch       chan hbCall
+	ctx      context.Context    // per-peer context; Done when removePeer cancels it
+	cancel   context.CancelFunc // cancels this batcher's context (used by removePeer)
+	pending  []hbCall           // reused across collection cycles; owned by run goroutine only
+	inflight chan struct{}      // bounds concurrent BatchHeartbeats RPCs to this peer
+	sends    sync.WaitGroup     // tracks in-flight flush goroutines
 }
 
-// run is the batcher goroutine. It blocks until the first call arrives,
-// opens a short window to collect stragglers, then sends one RPC and
-// distributes the results before looping.
+// run is the batcher goroutine. It blocks until the first call arrives, opens
+// a short window to collect stragglers, then hands the batch to a flush
+// goroutine and loops without waiting for the RPC to complete.
 func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
+	// A flush goroutine may still be waiting on an RPC when the loop exits; it
+	// owns the response channels of the calls it took, so it must finish before
+	// stop() can report the batcher as fully drained.
+	defer b.sends.Wait()
+
 	for {
 		// Block until the first call (or shutdown).
 		var first hbCall
@@ -64,14 +89,8 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 			// Drain any calls that arrived before shutdown so that Send's drainer
 			// goroutines (spawned when the caller ctx cancelled after enqueue) are
 			// not left waiting on respCh forever.
-			for {
-				select {
-				case c := <-b.ch:
-					c.respCh <- hbResp{err: ctx.Err()}
-				default:
-					return
-				}
-			}
+			b.drainAll(ctx.Err())
+			return
 		}
 
 		// Collect remaining calls within hbWindow. Reuse the slice across
@@ -93,64 +112,159 @@ func (b *peerBatcher) run(ctx context.Context, t *GRPCTransport) {
 				}
 				// Drain calls that arrived in the channel during the window so
 				// that Send's drainer goroutines do not leak.
-				for {
-					select {
-					case c := <-b.ch:
-						c.respCh <- hbResp{err: ctx.Err()}
-					default:
-						return
-					}
-				}
+				b.drainAll(ctx.Err())
+				return
 			}
 		}
 		window.Stop()
 
-		// Build and send the batched RPC.
-		req := &pb.BatchedHeartbeatRequest{
-			Entries: make([]*pb.HeartbeatEntry, len(b.pending)),
-		}
-		for i, c := range b.pending {
-			req.Entries[i] = c.entry
-		}
+		// Hand the batch off and immediately start collecting the next window.
+		// b.pending is reused, so the flush gets a copy of its own.
+		batch := make([]hbCall, len(b.pending))
+		copy(batch, b.pending)
+		b.flush(ctx, t, batch)
+	}
+}
 
-		client, err := t.clientFor(b.peer)
-		if err != nil {
-			for _, c := range b.pending {
-				c.respCh <- hbResp{err: err}
-			}
-			continue
-		}
-
-		sendCtx, cancel := context.WithTimeout(ctx, t.heartbeatRPCTimeout())
-		resp, err := client.BatchHeartbeats(sendCtx, req)
-		cancel()
-
-		if err != nil {
-			for _, c := range b.pending {
-				c.respCh <- hbResp{err: err}
-			}
-			continue
-		}
-
-		// Index results by group_id for O(1) lookup.
-		// Reuse the map across cycles: clear entries (keeps underlying memory) rather
-		// than allocating a new map on every RPC.
-		for k := range b.results {
-			delete(b.results, k)
-		}
-		for _, r := range resp.Results {
-			b.results[r.GroupId] = r
-		}
-		for _, c := range b.pending {
-			if r, ok := b.results[c.entry.GroupId]; ok {
-				c.respCh <- hbResp{term: r.Term, success: r.Success}
-			} else {
-				// No result for this group (e.g. receiver doesn't know it yet).
-				// Return a best-effort non-success so the Node retries next tick.
-				c.respCh <- hbResp{success: false}
-			}
+// drainAll answers every call still queued on the channel with err. Called on
+// shutdown so that no caller, and no Send drainer goroutine, waits forever.
+func (b *peerBatcher) drainAll(err error) {
+	for {
+		select {
+		case c := <-b.ch:
+			c.respCh <- hbResp{err: err}
+		default:
+			return
 		}
 	}
+}
+
+// flush sends one batch. The RPC runs on a separate goroutine bounded by
+// b.inflight; when every slot is taken it is sent inline, which applies
+// backpressure to this peer alone.
+func (b *peerBatcher) flush(ctx context.Context, t *GRPCTransport, batch []hbCall) {
+	select {
+	case b.inflight <- struct{}{}:
+	default:
+		// This peer already has the maximum number of batches in flight. Send
+		// inline rather than growing the number of outstanding RPCs without
+		// bound.
+		b.send(ctx, t, batch)
+		return
+	}
+	b.sends.Add(1)
+	go func() {
+		defer b.sends.Done()
+		defer func() { <-b.inflight }()
+		b.send(ctx, t, batch)
+	}()
+}
+
+// send performs one BatchHeartbeats RPC and distributes the per-group results
+// to the waiting callers. Every call in batch is answered exactly once.
+func (b *peerBatcher) send(ctx context.Context, t *GRPCTransport, batch []hbCall) {
+	// Drop entries whose caller has already given up. Sending them wastes
+	// bandwidth and, worse, makes the receiving node process heartbeats on
+	// behalf of a leader that stopped waiting for the answer several windows
+	// ago.
+	live := batch[:0]
+	for _, c := range batch {
+		if err := c.ctx.Err(); err != nil {
+			c.respCh <- hbResp{err: err}
+			continue
+		}
+		live = append(live, c)
+	}
+	batch = live
+	if len(batch) == 0 {
+		return
+	}
+
+	req := &pb.BatchedHeartbeatRequest{
+		Entries: make([]*pb.HeartbeatEntry, len(batch)),
+	}
+	for i, c := range batch {
+		req.Entries[i] = c.entry
+	}
+
+	client, err := t.clientFor(b.peer)
+	if err != nil {
+		for _, c := range batch {
+			c.respCh <- hbResp{err: err}
+		}
+		return
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, batchDeadline(batch, t.heartbeatRPCTimeout()))
+	resp, err := client.BatchHeartbeats(outgoingContext(sendCtx, b.peer), req)
+	cancel()
+
+	if err != nil {
+		err = sendErr("BatchHeartbeats", err)
+		for _, c := range batch {
+			c.respCh <- hbResp{err: err}
+		}
+		return
+	}
+
+	// Index results by group_id for O(1) lookup.
+	results := make(map[uint64]*pb.HeartbeatResult, len(resp.Results))
+	for _, r := range resp.Results {
+		results[r.GroupId] = r
+	}
+	for _, c := range batch {
+		r, ok := results[c.entry.GroupId]
+		if !ok {
+			// The receiver answered the batch but said nothing about this group.
+			// That is a protocol violation, not a log mismatch, so it is
+			// reported as an error: a synthetic Success:false would make the
+			// leader rewind this follower's nextIndex for no reason.
+			c.respCh <- hbResp{err: fmt.Errorf(
+				"grpctransport: BatchHeartbeats returned no result for group %d",
+				c.entry.GroupId)}
+			continue
+		}
+		if code := codes.Code(r.ErrorCode); code != codes.OK {
+			// The receiver could not dispatch this entry (unknown group, failed
+			// handler, cancelled context). Surface it the way the unbatched
+			// AppendEntries path would: as a Go error, so the core treats the
+			// heartbeat as dropped rather than as a log mismatch.
+			c.respCh <- hbResp{err: sendErr("BatchHeartbeats",
+				status.Error(code, r.ErrorMessage))}
+			continue
+		}
+		c.respCh <- hbResp{
+			term:          r.Term,
+			success:       r.Success,
+			conflictIndex: r.ConflictIndex,
+			conflictTerm:  r.ConflictTerm,
+		}
+	}
+}
+
+// batchDeadline returns the timeout to apply to one BatchHeartbeats RPC: the
+// shortest deadline among the batch's callers, clamped to
+// [hbMinRPCTimeout, max].
+//
+// Applying the configured maximum unconditionally decouples the RPC from the
+// callers it serves, so a wedged peer keeps a connection and a goroutine busy
+// for the full timeout even when every caller gave up milliseconds in.
+func batchDeadline(batch []hbCall, maxWait time.Duration) time.Duration {
+	now := time.Now()
+	timeout := maxWait
+	for _, c := range batch {
+		dl, ok := c.ctx.Deadline()
+		if !ok {
+			continue
+		}
+		if remaining := dl.Sub(now); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout < hbMinRPCTimeout {
+		return hbMinRPCTimeout
+	}
+	return timeout
 }
 
 // heartbeatBatcher manages one peerBatcher goroutine per remote peer.
@@ -183,9 +297,10 @@ func newHeartbeatBatcher(t *GRPCTransport) *heartbeatBatcher {
 	return b
 }
 
-// stop cancels the shared context and blocks until all peerBatcher goroutines
-// have exited. Callers (e.g. GRPCTransport.Close) must call stop before
-// releasing any resources the goroutines depend on.
+// stop cancels the shared context and blocks until all peerBatcher goroutines,
+// and any batch RPCs they still have in flight, have finished. Callers (e.g.
+// GRPCTransport.Close) must call stop before releasing any resources the
+// goroutines depend on.
 func (b *heartbeatBatcher) stop() {
 	b.mu.Lock()
 	b.stopped = true
@@ -232,12 +347,16 @@ func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) (*peerBatcher, error
 	// Each peerBatcher gets its own cancellable child context so that
 	// removePeer can stop just that goroutine without affecting others.
 	peerCtx, peerCancel := context.WithCancel(b.ctx)
+	inflight := b.t.hbInflight
+	if inflight < 1 {
+		inflight = 1
+	}
 	batcher := &peerBatcher{
-		peer:    peer,
-		ch:      make(chan hbCall, b.t.hbChanSize),
-		ctx:     peerCtx,
-		cancel:  peerCancel,
-		results: make(map[uint64]*pb.HeartbeatResult),
+		peer:     peer,
+		ch:       make(chan hbCall, b.t.hbChanSize),
+		ctx:      peerCtx,
+		cancel:   peerCancel,
+		inflight: make(chan struct{}, inflight),
 	}
 	b.batchers[peer] = batcher
 	b.wg.Add(1)
@@ -250,6 +369,11 @@ func (b *heartbeatBatcher) peerBatcherFor(peer raft.NodeID) (*peerBatcher, error
 
 // Send enqueues a pure-heartbeat AppendEntries call and blocks until the
 // batcher receives the result from the remote peer.
+//
+// The response mirrors what the unbatched AppendEntries path would return,
+// conflict hints included. A failure to reach the peer, or to dispatch on it,
+// is returned as a non-nil error rather than as a Success:false response, so
+// the core can tell a dropped heartbeat from a log mismatch.
 func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
 	entry := &pb.HeartbeatEntry{
 		GroupId:      req.GroupID,
@@ -263,7 +387,7 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 
 	// Get a buffered response channel from the pool to avoid per-call allocation.
 	respCh := b.respChanPool.Get().(chan hbResp)
-	call := hbCall{entry: entry, respCh: respCh}
+	call := hbCall{entry: entry, ctx: ctx, respCh: respCh}
 
 	batcher, err := b.peerBatcherFor(to)
 	if err != nil {
@@ -306,8 +430,10 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 			return nil, r.err
 		}
 		return &raft.AppendEntriesResponse{
-			Term:    raft.Term(r.term),
-			Success: r.success,
+			Term:          raft.Term(r.term),
+			Success:       r.success,
+			ConflictIndex: raft.Index(r.conflictIndex),
+			ConflictTerm:  raft.Term(r.conflictTerm),
 		}, nil
 	case <-ctx.Done():
 		// call was enqueued but we abandoned the wait. The batcher will still
@@ -320,16 +446,13 @@ func (b *heartbeatBatcher) Send(ctx context.Context, to raft.NodeID, req *raft.A
 		}()
 		return nil, ctx.Err()
 	case <-batcherCtx.Done():
-		// Batcher goroutine exited after we enqueued the call. The call was
-		// written to the channel but the goroutine may have drained it (writing
-		// to respCh) or may have exited before reading it. Drain respCh before
-		// returning it to the pool to handle the case where the batcher wrote
-		// to it in its shutdown drain loop.
-		select {
-		case <-respCh:
-		default:
-		}
-		b.respChanPool.Put(respCh)
+		// The batcher was stopped after we enqueued the call. The call may
+		// already have been taken by a flush that is still waiting on its RPC,
+		// in which case a write to respCh is still to come; or the batcher may
+		// have exited without ever reading it, in which case none is. Neither
+		// draining nor waiting is safe, so the channel is dropped rather than
+		// recycled: returning it to the pool could hand a later caller a
+		// channel that already holds a stale response.
 		return nil, errBatcherStopped
 	}
 }

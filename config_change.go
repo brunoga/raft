@@ -101,6 +101,76 @@ func decodeFinaliseConfigEntry(cmd []byte) (members []PeerConfig, ok bool) {
 	return members, ok
 }
 
+// ---- Membership snapshot encoding ------------------------------------------
+//
+// The membership in effect at a snapshot's last-included index is stored inside
+// the snapshot, so that a node restarting from that snapshot recovers the
+// cluster it belongs to rather than falling back to the peer list its operator
+// happened to pass to New.
+//
+// Wire format:
+//
+//	[1-byte kind] 0 = simple, 1 = joint
+//	simple: [peer list]                  — every member, including self
+//	joint:  [peer list][peer list]       — C_old then C_new, each including self
+const (
+	membershipKindSimple byte = 0
+	membershipKindJoint  byte = 1
+)
+
+// membershipState is the cluster membership in effect at a point in the log.
+// Every list includes the local node: unlike Config.Peers, this representation
+// is independent of which node holds it, which is what makes it safe to store
+// in a snapshot and to compare across nodes.
+type membershipState struct {
+	// joint reports whether a joint-consensus reconfiguration is in progress.
+	// While it is, a decision needs a majority of both old and new.
+	joint bool
+
+	// members is the membership when joint is false.
+	members []PeerConfig
+
+	// old and new are the two configurations when joint is true.
+	old, new []PeerConfig
+}
+
+// encodeMembership serialises a membershipState.
+func encodeMembership(ms *membershipState) []byte {
+	if ms.joint {
+		b := []byte{membershipKindJoint}
+		b = appendPeerList(b, ms.old)
+		return appendPeerList(b, ms.new)
+	}
+	return appendPeerList([]byte{membershipKindSimple}, ms.members)
+}
+
+// decodeMembership parses a membershipState. ok is false if buf is malformed.
+func decodeMembership(buf []byte) (ms membershipState, ok bool) {
+	if len(buf) < 1 {
+		return membershipState{}, false
+	}
+	switch buf[0] {
+	case membershipKindSimple:
+		members, _, ok := decodePeerList(buf[1:])
+		if !ok {
+			return membershipState{}, false
+		}
+		return membershipState{members: members}, true
+	case membershipKindJoint:
+		old, rest, ok := decodePeerList(buf[1:])
+		if !ok {
+			return membershipState{}, false
+		}
+		new_, _, ok := decodePeerList(rest)
+		if !ok {
+			return membershipState{}, false
+		}
+		return membershipState{joint: true, old: old, new: new_}, true
+	default:
+		return membershipState{}, false
+	}
+}
+
 // encodePeerLists encodes [magic][op] followed by one or more peer lists.
 func encodePeerLists(op byte, lists ...[]PeerConfig) []byte {
 	// Calculate total size.
@@ -111,25 +181,26 @@ func encodePeerLists(op byte, lists ...[]PeerConfig) []byte {
 			size += 3 + len(p.ID) // 2-byte length + 1-byte voter + bytes
 		}
 	}
-	b := make([]byte, size)
+	b := make([]byte, 5, size)
 	copy(b[:4], configMagic[:])
 	b[4] = op
-	off := 5
 	for _, list := range lists {
-		binary.BigEndian.PutUint32(b[off:], uint32(len(list)))
-		off += 4
-		for _, p := range list {
-			binary.BigEndian.PutUint16(b[off:], uint16(len(p.ID)))
-			off += 2
-			if p.Voter {
-				b[off] = 1
-			} else {
-				b[off] = 0
-			}
-			off++
-			copy(b[off:], p.ID)
-			off += len(p.ID)
+		b = appendPeerList(b, list)
+	}
+	return b
+}
+
+// appendPeerList appends a length-prefixed peer list to b and returns it.
+func appendPeerList(b []byte, list []PeerConfig) []byte {
+	b = binary.BigEndian.AppendUint32(b, uint32(len(list)))
+	for _, p := range list {
+		b = binary.BigEndian.AppendUint16(b, uint16(len(p.ID)))
+		if p.Voter {
+			b = append(b, 1)
+		} else {
+			b = append(b, 0)
 		}
+		b = append(b, p.ID...)
 	}
 	return b
 }
