@@ -111,6 +111,24 @@ type Config struct {
 	// Default: 1 MiB.
 	MaxBytesPerRPC uint64
 
+	// MaxProposalBytes is the largest command Propose and ProposeOnce will
+	// accept, in bytes. A larger one is refused with ErrProposalTooLarge.
+	//
+	// This exists because a command that cannot be replicated is far worse
+	// than one that is refused. An oversized command is appended to the
+	// leader's log, rejected by the transport on every send, and retried for
+	// ever: the entry never commits, every later proposal queues behind it,
+	// and the group stops making progress with nothing having reported an
+	// error.
+	//
+	// When zero, the limit is taken from the transport if it implements
+	// MessageSizeLimiter, leaving room for the entry's own framing. When the
+	// transport cannot report one either, no limit is applied — set this
+	// explicitly if your transport has a limit it cannot advertise.
+	//
+	// Default: 0 (ask the transport).
+	MaxProposalBytes int
+
 	// SnapshotThreshold is the number of log entries after which the leader
 	// automatically requests a snapshot from the state machine:
 	//   trigger when  lastApplied − lastSnapshotIndex >= SnapshotThreshold

@@ -1692,8 +1692,18 @@ func openFile(path string) (*os.File, error) {
 }
 
 // syncDir fsyncs the directory itself to make create/rename/unlink operations
-// durable. An fsync on a file descriptor does not cover its directory entry.
-func syncDir(dir string) error {
+// durable. An fsync on a file descriptor does not cover its directory entry:
+// without this, a crash can leave a segment that was written, fsynced and
+// acknowledged to the Raft engine but whose name never reached disk, so every
+// entry in it is silently gone on restart.
+//
+// It is a variable rather than a plain function purely so that tests can wrap
+// it and record which directory was synced; nothing outside tests assigns to
+// it, and the production path always runs fsyncDir.
+var syncDir = fsyncDir
+
+// fsyncDir is the real implementation behind syncDir.
+func fsyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("filestore: open dir for sync: %w", err)
