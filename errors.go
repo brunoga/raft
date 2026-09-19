@@ -47,6 +47,14 @@ var (
 	// would track it. Retry once StopAll has returned.
 	ErrManagerStopping = errors.New("raft: manager is stopping")
 
+	// ErrMemberNotCaughtUp is returned by PromoteMember when the member is too
+	// far behind to be made a voter. Retry once it has caught up.
+	ErrMemberNotCaughtUp = errors.New("raft: member is too far behind to become a voter")
+
+	// ErrNotMember is returned when an operation names a node that is not part
+	// of the cluster.
+	ErrNotMember = errors.New("raft: node is not a member of this cluster")
+
 	// ErrLeaseExpired is returned by ReadIndexLease when the leader does not
 	// currently hold a valid clock-based read lease. The caller should fall back
 	// to ReadIndex (which performs a heartbeat round-trip) or retry after the
