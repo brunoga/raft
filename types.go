@@ -114,6 +114,25 @@ type Metrics interface {
 	SnapshotTaken(id NodeID, lastIncludedIndex Index, sizeBytes int)
 }
 
+// StorageMetrics is an optional interface that a Config.Metrics implementation
+// may also satisfy. When it does, the node reports how long each durable write
+// took.
+//
+// These are the writes the event loop waits on: the term and vote, and log
+// entries. A disk that has become slow shows up here before it shows up
+// anywhere else, and it explains a rise in proposal latency that nothing in
+// the Raft state would otherwise account for. Watching it is how an operator
+// tells "the network is slow" from "this node's disk is slow".
+//
+// Implementations must not block; they are called from the goroutine that made
+// the write.
+type StorageMetrics interface {
+	// StorageWrite is called after each durable write. op is one of
+	// "hardstate", "append" or "snapshot"; err is the error the storage
+	// backend returned, so failures can be counted as well as timed.
+	StorageWrite(id NodeID, op string, d time.Duration, err error)
+}
+
 // ProposalMetrics is an optional interface that a Config.Metrics implementation
 // may also satisfy. When it does, the node reports how long each proposal took
 // and whether it succeeded.

@@ -1219,10 +1219,13 @@ func (n *Node) Term() Term {
 // saveTerm persists currentTerm+votedFor atomically then updates the cache.
 // Must be called from the event-loop goroutine only.
 func (n *Node) saveTerm(term Term, votedFor NodeID) error {
-	if err := n.cfg.Storage.SaveHardState(n.stopCtx, HardState{
+	started := n.now()
+	err := n.cfg.Storage.SaveHardState(n.stopCtx, HardState{
 		CurrentTerm: term,
 		VotedFor:    votedFor,
-	}); err != nil {
+	})
+	n.reportStorageWriteSince("hardstate", started, err)
+	if err != nil {
 		n.fail(err, "persist term and vote")
 		return fmt.Errorf("saveTerm: %w", err)
 	}
@@ -1282,6 +1285,34 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	written, err := c.w.Write(p)
 	c.n += int64(written)
 	return written, err
+}
+
+// reportStorageWrite tells a StorageMetrics implementation how long a durable
+// write took. A no-op unless Config.Metrics also implements it.
+func (n *Node) reportStorageWrite(op string, d time.Duration, err error) {
+	if n.cfg.Metrics == nil {
+		return
+	}
+	sm, isStorageMetrics := n.cfg.Metrics.(StorageMetrics)
+	if !isStorageMetrics {
+		return
+	}
+	sm.StorageWrite(n.cfg.ID, op, d, err)
+}
+
+// reportStorageWriteSince is reportStorageWrite for a write that has just
+// finished and whose start time the caller holds.
+func (n *Node) reportStorageWriteSince(op string, started time.Time, err error) {
+	n.reportStorageWrite(op, n.now().Sub(started), err)
+}
+
+// appendEntries writes entries to the log and reports what the write cost.
+// Every append the event loop waits on goes through here.
+func (n *Node) appendEntries(ctx context.Context, entries []LogEntry) error {
+	started := n.now()
+	err := n.log.append(ctx, entries)
+	n.reportStorageWriteSince("append", started, err)
+	return err
 }
 
 // reportProposal tells a ProposalMetrics implementation how a proposal ended.
