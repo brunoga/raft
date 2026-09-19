@@ -170,7 +170,7 @@ const (
 
 // writeWrappedSnapshot writes the client dedup table and the cluster
 // membership, followed by the state-machine data (via smSnapshot), to w.
-func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, ms membershipState, smSnapshot func(io.Writer) error) error {
+func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, ms *membershipState, smSnapshot func(io.Writer) error) error {
 	tableBytes := encodeClientTable(table)
 	membershipBytes := encodeMembership(ms)
 

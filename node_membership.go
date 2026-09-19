@@ -50,7 +50,7 @@ func (n *Node) currentMembership() membershipState {
 
 // restoreMembership installs ms as the membership in effect, replacing whatever
 // was there. Event-loop only.
-func (n *Node) restoreMembership(ms membershipState) {
+func (n *Node) restoreMembership(ms *membershipState) {
 	if !ms.joint {
 		peers, present, voter := splitSelf(ms.members, n.cfg.ID)
 		n.cfg.Peers = peers
@@ -103,7 +103,7 @@ func splitSelf(members []PeerConfig, self NodeID) (peers []PeerConfig, present, 
 // plus every config entry currently in the log. Used at startup and whenever a
 // truncation removes the entry the current membership came from.
 func (n *Node) rebuildMembership(ctx context.Context) error {
-	n.restoreMembership(n.baseMembership)
+	n.restoreMembership(&n.baseMembership)
 	n.configIndex = n.log.snapMeta.LastIncludedIndex
 
 	first, last := n.log.first, n.log.last
@@ -195,7 +195,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 		}
 		// The joint entry carries C_old as peers only (self excluded) and C_new
 		// as a full membership that may or may not include self.
-		n.restoreMembership(membershipState{
+		n.restoreMembership(&membershipState{
 			joint: true,
 			old:   withSelf(old, n.cfg.ID, true, n.cfg.Voter),
 			new:   new_,
@@ -218,18 +218,19 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 			return
 		}
 		oldPeers := n.cfg.Peers
-		n.restoreMembership(membershipState{members: members})
+		n.restoreMembership(&membershipState{members: members})
 
 		// Clean up leader tracking for peers that left the cluster.
 		if n.state == Leader {
 			for _, p := range oldPeers {
-				if !containsPeer(n.cfg.Peers, p.ID) {
-					n.stopHBPumpFor(p.ID)
-					delete(n.nextIndex, p.ID)
-					delete(n.matchIndex, p.ID)
-					delete(n.inflight, p.ID)
-					delete(n.snapshotInflight, p.ID)
+				if containsPeer(n.cfg.Peers, p.ID) {
+					continue
 				}
+				n.stopHBPumpFor(p.ID)
+				delete(n.nextIndex, p.ID)
+				delete(n.matchIndex, p.ID)
+				delete(n.inflight, p.ID)
+				delete(n.snapshotInflight, p.ID)
 			}
 			// Quorum size has changed; re-check whether anything can commit.
 			n.maybeAdvanceCommit()

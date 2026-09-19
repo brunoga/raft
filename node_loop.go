@@ -66,7 +66,7 @@ func (n *Node) run() {
 			n.handleApplyResult(&ar)
 
 		case sr := <-n.snapshotResultCh:
-			n.handleSnapshotResult(sr)
+			n.handleSnapshotResult(&sr)
 		}
 	}
 }

@@ -210,7 +210,7 @@ func TestSnapshotFraming_RoundTripsMembership(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			err := writeWrappedSnapshot(&buf, table, tt.ms, func(w io.Writer) error {
+			err := writeWrappedSnapshot(&buf, table, &tt.ms, func(w io.Writer) error {
 				_, werr := w.Write([]byte("machine-state"))
 				return werr
 			})
@@ -292,7 +292,7 @@ func TestMembership_SelfRoleRoundTrips(t *testing.T) {
 
 	fresh := newMembershipTestNode(t, &memLogStorage{}, nil)
 	fresh.cfg.ID = "self"
-	fresh.restoreMembership(ms)
+	fresh.restoreMembership(&ms)
 
 	if fresh.cfg.Voter {
 		t.Error("witness came back from its own membership record as a voter")

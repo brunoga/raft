@@ -427,7 +427,7 @@ func (n *Node) maybeSnapshot() {
 
 // handleSnapshotResult is called when the snapshot goroutine completes. It
 // persists the snapshot and truncates the log prefix.
-func (n *Node) handleSnapshotResult(sr snapshotResult) {
+func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 	defer func() {
 		n.snapshotting = false
 		if n.cfg.SnapshotSemaphore != nil {

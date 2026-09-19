@@ -1229,7 +1229,7 @@ func (n *Node) applyLoop() {
 				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
 			}()
 
-			serr := writeWrappedSnapshot(pw, trig.clientTable, trig.membership, func(w io.Writer) error {
+			serr := writeWrappedSnapshot(pw, trig.clientTable, &trig.membership, func(w io.Writer) error {
 				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
 			})
 			_ = pw.Close() // signals EOF to SaveSnapshot
