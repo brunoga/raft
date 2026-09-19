@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/brunoga/raft"
@@ -34,6 +36,13 @@ func makeEntries(from, to raft.Index, term raft.Term) []raft.LogEntry {
 		})
 	}
 	return entries
+}
+
+// segPath returns the on-disk path of the log/index file of segment seq.
+// The sequence number is zero-padded in the file name; tests build the path
+// through this helper so the padding width lives in one place.
+func segPath(dir string, seq int, ext string) string {
+	return filepath.Join(dir, fmt.Sprintf("seg-%010d%s", seq, ext))
 }
 
 // --- Hard state -------------------------------------------------------------
@@ -273,7 +282,7 @@ func TestRecovery_CorruptTail(t *testing.T) {
 	_ = fs1.Close()
 
 	// Corrupt the last few bytes of the active segment log file.
-	logPath := dir + "/seg-00000.log"
+	logPath := segPath(dir, 0, ".log")
 	info, _ := os.Stat(logPath)
 	f, _ := os.OpenFile(logPath, os.O_RDWR, 0o600)
 	_, _ = f.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, info.Size()-4)
@@ -318,8 +327,8 @@ func TestSegment_RotationCreatesMultipleFiles(t *testing.T) {
 	}
 
 	// Verify more than one segment file was created.
-	seg1 := dir + "/seg-00000.log"
-	seg2 := dir + "/seg-00001.log"
+	seg1 := segPath(dir, 0, ".log")
+	seg2 := segPath(dir, 1, ".log")
 	if _, err := os.Stat(seg1); err != nil {
 		t.Fatalf("expected seg-00000.log: %v", err)
 	}
@@ -502,8 +511,8 @@ func TestPhase2Crash_BothTmps(t *testing.T) {
 
 	// Place decoy .log.tmp and .idx.tmp for seg-00000 to simulate a crash
 	// during Phase 2 before the first rename.
-	logTmp := dir + "/seg-00000.log.tmp"
-	idxTmp := dir + "/seg-00000.idx.tmp"
+	logTmp := segPath(dir, 0, ".log.tmp")
+	idxTmp := segPath(dir, 0, ".idx.tmp")
 	if err := os.WriteFile(logTmp, []byte("bad-log"), 0o600); err != nil {
 		t.Fatalf("write log.tmp: %v", err)
 	}
@@ -547,11 +556,11 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 	}
 	// Read and save the original seg-00000 content so we can reconstruct
 	// the crash state after Phase 2 renames have already happened.
-	origLog, err := os.ReadFile(dir + "/seg-00000.log")
+	origLog, err := os.ReadFile(segPath(dir, 0, ".log"))
 	if err != nil {
 		t.Fatalf("read orig log: %v", err)
 	}
-	origIdx, err := os.ReadFile(dir + "/seg-00000.idx")
+	origIdx, err := os.ReadFile(segPath(dir, 0, ".idx"))
 	if err != nil {
 		t.Fatalf("read orig idx: %v", err)
 	}
@@ -566,11 +575,11 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 		t.Fatalf("TruncatePrefix: %v", err)
 	}
 	// Grab the correctly-rewritten idx file content (Phase 2 produced it).
-	newLog, err := os.ReadFile(dir + "/seg-00000.log")
+	newLog, err := os.ReadFile(segPath(dir, 0, ".log"))
 	if err != nil {
 		t.Fatalf("read new log: %v", err)
 	}
-	newIdx, err := os.ReadFile(dir + "/seg-00000.idx")
+	newIdx, err := os.ReadFile(segPath(dir, 0, ".idx"))
 	if err != nil {
 		t.Fatalf("read new idx: %v", err)
 	}
@@ -578,13 +587,13 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 
 	// Reconstruct crash state: log was renamed (new content), idx was NOT
 	// renamed (old content), idx.tmp has the new content.
-	if err = os.WriteFile(dir+"/seg-00000.log", newLog, 0o600); err != nil {
+	if err = os.WriteFile(segPath(dir, 0, ".log"), newLog, 0o600); err != nil {
 		t.Fatalf("restore log: %v", err)
 	}
-	if err = os.WriteFile(dir+"/seg-00000.idx", origIdx, 0o600); err != nil {
+	if err = os.WriteFile(segPath(dir, 0, ".idx"), origIdx, 0o600); err != nil {
 		t.Fatalf("restore orig idx: %v", err)
 	}
-	if err = os.WriteFile(dir+"/seg-00000.idx.tmp", newIdx, 0o600); err != nil {
+	if err = os.WriteFile(segPath(dir, 0, ".idx.tmp"), newIdx, 0o600); err != nil {
 		t.Fatalf("write idx.tmp: %v", err)
 	}
 	_ = origLog // suppress unused warning
@@ -608,7 +617,7 @@ func TestPhase2Crash_OnlyIdxTmp(t *testing.T) {
 	}
 
 	// idx.tmp must be gone.
-	if _, err := os.Stat(dir + "/seg-00000.idx.tmp"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(segPath(dir, 0, ".idx.tmp")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("idx.tmp should have been renamed away by recovery")
 	}
 }
@@ -627,7 +636,7 @@ func TestPhase2Crash_OnlyLogTmp(t *testing.T) {
 	_ = fs.Close()
 
 	// Place only a log.tmp (no idx.tmp).
-	logTmp := dir + "/seg-00000.log.tmp"
+	logTmp := segPath(dir, 0, ".log.tmp")
 	if err := os.WriteFile(logTmp, []byte("partial"), 0o600); err != nil {
 		t.Fatalf("write log.tmp: %v", err)
 	}
