@@ -3,7 +3,9 @@ package easyraft
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -176,15 +178,24 @@ func (m *Manager) Start() error {
 	tr.SetGroupLookup(m.mgr.Lookup)
 
 	// cleanup tears down all resources initialised so far; called on any error.
+	//
+	// Errors from the teardown itself are discarded: Start already has the
+	// error that made it fail, and that is the one the caller needs. Each
+	// store's storage handle is cleared as it is closed so a caller that calls
+	// Stop anyway does not close it a second time.
 	cleanup := func() {
 		m.cancel()      // cancels all per-store derived contexts (dispatchChanges)
 		m.mgr.StopAll() // stops any Raft nodes that were started
 		for _, g := range groups {
 			if g.store.storage != nil {
-				if c, ok := g.store.storage.(interface{ Close() error }); ok {
+				if c, ok := g.store.storage.(io.Closer); ok {
 					_ = c.Close()
 				}
+				g.store.storage = nil
 			}
+			// The transport is shared and closed once, just below; drop the
+			// store's reference so a later Stop cannot close it again.
+			g.store.transport = nil
 		}
 		_ = tr.Close()
 		m.mu.Lock()
@@ -198,19 +209,35 @@ func (m *Manager) Start() error {
 			cleanup()
 			return fmt.Errorf("init store %d: %w", g.id, err)
 		}
+		// Join an existing cluster before starting the event loop, if configured.
+		// This can retry for up to 30 seconds, which is exactly why the Manager
+		// lock is not held here.
+		//
+		// A group that was told to join and did not is not a replica of that
+		// group, so it fails Start for the same reason [Store.Start] does — and
+		// it fails the whole Manager, because a node silently missing one of
+		// its shards is the kind of partial start an operator has no way to
+		// notice.
+		//
+		// The join runs before the node is registered with the underlying
+		// raft.Manager, so a group that fails here leaves no registered but
+		// unstarted node behind: cleanup stops every node it finds registered,
+		// and Node.Stop waits for goroutines that only Node.Start creates.
+		if len(g.store.cfg.JoinAddrs) > 0 {
+			if err := g.store.joinCluster(g.store.stopCtx); err != nil {
+				cleanup()
+				return fmt.Errorf("easyraft: group %d did not join the cluster: %w", g.id, err)
+			}
+		}
 		if err := m.mgr.Add(g.id, g.store.node); err != nil {
 			cleanup()
 			return fmt.Errorf("register store %d: %w", g.id, err)
 		}
-		// Join an existing cluster before starting the event loop, if configured.
-		// This can retry for up to 30 seconds, which is exactly why the Manager
-		// lock is not held here.
-		if len(g.store.cfg.JoinAddrs) > 0 {
-			if err := g.store.joinCluster(g.store.stopCtx); err != nil {
-				g.store.logger().Warn("easyraft: cluster join failed", "group", g.id, "err", err)
-			}
-		}
 		g.store.node.Start()
+		// Record that this group's event loop is running, so a later
+		// Store-level Stop stops the node instead of mistaking the store for
+		// one that was never started and closing the shared transport.
+		g.store.started.Store(true)
 		go g.store.dispatchChanges()
 		// Advertise this node's HTTP address so the cluster can redirect clients.
 		if g.store.cfg.HTTPAddr != "" {
@@ -230,22 +257,58 @@ func (m *Manager) Start() error {
 }
 
 // Stop shuts down all stores, the shared HTTP server, and the shared transport.
-func (m *Manager) Stop() {
+//
+// Like [Store.Stop], every step runs whatever the earlier ones reported, and
+// the returned error joins the failures so the caller can act on them instead
+// of finding them in a log. The one that matters most is a group whose storage
+// did not close cleanly: that group's on-disk log may not be intact, which
+// decides whether this node can be restarted or has to be rebuilt from a peer.
+//
+// Stopping the Raft nodes and closing each group's storage go through the
+// stores themselves, so a group that was already shut down individually is not
+// torn down twice.
+func (m *Manager) Stop() error {
 	m.cancel()
 
 	m.mu.Lock()
 	httpServer := m.httpServer
 	transport := m.transport
 	m.transport = nil
+	stores := make([]*Store, 0, len(m.stores))
+	for _, s := range m.stores {
+		stores = append(stores, s)
+	}
 	m.mu.Unlock()
 
+	var errs []error
+
 	if httpServer != nil {
-		_ = httpServer.Shutdown(context.Background())
+		if err := httpServer.Shutdown(context.Background()); err != nil {
+			errs = append(errs, fmt.Errorf("easyraft: shut down manager http server: %w", err))
+		}
 	}
+
+	// Shut the groups down through their own stores, so each one stops its
+	// node and closes its storage exactly once, and so a group configured with
+	// [WithLeaveOnStop] departs while its node is still able to propose the
+	// membership change.
+	for _, s := range stores {
+		if err := s.Stop(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Catch any node registered with the underlying raft.Manager that no store
+	// owns. Node.Stop is idempotent, so the groups just handled are unaffected.
 	m.mgr.StopAll()
+
 	if transport != nil {
-		_ = transport.Close()
+		if err := transport.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("easyraft: close manager transport: %w", err))
+		}
 	}
+
+	return errors.Join(errs...)
 }
 
 // GetStore returns the Store registered under groupID, or an error if no store
@@ -329,12 +392,19 @@ func (m *Manager) RemoveStore(groupID uint64) error {
 		s.cancel()
 	}
 	// Stop the Raft node via the underlying raft.Manager (also unregisters it).
+	// A failure here means the group was never registered — it was added but
+	// the Manager was never started — which is not something the caller asked
+	// about: the group is gone from this Manager either way.
 	_ = m.mgr.Remove(groupID)
-	// Close persistent storage.
+	// Close persistent storage. A failure is worth reporting: this group's
+	// on-disk log may not be intact.
 	if s.storage != nil {
-		if closer, ok := s.storage.(interface{ Close() error }); ok {
-			_ = closer.Close()
+		if closer, ok := s.storage.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				return fmt.Errorf("easyraft: close storage for group %d: %w", groupID, err)
+			}
 		}
+		s.storage = nil
 	}
 	return nil
 }
@@ -359,13 +429,19 @@ func (m *Manager) RemoveStoreGraceful(ctx context.Context, groupID uint64, trans
 	}
 	// Delegate graceful removal (leadership transfer + node stop) to raft.Manager.
 	removeErr := m.mgr.RemoveGraceful(ctx, groupID, transferTo)
-	// Close persistent storage regardless of whether the graceful transfer succeeded.
+	// Close persistent storage regardless of whether the graceful transfer
+	// succeeded, and report a close failure alongside it: either one on its own
+	// is something the caller may need to act on.
+	var closeErr error
 	if s.storage != nil {
-		if closer, ok := s.storage.(interface{ Close() error }); ok {
-			_ = closer.Close()
+		if closer, ok := s.storage.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				closeErr = fmt.Errorf("easyraft: close storage for group %d: %w", groupID, err)
+			}
 		}
+		s.storage = nil
 	}
-	return removeErr
+	return errors.Join(removeErr, closeErr)
 }
 
 // TransferGroupLeadership asks the node managing groupID to transfer

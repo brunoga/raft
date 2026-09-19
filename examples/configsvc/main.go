@@ -256,8 +256,19 @@ func main() {
 		Handler: mux,
 	}
 
-	store.Start() // registers easyraft routes on mux
-	defer store.Stop()
+	// Start registers the easyraft routes on mux. It fails if this node was
+	// told to join a cluster and could not: better to exit than to serve an
+	// endpoint that is not part of any cluster.
+	if err := store.Start(); err != nil {
+		logger.Error("configsvc: cannot start", "err", err)
+		_ = store.Stop()
+		os.Exit(1)
+	}
+	defer func() {
+		if err := store.Stop(); err != nil {
+			logger.Error("configsvc: unclean shutdown", "err", err)
+		}
+	}()
 
 	logger.Info("configsvc started", "id", *id, "raft", *raftAddr, "http", *httpAddr)
 

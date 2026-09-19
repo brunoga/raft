@@ -166,9 +166,12 @@ func (s *Store) initHTTP() error {
 	return nil
 }
 
-// serveHTTP starts serving the routes registered for this store. The listener
-// was already bound by initHTTP, so the only failures left here are
-// serve-time ones, which are logged.
+// serveHTTP starts serving the routes registered for this store.
+//
+// It returns nothing because there is nothing left to report: the listener was
+// already bound by initHTTP, so a bad or occupied address failed [NewStore].
+// What remains can only go wrong once the server is accepting connections,
+// which is after [Store.Start] has returned, so it is logged.
 func (s *Store) serveHTTP() {
 	logger := s.logger()
 
@@ -671,6 +674,9 @@ func (s *Store) leaderURL(leaderID raft.NodeID, path, rawQuery string) string {
 	var advertised string
 	if coll := s.collections[metadataCollection]; coll != nil {
 		if raw, ok := coll[string(leaderID)]; ok {
+			// A decode failure leaves advertised empty, which is handled just
+			// below as "the leader has no usable address" — the same outcome
+			// as no entry at all.
 			_ = json.Unmarshal(raw, &advertised)
 		}
 	}

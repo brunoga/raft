@@ -53,12 +53,14 @@ func BenchmarkRateLimiter(b *testing.B) {
 			return q, nil, nil
 		})
 
-		s.Start()
+		if err := s.Start(); err != nil {
+			b.Fatalf("failed to start store %s: %v", id, err)
+		}
 	}
 
 	defer func() {
 		for _, s := range stores {
-			s.Stop()
+			_ = s.Stop()
 		}
 	}()
 

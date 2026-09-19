@@ -32,14 +32,18 @@ func New[T any](opts ...Option) (*EasyRaft[T], error) {
 	}, nil
 }
 
-// Start launches the Raft event loop. Register all mutations before calling Start.
-func (e *EasyRaft[T]) Start() {
-	e.store.Start()
+// Start launches the Raft event loop. Register all mutations before calling
+// Start. It returns an error if this instance was configured with
+// [WithJoinAddr] and could not join the cluster — see [Store.Start] for why
+// that is fatal and what is deliberately left out of the error.
+func (e *EasyRaft[T]) Start() error {
+	return e.store.Start()
 }
 
-// Stop shuts down the node.
-func (e *EasyRaft[T]) Stop() {
-	e.store.Stop()
+// Stop shuts down the node, returning whatever part of the shutdown failed.
+// See [Store.Stop] for which failures are worth acting on.
+func (e *EasyRaft[T]) Stop() error {
+	return e.store.Stop()
 }
 
 // RegisterMutation defines a named atomic read-modify-write operation.

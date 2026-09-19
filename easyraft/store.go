@@ -60,8 +60,17 @@
 //	    easyraft.WithDataDir("/data/n1"),
 //	    easyraft.WithPeers(map[raft.NodeID]string{"n2": "host2:7001"}),
 //	)
-//	er.Start()
-//	defer er.Stop()
+//	if err != nil {
+//	    return err
+//	}
+//	if err := er.Start(); err != nil {
+//	    return err // e.g. this node was told to join a cluster and could not
+//	}
+//	defer func() {
+//	    if err := er.Stop(); err != nil {
+//	        log.Printf("easyraft shutdown: %v", err)
+//	    }
+//	}()
 //
 // See the package README and [examples/ratelimiter] for complete examples.
 package easyraft
@@ -251,6 +260,12 @@ type Store struct {
 	// a store that was constructed but never started.
 	started atomic.Bool
 
+	// stopOnce and stopErr make Stop idempotent. Shutdown closes file handles
+	// and listeners, which report an error the second time round, so the first
+	// call does the work and every later call repeats its verdict.
+	stopOnce sync.Once
+	stopErr  error
+
 	cfg          Config
 	cancel       context.CancelFunc
 	stopCtx      context.Context
@@ -313,6 +328,10 @@ func NewStore(opts ...Option) (*Store, error) {
 // The Raft node is deliberately not stopped: it has not been started, and
 // Node.Stop waits for goroutines that Node.Start would have created. Closing
 // the transport and the storage releases everything the node actually holds.
+//
+// Close errors are discarded rather than returned. [NewStore] already has the
+// error that made construction fail, and that is the one the caller needs;
+// replacing or padding it with a failure from unwinding would bury the cause.
 func (s *Store) closeAfterFailedInit() {
 	if closer, ok := s.transport.(io.Closer); ok {
 		_ = closer.Close()
@@ -559,6 +578,12 @@ type peerAdder interface {
 // Discovered peers are added as non-voting learners by default: a discovery
 // announcement is a network-level claim, and honouring it as a voter would let
 // that claim change the cluster's quorum. [WithDiscoveryAsVoter] opts out.
+//
+// Failures in these loops are logged rather than reported to [Store.Start].
+// Discovery is a continuous background process, not a startup step: a lookup
+// or an AddServer that fails on one poll is retried on the next, and the node
+// keeps replicating with the peers it already has in the meantime. There is no
+// point at which such a failure is final enough to hand a caller.
 func (s *Store) startDiscovery(node *raft.Node, tr peerAdder) {
 	logger := s.logger()
 
@@ -668,13 +693,27 @@ func (s *Store) applyDiscoveredAddr(tr peerAdder, id raft.NodeID, addr string) {
 // HTTP API on the listener bound by [NewStore].
 // Register all collections and mutations before calling Start.
 //
-// If [WithJoinAddr] was set, Start contacts the seed nodes to join the cluster
-// before starting the Raft event loop. A join failure is logged but not fatal —
-// the node will still start and may be added via discovery or a manual retry.
-func (s *Store) Start() {
+// If [WithJoinAddr] was set, Start contacts the seed nodes first and returns an
+// error if it could not join before the join deadline expires. That failure is
+// fatal on purpose: a node that was told to join a cluster and did not is not a
+// replica of anything. It holds an empty log, no existing member knows to
+// replicate to it, and every write it accepts will fail. Returning the error
+// lets the caller fail its own startup, retry, or report unreadiness, instead
+// of running a process that looks healthy and is not in the cluster. Nothing is
+// started when the join fails, so the only thing left for the caller to do is
+// call [Store.Stop] to release the listeners bound by [NewStore].
+//
+// Two failures deliberately stay out of the return value, because neither
+// decides whether this node participates in consensus and neither is settled
+// by the time Start returns. Advertising this node's HTTP address retries in
+// the background until it succeeds — it only affects whether other nodes can
+// redirect clients here. Serving the HTTP API can only fail after the listener
+// bound by [NewStore] is already accepting, so a serve error arrives later and
+// is logged. Both are reported through the configured logger.
+func (s *Store) Start() error {
 	if len(s.cfg.JoinAddrs) > 0 {
 		if err := s.joinCluster(s.stopCtx); err != nil {
-			s.logger().Warn("easyraft: cluster join failed", "err", err)
+			return fmt.Errorf("easyraft: node %s did not join the cluster: %w", s.cfg.ID, err)
 		}
 	}
 
@@ -691,8 +730,18 @@ func (s *Store) Start() {
 	}
 
 	s.serveHTTP()
+
+	return nil
 }
 
+// advertiseMetadata publishes this node's HTTP address to the cluster so that
+// other members can redirect clients here.
+//
+// It retries until it succeeds or the store stops, which is why Start does not
+// wait for it or report its failures: the address is only needed for client
+// redirection, a node without one still replicates normally, and a leader
+// election in progress at startup makes an early failure the common case
+// rather than an exceptional one.
 func (s *Store) advertiseMetadata() {
 	// Retry until we successfully register our HTTP address with the leader.
 	// This ensures that after a leadership rotation, every node's URL is known.
@@ -1063,20 +1112,33 @@ func (s *Store) Leader() raft.NodeID {
 
 // Stop cancels the store's context (terminating discovery goroutines), shuts
 // down the HTTP server, stops the Raft node, and closes persistent storage.
-// It is safe to call Stop more than once, and on a store that was created but
-// never started.
+// It is safe to call Stop more than once — later calls repeat the first call's
+// verdict without redoing the work — and on a store that was created but never
+// started.
 //
-// If [WithLeaveOnStop] was set, Stop first removes this node from the cluster
-// membership — see [Store.Leave] for how that is done on a follower. Failures
-// are logged; shutdown always proceeds.
-func (s *Store) Stop() {
+// Every step runs whatever the earlier ones reported: a shutdown that gave up
+// halfway would strand listeners and file handles. The returned error joins
+// whatever did fail, so a caller can act on it rather than read about it in a
+// log. Two of them matter in practice. A failed departure under
+// [WithLeaveOnStop] leaves this node in the cluster's membership, where it
+// still counts towards quorum until an operator removes it — see [Store.Leave].
+// A storage close failure is the last opportunity to learn that the on-disk
+// Raft log may not be intact, which decides whether this node can be restarted
+// or has to be rebuilt from a peer.
+func (s *Store) Stop() error {
+	s.stopOnce.Do(func() { s.stopErr = s.stop() })
+	return s.stopErr
+}
+
+func (s *Store) stop() error {
 	running := s.started.Load()
+
+	var errs []error
 
 	if s.cfg.LeaveOnStop && running {
 		leaveCtx, leaveCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := s.Leave(leaveCtx); err != nil {
-			s.logger().Warn("easyraft: graceful departure failed; shutting down anyway",
-				"node", s.cfg.ID, "err", err)
+			errs = append(errs, fmt.Errorf("easyraft: node %s did not leave the cluster: %w", s.cfg.ID, err))
 		}
 		leaveCancel()
 	}
@@ -1085,23 +1147,33 @@ func (s *Store) Stop() {
 		s.cancel()
 	}
 	if s.httpServer != nil {
-		_ = s.httpServer.Shutdown(context.Background())
+		if err := s.httpServer.Shutdown(context.Background()); err != nil {
+			errs = append(errs, fmt.Errorf("easyraft: shut down http server: %w", err))
+		}
 	} else if s.httpListener != nil {
 		// Bound at construction but never served: release the port anyway.
-		_ = s.httpListener.Close()
+		if err := s.httpListener.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("easyraft: close http listener: %w", err))
+		}
 	}
 	if running {
 		s.node.Stop()
 	} else if closer, ok := s.transport.(io.Closer); ok {
 		// Never started: the node holds nothing, but the transport is already
 		// listening and must be released.
-		_ = closer.Close()
+		if err := closer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("easyraft: close transport: %w", err))
+		}
 	}
 	if s.storage != nil {
 		if closer, ok := s.storage.(io.Closer); ok {
-			_ = closer.Close()
+			if err := closer.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("easyraft: close storage: %w", err))
+			}
 		}
 	}
+
+	return errors.Join(errs...)
 }
 
 // Leave removes this node from the cluster membership.
