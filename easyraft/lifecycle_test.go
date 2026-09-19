@@ -3,6 +3,7 @@ package easyraft_test
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -226,5 +227,47 @@ func TestStore_StopReportsAFailedDeparture(t *testing.T) {
 	// than a second round of close failures.
 	if again := store.Stop(); again.Error() != stopErr.Error() {
 		t.Errorf("second Stop = %v, want the first call's result %v", again, stopErr)
+	}
+}
+
+// TestStore_CreatesAMissingDataDirectory pins that the caller does not have to
+// create the data directory, including its parents.
+//
+// The store used to call os.MkdirAll itself before handing the path to the
+// filestore. That has been removed, because pre-creating the directory left
+// the filestore nothing to create and so skipped the fsync that makes the
+// directory's own name survive a crash. The convenience is not meant to go
+// with it: a path several levels below anything that exists must still work,
+// which is the normal shape of a data directory under a per-node subdirectory.
+func TestStore_CreatesAMissingDataDirectory(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "cluster", "n1", "raft")
+
+	er, err := easyraft.New[Counter](
+		easyraft.WithID("n1"),
+		easyraft.WithRaftAddr(freePort(t)),
+		easyraft.WithDataDir(dataDir),
+		easyraft.WithLogger(quietLogger()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if startErr := er.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er.Stop() }()
+
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		t.Fatalf("data directory was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("%s is not a directory", dataDir)
+	}
+	// The filestore creates it private to the owning user. Raft state is a
+	// node's votes and its log; nothing else on the host has business reading
+	// it, and anything that can write it can rewrite history.
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("data directory mode = %#o, want %#o", perm, 0o700)
 	}
 }

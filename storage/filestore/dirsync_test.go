@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -397,4 +398,71 @@ func TestTruncateSuffixSyncsDirectory(t *testing.T) {
 
 	requireSync(t, rec, "unlink of truncated "+last, dir,
 		nil, []string{last + ".log", last + ".idx"})
+}
+
+// TestDataDirectoryCreationSyncsItsParents checks the level nobody thinks
+// about: the data directory's own name.
+//
+// Every other test here covers a name created *inside* the data directory. The
+// data directory is itself a name inside its parent, created on first start by
+// the store, and subject to the same rule. If it is not made durable, a node
+// can create it, persist a vote and a run of entries, fsync each of those
+// files, acknowledge them to the cluster, and then crash to find the whole
+// directory gone — rejoining with the same ID, an empty log and no memory of
+// its vote. Fsyncing files inside a directory whose own name is not durable
+// buys nothing at all.
+//
+// The store is opened at a path two levels below an existing directory, so the
+// assertion covers the whole created chain rather than just the last link.
+func TestDataDirectoryCreationSyncsItsParents(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "cluster", "node1", "raft")
+
+	rec := recordDirSyncs(t)
+
+	fs, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = fs.Close() }()
+
+	// Each created directory is durable only once the directory holding its
+	// name has been fsynced, so walk the chain: base must have been synced
+	// holding "cluster", and so on down to the data directory itself.
+	requireSync(t, rec, "creating the data directory",
+		base, []string{"cluster"}, nil)
+	requireSync(t, rec, "creating the data directory",
+		filepath.Join(base, "cluster"), []string{"node1"}, nil)
+	requireSync(t, rec, "creating the data directory",
+		filepath.Join(base, "cluster", "node1"), []string{"raft"}, nil)
+}
+
+// TestOpeningAnExistingDataDirectorySyncsNoParent pins the other half: the
+// fsyncs above are the cost of *creating* the directory, not a cost paid on
+// every open. Reopening an existing store must not walk back up the path.
+func TestOpeningAnExistingDataDirectorySyncsNoParent(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "raft")
+
+	fs, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if closeErr := fs.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
+	}
+
+	rec := recordDirSyncs(t)
+
+	fs2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = fs2.Close() }()
+
+	if rec.saw(base, nil, nil) {
+		t.Errorf("reopening an existing store fsynced its parent %s;"+
+			" that work belongs to the open that created the directory.\nrecorded:\n  %s",
+			base, rec)
+	}
 }
