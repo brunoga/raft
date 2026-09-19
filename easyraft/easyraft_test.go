@@ -75,10 +75,14 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	er1.Start()
-	defer er1.Stop()
-	er2.Start()
-	defer er2.Stop()
+	if startErr := er1.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er1.Stop() }()
+	if startErr := er2.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er2.Stop() }()
 
 	// Wait for a leader to be elected and the cluster to be fully operational.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -144,8 +148,10 @@ func TestEasyRaft_Basic(t *testing.T) {
 		return c, nil, nil
 	})
 
-	er.Start()
-	defer er.Stop()
+	if startErr := er.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er.Stop() }()
 
 	// Wait for leader election (single node cluster elects itself quickly, but timeout is 1-2s)
 	time.Sleep(3 * time.Second)
@@ -215,8 +221,10 @@ func TestEasyRaft_HTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	er.Start()
-	defer er.Stop()
+	if startErr := er.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er.Stop() }()
 
 	time.Sleep(3 * time.Second) // wait for leader
 
@@ -282,8 +290,10 @@ func TestStore_MultiCollection(t *testing.T) {
 	users := easyraft.AddCollection[string](s, "users")
 	scores := easyraft.AddCollection[int](s, "scores")
 
-	s.Start()
-	defer s.Stop()
+	if startErr := s.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = s.Stop() }()
 
 	time.Sleep(3 * time.Second) // wait for leader
 
@@ -326,8 +336,10 @@ func TestStore_Txn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.Start()
-	defer s.Stop()
+	if startErr := s.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = s.Stop() }()
 
 	time.Sleep(3 * time.Second) // wait for leader
 
@@ -375,8 +387,10 @@ func TestStore_Txn_Rollback(t *testing.T) {
 
 	accounts := easyraft.AddCollection[string](s, "accounts")
 
-	s.Start()
-	defer s.Stop()
+	if startErr := s.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = s.Stop() }()
 
 	time.Sleep(3 * time.Second)
 
@@ -441,8 +455,10 @@ func TestStore_ProposeOnce(t *testing.T) {
 		return &res, nil, nil
 	})
 
-	s.Start()
-	defer s.Stop()
+	if startErr := s.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = s.Stop() }()
 
 	time.Sleep(3 * time.Second) // wait for leader
 
@@ -492,7 +508,7 @@ func TestManager_MultiRaft(t *testing.T) {
 	if errStart := mgr.Start(); errStart != nil {
 		t.Fatal(errStart)
 	}
-	defer mgr.Stop()
+	defer func() { _ = mgr.Stop() }()
 
 	// Wait for leaders
 	time.Sleep(3 * time.Second)
@@ -552,8 +568,10 @@ func TestEasyRaft_Join(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	er1.Start()
-	defer er1.Stop()
+	if startErr := er1.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er1.Stop() }()
 
 	// Wait for n1 to elect itself leader before n2 tries to join.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -578,8 +596,10 @@ func TestEasyRaft_Join(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	er2.Start()
-	defer er2.Stop()
+	if startErr := er2.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er2.Stop() }()
 
 	// Wait until n2 is part of the cluster: it should be able to read the
 	// entry that n1 committed (stale read is fine — we just need it caught up).
@@ -627,10 +647,14 @@ func TestEasyRaft_Members(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	er1.Start()
-	defer er1.Stop()
-	er2.Start()
-	defer er2.Stop()
+	if startErr := er1.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er1.Stop() }()
+	if startErr := er2.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er2.Stop() }()
 
 	// Wait for a leader.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -701,8 +725,10 @@ func TestEasyRaft_Batch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	er.Start()
-	defer er.Stop()
+	if startErr := er.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er.Stop() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -786,11 +812,17 @@ func TestEasyRaft_LeaveOnStop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	er1.Start()
-	defer er1.Stop()
-	er2.Start()
-	defer er2.Stop()
-	er3.Start()
+	if startErr := er1.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er1.Stop() }()
+	if startErr := er2.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er2.Stop() }()
+	if startErr := er3.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
 
 	// Wait for the cluster to be operational.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -812,7 +844,12 @@ func TestEasyRaft_LeaveOnStop(t *testing.T) {
 	}
 
 	// Stop n3 with LeaveOnStop — it should remove itself from the cluster.
-	er3.Stop()
+	// Stop's error is not asserted here: no node in this test advertises an
+	// HTTP address, so a follower has no leader endpoint to forward its
+	// removal to and the departure legitimately may not complete. What this
+	// test pins is the outcome below — the remaining two nodes keep
+	// committing. TestStore_StopReportsAFailedDeparture covers the error.
+	_ = er3.Stop()
 
 	// n1 and n2 should still be able to commit (2-node quorum of the original 3).
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)

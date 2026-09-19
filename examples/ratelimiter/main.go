@@ -151,9 +151,17 @@ func main() {
 		return q, b, nil
 	})
 
-	// 4. Start the cluster.
-	store.Start()
-	defer store.Stop()
+	// 4. Start the cluster. A node configured with --join that never reached a
+	// seed is not a cluster member, so there is nothing useful to serve.
+	if err := store.Start(); err != nil {
+		_ = store.Stop()
+		log.Fatalf("Rate Limiter %s cannot start: %v", *id, err)
+	}
+	defer func() {
+		if err := store.Stop(); err != nil {
+			log.Printf("Rate Limiter %s: unclean shutdown: %v", *id, err)
+		}
+	}()
 
 	log.Printf("Rate Limiter %s starting on %s (HTTP %s)", *id, *raftAddr, *httpAddr)
 

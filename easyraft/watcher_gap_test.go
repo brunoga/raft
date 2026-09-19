@@ -260,10 +260,12 @@ func TestStore_SlowHandlerDoesNotStarveOtherCollections(t *testing.T) {
 		fastSaw <- key
 	})
 
-	store.Start()
+	if startErr := store.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
 	defer func() {
 		close(blocked)
-		store.Stop()
+		_ = store.Stop()
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

@@ -49,8 +49,14 @@ er, err := easyraft.New[Counter](
         "n3": "host3:7001",
     }),
 )
-er.Start()
-defer er.Stop()
+if err := er.Start(); err != nil {
+    log.Fatal(err) // e.g. this node was told to join a cluster and could not
+}
+defer func() {
+    if err := er.Stop(); err != nil {
+        log.Printf("easyraft shutdown: %v", err)
+    }
+}()
 
 ctx := context.Background()
 
@@ -87,8 +93,14 @@ store, err := easyraft.NewStore(
 users    := easyraft.AddCollection[User](store, "users")
 sessions := easyraft.AddCollection[Session](store, "sessions")
 
-store.Start()
-defer store.Stop()
+if err := store.Start(); err != nil {
+    log.Fatal(err)
+}
+defer func() {
+    if err := store.Stop(); err != nil {
+        log.Printf("easyraft shutdown: %v", err)
+    }
+}()
 
 ctx := context.Background()
 users.Create(ctx, "alice", User{Name: "Alice"})
@@ -346,8 +358,14 @@ users  := easyraft.AddCollection[User](s1, "users")
 s2, _ := mgr.AddStore(2, easyraft.WithDataDir("/data/shard2"))
 orders := easyraft.AddCollection[Order](s2, "orders")
 
-mgr.Start()
-defer mgr.Stop()
+if err := mgr.Start(); err != nil {
+    log.Fatal(err) // no group half-started: Start cleans up before returning
+}
+defer func() {
+    if err := mgr.Stop(); err != nil {
+        log.Printf("easyraft shutdown: %v", err)
+    }
+}()
 ```
 
 `AddStore` accepts the same options as `NewStore`. Options set on the `Manager` (e.g. `WithID`, `WithPeers`) are inherited by stores; store-level options override them — including `WithPrometheus`, whose registerer every group shares. Each group's series are told apart by a `group` label.
@@ -369,7 +387,9 @@ n1, _ := easyraft.New[Counter](
     easyraft.WithBearerTokenAuth(token),
     easyraft.WithDataDir("/data/n1"),
 )
-n1.Start()
+if err := n1.Start(); err != nil {
+    log.Fatal(err)
+}
 
 // Joining node — contacts n1 on startup.
 n2, _ := easyraft.New[Counter](
@@ -379,7 +399,9 @@ n2, _ := easyraft.New[Counter](
     easyraft.WithJoinAddr("localhost:8001"),
     easyraft.WithBearerTokenAuth(token), // same token as the seed
 )
-n2.Start()
+if err := n2.Start(); err != nil {
+    log.Fatal(err) // the seed never answered; this node is not in the cluster
+}
 ```
 
 `WithJoinAddr` accepts one or more HTTP addresses; the joining node tries each in turn until one succeeds. If the contacted node is not the leader it responds with `307 Temporary Redirect` automatically. When the seeds require authorization, configure the joiner with the matching `WithBearerTokenAuth` — it is sent on the join request.
@@ -400,7 +422,9 @@ replica, _ := easyraft.New[Counter](
     easyraft.WithJoinAddr("leader-host:8001"),
     easyraft.WithJoinAsLearner(),
 )
-replica.Start()
+if err := replica.Start(); err != nil {
+    log.Fatal(err)
+}
 ```
 
 Requires `WithJoinAddr` — learner mode only applies during the join flow.
@@ -419,11 +443,19 @@ node, _ := easyraft.New[Counter](
     easyraft.WithJoinAddr("seed:8001"),
     easyraft.WithLeaveOnStop(),
 )
-node.Start()
-defer node.Stop() // removes self from cluster before shutting down
+if err := node.Start(); err != nil {
+    log.Fatal(err)
+}
+defer func() {
+    // Stop removes this node from the cluster before shutting down, and says
+    // so if the departure did not happen.
+    if err := node.Stop(); err != nil {
+        log.Printf("did not leave the cluster cleanly: %v", err)
+    }
+}()
 ```
 
-On the leader the membership change is proposed directly. A follower cannot commit one, so the removal is **forwarded to the leader's HTTP API** (`DELETE /members/{self}`), carrying the credential from `WithBearerTokenAuth` when one is configured. If the leader is unknown, has not advertised an HTTP address, or rejects the request, the reason is logged and shutdown continues — the node is then still a member and an operator must remove it. Call `store.Leave(ctx)` directly if you want to handle that error yourself.
+On the leader the membership change is proposed directly. A follower cannot commit one, so the removal is **forwarded to the leader's HTTP API** (`DELETE /members/{self}`), carrying the credential from `WithBearerTokenAuth` when one is configured. If the leader is unknown, has not advertised an HTTP address, or rejects the request, shutdown still completes — releasing the ports and file handles — and `Stop` returns the reason. The node is then still a member and an operator must remove it, so do not discard that error. Call `store.Leave(ctx)` directly if you want to handle the departure separately from shutdown.
 
 The whole attempt is abandoned after 5 seconds. Do not use this on a bootstrap node (the first node in a brand-new cluster) — removing the sole member leaves the cluster with no voters.
 
@@ -528,6 +560,22 @@ if err != nil {
 
 When no `WithLogger` is set, easyraft logs through `slog.Default()` rather than staying silent, so serve-time failures are still reported.
 
+### What `Start` and `Stop` report
+
+`Store.Start`, `EasyRaft.Start`, `Manager.Start`, and their `Stop` counterparts all return an `error`. Handle it — a node that did not join the cluster it was pointed at is the difference between "my process started" and "my process is part of the cluster", and an application needs to tell those apart to fail its own startup, retry, or report unreadiness to an orchestrator.
+
+`Start` fails when `WithJoinAddr` was set and no seed accepted the join before the 30-second retry budget expired. Nothing is started in that case, so the only thing left to do is call `Stop` to release the listeners `NewStore` bound. `Manager.Start` applies the same rule per group and fails the whole Manager, because a node that silently comes up missing one of its shards gives an operator nothing to notice.
+
+The following startup failures stay out of `Start`'s return value on purpose: none of them decides whether this node participates in consensus, and none is settled by the time `Start` returns.
+
+| Not fatal | Why |
+|-----------|-----|
+| Advertising this node's HTTP address | Retried in the background until it succeeds. It only affects whether other nodes can redirect clients here; a node without an advertised address replicates normally. A leader election in progress at startup makes an early failure the common case. |
+| Serving the HTTP API | The listener is bound by `NewStore`, so a bind failure is already reported there. Anything left can only happen after the server is accepting, which is after `Start` has returned. |
+| A discovery lookup or `AddServer` | Discovery polls on an interval and retries; a peer that is missed this round is picked up on the next one. |
+
+`Stop` runs every shutdown step whatever the earlier ones reported — it must release the listeners and file handles either way — and returns the failures joined together. Two are worth acting on: a departure that did not happen under `WithLeaveOnStop` (this node is still in the committed membership and still counts towards quorum), and a storage close failure (the on-disk Raft log may not be intact, which decides whether this node can be restarted or has to be rebuilt from a peer). `Stop` is idempotent; a second call repeats the first call's verdict.
+
 ---
 
 ## HTTP API
@@ -545,7 +593,9 @@ store, _ := easyraft.NewStore(
 
 mux.HandleFunc("GET /my-route", myHandler) // add your own routes
 
-store.Start()
+if err := store.Start(); err != nil {
+    log.Fatal(err)
+}
 http.ListenAndServe(":8001", mux) // one server, no conflict
 ```
 
@@ -759,7 +809,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithPeers(map[NodeID]string)` | Static initial peer list |
 | `WithJoinAddr(addrs...)` | HTTP address(es) of seed nodes to join on startup |
 | `WithJoinAsLearner()` | Join as a non-voting learner (requires `WithJoinAddr`) |
-| `WithLeaveOnStop()` | Call `RemoveServer(self)` before shutdown for graceful departure |
+| `WithLeaveOnStop()` | Call `RemoveServer(self)` before shutdown for graceful departure; `Stop` reports a departure that did not happen |
 | `WithDiscovery(d, interval)` | Dynamic peer discovery; wires both transport and membership. Discovered peers join as learners |
 | `WithDiscoveryAsVoter()` | Add discovered peers as voters instead of learners — only with an authenticated discovery source |
 | `WithLeaseReads()` | Serve linearizable reads from the leader's read lease when valid; falls back to a quorum read otherwise |

@@ -375,8 +375,16 @@ func main() {
 		Handler: mux,
 	}
 
-	store.Start()
-	defer store.Stop()
+	if err := store.Start(); err != nil {
+		logger.Error("ledger: cannot start", "err", err)
+		_ = store.Stop()
+		os.Exit(1)
+	}
+	defer func() {
+		if err := store.Stop(); err != nil {
+			logger.Error("ledger: unclean shutdown", "err", err)
+		}
+	}()
 
 	logger.Info("ledger started", "id", *id, "raft", *raftAddr, "http", *httpAddr)
 

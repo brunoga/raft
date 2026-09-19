@@ -61,8 +61,10 @@ func TestHTTPAuth_GuardsEveryRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	er.Start()
-	defer er.Stop()
+	if startErr := er.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = er.Stop() }()
 
 	base := "http://" + httpAddr
 
@@ -245,7 +247,7 @@ func TestNewStore_ReportsHTTPBindFailure(t *testing.T) {
 				easyraft.WithLogger(quietLogger()),
 			)
 			if err == nil {
-				s.Stop()
+				_ = s.Stop()
 				t.Fatal("a failed HTTP bind was not reported to the caller")
 			}
 			if !strings.Contains(err.Error(), "listen http") {
@@ -285,7 +287,7 @@ func TestManager_SharedPrometheusRegistryAcrossGroups(t *testing.T) {
 	if err := mgr.Start(); err != nil {
 		t.Fatalf("Start with %d groups sharing one registry: %v", groups, err)
 	}
-	defer mgr.Stop()
+	defer func() { _ = mgr.Stop() }()
 
 	// Each group should be able to report its own series.
 	deadline := time.Now().Add(10 * time.Second)
@@ -342,7 +344,7 @@ func TestManager_StaticPeersAreReportedWithTheirRaftAddress(t *testing.T) {
 	if startErr := mgr.Start(); startErr != nil {
 		t.Fatal(startErr)
 	}
-	defer mgr.Stop()
+	defer func() { _ = mgr.Stop() }()
 
 	resp, err := http.Get("http://" + httpAddr + "/groups/7/members")
 	if err != nil {
@@ -419,7 +421,7 @@ func TestManager_StartDoesNotHoldTheLockAcrossJoins(t *testing.T) {
 	go func() { started <- mgr.Start() }()
 	defer func() {
 		<-started
-		mgr.Stop()
+		_ = mgr.Stop()
 	}()
 
 	// While the join is in flight, the Manager must still answer.
@@ -458,8 +460,10 @@ func TestStore_ExactlyOnceViaSessionIsRetrySafe(t *testing.T) {
 		c.Value++
 		return c, nil, nil
 	})
-	store.Start()
-	defer store.Stop()
+	if startErr := store.Start(); startErr != nil {
+		t.Fatalf("Start: %v", startErr)
+	}
+	defer func() { _ = store.Stop() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -529,7 +533,7 @@ func TestStore_StopBeforeStartReleasesResources(t *testing.T) {
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		s.Stop()
+		_ = s.Stop()
 	}()
 
 	select {
