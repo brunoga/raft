@@ -18,6 +18,9 @@ type recordingMetrics struct {
 	latencies []time.Duration
 	outcomes  []bool
 	snapshots []int
+
+	storage           map[string]int
+	negativeDurations int
 }
 
 func (m *recordingMetrics) StateChange(raft.NodeID, raft.State, raft.State, raft.Term) {}
@@ -27,6 +30,28 @@ func (m *recordingMetrics) SnapshotTaken(_ raft.NodeID, _ raft.Index, sizeBytes 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.snapshots = append(m.snapshots, sizeBytes)
+}
+
+func (m *recordingMetrics) StorageWrite(_ raft.NodeID, op string, d time.Duration, _ error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.storage == nil {
+		m.storage = make(map[string]int)
+	}
+	m.storage[op]++
+	if d < 0 {
+		m.negativeDurations++
+	}
+}
+
+func (m *recordingMetrics) storageWrites() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]int, len(m.storage))
+	for k, v := range m.storage {
+		out[k] = v
+	}
+	return out
 }
 
 func (m *recordingMetrics) ProposalCompleted(_ raft.NodeID, latency time.Duration, ok bool) {
@@ -198,6 +223,39 @@ func TestSnapshotMetrics_ReportTheirRealSize(t *testing.T) {
 	for i, size := range sizes {
 		if size < 4096 {
 			t.Errorf("snapshot %d reported %d bytes; the state machine alone writes 4096", i, size)
+		}
+	}
+}
+
+// TestStorageMetrics_ReportsDurableWrites asserts that the writes the event
+// loop waits on are timed and reported.
+//
+// These are the ones that matter: a slow disk delays the term and vote write
+// and the log append, and with them heartbeats and every inbound RPC. Without
+// this, a node whose disk has degraded looks identical to one on a slow
+// network.
+func TestStorageMetrics_ReportsDurableWrites(t *testing.T) {
+	ctx := context.Background()
+	m := &recordingMetrics{}
+	node := metricsNode(t, m, func(cfg *raft.Config) {
+		cfg.SnapshotThreshold = 4
+	})
+
+	for range 8 {
+		if _, err := node.Propose(ctx, []byte("x")); err != nil {
+			t.Fatalf("propose: %v", err)
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for node.SnapshotIndex() == 0 && time.Now().Before(deadline) {
+		node.Tick()
+		time.Sleep(time.Millisecond)
+	}
+
+	writes := m.storageWrites()
+	for _, op := range []string{"hardstate", "append", "snapshot"} {
+		if writes[op] == 0 {
+			t.Errorf("no %q write was reported; observed %v", op, writes)
 		}
 	}
 }

@@ -270,7 +270,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 	}
 
 	if len(entries) > 0 {
-		if err := n.log.append(n.stopCtx, entries); err != nil {
+		if err := n.appendEntries(n.stopCtx, entries); err != nil {
 			// A leader that cannot write its own log cannot make progress, and
 			// entries it believes it appended may or may not be there.
 			n.fail(err, "append proposed entries")

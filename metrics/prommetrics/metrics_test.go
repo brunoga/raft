@@ -1,11 +1,14 @@
 package prommetrics_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/metrics/prommetrics"
@@ -207,4 +210,154 @@ func TestNew_NilRegisterer(t *testing.T) {
 	m.StateChange("n1", raft.Follower, raft.Leader, 1)
 	m.CommitAdvanced("n1", 3)
 	m.SnapshotTaken("n1", 3, 128)
+}
+
+// TestStorageWrite_RecordsDurationAndOutcome asserts that durable writes are
+// timed and counted, separately per operation and outcome.
+//
+// A disk that has become slow shows up here before anywhere else, and it is
+// what distinguishes "the network is slow" from "this node's disk is slow"
+// when proposal latency rises with nothing in the Raft state to explain it.
+func TestStorageWrite_RecordsDurationAndOutcome(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := prommetrics.New(reg)
+
+	m.StorageWrite("n1", "append", 5*time.Millisecond, nil)
+	m.StorageWrite("n1", "append", 7*time.Millisecond, nil)
+	m.StorageWrite("n1", "hardstate", 2*time.Millisecond, errors.New("disk gone"))
+
+	if got := counterValue(t, reg, "raft_storage_writes_total",
+		map[string]string{"node": "n1", "op": "append", "outcome": "ok"}); got != 2 {
+		t.Errorf("successful appends counted %v, want 2", got)
+	}
+	if got := counterValue(t, reg, "raft_storage_writes_total",
+		map[string]string{"node": "n1", "op": "hardstate", "outcome": "failed"}); got != 1 {
+		t.Errorf("failed hard-state writes counted %v, want 1", got)
+	}
+	// A failed write must not be filed under the successful operation.
+	if got := counterValue(t, reg, "raft_storage_writes_total",
+		map[string]string{"node": "n1", "op": "hardstate", "outcome": "ok"}); got != 0 {
+		t.Errorf("a failed write was counted as successful (%v)", got)
+	}
+}
+
+// fakeNode reports fixed indices.
+type fakeNode struct {
+	id      raft.NodeID
+	commit  raft.Index
+	applied raft.Index
+}
+
+func (f fakeNode) ID() raft.NodeID         { return f.id }
+func (f fakeNode) CommitIndex() raft.Index { return f.commit }
+func (f fakeNode) LastApplied() raft.Index { return f.applied }
+
+// TestTrack_ReportsApplyLagAtScrapeTime asserts that a tracked node's progress
+// is read when the registry is scraped.
+//
+// The gap between committing and applying is the one number that says whether
+// a node is keeping up, and it cannot be derived from the event-driven metrics:
+// those say what happened, not how far behind the state machine is now. A node
+// that commits happily while its state machine falls further behind looks
+// healthy in every other series.
+func TestTrack_ReportsApplyLagAtScrapeTime(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := prommetrics.New(reg)
+
+	m.Track(fakeNode{id: "n1", commit: 100, applied: 60})
+
+	if got := gaugeValue(t, reg, "raft_apply_lag", map[string]string{"node": "n1"}); got != 40 {
+		t.Errorf("raft_apply_lag = %v, want 40", got)
+	}
+	if got := gaugeValue(t, reg, "raft_progress_commit_index", map[string]string{"node": "n1"}); got != 100 {
+		t.Errorf("raft_progress_commit_index = %v, want 100", got)
+	}
+	if got := gaugeValue(t, reg, "raft_progress_last_applied", map[string]string{"node": "n1"}); got != 60 {
+		t.Errorf("raft_progress_last_applied = %v, want 60", got)
+	}
+}
+
+// TestTrack_LagIsNeverNegative guards the moment between the apply loop
+// advancing and the commit index being read, where applied can briefly read
+// higher than commit.
+func TestTrack_LagIsNeverNegative(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	m := prommetrics.New(reg)
+
+	m.Track(fakeNode{id: "n1", commit: 10, applied: 12})
+
+	if got := gaugeValue(t, reg, "raft_apply_lag", map[string]string{"node": "n1"}); got != 0 {
+		t.Errorf("raft_apply_lag = %v, want 0", got)
+	}
+}
+
+// TestTrack_SeveralGroupsOnOneRegistry asserts that tracking nodes from more
+// than one group works, which is the case that makes these collectors
+// unchecked.
+func TestTrack_SeveralGroupsOnOneRegistry(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	g1 := prommetrics.NewForGroup(reg, 1)
+	g2 := prommetrics.NewForGroup(reg, 2)
+
+	g1.Track(fakeNode{id: "n1", commit: 10, applied: 4})
+	g2.Track(fakeNode{id: "n1", commit: 20, applied: 20})
+
+	if got := gaugeValue(t, reg, "raft_apply_lag",
+		map[string]string{"node": "n1", "group": "1"}); got != 6 {
+		t.Errorf("group 1 apply lag = %v, want 6", got)
+	}
+	if got := gaugeValue(t, reg, "raft_apply_lag",
+		map[string]string{"node": "n1", "group": "2"}); got != 0 {
+		t.Errorf("group 2 apply lag = %v, want 0", got)
+	}
+}
+
+// counterValue returns the value of a counter series matching labels.
+func counterValue(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string) float64 {
+	t.Helper()
+	return seriesValue(t, g, name, labels, func(m *dto.Metric) float64 {
+		return m.GetCounter().GetValue()
+	})
+}
+
+// gaugeValue returns the value of a gauge series matching labels.
+func gaugeValue(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string) float64 {
+	t.Helper()
+	return seriesValue(t, g, name, labels, func(m *dto.Metric) float64 {
+		return m.GetGauge().GetValue()
+	})
+}
+
+// seriesValue gathers and finds the one series of name whose labels are a
+// superset of labels. A missing series reads as 0, which lets a test assert
+// that nothing was recorded under a label set.
+func seriesValue(t *testing.T, g prometheus.Gatherer, name string, labels map[string]string, read func(*dto.Metric) float64) float64 {
+	t.Helper()
+
+	families, err := g.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			have := make(map[string]string, len(m.GetLabel()))
+			for _, l := range m.GetLabel() {
+				have[l.GetName()] = l.GetValue()
+			}
+			matched := true
+			for k, v := range labels {
+				if have[k] != v {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return read(m)
+			}
+		}
+	}
+	return 0
 }

@@ -163,6 +163,18 @@ type Node struct {
 	// is counted implicitly when evaluating quorum.
 	quorumAcks map[NodeID]bool
 
+	// termStartIndex is the index of the no-op this node appended when it
+	// became leader, and so the first index in its own term. Zero when not
+	// leading.
+	//
+	// Everything at or above it was appended by this node in the current term:
+	// a leader only ever appends its own entries, and one that accepts an
+	// AppendEntries has already stepped down. Everything below it is from an
+	// earlier term and can never be committed by replica count (Raft 5.4.2).
+	// That makes it the exact lower bound for the commit scan, and removes the
+	// need to read each entry's term back from storage.
+	termStartIndex Index
+
 	// --- Leadership transfer state (leader only) ----------------------------
 	transferTarget  NodeID // non-empty while a transfer is in progress
 	transferElapsed int    // ticks since transfer was initiated
@@ -229,6 +241,12 @@ type Node struct {
 	// Cleared on becomeFollower so a stale partial install cannot be completed
 	// by a message from a previous leader after an election.
 	pendingSnap *partialSnapshot
+
+	// snapshotWriteWg tracks background snapshot writers started for a
+	// captured state machine. Stop waits on it so that a writer holding a
+	// capture and the storage backend has finished before the node is
+	// considered stopped.
+	snapshotWriteWg sync.WaitGroup
 
 	// snapshotInstallWg tracks all live runSnapshotInstall goroutines.
 	// Stop() waits on this WaitGroup so that those goroutines — which hold
@@ -669,6 +687,7 @@ func (n *Node) Stop() {
 		// cancelled their contexts, so they exit quickly; we just need to be sure
 		// they have released all references before we return.
 		n.snapshotInstallWg.Wait()
+		n.snapshotWriteWg.Wait()
 		n.closeWatchers()
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
@@ -703,6 +722,9 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	// Non-blocking pre-check: if the node is stopped or broken, return
 	// immediately rather than racing with a buffered proposeCh.
 	if err := n.checkRunning(); err != nil {
+		return nil, err
+	}
+	if err := n.checkProposalSize(len(cmd)); err != nil {
 		return nil, err
 	}
 
@@ -1219,10 +1241,13 @@ func (n *Node) Term() Term {
 // saveTerm persists currentTerm+votedFor atomically then updates the cache.
 // Must be called from the event-loop goroutine only.
 func (n *Node) saveTerm(term Term, votedFor NodeID) error {
-	if err := n.cfg.Storage.SaveHardState(n.stopCtx, HardState{
+	started := n.now()
+	err := n.cfg.Storage.SaveHardState(n.stopCtx, HardState{
 		CurrentTerm: term,
 		VotedFor:    votedFor,
-	}); err != nil {
+	})
+	n.reportStorageWriteSince("hardstate", started, err)
+	if err != nil {
 		n.fail(err, "persist term and vote")
 		return fmt.Errorf("saveTerm: %w", err)
 	}
@@ -1272,6 +1297,40 @@ func (n *Node) resetElectionTimeout() {
 	n.electionElapsed = 0
 }
 
+// writeSnapshot streams a snapshot into storage and reports what it cost.
+// write does the state-machine half; everything around it is the same whether
+// the state was captured first or is being serialised in place.
+func (n *Node) writeSnapshot(trig *snapshotTrigger, write func(context.Context, io.Writer) error) snapshotResult {
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
+	}()
+
+	// Count the bytes on the way past. The size of a snapshot is the main
+	// thing that decides how long a lagging follower takes to catch up, so it
+	// is worth reporting, and this is the only place that sees it.
+	counter := &countingWriter{w: pw}
+	started := n.now()
+	serr := writeWrappedSnapshot(counter, trig.clientTable, &trig.membership, func(w io.Writer) error {
+		return write(n.stopCtx, w)
+	})
+	_ = pw.Close() // signals EOF to SaveSnapshot
+
+	saveErr := <-errCh
+	if serr == nil {
+		serr = saveErr
+	}
+
+	return snapshotResult{
+		meta:       trig.meta,
+		membership: trig.membership,
+		sizeBytes:  counter.n,
+		duration:   n.now().Sub(started),
+		err:        serr,
+	}
+}
+
 // countingWriter counts the bytes written through it.
 type countingWriter struct {
 	w io.Writer
@@ -1282,6 +1341,34 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	written, err := c.w.Write(p)
 	c.n += int64(written)
 	return written, err
+}
+
+// reportStorageWrite tells a StorageMetrics implementation how long a durable
+// write took. A no-op unless Config.Metrics also implements it.
+func (n *Node) reportStorageWrite(op string, d time.Duration, err error) {
+	if n.cfg.Metrics == nil {
+		return
+	}
+	sm, isStorageMetrics := n.cfg.Metrics.(StorageMetrics)
+	if !isStorageMetrics {
+		return
+	}
+	sm.StorageWrite(n.cfg.ID, op, d, err)
+}
+
+// reportStorageWriteSince is reportStorageWrite for a write that has just
+// finished and whose start time the caller holds.
+func (n *Node) reportStorageWriteSince(op string, started time.Time, err error) {
+	n.reportStorageWrite(op, n.now().Sub(started), err)
+}
+
+// appendEntries writes entries to the log and reports what the write cost.
+// Every append the event loop waits on goes through here.
+func (n *Node) appendEntries(ctx context.Context, entries []LogEntry) error {
+	started := n.now()
+	err := n.log.append(ctx, entries)
+	n.reportStorageWriteSince("append", started, err)
+	return err
 }
 
 // reportProposal tells a ProposalMetrics implementation how a proposal ended.
@@ -1295,6 +1382,50 @@ func (n *Node) reportProposal(submitted time.Time, ok bool) {
 		return
 	}
 	pm.ProposalCompleted(n.cfg.ID, n.now().Sub(submitted), ok)
+}
+
+// proposalLimit returns the largest command this node will accept, or 0 when
+// no limit applies. Config.MaxProposalBytes wins; otherwise the transport is
+// asked, leaving headroom for the framing that surrounds the command on the
+// wire.
+func (n *Node) proposalLimit() int {
+	if n.cfg.MaxProposalBytes > 0 {
+		return n.cfg.MaxProposalBytes
+	}
+	limiter, ok := n.cfg.Transport.(MessageSizeLimiter)
+	if !ok {
+		return 0
+	}
+	limit := limiter.MaxMessageBytes()
+	if limit <= 0 {
+		return 0
+	}
+	// The command is not the whole message: the request carries the term, the
+	// leader ID, the previous-log fields and each entry's own header, and the
+	// transport adds its framing on top. Reserve a slice of the budget for all
+	// of that rather than accepting a command that only just fits on paper.
+	reserved := limit / 16
+	if reserved < proposalFramingReserve {
+		reserved = proposalFramingReserve
+	}
+	if reserved >= limit {
+		return 0
+	}
+	return limit - reserved
+}
+
+// proposalFramingReserve is the minimum headroom left for request and entry
+// framing when deriving a proposal limit from the transport.
+const proposalFramingReserve = 4096
+
+// checkProposalSize reports whether a command of this size can be replicated.
+func (n *Node) checkProposalSize(size int) error {
+	limit := n.proposalLimit()
+	if limit > 0 && size > limit {
+		return fmt.Errorf("%w: %d bytes exceeds the %d the transport can carry",
+			ErrProposalTooLarge, size, limit)
+	}
+	return nil
 }
 
 // trailingLogs returns how many entries to retain behind the snapshot point,
@@ -1526,38 +1657,40 @@ func (n *Node) applyLoop() {
 			localClientTable = n.applyRestore(ctx, si, &localLastApplied, localClientTable)
 
 		case trig := <-n.snapshotTriggerCh:
-			// Take the snapshot here in applyLoop so Snapshot() and Apply()
-			// are never concurrent on the same state machine.
-			pr, pw := io.Pipe()
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
-			}()
-
-			// Count the bytes on the way past. The size of a snapshot is the
-			// main thing that decides how long a lagging follower takes to
-			// catch up, so it is worth reporting, and this is the only place
-			// that sees it.
-			counter := &countingWriter{w: pw}
-			started := n.now()
-			serr := writeWrappedSnapshot(counter, trig.clientTable, &trig.membership, func(w io.Writer) error {
-				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
-			})
-			_ = pw.Close() // signals EOF to SaveSnapshot
-
-			saveErr := <-errCh
-			if serr == nil {
-				serr = saveErr
+			// A state machine that can hand over a point-in-time capture
+			// cheaply lets the serialisation move off this goroutine, so
+			// entries keep applying while the snapshot is written. Otherwise
+			// Snapshot runs here, because it must not run concurrently with
+			// Apply, and apply waits for it.
+			if capturer, ok := n.cfg.StateMachine.(SnapshotCapturer); ok {
+				captured, err := capturer.Capture(ctx)
+				if err != nil {
+					n.logger.Error("snapshot: capture failed", "err", err)
+					select {
+					case n.snapshotResultCh <- snapshotResult{meta: trig.meta, err: err}:
+					case <-n.stopCh:
+						return
+					}
+					continue
+				}
+				n.snapshotWriteWg.Add(1)
+				go func(trig snapshotTrigger, captured Snapshot) {
+					defer n.snapshotWriteWg.Done()
+					defer captured.Release()
+					res := n.writeSnapshot(&trig, captured.Write)
+					select {
+					case n.snapshotResultCh <- res:
+					case <-n.stopCh:
+					}
+				}(trig, captured)
+				continue
 			}
 
+			res := n.writeSnapshot(&trig, func(wctx context.Context, w io.Writer) error {
+				return n.cfg.StateMachine.Snapshot(wctx, w)
+			})
 			select {
-			case n.snapshotResultCh <- snapshotResult{
-				meta:       trig.meta,
-				membership: trig.membership,
-				sizeBytes:  counter.n,
-				duration:   n.now().Sub(started),
-				err:        serr,
-			}:
+			case n.snapshotResultCh <- res:
 			case <-n.stopCh:
 				return
 			}
