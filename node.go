@@ -633,12 +633,17 @@ func New(cfg *Config) (*Node, error) {
 // For deterministic tests set TickInterval to 0 and call Tick() manually.
 func (n *Node) Start() {
 	n.startOnce.Do(func() {
+		// Read the term before the goroutines start. Once the event loop is
+		// running it owns currentTerm, and it can change it within microseconds
+		// of starting -- an election timeout is all it takes.
+		term := n.currentTerm
+
 		go n.run()
 		go n.applyLoop()
 		if n.cfg.TickInterval > 0 {
 			go n.tickerLoop()
 		}
-		n.logger.Info("started", "term", n.currentTerm)
+		n.logger.Info("started", "term", term)
 	})
 }
 
