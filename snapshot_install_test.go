@@ -114,8 +114,8 @@ func snapshotPayload(t *testing.T) []byte {
 		time.Sleep(time.Millisecond)
 	}
 	for range 3 {
-		if _, err := node.Propose(context.Background(), []byte("x")); err != nil {
-			t.Fatalf("propose: %v", err)
+		if _, proposeErr := node.Propose(context.Background(), []byte("x")); proposeErr != nil {
+			t.Fatalf("propose: %v", proposeErr)
 		}
 	}
 	for node.SnapshotIndex() == 0 {
