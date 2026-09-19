@@ -452,13 +452,25 @@ func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf
 // on a majority) and advances commitIndex if so. During joint consensus a
 // commit requires a majority of both C_old and C_new independently.
 func (n *Node) maybeAdvanceCommit() {
+	if n.state != Leader || n.termStartIndex == 0 {
+		return
+	}
+
 	// Find the highest N such that the required quorum have matchIndex >= N and
 	// log[N].term == currentTerm.
-	for idx := n.log.lastLogIndex(); idx > n.commitIndex; idx-- {
-		t, err := n.log.termAt(n.stopCtx, idx)
-		if err != nil || t != n.currentTerm {
-			continue
-		}
+	//
+	// The scan stops at the first index of this leader's term rather than
+	// walking down to commitIndex: an entry from an earlier term can never be
+	// committed by replica count (Raft 5.4.2), so there is nothing below that
+	// point worth testing. Everything at or above it is this leader's own
+	// entry, in the current term, which is what makes the term check
+	// unnecessary -- and with it the storage read that used to be done for
+	// every index on every acknowledgement.
+	lo := n.commitIndex + 1
+	if n.termStartIndex > lo {
+		lo = n.termStartIndex
+	}
+	for idx := n.log.lastLogIndex(); idx >= lo; idx-- {
 		var committed bool
 		if n.jointOld == nil {
 			// Normal single-config majority. Self is always a member.
