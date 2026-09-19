@@ -256,3 +256,47 @@ func TestWithMaxMessageSize_RaisesLimit(t *testing.T) {
 		t.Fatalf("InstallSnapshot under the configured limit: %v", err)
 	}
 }
+
+// TestMaxMessageBytes_ReportsTheConfiguredLimit asserts that the transport
+// tells the node how large a message it can carry.
+//
+// The node uses this to refuse a proposal it could never replicate. A transport
+// that does not answer leaves the node with no limit at all, which is how an
+// oversized command reaches the log and jams it.
+func TestMaxMessageBytes_ReportsTheConfiguredLimit(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		tr, err := grpctransport.Listen("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = tr.Close() })
+
+		if got := tr.MaxMessageBytes(); got != grpctransport.DefaultMaxMessageSize {
+			t.Errorf("MaxMessageBytes() = %d, want the default %d",
+				got, grpctransport.DefaultMaxMessageSize)
+		}
+	})
+
+	t.Run("configured", func(t *testing.T) {
+		const limit = 8 << 20
+		tr, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithMaxMessageSize(limit))
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = tr.Close() })
+
+		if got := tr.MaxMessageBytes(); got != limit {
+			t.Errorf("MaxMessageBytes() = %d, want %d", got, limit)
+		}
+	})
+
+	t.Run("satisfies the interface", func(t *testing.T) {
+		tr, err := grpctransport.Listen("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = tr.Close() })
+
+		var _ raft.MessageSizeLimiter = tr
+	})
+}

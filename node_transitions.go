@@ -34,6 +34,7 @@ func (n *Node) applyFollowerTransition(leaderID NodeID) {
 	n.transferTarget = ""
 	n.transferElapsed = 0
 	n.pendingConfigIndex = 0
+	n.termStartIndex = 0
 	n.leaderNopCommitted = false
 	// Reject all in-flight client proposals. If an uncommitted entry is later
 	// overwritten by a new leader at the same log index, the apply goroutine
@@ -178,6 +179,7 @@ func (n *Node) becomeLeader() {
 		return
 	}
 
+	n.termStartIndex = noop.Index
 	n.broadcastHeartbeat()
 	// For single-node clusters the noop commits immediately (quorum = 1).
 	// For multi-node clusters this advances the commit index once the noop
