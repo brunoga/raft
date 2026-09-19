@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"slices"
 	"sync"
 
@@ -455,9 +454,10 @@ func (m *Manager) TransferGroupLeadership(ctx context.Context, groupID uint64, t
 // initRaftForManager is a modified initRaft that uses a shared transport.
 func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	// Storage
-	if err := os.MkdirAll(s.cfg.DataDir, 0o755); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
-	}
+	// filestore.Open creates the directory itself, and makes the creation
+	// durable by fsyncing the parents it had to create. Creating it here first
+	// would leave the store nothing to create, so that durability would be
+	// skipped and the directory's own name would never be fsynced.
 	st, err := filestore.Open(s.cfg.DataDir)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)

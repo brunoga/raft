@@ -327,8 +327,8 @@ func OpenWithSegmentSize(dir string, size int64) (*FileStore, error) {
 }
 
 func openWith(dir string, segSize int64) (*FileStore, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("filestore: mkdir %s: %w", dir, err)
+	if err := mkdirAllSync(dir, 0o700); err != nil {
+		return nil, err
 	}
 
 	// Complete or roll back any interrupted TruncatePrefix Phase 2 operations
@@ -1689,6 +1689,59 @@ func openFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("filestore: open %s: %w", path, err)
 	}
 	return f, nil
+}
+
+// mkdirAllSync creates dir and any missing parents, and makes each creation
+// durable before returning.
+//
+// os.MkdirAll alone is not enough. A directory's name lives in its parent, so
+// the parent is what has to be fsynced for the creation to survive a crash --
+// exactly the rule syncDir exists to enforce for files, applied one level up.
+// Without it the data directory itself is the unsynced name: a node can create
+// it, write a vote and a run of log entries, fsync every one of those files
+// and acknowledge them, then crash and come back to find the whole directory
+// absent. It would rejoin with the same ID, an empty log and no record of its
+// vote, which is the one thing Raft's safety argument assumes storage never
+// does.
+//
+// The window is narrow -- first start on a fresh data directory -- but it is
+// the start of a node's life, when it is most likely to be one of several
+// coming up at once and casting the votes that elect the first leader.
+func mkdirAllSync(dir string, perm os.FileMode) error {
+	// Collect the missing suffix of the path, deepest first, stopping at the
+	// first ancestor that already exists.
+	var created []string
+	for p := filepath.Clean(dir); ; {
+		_, err := os.Stat(p)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("filestore: stat %s: %w", p, err)
+		}
+		created = append(created, p)
+		parent := filepath.Dir(p)
+		if parent == p {
+			break // reached the root, which cannot itself be created
+		}
+		p = parent
+	}
+
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return fmt.Errorf("filestore: mkdir %s: %w", dir, err)
+	}
+
+	// Shallowest first, so that a directory's own name is durable before
+	// anything inside it is. Each created directory is made durable by syncing
+	// the directory that holds its name; for the shallowest that is the
+	// pre-existing ancestor the loop above stopped at.
+	for i := len(created) - 1; i >= 0; i-- {
+		if err := syncDir(filepath.Dir(created[i])); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // syncDir fsyncs the directory itself to make create/rename/unlink operations
