@@ -41,6 +41,15 @@ Other knobs:
 | `RAFT_SIM_ITERS` | Randomized iterations per chaos profile. Defaults to 1 so that `go test ./...` stays under a minute. |
 | `RAFT_SIM_LONG=1` | Soak mode: many more iterations, each running much longer. |
 
+Soak runs need a longer deadline than the ten minutes `go test` allows by
+default, or they are killed part-way through and report a goroutine dump rather
+than a result:
+
+```sh
+RAFT_SIM_LONG=1 RAFT_SIM_ITERS=40 go test -race -timeout 60m \
+    -run 'TestSimChaos|TestSimLinearizability' .
+```
+
 Every invariant violation fails the test. If a run turns up a defect that
 cannot be fixed immediately, add a test that constructs it deliberately rather
 than relaxing the checker — a checker that tolerates one shape of violation
