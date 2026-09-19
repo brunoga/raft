@@ -19,6 +19,16 @@ var ErrStopped = errors.New("raft: node is stopped")
 type proposeMsg struct {
 	cmd    []byte
 	respCh chan<- result[[]byte]
+	// submitted is when the caller handed the command over, so that reported
+	// latency includes the time spent queued for the event loop -- which is
+	// time the caller waited, and is exactly what gets long under load.
+	submitted time.Time
+}
+
+// pendingProposal is a proposal waiting for its entry to be applied.
+type pendingProposal struct {
+	promise   promise[[]byte]
+	submitted time.Time
 }
 
 // rpcEnvelope wraps any inbound RPC together with a one-shot response channel.
@@ -189,7 +199,7 @@ type Node struct {
 	applyAdvancedCh chan struct{}
 
 	// --- Pending proposals (leader only) ------------------------------------
-	pending map[Index]promise[[]byte]
+	pending map[Index]pendingProposal
 
 	// --- Synchronisation ----------------------------------------------------
 	startOnce sync.Once
@@ -576,7 +586,7 @@ func New(cfg *Config) (*Node, error) {
 		snapshotTriggerCh: make(chan snapshotTrigger, 1),
 		snapshotResultCh:  make(chan snapshotResult, 1),
 		restoreSnapshotCh: make(chan snapshotInstall, 1),
-		pending:           make(map[Index]promise[[]byte]),
+		pending:           make(map[Index]pendingProposal),
 		clientTable:       newClientLRU(cfg.MaxClientTableSize),
 		rng:               rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
@@ -697,7 +707,7 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	}
 
 	respCh := make(chan result[[]byte], 1)
-	msg := proposeMsg{cmd: cmd, respCh: respCh}
+	msg := proposeMsg{cmd: cmd, respCh: respCh, submitted: n.now()}
 	select {
 	case n.proposeCh <- msg:
 	case <-ctx.Done():
@@ -1262,6 +1272,31 @@ func (n *Node) resetElectionTimeout() {
 	n.electionElapsed = 0
 }
 
+// countingWriter counts the bytes written through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	written, err := c.w.Write(p)
+	c.n += int64(written)
+	return written, err
+}
+
+// reportProposal tells a ProposalMetrics implementation how a proposal ended.
+// Event-loop only; a no-op unless Config.Metrics also implements it.
+func (n *Node) reportProposal(submitted time.Time, ok bool) {
+	if submitted.IsZero() || n.cfg.Metrics == nil {
+		return
+	}
+	pm, isProposalMetrics := n.cfg.Metrics.(ProposalMetrics)
+	if !isProposalMetrics {
+		return
+	}
+	pm.ProposalCompleted(n.cfg.ID, n.now().Sub(submitted), ok)
+}
+
 // trailingLogs returns how many entries to retain behind the snapshot point,
 // capped so that compaction always reclaims something.
 func (n *Node) trailingLogs() Index {
@@ -1499,7 +1534,13 @@ func (n *Node) applyLoop() {
 				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
 			}()
 
-			serr := writeWrappedSnapshot(pw, trig.clientTable, &trig.membership, func(w io.Writer) error {
+			// Count the bytes on the way past. The size of a snapshot is the
+			// main thing that decides how long a lagging follower takes to
+			// catch up, so it is worth reporting, and this is the only place
+			// that sees it.
+			counter := &countingWriter{w: pw}
+			started := n.now()
+			serr := writeWrappedSnapshot(counter, trig.clientTable, &trig.membership, func(w io.Writer) error {
 				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
 			})
 			_ = pw.Close() // signals EOF to SaveSnapshot
@@ -1513,6 +1554,8 @@ func (n *Node) applyLoop() {
 			case n.snapshotResultCh <- snapshotResult{
 				meta:       trig.meta,
 				membership: trig.membership,
+				sizeBytes:  counter.n,
+				duration:   n.now().Sub(started),
 				err:        serr,
 			}:
 			case <-n.stopCh:

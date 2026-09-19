@@ -113,3 +113,25 @@ type Metrics interface {
 	// SnapshotTaken is called after a snapshot is successfully persisted.
 	SnapshotTaken(id NodeID, lastIncludedIndex Index, sizeBytes int)
 }
+
+// ProposalMetrics is an optional interface that a Config.Metrics implementation
+// may also satisfy. When it does, the node reports how long each proposal took
+// and whether it succeeded.
+//
+// This is the number an operator actually watches: how long a write takes from
+// being submitted to being applied, covering the queue at the event loop, the
+// durable append, the replication round-trip and the state machine. None of
+// that is visible from the commit index alone, and the parts of it that get
+// slow -- a stalling disk, one lagging follower -- are exactly the ones worth
+// alerting on.
+//
+// It is a separate interface so that adding it does not break existing Metrics
+// implementations. Implementations must not block; they are called from the
+// event-loop goroutine.
+type ProposalMetrics interface {
+	// ProposalCompleted is called once per proposal, with the time from
+	// submission to the proposal being resolved. ok is false when the proposal
+	// failed, including when it was rejected because this node is not the
+	// leader.
+	ProposalCompleted(id NodeID, latency time.Duration, ok bool)
+}

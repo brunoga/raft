@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 )
 
 // ---- Snapshotting -----------------------------------------------------------
@@ -98,7 +99,12 @@ type snapshotResult struct {
 	// membership is the membership written into the snapshot; it becomes the
 	// new base once the log prefix it covers is truncated away.
 	membership membershipState
-	err        error
+	// sizeBytes is how much the snapshot came to on the wire, and duration how
+	// long it took to produce. Both are only observable while it is being
+	// written, so they are carried back rather than recomputed.
+	sizeBytes int64
+	duration  time.Duration
+	err       error
 }
 
 // snapshotInstall is sent from the event loop to the apply goroutine when an
@@ -460,9 +466,11 @@ func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 	n.log.snapMeta = sr.meta
 	n.baseMembership = sr.membership
 	n.atomicSnapshotIndex.Store(uint64(sr.meta.LastIncludedIndex))
-	n.logger.Info("snapshot saved", "index", sr.meta.LastIncludedIndex, "term", sr.meta.LastIncludedTerm)
+	n.logger.Info("snapshot saved",
+		"index", sr.meta.LastIncludedIndex, "term", sr.meta.LastIncludedTerm,
+		"bytes", sr.sizeBytes, "took", sr.duration)
 	if n.cfg.Metrics != nil {
-		n.cfg.Metrics.SnapshotTaken(n.cfg.ID, sr.meta.LastIncludedIndex, 0) // size unknown without more plumbing
+		n.cfg.Metrics.SnapshotTaken(n.cfg.ID, sr.meta.LastIncludedIndex, int(sr.sizeBytes))
 	}
 }
 

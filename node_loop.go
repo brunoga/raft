@@ -212,6 +212,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		for _, prop := range props {
 			p := promise[[]byte]{ch: prop.respCh}
 			p.reject(&NotLeaderError{Leader: n.leaderID})
+			n.reportProposal(prop.submitted, false)
 		}
 		return
 	}
@@ -219,6 +220,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		for _, prop := range props {
 			p := promise[[]byte]{ch: prop.respCh}
 			p.reject(ErrLeadershipTransferInProgress)
+			n.reportProposal(prop.submitted, false)
 		}
 		return
 	}
@@ -228,6 +230,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
 			p := promise[[]byte]{ch: prop.respCh}
 			p.reject(ErrConfigChangeInProgress)
+			n.reportProposal(prop.submitted, false)
 			continue
 		}
 
@@ -239,12 +242,14 @@ func (n *Node) handleProposals(props []proposeMsg) {
 					if seqNum < cached.seqNum {
 						p := promise[[]byte]{ch: prop.respCh}
 						p.reject(ErrObsoleteSeqNum)
+						n.reportProposal(prop.submitted, false)
 						continue
 					}
 					if seqNum == cached.seqNum {
 						// Exact duplicate — return the cached result without re-appending.
 						p := promise[[]byte]{ch: prop.respCh}
 						p.resolve(cached.result)
+						n.reportProposal(prop.submitted, true)
 						continue
 					}
 					// seqNum > cached.seqNum — new request; fall through to normal propose.
@@ -255,7 +260,10 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		idx := n.log.lastLogIndex() + Index(len(entries)) + 1
 		entry := LogEntry{Index: idx, Term: n.currentTerm, Command: prop.cmd}
 		entries = append(entries, entry)
-		n.pending[idx] = promise[[]byte]{ch: prop.respCh}
+		n.pending[idx] = pendingProposal{
+			promise:   promise[[]byte]{ch: prop.respCh},
+			submitted: prop.submitted,
+		}
 		if isConfigEntry(prop.cmd) {
 			n.pendingConfigIndex = idx
 		}
@@ -269,7 +277,8 @@ func (n *Node) handleProposals(props []proposeMsg) {
 			// Fail all in-flight entries in this batch.
 			for _, entry := range entries {
 				if p, ok := n.pending[entry.Index]; ok {
-					p.reject(fmt.Errorf("propose: append: %w", err))
+					p.promise.reject(fmt.Errorf("propose: append: %w", err))
+					n.reportProposal(p.submitted, false)
 					delete(n.pending, entry.Index)
 				}
 				if n.pendingConfigIndex == entry.Index {
@@ -326,10 +335,11 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 	p, ok := n.pending[ar.index]
 	if ok {
 		if ar.err != nil {
-			p.reject(ar.err)
+			p.promise.reject(ar.err)
 		} else {
-			p.resolve(ar.val)
+			p.promise.resolve(ar.val)
 		}
+		n.reportProposal(p.submitted, ar.err == nil)
 		delete(n.pending, ar.index)
 	}
 	n.maybeSnapshot()
@@ -362,7 +372,8 @@ func (n *Node) notifyApply() {
 // drainPending rejects all in-flight proposals with the given error.
 func (n *Node) drainPending(err error) {
 	for idx, p := range n.pending {
-		p.reject(err)
+		p.promise.reject(err)
+		n.reportProposal(p.submitted, false)
 		delete(n.pending, idx)
 	}
 	n.drainPendingReads(err)
