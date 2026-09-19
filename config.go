@@ -92,6 +92,25 @@ type Config struct {
 	// Default: 64.
 	MaxLogEntriesPerRPC int
 
+	// MaxBytesPerRPC caps the total size of the entry payloads in a single
+	// AppendEntries RPC. It complements MaxLogEntriesPerRPC, which caps their
+	// number: a count alone says nothing about the size of the message, and
+	// MaxLogEntriesPerRPC entries of a megabyte each is a message no transport
+	// will carry.
+	//
+	// That matters because there is no smaller batch to fall back on. A leader
+	// whose message is rejected for being too large re-sends the same batch,
+	// and the follower behind it never catches up again.
+	//
+	// A single entry larger than this budget is still sent, on its own:
+	// refusing to send it would stall replication permanently, and the
+	// transport may well accept it.
+	//
+	// Set to 0 for no byte limit (the count limit still applies).
+	//
+	// Default: 1 MiB.
+	MaxBytesPerRPC uint64
+
 	// SnapshotThreshold is the number of log entries after which the leader
 	// automatically requests a snapshot from the state machine:
 	//   trigger when  lastApplied − lastSnapshotIndex >= SnapshotThreshold
@@ -191,14 +210,19 @@ type Config struct {
 	// leader splits it into sequential chunks and sends them in order; the
 	// follower reassembles the chunks before applying.
 	//
-	// Chunking prevents large snapshots from exceeding gRPC's
-	// MaxCallRecvMsgSize (default 4 MiB) and bounds the peak heap allocation
-	// per RPC to roughly SnapshotChunkSize bytes on both sender and receiver.
+	// Chunking bounds the peak heap allocation per RPC to roughly
+	// SnapshotChunkSize bytes on both sender and receiver, and keeps each
+	// message inside whatever limit the transport enforces.
 	//
-	// Set to 0 to send the entire snapshot in a single RPC (the original
-	// behaviour, suitable only when snapshots are known to be small).
+	// Leave room for framing when choosing this: a chunk sized at exactly the
+	// transport's message limit does not fit, because the request carries its
+	// other fields too. The default is deliberately well below gRPC's own
+	// default limit of 4 MiB for that reason.
 	//
-	// Default: 4 MiB.
+	// Set to 0 to send the entire snapshot in a single RPC, which is suitable
+	// only when snapshots are known to be small.
+	//
+	// Default: 1 MiB.
 	SnapshotChunkSize int
 
 	// RPCTimeout is the per-RPC deadline applied to every outbound Raft RPC
@@ -343,12 +367,13 @@ func DefaultConfig() Config {
 		ElectionTimeoutMax:  300 * time.Millisecond,
 		HeartbeatInterval:   50 * time.Millisecond,
 		MaxLogEntriesPerRPC: 64,
+		MaxBytesPerRPC:      1 << 20, // 1 MiB
 		SnapshotThreshold:   10_000,
 		TrailingLogs:        1024,
 		MaxInflightRPCs:     4,
 		CheckQuorum:         true,
 		MaxClientTableSize:  100_000,
-		SnapshotChunkSize:   4 * 1024 * 1024, // 4 MiB
+		SnapshotChunkSize:   1 << 20, // 1 MiB
 		TickInterval:        10 * time.Millisecond,
 	}
 }
