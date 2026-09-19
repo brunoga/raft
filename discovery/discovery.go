@@ -13,6 +13,24 @@
 // a genuine departure — they are indistinguishable at the network level. Actual
 // removal must go through the Raft membership-change protocol (RemoveServer).
 // The agent only adds; operators remove.
+//
+// # Trust model
+//
+// A Discovery implementation answers the question "which addresses claim to be
+// cluster peers", and nothing more. Whether a claim can be trusted depends
+// entirely on the implementation and its configuration:
+//
+//   - udpbroadcast accepts announcements from anyone on the subnet unless a
+//     shared secret is configured. Configure one unless the network is trusted.
+//   - dnsdiscovery inherits the trust you place in the DNS records it reads.
+//
+// Because of that, a discovered peer must never be promoted to a voting member
+// on the strength of discovery alone: adding a voter changes the quorum size
+// and hands the new node a vote in every election. Callers that turn Discover
+// output into Raft membership changes should add discovered nodes as
+// non-voting learners and promote them by explicit operator action. The
+// easyraft package does this by default; see easyraft.WithDiscoveryAsVoter for
+// the opt-in that restores the older, more permissive behaviour.
 package discovery
 
 import (

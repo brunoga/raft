@@ -31,6 +31,30 @@ var (
 	// for that client. The client should not retry with this seqNum.
 	ErrObsoleteSeqNum = errors.New("raft: sequence number is obsolete")
 
+	// ErrNodeFailed is returned by every operation on a node that has stopped
+	// because it could not complete a durable write. Use errors.Is to detect
+	// it; the returned error also wraps the underlying storage error.
+	//
+	// Raft's safety argument assumes that a node's term, vote and log reach
+	// stable storage before it acts on them. A node that cannot write can no
+	// longer honour that, so it stops rather than continuing with state that
+	// may not survive a restart. Operator action is required: the node has to
+	// be restarted once its storage is healthy.
+	ErrNodeFailed = errors.New("raft: node stopped after a durable write failed")
+
+	// ErrManagerStopping is returned by Manager.Add while StopAll is in
+	// progress. A node added at that moment would not be stopped and nothing
+	// would track it. Retry once StopAll has returned.
+	ErrManagerStopping = errors.New("raft: manager is stopping")
+
+	// ErrMemberNotCaughtUp is returned by PromoteMember when the member is too
+	// far behind to be made a voter. Retry once it has caught up.
+	ErrMemberNotCaughtUp = errors.New("raft: member is too far behind to become a voter")
+
+	// ErrNotMember is returned when an operation names a node that is not part
+	// of the cluster.
+	ErrNotMember = errors.New("raft: node is not a member of this cluster")
+
 	// ErrLeaseExpired is returned by ReadIndexLease when the leader does not
 	// currently hold a valid clock-based read lease. The caller should fall back
 	// to ReadIndex (which performs a heartbeat round-trip) or retry after the

@@ -16,9 +16,17 @@ type raftLog struct {
 	snapMeta SnapshotMeta // metadata of the last installed snapshot
 
 	// snapClientTable holds the client dedup table loaded from the snapshot
-	// during initialisation. It is consumed by Node.New() to seed n.clientTable
-	// and then cleared.
-	snapClientTable map[NodeID]clientEntry
+	// during initialisation, in eviction order. It is consumed by Node.New() to
+	// seed n.clientTable and then cleared.
+	snapClientTable []clientRecord
+
+	// snapMembership is the cluster membership recorded in that snapshot, and
+	// hasSnapMembership reports whether the snapshot carried one at all —
+	// snapshots written before the membership section existed do not, and an
+	// empty membership must not be mistaken for an empty cluster. Both are
+	// consumed by Node.New() and then cleared.
+	snapMembership    membershipState
+	hasSnapMembership bool
 
 	// cached positions; 0 means "no entries in storage"
 	first    Index
@@ -42,11 +50,13 @@ func newRaftLog(s Storage) (*raftLog, error) {
 		defer func() { _ = r.Close() }()
 		rl.snapMeta = meta
 		// Read the framing header to extract the client dedup table.
-		table, _, parseErr := readWrappedSnapshot(r)
+		table, ms, hasMS, _, parseErr := readWrappedSnapshot(r)
 		if parseErr != nil {
 			return nil, fmt.Errorf("raftLog: read snapshot framing: %w", parseErr)
 		}
 		rl.snapClientTable = table
+		rl.snapMembership = ms
+		rl.hasSnapMembership = hasMS
 	} else if loadErr != ErrNoSnapshot {
 		return nil, fmt.Errorf("raftLog: load snapshot: %w", loadErr)
 	}
@@ -154,8 +164,23 @@ func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
 	return nil
 }
 
+// canDescribe reports whether this log can describe the entry at index: either
+// it is still present, or it is the snapshot boundary, or it is the empty
+// position before the first entry. Replication needs this for the entry before
+// the one it is about to send; when the answer is no, the peer has fallen
+// behind what the log still holds and needs a snapshot instead.
+func (rl *raftLog) canDescribe(index Index) bool {
+	if index == 0 || index == rl.snapMeta.LastIncludedIndex {
+		return true
+	}
+	return rl.first != 0 && index >= rl.first && index <= rl.last
+}
+
 // truncatePrefix removes entries at index < toIndex and updates the cache.
 func (rl *raftLog) truncatePrefix(ctx context.Context, toIndex Index) error {
+	if rl.first != 0 && toIndex <= rl.first {
+		return nil // nothing to reclaim
+	}
 	if err := rl.storage.TruncatePrefix(ctx, toIndex); err != nil {
 		return err
 	}
@@ -165,6 +190,40 @@ func (rl *raftLog) truncatePrefix(ctx context.Context, toIndex Index) error {
 		rl.lastTerm = rl.snapMeta.LastIncludedTerm
 	} else {
 		rl.first = toIndex
+	}
+	return nil
+}
+
+// installSnapshot makes meta this log's new base, keeping only the entries that
+// belong to the same history as the snapshot.
+//
+// Raft section 7: entries after the snapshot point may be retained only when
+// the log agrees with the snapshot at that point. If the entry there has a
+// different term, everything from the snapshot point onwards belongs to a
+// history the cluster abandoned, and keeping it would leave a log that starts
+// with the leader's state and continues with somebody else's.
+func (rl *raftLog) installSnapshot(ctx context.Context, meta SnapshotMeta) error {
+	agrees := false
+	if t, err := rl.termAt(ctx, meta.LastIncludedIndex); err == nil && t == meta.LastIncludedTerm {
+		agrees = true
+	}
+
+	switch {
+	case agrees:
+		if err := rl.truncatePrefix(ctx, meta.LastIncludedIndex+1); err != nil {
+			return err
+		}
+	case rl.first != 0:
+		if err := rl.truncateSuffix(ctx, rl.first); err != nil {
+			return err
+		}
+	}
+
+	rl.snapMeta = meta
+	if rl.last == 0 {
+		// Nothing survived: the snapshot boundary is now the end of the log.
+		rl.first = 0
+		rl.lastTerm = meta.LastIncludedTerm
 	}
 	return nil
 }

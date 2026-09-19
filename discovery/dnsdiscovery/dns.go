@@ -14,6 +14,15 @@
 //
 // Both implementations use only the standard library; no external dependencies
 // are required.
+//
+// # Trust model
+//
+// These implementations are exactly as trustworthy as the DNS records they
+// read: anything that can answer the lookup — a compromised resolver, a
+// poisoned cache, or whoever controls the zone — decides which addresses are
+// reported as peers. Prefer a resolver you control, and see the discovery
+// package documentation for why discovered nodes should join as non-voting
+// learners rather than as voters.
 package dnsdiscovery
 
 import (

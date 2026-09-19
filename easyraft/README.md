@@ -6,6 +6,15 @@ EasyRaft is a high-level abstraction layer over the `brunoga/raft` package. It l
 go get github.com/brunoga/raft/easyraft
 ```
 
+> ### Read this before exposing a node
+>
+> Two subsystems reshape cluster membership, and both are permissive by default so that existing deployments keep working:
+>
+> - **The HTTP API is unauthenticated unless you configure a hook.** Anyone who can reach the `WithHTTPAddr` listener can `POST /join` to add a member, `DELETE /members/{id}` to shrink the cluster, transfer leadership, or write to any collection. Set `WithBearerTokenAuth` (or `WithHTTPAuth`), bind the listener to a management interface rather than all interfaces, and use `WithHTTPTLS` when it is not on a trusted link. A node started without a hook logs a warning at startup; `WithInsecureHTTPAcknowledged` silences it once you have mitigated the exposure elsewhere.
+> - **Peer discovery trusts its source.** `udpbroadcast` accepts any datagram on the subnet unless you give it a shared secret. Discovered peers therefore join as **non-voting learners** by default, so a rogue announcement cannot change the quorum; `WithDiscoveryAsVoter` opts out of that.
+>
+> The [Security](#security) section covers both in full.
+
 ---
 
 ## Two entry points
@@ -30,7 +39,10 @@ type Counter struct {
 er, err := easyraft.New[Counter](
     easyraft.WithID("n1"),
     easyraft.WithRaftAddr(":7001"),
-    easyraft.WithHTTPAddr(":8001"),
+    // The HTTP address is advertised to peers for leader redirects, so it must
+    // name a host they can dial — not a port-only ":8001".
+    easyraft.WithHTTPAddr("host1:8001"),
+    easyraft.WithBearerTokenAuth(os.Getenv("RAFT_TOKEN")), // see Security
     easyraft.WithDataDir("/data/n1"),
     easyraft.WithPeers(map[raft.NodeID]string{
         "n2": "host2:7001",
@@ -171,6 +183,25 @@ _, err = counts.MutateOnce(ctx, "client-42", seqNum, "k1", "inc", nil)
 
 Available for all write operations: `CreateOnce`, `UpdateOnce`, `DeleteOnce`, `MutateOnce`.
 
+### Named identities — `Session`, `OnceID`, `Exactly`
+
+The positional `(clientID, seqNum)` pair sits before the key and is easy to transpose. `Exactly` takes the same identity as a named-field `OnceID`, which cannot be:
+
+```go
+session := easyraft.NewSession("client-42") // hands out increasing sequence numbers
+
+id := session.Next()                        // one logical write
+err := users.Exactly(id).Create(ctx, "alice", User{Name: "Alice"})
+
+// Retrying? Reuse the same id — that is what makes the write exactly-once.
+// Allocating a fresh one would apply the command twice.
+err = users.Exactly(id).Create(ctx, "alice", User{Name: "Alice"})
+```
+
+`Exactly` offers `Create`, `Update`, `Upsert`, `Delete` and `Mutate`. The `*Once` methods are unchanged and remain supported — they now delegate to the same path.
+
+A `Session` starts at sequence number 1, so a process that restarts and reuses a client ID must resume where it left off. Record `session.LastSeqNum()` and rebuild with `easyraft.NewSessionAt(clientID, last)`.
+
 ---
 
 ## Upsert — atomic create-or-update
@@ -199,7 +230,25 @@ configs.OnChange(func(key string, entry *ConfigEntry, deleted bool) {
 
 The callback is called on followers as well as the leader, and during log replay after a restart or snapshot restore. One handler per collection is supported; a second call replaces the first. Register before `Start`.
 
-**What `OnChange` does not guarantee:** if `notifyCh` (capacity 1024) fills up because the handler is slow, events are dropped. For production watch implementations, keep the handler fast — fan out to channels and let consumers process asynchronously.
+**Each collection gets its own dispatcher goroutine and queue**, so a handler that blocks delays only the collection it was registered for — one slow watcher can no longer starve every other collection in the store.
+
+### Detecting dropped events — `OnChangeEvent`
+
+A handler that falls far enough behind still loses events: the store-wide queue holds 1024 and each collection's holds 256. `OnChange` cannot tell you that happened. `OnChangeEvent` can:
+
+```go
+configs.OnChangeEvent(func(ev easyraft.ChangeEvent[ConfigEntry]) {
+    if ev.Gap {
+        // Events were dropped. Nothing behind the gap is recoverable —
+        // re-read the collection instead of assuming you are up to date.
+        resync()
+        return
+    }
+    apply(ev.Seq, ev.Key, ev.Value, ev.Deleted)
+})
+```
+
+`Seq` increases by one per event the store emits, so a handler that remembers the last one it saw can detect a discontinuity itself. A `Gap` event carries no key or value — it is a signal, not an entry.
 
 ---
 
@@ -224,33 +273,53 @@ ch = w.Subscribe("db.host")
 defer w.Unsubscribe("db.host", ch)
 ```
 
-`ChangeEvent[T]` carries `Key string`, `Value *T` (nil on delete), and `Deleted bool`.
+`ChangeEvent[T]` carries `Seq uint64`, `Key string`, `Value *T` (nil on delete), `Deleted bool`, and `Gap bool`.
 
-Events that arrive while a subscriber's channel (capacity 64) is full are silently dropped — keep consumers fast or size the channel appropriately.
+Wire `NotifyEvent` to `OnChangeEvent` instead of `Notify`/`OnChange` so that gaps reported by the store reach subscribers too:
+
+```go
+configs.OnChangeEvent(w.NotifyEvent)
+```
+
+**Subscriber channels hold 64 events.** A subscriber that falls behind loses events — but never silently: the next event it receives is preceded by one with `Gap` set, telling it to resynchronise. `Seq` is assigned by the `Watcher` and is contiguous across everything it dispatches, so a consumer can verify this for itself.
+
+**`Unsubscribe` is mandatory.** An abandoned subscription keeps its channel and registry slot for the lifetime of the `Watcher`, and every later event pays the cost of trying to deliver to it. Use `SubscribeContext` to tie that cleanup to a context:
+
+```go
+for ev := range w.SubscribeContext(r.Context(), key) {
+    // the channel is closed and the subscription removed when ctx ends
+}
+```
 
 ### ServeSSE — streaming events over HTTP
 
-`ServeSSE` handles the full SSE lifecycle: sets headers, sends a snapshot of existing entries on connect, then streams live events until the client disconnects:
+`ServeSSEFunc` handles the full SSE lifecycle: sets headers, reads a snapshot of existing entries as part of subscribing, then streams live events until the client disconnects:
 
 ```go
 func (s *server) handleWatch(w http.ResponseWriter, r *http.Request) {
-    snap, _ := s.configs.ListStale()
-    s.watcher.ServeSSE(w, r, r.PathValue("key"), snap)
+    s.watcher.ServeSSEFunc(w, r, r.PathValue("key"), s.configs.ListStale)
 }
 ```
+
+Passing the read rather than its result is what anchors the stream: the snapshot is taken with dispatch held off, so every event the client receives describes a change that happened *after* it. The older `ServeSSE(w, r, key, snapshot)` takes an already-read map and is still supported, but a write landing between the read and the subscription leaves a window where the client can see a change event for a key whose snapshot value is already newer.
 
 The `key` argument scopes the stream — pass `""` to receive all keys. SSE events are JSON-encoded `ChangeEvent[T]`:
 
 ```
 event: snapshot
-data: {"key":"db.host","value":{...}}
+data: {"seq":12,"key":"db.host","value":{...}}
 
 event: change
-data: {"key":"db.host","value":{...}}
+data: {"seq":13,"key":"db.host","value":{...}}
 
 event: delete
-data: {"key":"db.host","deleted":true}
+data: {"seq":14,"key":"db.host","deleted":true}
+
+event: gap
+data: {"seq":15,"gap":true}
 ```
+
+A `gap` event means the client missed one or more changes and should re-read the collection. If the snapshot read itself fails, the stream carries a single `error` event and closes — the headers are already sent by then, so there is no status code left to use.
 
 See [`examples/configsvc`](../examples/configsvc/) for a complete SSE watch service.
 
@@ -264,7 +333,9 @@ See [`examples/configsvc`](../examples/configsvc/) for a complete SSE watch serv
 mgr, err := easyraft.NewManager(
     easyraft.WithID("n1"),
     easyraft.WithRaftAddr(":7001"),
-    easyraft.WithHTTPAddr(":8001"),
+    easyraft.WithHTTPAddr("host1:8001"),
+    easyraft.WithBearerTokenAuth(token),
+    easyraft.WithPrometheus(reg), // one registry for every group
     easyraft.WithPeers(peers),
 )
 
@@ -279,7 +350,9 @@ mgr.Start()
 defer mgr.Stop()
 ```
 
-`AddStore` accepts the same options as `NewStore`. Options set on the `Manager` (e.g. `WithID`, `WithPeers`) are inherited by stores; store-level options override them.
+`AddStore` accepts the same options as `NewStore`. Options set on the `Manager` (e.g. `WithID`, `WithPeers`) are inherited by stores; store-level options override them — including `WithPrometheus`, whose registerer every group shares. Each group's series are told apart by a `group` label.
+
+`Manager.Start` does not hold its lock while a group joins its cluster, so `GetStore` and the HTTP handlers stay responsive even when a join is waiting out its 30-second retry budget against a seed that is still coming up.
 
 ---
 
@@ -292,7 +365,8 @@ defer mgr.Stop()
 n1, _ := easyraft.New[Counter](
     easyraft.WithID("n1"),
     easyraft.WithRaftAddr(":7001"),
-    easyraft.WithHTTPAddr(":8001"),
+    easyraft.WithHTTPAddr("localhost:8001"),
+    easyraft.WithBearerTokenAuth(token),
     easyraft.WithDataDir("/data/n1"),
 )
 n1.Start()
@@ -303,11 +377,12 @@ n2, _ := easyraft.New[Counter](
     easyraft.WithRaftAddr(":7002"),
     easyraft.WithDataDir("/data/n2"),
     easyraft.WithJoinAddr("localhost:8001"),
+    easyraft.WithBearerTokenAuth(token), // same token as the seed
 )
 n2.Start()
 ```
 
-`WithJoinAddr` accepts one or more HTTP addresses; the joining node tries each in turn until one succeeds. If the contacted node is not the leader it responds with `307 Temporary Redirect` automatically.
+`WithJoinAddr` accepts one or more HTTP addresses; the joining node tries each in turn until one succeeds. If the contacted node is not the leader it responds with `307 Temporary Redirect` automatically. When the seeds require authorization, configure the joiner with the matching `WithBearerTokenAuth` — it is sent on the join request.
 
 You can add nodes one at a time in separate terminal sessions — no reconfiguration of the existing nodes is required.
 
@@ -348,7 +423,9 @@ node.Start()
 defer node.Stop() // removes self from cluster before shutting down
 ```
 
-If removal does not complete within 5 seconds the node shuts down anyway. Do not use this on a bootstrap node (the first node in a brand-new cluster) — removing the sole member leaves the cluster with no voters.
+On the leader the membership change is proposed directly. A follower cannot commit one, so the removal is **forwarded to the leader's HTTP API** (`DELETE /members/{self}`), carrying the credential from `WithBearerTokenAuth` when one is configured. If the leader is unknown, has not advertised an HTTP address, or rejects the request, the reason is logged and shutdown continues — the node is then still a member and an operator must remove it. Call `store.Leave(ctx)` directly if you want to handle that error yourself.
+
+The whole attempt is abandoned after 5 seconds. Do not use this on a bootstrap node (the first node in a brand-new cluster) — removing the sole member leaves the cluster with no voters.
 
 ---
 
@@ -373,16 +450,17 @@ err := er.TransferLeadership(ctx, "n2")
 When `WithDiscovery` is configured, EasyRaft polls the discovery source periodically and:
 
 1. Registers newly found peers with the gRPC transport (`AddPeer`).
-2. Calls `AddServer` to add them to the Raft cluster membership.
+2. Calls `AddServer` to add them to the Raft cluster membership **as non-voting learners**.
 
-Only the current leader can commit membership changes; `AddServer` calls on followers fail silently and are retried on the next discovery interval.
+Only the current leader can commit membership changes; `AddServer` calls on followers fail and are retried on the next discovery interval.
 
 ```go
 import "github.com/brunoga/raft/discovery/udpbroadcast"
 
 d, _ := udpbroadcast.New(&udpbroadcast.Config{
     NodeID: "n1",
-    Addr:   ":9001",
+    Addr:   "10.0.0.1:7001",
+    Secret: []byte(os.Getenv("RAFT_DISCOVERY_SECRET")), // authenticate announcements
 })
 
 er, _ := easyraft.New[Counter](
@@ -392,7 +470,37 @@ er, _ := easyraft.New[Counter](
 )
 ```
 
-Static peers (`WithPeers`) and discovery can be combined — peers added via `WithPeers` are pre-populated in the known-member set and will not trigger redundant `AddServer` calls.
+### Why learners, and how to promote
+
+A discovery announcement is a claim made over the network. Honouring it as a *voting* member would let whoever made the claim change the cluster's quorum size and gain a vote in every election. Discovered peers therefore join as learners: they replicate the log but do not vote. Promote one, from the leader, once an operator has verified it:
+
+```go
+err := store.AddServer(ctx, "n4", "10.0.0.4:7001") // learner → voter
+```
+
+`WithDiscoveryAsVoter` restores the older behaviour of adding discovered peers directly as voters. Only enable it when the discovery source is authenticated — `udpbroadcast` with a shared secret on a subnet you control, for instance.
+
+### Address changes
+
+A peer listed in `WithPeers` is authoritative: discovery will never repoint it, because repointing a member redirects that member's Raft traffic to whoever announced the new address. Attempts are logged and ignored. A peer that discovery itself introduced *can* change address — a pod restarting with a new IP is normal — and every change is logged.
+
+Static peers (`WithPeers`) and discovery can be combined: peers added via `WithPeers` are pre-populated in the known-member set and will not trigger redundant `AddServer` calls.
+
+---
+
+## Read consistency
+
+`Read` and `List` are linearizable: before serving from local state they confirm that this node has applied everything committed cluster-wide. `ReadStale` and `ListStale` skip that and read local state directly.
+
+By default the confirmation is a quorum heartbeat — one round-trip, and no assumption about clocks. `WithLeaseReads` lets the leader answer from its clock-based read lease instead, skipping the round-trip:
+
+```go
+easyraft.WithLeaseReads()
+```
+
+A read lease is only sound while clock drift between the leader and its followers stays below the election timeout; leave the option off if you cannot bound drift. Either way a caller never sees `raft.ErrLeaseExpired` — an expired lease falls back to the quorum-confirmed path automatically rather than failing the read.
+
+The same applies to `GET /{collection}` and `GET /{collection}/{key}`; add `?consistency=stale` to read local state instead.
 
 ---
 
@@ -408,6 +516,17 @@ if err := store.Ready(ctx); err != nil {
     log.Fatal("cluster not ready:", err)
 }
 ```
+
+Both listeners are bound by `NewStore`, not by `Start`, so an address that is malformed or already in use is reported as an error you can act on instead of disappearing into a background goroutine and leaving the node up with no API:
+
+```go
+store, err := easyraft.NewStore(/* ... */, easyraft.WithHTTPAddr(":8001"))
+if err != nil {
+    log.Fatal(err) // "easyraft: listen http :8001: address already in use"
+}
+```
+
+When no `WithLogger` is set, easyraft logs through `slog.Default()` rather than staying silent, so serve-time failures are still reported.
 
 ---
 
@@ -429,6 +548,8 @@ mux.HandleFunc("GET /my-route", myHandler) // add your own routes
 store.Start()
 http.ListenAndServe(":8001", mux) // one server, no conflict
 ```
+
+**Every route below is behind the `WithHTTPAuth` hook when one is configured, and open to anyone who can reach the listener when one is not.** See [Security](#security) before binding to anything but loopback.
 
 ### `Store` routes
 
@@ -499,6 +620,20 @@ When a non-leader node receives a write or read request:
 
 Clients that follow redirects (`curl -L`, most HTTP client libraries) are routed to the leader automatically without any special handling.
 
+The redirect host comes only from the internal metadata collection — which HTTP clients cannot read or write — and is re-validated as a bare `host:port` before use. An advertised value that is not one (an appended path, a userinfo section, an embedded newline, or a port-only `:8001` that no client could dial) is refused and logged, and the node answers `503` instead. Nothing from the incoming request ever reaches the `Location` header except its path and query.
+
+### Error responses
+
+| Status | Returned for |
+|--------|--------------|
+| `400 Bad Request` | Malformed JSON, missing `id`/`raft_addr`/`to`, a `raft_addr` that is not `host:port` |
+| `401 Unauthorized` | Missing or unusable credential (see Security) |
+| `403 Forbidden` | Valid credential without permission, or any request naming a reserved `__`-prefixed collection |
+| `404 Not Found` | `ErrKeyNotFound`, unknown collection, unknown group |
+| `408 Request Timeout` | The request context expired before the entry committed |
+| `409 Conflict` | `ErrKeyExists`, `raft.ErrObsoleteSeqNum`, a config change or leadership transfer already in progress |
+| `503 Service Unavailable` | No leader elected, leader's address unknown, node stopped, request cancelled |
+
 ### Mutation request body
 
 ```json
@@ -511,13 +646,86 @@ Clients that follow redirects (`curl -L`, most HTTP client libraries) are routed
 
 ## Security
 
-TLS for all gRPC Raft traffic:
+Three separate surfaces, each configured on its own: the Raft transport, the HTTP API, and peer discovery.
+
+### Raft transport (gRPC)
 
 ```go
 easyraft.WithTLS(tlsConfig)
 ```
 
-The same `*tls.Config` is applied to both the gRPC server listener and all outbound client connections.
+The same `*tls.Config` is applied to both the gRPC server listener and all outbound client connections. It does **not** cover the HTTP API.
+
+### HTTP API
+
+The HTTP API is a cluster control plane: `POST /join` adds a member, `DELETE /members/{id}` removes one, `POST /transfer-leadership` moves leadership, and the CRUD routes write to every collection. Anyone who can reach the listener can do all of that.
+
+```go
+er, _ := easyraft.New[Counter](
+    // Bind to an interface only your operators and peers can reach, not to
+    // every interface. This address is also what peers redirect clients to,
+    // so it must be one they can dial.
+    easyraft.WithHTTPAddr("10.0.0.1:8001"),
+    easyraft.WithBearerTokenAuth(os.Getenv("RAFT_TOKEN")),
+    // ...
+)
+```
+
+`WithBearerTokenAuth` does two things: it requires `Authorization: Bearer <token>` on every inbound request, and it sends the same header on the cluster-control requests this node makes to its peers — so `WithJoinAddr` and `WithLeaveOnStop` keep working against an authenticated cluster. Use the same token on every node.
+
+For mutual TLS instead, serve the API over TLS and authorize on the client certificate:
+
+```go
+tlsCfg := &tls.Config{
+    Certificates: []tls.Certificate{serverCert},
+    ClientCAs:    pool,
+    ClientAuth:   tls.RequireAndVerifyClientCert,
+}
+
+easyraft.WithHTTPTLS(tlsCfg),
+easyraft.WithHTTPAuth(easyraft.ClientCertAuth("admin", "n1", "n2")),
+```
+
+`WithHTTPTLS` also makes leader redirects use the `https` scheme. It is ignored with `WithHTTPMux`, where the caller owns the listener.
+
+Any policy works — `WithHTTPAuth` takes a `func(*http.Request) error`. Wrap `easyraft.ErrUnauthorized` to answer `401` and `easyraft.ErrForbidden` to answer `403`; any other error is reported as `403` without echoing its text to the client.
+
+```go
+easyraft.WithHTTPAuth(func(r *http.Request) error {
+    if !myACL.Allows(r) {
+        return fmt.Errorf("%w: not on the admin allowlist", easyraft.ErrForbidden)
+    }
+    return nil
+})
+```
+
+The hook runs before **every** easyraft route, reads included — a hook covering only writes would be a trap, since `GET /members` maps out the cluster. Routes registered on your own mux are unaffected.
+
+**Without a hook the API stays open**, so upgrading breaks nothing, and the node logs a warning once at startup. `WithInsecureHTTPAcknowledged` silences it when the exposure is mitigated elsewhere (a loopback bind, a service mesh, a network policy).
+
+#### Reserved collections
+
+Collection names beginning with `__` are easyraft's own. They hold the map of advertised HTTP addresses that leader redirects are built from, so the HTTP layer refuses them outright — reads and writes, single-key and batch, `403 Forbidden` — and `AddCollection` panics on one. A client able to write that map would choose where every follower forwards its traffic, request bodies included; one able to read it would get the cluster's internal address map.
+
+### Peer discovery
+
+`udpbroadcast` accepts any well-formed datagram on the subnet unless you configure a shared secret:
+
+```go
+d, _ := udpbroadcast.New(&udpbroadcast.Config{
+    NodeID: "n1",
+    Addr:   "10.0.0.1:7001",
+    Secret: []byte(os.Getenv("RAFT_DISCOVERY_SECRET")),
+})
+```
+
+With a secret set, every announcement is signed with an HMAC over `(id, addr, timestamp, nonce)`; announcements that are unsigned, wrongly signed, outside the replay window (30 s by default, which also bounds tolerated clock skew), or replaying a nonce are dropped and logged. Without one, **this is only safe on a network you fully trust** — any host on it can announce itself as a peer.
+
+Rebinding a *known* member's address is refused and logged regardless, unless `Config.AllowAddressChange` is set; a packet reusing an existing ID with a new address would otherwise redirect that member's traffic.
+
+`dnsdiscovery` is exactly as trustworthy as the records it reads — use a resolver you control.
+
+And as above: discovered peers join as learners, so no discovery source can change the quorum on its own. See [Discovery](#discovery).
 
 ---
 
@@ -529,7 +737,9 @@ import "github.com/prometheus/client_golang/prometheus"
 easyraft.WithPrometheus(prometheus.DefaultRegisterer)
 ```
 
-Prometheus metrics are exposed on `GET /metrics`. The option must be set before `Start()`.
+Prometheus metrics are exposed on `GET /metrics` (behind the authorization hook, if configured). The option must be set before `Start()`.
+
+The same registerer can be passed to every group of a `Manager`: collectors are registered once per registry and each group's series carry a `group` label holding its group ID. A single-group `Store` writes an empty `group` label, so queries that ignore the label are unaffected.
 
 ---
 
@@ -541,15 +751,21 @@ Prometheus metrics are exposed on `GET /metrics`. The option must be set before 
 | `WithRaftAddr(addr)` | gRPC listen address for Raft RPCs — required |
 | `WithHTTPAddr(addr)` | HTTP listen address; enables the REST API and sets the advertised URL for leader redirects |
 | `WithHTTPMux(mux)` | Register EasyRaft routes on an existing mux instead of starting a dedicated server; pair with `WithHTTPAddr` for redirect advertising |
+| `WithHTTPAuth(fn)` | Authorize every HTTP request with `func(*http.Request) error` |
+| `WithBearerTokenAuth(token)` | Require `Authorization: Bearer <token>` inbound, and send it on outbound join/leave requests |
+| `WithHTTPTLS(tlsConfig)` | Serve the HTTP API over TLS; leader redirects then use `https` |
+| `WithInsecureHTTPAcknowledged()` | Silence the startup warning about an unauthenticated HTTP API |
 | `WithDataDir(dir)` | Persistent storage directory — required |
 | `WithPeers(map[NodeID]string)` | Static initial peer list |
 | `WithJoinAddr(addrs...)` | HTTP address(es) of seed nodes to join on startup |
 | `WithJoinAsLearner()` | Join as a non-voting learner (requires `WithJoinAddr`) |
 | `WithLeaveOnStop()` | Call `RemoveServer(self)` before shutdown for graceful departure |
-| `WithDiscovery(d, interval)` | Dynamic peer discovery; wires both transport and membership |
+| `WithDiscovery(d, interval)` | Dynamic peer discovery; wires both transport and membership. Discovered peers join as learners |
+| `WithDiscoveryAsVoter()` | Add discovered peers as voters instead of learners — only with an authenticated discovery source |
+| `WithLeaseReads()` | Serve linearizable reads from the leader's read lease when valid; falls back to a quorum read otherwise |
 | `WithSnapCount(n)` | Log entries between automatic snapshots (default 1000) |
 | `WithLogger(logger)` | Custom `*slog.Logger` |
-| `WithTLS(tlsConfig)` | TLS for gRPC transport |
+| `WithTLS(tlsConfig)` | TLS for the gRPC transport (not the HTTP API — see `WithHTTPTLS`) |
 | `WithPrometheus(registerer)` | Enable Prometheus metrics |
 | `WithRaftTiming(tick, heartbeat, electionMin, electionMax)` | Override Raft timing (easyraft defaults: 100 ms tick/heartbeat, 1–2 s election) |
 
@@ -562,6 +778,10 @@ Prometheus metrics are exposed on `GET /metrics`. The option must be set before 
 | `easyraft.ErrKeyNotFound` | Key does not exist in the collection |
 | `easyraft.ErrKeyExists` | Key already exists (returned by `Create`) |
 | `easyraft.ErrNotLeader` | This node is not the leader; retry on the leader |
+| `easyraft.ErrUnauthorized` | Request carried no usable credential — the HTTP layer answers `401` |
+| `easyraft.ErrForbidden` | Credential is valid but not permitted — the HTTP layer answers `403` |
+| `easyraft.ErrReservedCollection` | Request named a `__`-prefixed internal collection |
+| `raft.ErrObsoleteSeqNum` | Exactly-once sequence number is below one already recorded for that client |
 
 ---
 
