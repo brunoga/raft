@@ -230,6 +230,12 @@ type Node struct {
 	// by a message from a previous leader after an election.
 	pendingSnap *partialSnapshot
 
+	// snapshotWriteWg tracks background snapshot writers started for a
+	// captured state machine. Stop waits on it so that a writer holding a
+	// capture and the storage backend has finished before the node is
+	// considered stopped.
+	snapshotWriteWg sync.WaitGroup
+
 	// snapshotInstallWg tracks all live runSnapshotInstall goroutines.
 	// Stop() waits on this WaitGroup so that those goroutines — which hold
 	// references to the storage backend and rpcCh — have fully exited before
@@ -669,6 +675,7 @@ func (n *Node) Stop() {
 		// cancelled their contexts, so they exit quickly; we just need to be sure
 		// they have released all references before we return.
 		n.snapshotInstallWg.Wait()
+		n.snapshotWriteWg.Wait()
 		n.closeWatchers()
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
@@ -1272,6 +1279,40 @@ func (n *Node) resetElectionTimeout() {
 	n.electionElapsed = 0
 }
 
+// writeSnapshot streams a snapshot into storage and reports what it cost.
+// write does the state-machine half; everything around it is the same whether
+// the state was captured first or is being serialised in place.
+func (n *Node) writeSnapshot(trig snapshotTrigger, write func(context.Context, io.Writer) error) snapshotResult {
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
+	}()
+
+	// Count the bytes on the way past. The size of a snapshot is the main
+	// thing that decides how long a lagging follower takes to catch up, so it
+	// is worth reporting, and this is the only place that sees it.
+	counter := &countingWriter{w: pw}
+	started := n.now()
+	serr := writeWrappedSnapshot(counter, trig.clientTable, &trig.membership, func(w io.Writer) error {
+		return write(n.stopCtx, w)
+	})
+	_ = pw.Close() // signals EOF to SaveSnapshot
+
+	saveErr := <-errCh
+	if serr == nil {
+		serr = saveErr
+	}
+
+	return snapshotResult{
+		meta:       trig.meta,
+		membership: trig.membership,
+		sizeBytes:  counter.n,
+		duration:   n.now().Sub(started),
+		err:        serr,
+	}
+}
+
 // countingWriter counts the bytes written through it.
 type countingWriter struct {
 	w io.Writer
@@ -1526,38 +1567,40 @@ func (n *Node) applyLoop() {
 			localClientTable = n.applyRestore(ctx, si, &localLastApplied, localClientTable)
 
 		case trig := <-n.snapshotTriggerCh:
-			// Take the snapshot here in applyLoop so Snapshot() and Apply()
-			// are never concurrent on the same state machine.
-			pr, pw := io.Pipe()
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- n.cfg.Storage.SaveSnapshot(n.stopCtx, trig.meta, pr)
-			}()
-
-			// Count the bytes on the way past. The size of a snapshot is the
-			// main thing that decides how long a lagging follower takes to
-			// catch up, so it is worth reporting, and this is the only place
-			// that sees it.
-			counter := &countingWriter{w: pw}
-			started := n.now()
-			serr := writeWrappedSnapshot(counter, trig.clientTable, &trig.membership, func(w io.Writer) error {
-				return n.cfg.StateMachine.Snapshot(n.stopCtx, w)
-			})
-			_ = pw.Close() // signals EOF to SaveSnapshot
-
-			saveErr := <-errCh
-			if serr == nil {
-				serr = saveErr
+			// A state machine that can hand over a point-in-time capture
+			// cheaply lets the serialisation move off this goroutine, so
+			// entries keep applying while the snapshot is written. Otherwise
+			// Snapshot runs here, because it must not run concurrently with
+			// Apply, and apply waits for it.
+			if capturer, ok := n.cfg.StateMachine.(SnapshotCapturer); ok {
+				captured, err := capturer.Capture(ctx)
+				if err != nil {
+					n.logger.Error("snapshot: capture failed", "err", err)
+					select {
+					case n.snapshotResultCh <- snapshotResult{meta: trig.meta, err: err}:
+					case <-n.stopCh:
+						return
+					}
+					continue
+				}
+				n.snapshotWriteWg.Add(1)
+				go func(trig snapshotTrigger, captured Snapshot) {
+					defer n.snapshotWriteWg.Done()
+					defer captured.Release()
+					res := n.writeSnapshot(trig, captured.Write)
+					select {
+					case n.snapshotResultCh <- res:
+					case <-n.stopCh:
+					}
+				}(trig, captured)
+				continue
 			}
 
+			res := n.writeSnapshot(trig, func(wctx context.Context, w io.Writer) error {
+				return n.cfg.StateMachine.Snapshot(wctx, w)
+			})
 			select {
-			case n.snapshotResultCh <- snapshotResult{
-				meta:       trig.meta,
-				membership: trig.membership,
-				sizeBytes:  counter.n,
-				duration:   n.now().Sub(started),
-				err:        serr,
-			}:
+			case n.snapshotResultCh <- res:
 			case <-n.stopCh:
 				return
 			}
