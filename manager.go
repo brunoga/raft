@@ -28,6 +28,10 @@ type GroupStatus struct {
 	State       State  `json:"state"`
 	Term        Term   `json:"term"`
 	LastApplied Index  `json:"last_applied"`
+	// Voter reports whether this replica votes and counts towards quorums. A
+	// non-voter cannot become leader, so leadership planning must not target
+	// one.
+	Voter bool `json:"voter"`
 }
 
 // Manager multiplexes multiple independent Raft groups on a single physical
@@ -60,6 +64,10 @@ type GroupStatus struct {
 type Manager struct {
 	mu    sync.RWMutex
 	nodes map[uint64]*Node // GroupID → Node
+	// stopping is true while StopAll is shutting the registered nodes down.
+	// Add refuses during that window: a node registered after StopAll took its
+	// snapshot would keep running with nothing tracking it.
+	stopping bool
 }
 
 // NewManager returns an empty Manager.
@@ -77,6 +85,12 @@ func (m *Manager) Add(groupID uint64, node *Node) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopping {
+		// StopAll has taken its snapshot of the registry. A node added now
+		// would not be in it, so it would keep running with nothing tracking
+		// it, and the caller would have no way to find it again.
+		return ErrManagerStopping
+	}
 	if _, exists := m.nodes[groupID]; exists {
 		return ErrGroupExists
 	}
@@ -234,7 +248,14 @@ func (m *Manager) StopAll() {
 		nodes = append(nodes, n)
 	}
 	m.nodes = make(map[uint64]*Node) // clear so the Manager can be reused
+	m.stopping = true
 	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		m.stopping = false
+		m.mu.Unlock()
+	}()
 
 	var wg sync.WaitGroup
 	for _, n := range nodes {
@@ -272,7 +293,7 @@ func (m *Manager) TransferGroupLeadership(ctx context.Context, groupID uint64, t
 // The manager lock is held only long enough to snapshot the node map; Node
 // methods are called after releasing the lock so that concurrent Add, Remove,
 // and StopAll calls are not blocked for the full iteration.
-func (m *Manager) StatusAll() []GroupStatus {
+func (m *Manager) StatusAll(_ context.Context) []GroupStatus {
 	m.mu.RLock()
 	type entry struct {
 		gid uint64
@@ -286,13 +307,9 @@ func (m *Manager) StatusAll() []GroupStatus {
 
 	out := make([]GroupStatus, 0, len(snap))
 	for _, e := range snap {
-		out = append(out, GroupStatus{
-			GroupID:     e.gid,
-			NodeID:      e.n.cfg.ID,
-			State:       e.n.State(),
-			Term:        e.n.Term(),
-			LastApplied: e.n.LastApplied(),
-		})
+		st := e.n.Status()
+		st.GroupID = e.gid
+		out = append(out, st)
 	}
 	return out
 }
@@ -326,17 +343,14 @@ func (m *Manager) RunTicker(ctx context.Context, interval time.Duration) {
 	// expect RunTicker to drive all groups should set TickInterval = 0.
 	var warnSkippedOnce sync.Once
 
-	// Cap the worker pool at min(GOMAXPROCS, initialGroupCount) so that we
-	// don't spawn idle goroutines when the manager holds only a handful of
-	// groups on a many-core machine. Groups added after RunTicker starts are
-	// handled by the existing workers; the channel buffer absorbs the extra
-	// work-items without stalling the main ticker loop.
+	// Sized by GOMAXPROCS, not by how many groups happen to be registered right
+	// now. Sizing it from the initial count means a manager that starts with
+	// one group and grows to hundreds ticks all of them through a single
+	// worker, one after another, for the rest of its life: every group's
+	// election and heartbeat timers then run slow, and the ticker drops the
+	// ticks it cannot keep up with. A few idle goroutines cost far less than
+	// that.
 	nWorkers := runtime.GOMAXPROCS(0)
-	m.mu.RLock()
-	if n := len(m.nodes); n > 0 && n < nWorkers {
-		nWorkers = n
-	}
-	m.mu.RUnlock()
 	// Buffer allows the main goroutine to keep sending while workers process;
 	// 2× nWorkers keeps the pipeline full without large memory cost.
 	work := make(chan tickItem, nWorkers*2)
