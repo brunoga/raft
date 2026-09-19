@@ -209,8 +209,8 @@ func main() {
 		cfg.Peers = peerIDs
 		cfg.Storage = store
 		cfg.StateMachine = sm
-		cfg.Transport = tr    // shared: one port for all shards
-		cfg.TickInterval = 0  // driven by mgr.RunTicker below
+		cfg.Transport = tr   // shared: one port for all shards
+		cfg.TickInterval = 0 // driven by mgr.RunTicker below
 		cfg.Logger = logger
 		cfg.Metrics = shardMetrics // shared instance; series tagged by node label
 
@@ -295,7 +295,13 @@ func buildMux(
 	// /raft/ — leader-balance HTTP endpoints exposed by Manager.Handler().
 	// GET  /raft/status   → Manager.StatusAll() as JSON (used by HTTPNodeProvider)
 	// POST /raft/transfer → Manager.TransferGroupLeadership (used by BalanceController)
-	mux.Handle("/raft/", http.StripPrefix("/raft", mgr.Handler()))
+	// This example binds to localhost only, so the balance endpoints are not
+	// reachable from outside the machine. A deployment that exposes them must
+	// pass raft.WithRequestAuthorizer instead: POST /raft/transfer moves
+	// leadership, and anyone who can reach it can keep the cluster permanently
+	// mid-election.
+	mux.Handle("/raft/", http.StripPrefix("/raft",
+		mgr.Handler(raft.WithInsecureHandlerAcknowledged())))
 	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// PUT /keys/{key}
@@ -384,7 +390,7 @@ func buildMux(
 			Term        uint64 `json:"term"`
 			LastApplied uint64 `json:"last_applied"`
 		}
-		statuses := mgr.StatusAll()
+		statuses := mgr.StatusAll(r.Context())
 		out := make([]shardStatus, 0, len(statuses))
 		for _, s := range statuses {
 			out = append(out, shardStatus{

@@ -150,7 +150,7 @@ func TestWatcher_ServeSSEFuncAnchorsTheSnapshot(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sse.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sse.URL, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}

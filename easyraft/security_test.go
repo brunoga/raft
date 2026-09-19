@@ -109,16 +109,16 @@ func TestHTTPAuth_GuardsEveryRoute(t *testing.T) {
 	for _, tt := range tests {
 		for _, cred := range credentials {
 			t.Run(tt.name+"/"+cred.name, func(t *testing.T) {
-				req, err := http.NewRequest(tt.method, base+tt.path, strings.NewReader(tt.body))
-				if err != nil {
-					t.Fatal(err)
+				req, reqErr := http.NewRequest(tt.method, base+tt.path, strings.NewReader(tt.body))
+				if reqErr != nil {
+					t.Fatal(reqErr)
 				}
 				if cred.header != "" {
 					req.Header.Set("Authorization", cred.header)
 				}
-				resp, err := client.Do(req)
-				if err != nil {
-					t.Fatalf("request: %v", err)
+				resp, doErr := client.Do(req)
+				if doErr != nil {
+					t.Fatalf("request: %v", doErr)
 				}
 				defer func() { _ = resp.Body.Close() }()
 
@@ -138,7 +138,7 @@ func TestHTTPAuth_GuardsEveryRoute(t *testing.T) {
 	}
 
 	// A correct credential still works.
-	req, err := http.NewRequest(http.MethodGet, base+"/health", nil)
+	req, err := http.NewRequest(http.MethodGet, base+"/health", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestBearerTokenAuth_Decisions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			auth := easyraft.BearerTokenAuth(tt.token)
-			req, err := http.NewRequest(http.MethodGet, "http://example/", nil)
+			req, err := http.NewRequest(http.MethodGet, "http://example/", http.NoBody)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -206,7 +206,7 @@ func TestBearerTokenAuth_Decisions(t *testing.T) {
 func TestClientCertAuth_RequiresVerifiedCertificate(t *testing.T) {
 	auth := easyraft.ClientCertAuth("admin")
 
-	req, err := http.NewRequest(http.MethodGet, "http://example/", nil)
+	req, err := http.NewRequest(http.MethodGet, "http://example/", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,14 +333,14 @@ func TestManager_StaticPeersAreReportedWithTheirRaftAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mgr.AddStore(7,
+	if _, addErr := mgr.AddStore(7,
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithPeers(map[raft.NodeID]string{"n2": peerAddr}),
-	); err != nil {
-		t.Fatal(err)
+	); addErr != nil {
+		t.Fatal(addErr)
 	}
-	if err := mgr.Start(); err != nil {
-		t.Fatal(err)
+	if startErr := mgr.Start(); startErr != nil {
+		t.Fatal(startErr)
 	}
 	defer mgr.Stop()
 
@@ -463,25 +463,25 @@ func TestStore_ExactlyOnceViaSessionIsRetrySafe(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := store.Ready(ctx); err != nil {
-		t.Fatalf("Ready: %v", err)
+	if readyErr := store.Ready(ctx); readyErr != nil {
+		t.Fatalf("Ready: %v", readyErr)
 	}
 
 	session := easyraft.NewSession("worker-1")
 
 	createID := session.Next()
-	if err := counters.Exactly(createID).Create(ctx, "k", Counter{}); err != nil {
-		t.Fatalf("Create: %v", err)
+	if createErr := counters.Exactly(createID).Create(ctx, "k", Counter{}); createErr != nil {
+		t.Fatalf("Create: %v", createErr)
 	}
 	// A retry of the same logical write must not create a second time.
-	if err := counters.Exactly(createID).Create(ctx, "k", Counter{}); err != nil {
-		t.Fatalf("replayed Create: %v", err)
+	if replayErr := counters.Exactly(createID).Create(ctx, "k", Counter{}); replayErr != nil {
+		t.Fatalf("replayed Create: %v", replayErr)
 	}
 
 	incID := session.Next()
 	for i := 0; i < 3; i++ {
-		if _, err := counters.Exactly(incID).Mutate(ctx, "k", "inc", nil); err != nil {
-			t.Fatalf("Mutate attempt %d: %v", i, err)
+		if _, mutateErr := counters.Exactly(incID).Mutate(ctx, "k", "inc", nil); mutateErr != nil {
+			t.Fatalf("Mutate attempt %d: %v", i, mutateErr)
 		}
 	}
 

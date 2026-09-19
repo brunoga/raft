@@ -207,7 +207,7 @@ func TestHTTPNodeProvider_StatusAll(t *testing.T) {
 	defer srv.Close()
 
 	provider := raft.NewHTTPNodeProvider(srv.URL, nil)
-	statuses := provider.StatusAll()
+	statuses := provider.StatusAll(context.Background())
 
 	if len(statuses) != 1 {
 		t.Fatalf("want 1 status, got %d", len(statuses))

@@ -898,8 +898,8 @@ func (m *Manager) handleBatch(w http.ResponseWriter, r *http.Request) {
 	m.withStore(w, r, (*Store).handleBatch)
 }
 
-func (m *Manager) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, m.StatusAll(), m.logger())
+func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, m.StatusAll(r.Context()), m.logger())
 }
 
 func (m *Manager) handleHealth(w http.ResponseWriter, _ *http.Request) {

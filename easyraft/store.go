@@ -821,7 +821,7 @@ type collectionDispatcher struct {
 
 // offer queues ev, emitting a gap marker first when one is owed. Neither send
 // blocks: a backlogged collection loses events and is told that it did.
-func (d *collectionDispatcher) offer(ev changeEvent) {
+func (d *collectionDispatcher) offer(ev *changeEvent) {
 	if d.gapOwed {
 		select {
 		case d.ch <- changeEvent{collection: ev.collection, seq: ev.seq, gap: true}:
@@ -831,7 +831,7 @@ func (d *collectionDispatcher) offer(ev changeEvent) {
 		}
 	}
 	select {
-	case d.ch <- ev:
+	case d.ch <- *ev:
 	default:
 		d.gapOwed = true
 	}
@@ -878,7 +878,7 @@ func (s *Store) dispatchChanges() {
 					s.runDispatcher(collection, d)
 				}(ev.collection, d)
 			}
-			d.offer(ev)
+			d.offer(&ev)
 		}
 	}
 }
@@ -906,10 +906,10 @@ func (s *Store) runDispatcher(collection string, d *collectionDispatcher) {
 // enqueueEvent hands ev to the dispatcher. A full queue never blocks Apply;
 // instead the affected collection is recorded as owing a gap marker, which is
 // delivered as soon as there is room again.
-func (s *Store) enqueueEvent(ev changeEvent) {
+func (s *Store) enqueueEvent(ev *changeEvent) {
 	s.flushGaps()
 	select {
-	case s.notifyCh <- ev:
+	case s.notifyCh <- *ev:
 	default:
 		s.recordGap(ev.collection)
 	}
@@ -1583,7 +1583,7 @@ func (s *Store) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
 
 	for i := range events {
 		events[i].seq = s.eventSeq.Add(1)
-		s.enqueueEvent(events[i])
+		s.enqueueEvent(&events[i])
 	}
 	return result, err
 }

@@ -23,16 +23,17 @@ Requires Go 1.22+.
 7. [Linearizable reads](#linearizable-reads)
 8. [Cluster membership changes](#cluster-membership-changes)
 9. [Leadership transfer](#leadership-transfer)
-10. [Configuration reference](#configuration-reference)
-11. [Storage backends](#storage-backends)
-12. [Transport backends](#transport-backends)
-13. [Observability — metrics and tracing](#observability--metrics-and-tracing)
-14. [Testing utilities](#testing-utilities)
-15. [Advanced features](#advanced-features)
-16. [Multi-Raft — thousands of groups on shared infrastructure](#multi-raft--thousands-of-groups-on-shared-infrastructure)
-17. [Caveats and known limitations](#caveats-and-known-limitations)
-18. [EasyRaft — high-level abstraction](#easyraft--high-level-abstraction)
-19. [Reference implementation](#reference-implementation)
+10. [Reacting to leadership changes](#reacting-to-leadership-changes)
+11. [Configuration reference](#configuration-reference)
+12. [Storage backends](#storage-backends)
+13. [Transport backends](#transport-backends)
+14. [Observability — metrics and tracing](#observability--metrics-and-tracing)
+15. [Testing utilities](#testing-utilities)
+16. [Advanced features](#advanced-features)
+17. [Multi-Raft — thousands of groups on shared infrastructure](#multi-raft--thousands-of-groups-on-shared-infrastructure)
+18. [Caveats and known limitations](#caveats-and-known-limitations)
+19. [EasyRaft — high-level abstraction](#easyraft--high-level-abstraction)
+20. [Reference implementation](#reference-implementation)
 
 ---
 
@@ -284,9 +285,12 @@ for {
 }
 ```
 
-**Caveats:**
-- The dedup table is persisted inside every snapshot — exactly-once is maintained across leader failovers and node restarts.
-- `MaxClientTableSize` (default 100 000) caps table memory. When exceeded, the least-recently-used client entry is evicted. Use unique, stable `clientID` values.
+**What it does and does not guarantee:**
+- The dedup table is replicated through the log and persisted inside every snapshot, so exactly-once survives leader failover and restart.
+- Only a *successful* apply is recorded. A command the state machine rejected is not cached, so a retry runs it again and sees the same error rather than a spurious success.
+- `MaxClientTableSize` (default 100 000) bounds the table. **A client that retries after its entry has been evicted has its request executed a second time** — size the table to outlive the retry window of your slowest client, and use stable `clientID` values.
+- Eviction order is a function of the log alone, so every replica evicts the same entry at the same point. This holds only if `MaxClientTableSize` is identical on every node in the group; a node with a smaller table forgets requests its peers still remember, and the replicas diverge.
+- The bound is on entry count, not bytes: each entry also retains the result the state machine returned.
 - `ErrObsoleteSeqNum` means the submitted `seqNum` is strictly less than the one already recorded for that client. Never retry with a lower `seqNum`.
 
 ---
@@ -309,6 +313,12 @@ if _, err := node.ReadIndex(ctx); err != nil {
 // State machine is now up-to-date; serve the read.
 value := sm.Get(key)
 ```
+
+A read is answered only by a leadership confirmation that began after the read
+arrived. Replies to a round that was already in flight prove leadership as of a
+moment that had already passed, and leadership can move in that window. Reads
+that arrive together still share one round, so the cost is one round-trip per
+round, not one per read.
 
 ### ReadIndexLease (lower latency)
 
@@ -364,6 +374,35 @@ err := node.RemoveServer(ctx, "node-2")
 Only one membership change may be in-flight at a time; concurrent calls return
 `ErrConfigChangeInProgress`.
 
+Adding a voter changes the quorum as soon as the change is applied. A member
+added as a voter while it is still empty counts towards the larger quorum
+without being able to help satisfy it: a three-node cluster that adds a fourth,
+empty voter goes from tolerating one failure to tolerating none until that
+member catches up.
+
+Add it as a non-voter and promote it once it is close:
+
+```go
+// Replicates, but does not vote or count towards quorums.
+err := node.AddServer(ctx, raft.PeerConfig{ID: "node-4", Voter: false})
+
+// Refuses with ErrMemberNotCaughtUp while it is more than 100 entries behind.
+err = node.PromoteMember(ctx, "node-4", 100)
+```
+
+`ReplicationProgress` shows how far each peer has kept up, which is what to
+check before any change that depends on replicas keeping up — promoting,
+removing a member, handing over leadership, or taking a node out for
+maintenance:
+
+```go
+progress, err := node.ReplicationProgress(ctx) // leader only
+for _, p := range progress {
+    log.Printf("%s: %d entries behind, voter=%v, snapshot=%v",
+        p.ID, p.Lag(), p.Voter, p.SendingSnapshot)
+}
+```
+
 ### Joint consensus (arbitrary reconfiguration)
 
 `ReconfigureCluster` atomically replaces the entire membership set using the
@@ -404,6 +443,33 @@ that instructs it to start an election immediately (skipping pre-vote).
 
 ---
 
+## Reacting to leadership changes
+
+Work that only the leader should do — driving a scheduler, running a
+compaction, holding an external lease — has to start and stop on the leadership
+edge. Polling `State()` answers late and cannot tell a brief leadership change
+from no change at all.
+
+```go
+changes, stop := node.LeadershipChanges()
+defer stop()
+
+for change := range changes {
+    if change.IsLeader {
+        go startLeaderWork()
+    } else {
+        stopLeaderWork()
+    }
+}
+```
+
+The current status is delivered on subscribe, and the channel is closed when
+the node stops. Delivery is coalescing rather than lossless: a subscriber that
+falls behind sees the most recent status, never a stale one, which means it
+cannot count transitions.
+
+---
+
 ## Configuration reference
 
 Start from `raft.DefaultConfig()` and override only what you need:
@@ -411,7 +477,7 @@ Start from `raft.DefaultConfig()` and override only what you need:
 ```go
 cfg := raft.DefaultConfig()
 cfg.ID        = "node-1"                    // required
-cfg.Peers     = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}   // required (initial peers, excluding self)
+cfg.Peers     = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}   // bootstrap peers, excluding self
 cfg.Storage   = store                       // required
 cfg.StateMachine = sm                       // required
 cfg.Transport = tr                          // required
@@ -426,12 +492,15 @@ cfg.Transport = tr                          // required
 | `HeartbeatInterval` | `50ms` | How often the leader sends heartbeats. Enforced constraint: `ElectionTimeoutMin ≥ 2×HeartbeatInterval`. Recommended: `HeartbeatInterval ≤ ElectionTimeoutMin / 5`. |
 | `TickInterval` | `10ms` | Wall-clock period per `Tick()`. Zero means manual ticks (recommended for tests). |
 | `MaxLogEntriesPerRPC` | `64` | Maximum entries per AppendEntries RPC. |
+| `MaxBytesPerRPC` | `1 MiB` | Maximum total payload per AppendEntries RPC. A count limit alone says nothing about message size. `0` means no byte limit. |
 | `MaxInflightRPCs` | `4` | Per-peer pipeline depth (concurrent unacknowledged AppendEntries RPCs). |
 | `SnapshotThreshold` | `10000` | Entries past the last snapshot that trigger an automatic snapshot. `0` disables auto-snapshots. |
-| `SnapshotChunkSize` | `4 MiB` | Maximum bytes per InstallSnapshot chunk. `0` sends snapshots as a single RPC. |
+| `TrailingLogs` | `1024` | Entries retained behind the snapshot point, so a slightly-behind follower catches up from the log instead of needing a full state transfer. Capped at `SnapshotThreshold-1` in use. |
+| `SnapshotChunkSize` | `1 MiB` | Maximum bytes per InstallSnapshot chunk. Leave room for framing: a chunk sized at exactly the transport's message limit does not fit. `0` sends snapshots as a single RPC. |
 | `RPCTimeout` | `0` | Per-RPC deadline. `0` falls back to `ElectionTimeoutMin`. Snapshot RPCs use `4×RPCTimeout`. |
 | `CheckQuorum` | `true` | Leader steps down if it doesn't hear from a quorum within one election timeout. |
-| `MaxClientTableSize` | `100000` | Maximum entries in the ProposeOnce dedup table. `0` disables eviction. |
+| `MaxClientTableSize` | `100000` | Maximum entries in the ProposeOnce dedup table. `0` disables eviction. **Must be identical on every node in a group.** |
+| `OnFatal` | `nil` | Called once, from its own goroutine, if the node stops because a durable write failed. |
 | `Logger` | `slog.Default()` | Structured logger. Set to a `slog.LevelWarn` logger to silence routine traffic. |
 | `Metrics` | `nil` | Observability hook (see [Metrics and tracing](#observability--metrics-and-tracing)). |
 | `Tracer` | `nil` | Per-RPC tracing hook. |
@@ -728,10 +797,21 @@ Snapshots are triggered automatically when:
 lastApplied − lastSnapshotIndex ≥ SnapshotThreshold
 ```
 
+Compaction keeps `TrailingLogs` entries behind the snapshot point. Without a
+retained tail, a full state transfer is the only way to catch up a follower that
+was even one entry behind at the moment of compaction — and with automatic
+snapshots, that moment comes round again and again.
+
+A follower is sent a snapshot only when the entries it needs are no longer in
+the leader's log, so raising `TrailingLogs` trades disk space for fewer state
+transfers.
+
 Large snapshots are split into `SnapshotChunkSize`-byte chunks and sent as
-sequential RPCs. The follower buffers chunks and applies the snapshot atomically
-on the final chunk. A partial transfer is discarded if the follower changes
-leaders.
+sequential RPCs. The follower streams chunks to storage rather than buffering
+the whole snapshot, and applies it atomically on the final chunk. A partial
+transfer is discarded if the follower changes leaders. When the snapshot
+disagrees with the follower's log at its last-included index, the whole log is
+discarded: entries after that point belong to a history the cluster abandoned.
 
 To disable automatic snapshots and manage compaction yourself:
 
@@ -964,10 +1044,49 @@ Use local SSDs in production for predictable latency.
 In a single-node cluster `Peers` is empty, so `CheckQuorum` is a no-op
 (the leader is always its own quorum). No special configuration is needed.
 
-### `Config.Peers` is mutated in-place
+### `Config.Peers` is a bootstrap value, and is mutated in-place
 
-The event loop updates `cfg.Peers` as `AddServer`/`RemoveServer` entries are
-applied. Do not read or write `cfg.Peers` after calling `Start()`.
+Membership is agreed through the log, so it is cluster state rather than
+configuration. On restart it is recovered from the snapshot and the log;
+`Config.Peers` applies only when there is neither. The event loop updates
+`cfg.Peers` as membership changes are applied, so do not read or write it after
+calling `Start()` — use `Members()`.
+
+### A node that cannot write to storage stops
+
+Raft's safety argument assumes a node's term, vote and log entries reach stable
+storage before it acts on them. A node that cannot complete one of those writes
+stops rather than continuing: carrying on could mean voting twice in one term,
+or acknowledging entries a leader then counts towards a commit quorum although
+they are not durable.
+
+`FatalError()` reports the failure, every subsequent operation returns it in
+place of `ErrStopped`, and `Config.OnFatal` is called once. The rest of the
+cluster treats the node as an ordinary unreachable peer. Recovery is operator
+action: fix the storage and restart the node.
+
+### Exactly-once is bounded by the dedup table
+
+`ProposeOnce` remembers the outcome of a request until its entry is evicted from
+a table of `MaxClientTableSize` entries. A client that retries after its entry
+has been evicted has its request executed a second time. Size the table to
+outlive the retry window of the slowest client.
+
+Eviction order is a function of the log alone, so every replica evicts the same
+entry at the same point — but only if `MaxClientTableSize` is identical across
+the group. A node with a smaller table forgets requests its peers still
+remember, and the replicas diverge.
+
+### The transport is not authenticated by default
+
+`grpctransport` is plaintext unless configured otherwise, and any host that can
+complete a connection can claim to be the leader and force the cluster to step
+down. Use `WithTLSConfig` together with `WithPeerAuthorizer`, which checks the
+claimed node identity against the verified certificate.
+
+`Manager.Handler` is likewise open unless given `WithRequestAuthorizer`. Its
+`POST /transfer` endpoint moves leadership, so reaching it is enough to keep a
+cluster permanently mid-election.
 
 ### `ErrObsoleteSeqNum` must not be retried
 

@@ -36,7 +36,7 @@ func (m *recordingMetrics) ProposalCompleted(_ raft.NodeID, latency time.Duratio
 	m.outcomes = append(m.outcomes, ok)
 }
 
-func (m *recordingMetrics) snapshot() ([]time.Duration, []bool, []int) {
+func (m *recordingMetrics) snapshot() (latencies []time.Duration, outcomes []bool, snapshotSizes []int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]time.Duration(nil), m.latencies...),
