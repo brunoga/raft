@@ -53,21 +53,21 @@ func TestReconnect_RestartedPeerIsReachedQuickly(t *testing.T) {
 	req := &raft.AppendEntriesRequest{Term: 1, LeaderID: "leader",
 		Entries: []raft.LogEntry{{Index: 1, Term: 1}}}
 
-	if _, err := cli.AppendEntries(ctx, "srv", req); err != nil {
-		t.Fatalf("initial AppendEntries: %v", err)
+	if _, e := cli.AppendEntries(ctx, "srv", req); e != nil {
+		t.Fatalf("initial AppendEntries: %v", e)
 	}
 
 	// Take the peer down and keep it down long enough that a backoff with a
 	// multiplier has had several failed attempts to grow on.
-	if err := srv.Close(); err != nil {
-		t.Fatalf("Close server: %v", err)
+	if e := srv.Close(); e != nil {
+		t.Fatalf("Close server: %v", e)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		_, err := cli.AppendEntries(attemptCtx, "srv", req)
+		_, attemptErr := cli.AppendEntries(attemptCtx, "srv", req)
 		attemptCancel()
-		if err == nil {
+		if attemptErr == nil {
 			t.Fatal("the peer answered after it was closed")
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -87,14 +87,14 @@ func TestReconnect_RestartedPeerIsReachedQuickly(t *testing.T) {
 	start := time.Now()
 	for {
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, time.Second)
-		_, err := cli.AppendEntries(attemptCtx, "srv", req)
+		_, attemptErr := cli.AppendEntries(attemptCtx, "srv", req)
 		attemptCancel()
-		if err == nil {
+		if attemptErr == nil {
 			t.Logf("reconnected after %v", time.Since(start))
 			return
 		}
 		if time.Since(start) > budget {
-			t.Fatalf("the restarted peer was still unreachable after %v: %v", budget, err)
+			t.Fatalf("the restarted peer was still unreachable after %v: %v", budget, attemptErr)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -171,17 +171,17 @@ func TestReconnect_BackoffIsConfigured(t *testing.T) {
 	req := &raft.AppendEntriesRequest{Term: 1, LeaderID: "leader",
 		Entries: []raft.LogEntry{{Index: 1, Term: 1}}}
 
-	if _, err := cli.AppendEntries(ctx, "srv", req); err != nil {
-		t.Fatalf("initial AppendEntries: %v", err)
+	if _, callErr := cli.AppendEntries(ctx, "srv", req); callErr != nil {
+		t.Fatalf("initial AppendEntries: %v", callErr)
 	}
 
 	// Take the peer down and fail one send against it, so the connection
 	// enters backoff.
-	if err := srv.Close(); err != nil {
-		t.Fatalf("Close server: %v", err)
+	if callErr := srv.Close(); callErr != nil {
+		t.Fatalf("Close server: %v", callErr)
 	}
 	failCtx, failCancel := context.WithTimeout(ctx, 2*time.Second)
-	if _, err := cli.AppendEntries(failCtx, "srv", req); err == nil {
+	if _, callErr := cli.AppendEntries(failCtx, "srv", req); callErr == nil {
 		failCancel()
 		t.Fatal("the peer answered after it was closed")
 	}

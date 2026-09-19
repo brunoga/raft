@@ -249,9 +249,9 @@ func (b *peerBatcher) send(ctx context.Context, t *GRPCTransport, batch []hbCall
 // Applying the configured maximum unconditionally decouples the RPC from the
 // callers it serves, so a wedged peer keeps a connection and a goroutine busy
 // for the full timeout even when every caller gave up milliseconds in.
-func batchDeadline(batch []hbCall, max time.Duration) time.Duration {
+func batchDeadline(batch []hbCall, maxWait time.Duration) time.Duration {
 	now := time.Now()
-	timeout := max
+	timeout := maxWait
 	for _, c := range batch {
 		dl, ok := c.ctx.Deadline()
 		if !ok {

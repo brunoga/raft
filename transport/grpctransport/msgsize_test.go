@@ -78,7 +78,7 @@ func (h *recordingHandler) HandleReadIndex(_ context.Context, req *raft.ReadInde
 // pairedTransports returns a (client, server) transport pair wired so that the
 // client can reach the server under the peer name "srv". Both are closed when
 // the test finishes.
-func pairedTransports(t *testing.T, opts ...grpctransport.Option) (*grpctransport.GRPCTransport, *grpctransport.GRPCTransport) {
+func pairedTransports(t *testing.T, opts ...grpctransport.Option) (client, server *grpctransport.GRPCTransport) {
 	t.Helper()
 	srv, err := grpctransport.Listen("127.0.0.1:0", opts...)
 	if err != nil {

@@ -34,8 +34,8 @@ func TestClose_SendAfterCloseLeaksNoConnection(t *testing.T) {
 	}
 	tr.AddPeer("peer", "127.0.0.1:1")
 
-	if err := tr.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if closeErr := tr.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -94,8 +94,8 @@ func TestClose_EmptyAppendEntriesAfterCloseReturnsError(t *testing.T) {
 	tr.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 	tr.AddPeer("peer", "127.0.0.1:1")
 
-	if err := tr.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if closeErr := tr.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -161,8 +161,8 @@ func TestClose_ConcurrentWithInFlightSends(t *testing.T) {
 
 	// Close while the sends are in flight.
 	time.Sleep(5 * time.Millisecond)
-	if err := tr.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if closeErr := tr.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
 	}
 	wg.Wait()
 
@@ -233,8 +233,8 @@ func TestClose_RacingClientForLeaksNoConnection(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	if err := tr.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if closeErr := tr.Close(); closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
 	}
 	close(closed)
 

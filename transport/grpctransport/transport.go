@@ -331,10 +331,10 @@ func WithMaxMessageSize(n int) Option {
 // election timeout rather than up to two minutes later.
 //
 // Non-positive values select the corresponding default.
-func WithReconnectBackoff(base, max time.Duration) Option {
+func WithReconnectBackoff(base, maxDelay time.Duration) Option {
 	return func(o *options) {
 		o.reconnectBaseDelay = base
-		o.reconnectMaxDelay = max
+		o.reconnectMaxDelay = maxDelay
 	}
 }
 
