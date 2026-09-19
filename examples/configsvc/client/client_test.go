@@ -14,9 +14,9 @@ import (
 
 // newTestServer registers handlers on a fresh ServeMux and returns both the
 // mux (for adding handlers) and the test server URL.
-func newTestServer(t *testing.T) (*http.ServeMux, string) {
+func newTestServer(t *testing.T) (mux *http.ServeMux, baseURL string) {
 	t.Helper()
-	mux := http.NewServeMux()
+	mux = http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return mux, srv.URL
@@ -120,11 +120,13 @@ func TestClient_Watch(t *testing.T) {
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher := w.(http.Flusher)
 
-		fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n",
+		// Write errors here mean the client hung up, which the test detects
+		// through the client side of the stream.
+		_, _ = fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n",
 			`{"key":"mykey","value":{"value":"init","version":1}}`)
 		flusher.Flush()
 
-		fmt.Fprintf(w, "event: change\ndata: %s\n\n",
+		_, _ = fmt.Fprintf(w, "event: change\ndata: %s\n\n",
 			`{"key":"mykey","value":{"value":"updated","version":2}}`)
 		flusher.Flush()
 

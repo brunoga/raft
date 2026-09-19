@@ -118,7 +118,17 @@ func (a *raftPeerAdder) AddPeer(id raft.NodeID, addr string) {
 	_ = a.node.AddServer(ctx, raft.PeerConfig{ID: id, Voter: true}) // best-effort; only the leader succeeds
 }
 
+// main keeps the process-exit decision in one place so that every resource
+// acquired by run — the signal context, the store, the transport, the node —
+// is released through its deferred cleanup before we exit.
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "idprovider: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var (
 		id                  = flag.String("id", "", "this node's unique ID (required)")
 		raftAddr            = flag.String("raft-addr", ":7001", "gRPC listen address for Raft RPCs")
@@ -138,9 +148,8 @@ func main() {
 	flag.Parse()
 
 	if *id == "" || *dataDir == "" {
-		fmt.Fprintln(os.Stderr, "idprovider: --id and --data-dir are required")
 		flag.Usage()
-		os.Exit(1)
+		return errors.New("--id and --data-dir are required")
 	}
 
 	// All three TLS flags must be provided together or not at all.
@@ -152,8 +161,7 @@ func main() {
 		}
 	}
 	if tlsCount != 0 && tlsCount != 3 {
-		fmt.Fprintln(os.Stderr, "idprovider: --tls-cert, --tls-key, and --tls-ca must all be provided together")
-		os.Exit(1)
+		return errors.New("--tls-cert, --tls-key, and --tls-ca must all be provided together")
 	}
 
 	// --peer, --udp-discovery, and --discover-dns are mutually exclusive.
@@ -168,8 +176,7 @@ func main() {
 		discoveryModes++
 	}
 	if discoveryModes > 1 {
-		fmt.Fprintln(os.Stderr, "idprovider: --peer, --udp-discovery, and --discover-dns are mutually exclusive")
-		os.Exit(1)
+		return errors.New("--peer, --udp-discovery, and --discover-dns are mutually exclusive")
 	}
 
 	// Set up the shutdown context early so we can respect SIGINT/SIGTERM even
@@ -189,8 +196,7 @@ func main() {
 		for _, p := range peers {
 			parts := strings.SplitN(p, "=", 2)
 			if len(parts) != 2 {
-				fmt.Fprintf(os.Stderr, "idprovider: invalid --peer %q (want id=raft_addr[,http_addr])\n", p)
-				os.Exit(1)
+				return fmt.Errorf("invalid --peer %q (want id=raft_addr[,http_addr])", p)
 			}
 			pid := raft.NodeID(parts[0])
 			if pid == raft.NodeID(*id) {
@@ -218,8 +224,7 @@ func main() {
 			Logger:        logger,
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "idprovider: udpbroadcast.New: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("udpbroadcast.New: %w", err)
 		}
 		bcast = b
 		go func() { _ = b.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
@@ -266,49 +271,30 @@ func main() {
 
 	// Open persistent storage.
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "idprovider: mkdir %s: %v\n", *dataDir, err)
-		os.Exit(1)
+		return fmt.Errorf("mkdir %s: %w", *dataDir, err)
 	}
 	store, err := filestore.Open(*dataDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "idprovider: filestore.Open: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("filestore.Open: %w", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	// Build TLS config when all three flags are set.
 	var trOpts []grpctransport.Option
 	if tlsCount == 3 {
-		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "idprovider: load TLS cert/key: %v\n", err)
-			os.Exit(1)
+		opt, tlsErr := mTLSOption(*tlsCert, *tlsKey, *tlsCA)
+		if tlsErr != nil {
+			return tlsErr
 		}
-		caPEM, err := os.ReadFile(*tlsCA)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "idprovider: read CA cert: %v\n", err)
-			os.Exit(1)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
-			fmt.Fprintln(os.Stderr, "idprovider: failed to parse CA certificate")
-			os.Exit(1)
-		}
-		trOpts = append(trOpts, grpctransport.WithTLSConfig(&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			RootCAs:      pool,
-			ClientCAs:    pool,
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-		}))
+		trOpts = append(trOpts, opt)
 	}
 
 	// Set up gRPC transport.
 	tr, err := grpctransport.Listen(*raftAddr, trOpts...)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "idprovider: grpctransport.Listen: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("grpctransport.Listen: %w", err)
 	}
-	defer tr.Close()
+	defer func() { _ = tr.Close() }()
 	for pid, addr := range peerRaftAddrs {
 		tr.AddPeer(pid, addr)
 	}
@@ -326,8 +312,7 @@ func main() {
 
 	node, err := raft.New(&cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "idprovider: raft.New: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("raft.New: %w", err)
 	}
 	node.Start()
 	defer node.Stop()
@@ -370,7 +355,35 @@ func main() {
 	slog.Info("idprovider: shutting down")
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(shutCtx) //nolint:errcheck // best-effort shutdown; error not actionable here
+	// Best-effort shutdown: the process is going away either way, so a failure
+	// here is not actionable.
+	_ = srv.Shutdown(shutCtx)
+
+	return nil
+}
+
+// mTLSOption builds the transport option enabling mutual TLS between Raft
+// peers, using certFile/keyFile as this node's identity and caFile as the
+// authority both sides are verified against.
+func mTLSOption(certFile, keyFile, caFile string) (grpctransport.Option, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS cert/key: %w", err)
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("failed to parse CA certificate")
+	}
+	return grpctransport.WithTLSConfig(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}), nil
 }
 
 // buildMux constructs the HTTP handler for a single Raft node.

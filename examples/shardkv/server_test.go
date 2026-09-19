@@ -208,36 +208,36 @@ func (c *shardCluster) anyServerURL() string { return c.servers[0].URL }
 
 // ---- HTTP helpers ----
 
-func doPut(t *testing.T, url, value string) int {
+func doPut(t *testing.T, reqURL, value string) int {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodPut, url, strings.NewReader(value))
+	req, _ := http.NewRequest(http.MethodPut, reqURL, strings.NewReader(value))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("PUT %s: %v", url, err)
+		t.Fatalf("PUT %s: %v", reqURL, err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return resp.StatusCode
 }
 
-func doGet(t *testing.T, url string) (int, string) {
+func doGet(t *testing.T, reqURL string) (code int, body string) {
 	t.Helper()
-	resp, err := http.Get(url)
+	resp, err := http.Get(reqURL)
 	if err != nil {
-		t.Fatalf("GET %s: %v", url, err)
+		t.Fatalf("GET %s: %v", reqURL, err)
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, strings.TrimSpace(string(body))
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, strings.TrimSpace(string(raw))
 }
 
-func doDelete(t *testing.T, url string) int {
+func doDelete(t *testing.T, reqURL string) int {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodDelete, url, nil)
+	req, _ := http.NewRequest(http.MethodDelete, reqURL, http.NoBody)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("DELETE %s: %v", url, err)
+		t.Fatalf("DELETE %s: %v", reqURL, err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return resp.StatusCode
 }
 
@@ -380,7 +380,7 @@ func TestHTTP_ShardsStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /shards: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /shards = %d, want 200", resp.StatusCode)
 	}
@@ -415,7 +415,7 @@ func TestHTTP_Status(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /status: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var status struct {
 		ID        string   `json:"id"`

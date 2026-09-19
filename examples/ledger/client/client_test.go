@@ -11,9 +11,9 @@ import (
 
 // newTestServer registers handlers on a fresh ServeMux and returns both the
 // mux (for adding handlers) and the test server URL.
-func newTestServer(t *testing.T) (*http.ServeMux, string) {
+func newTestServer(t *testing.T) (mux *http.ServeMux, baseURL string) {
 	t.Helper()
-	mux := http.NewServeMux()
+	mux = http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return mux, srv.URL
@@ -173,10 +173,7 @@ func TestClient_Transfer_InsufficientFunds(t *testing.T) {
 	}
 	// unwrap should reach ErrInsufficientFunds
 	unwrapped := err
-	for {
-		if unwrapped == ErrInsufficientFunds {
-			break
-		}
+	for unwrapped != ErrInsufficientFunds {
 		u, ok := unwrapped.(interface{ Unwrap() error })
 		if !ok {
 			t.Fatalf("error chain does not contain ErrInsufficientFunds: %v", err)
@@ -301,4 +298,3 @@ func TestClient_ContextCancelled_StopsRetries(t *testing.T) {
 		t.Fatal("expected error with cancelled context")
 	}
 }
-

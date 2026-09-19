@@ -174,8 +174,8 @@ func main() {
 
 func parseQuota(maxStr, refillStr string) (client.Quota, bool) {
 
-	max, err := strconv.ParseInt(maxStr, 10, 64)
-	if err != nil || max <= 0 {
+	maxTokens, err := strconv.ParseInt(maxStr, 10, 64)
+	if err != nil || maxTokens <= 0 {
 		fmt.Fprintln(os.Stderr, "error: max-tokens must be a positive integer")
 		return client.Quota{}, false
 	}
@@ -185,8 +185,8 @@ func parseQuota(maxStr, refillStr string) (client.Quota, bool) {
 		return client.Quota{}, false
 	}
 	return client.Quota{
-		MaxTokens:     max,
-		CurrentTokens: max,
+		MaxTokens:     maxTokens,
+		CurrentTokens: maxTokens,
 		RefillRate:    refill,
 	}, true
 }

@@ -147,9 +147,9 @@ func (c *Client) doOnce(ctx context.Context, shardID uint64, addr, method, path 
 		if location == "" {
 			return errors.New("redirect with empty Location")
 		}
-		u, err := url.Parse(location)
-		if err != nil {
-			return fmt.Errorf("bad redirect location %q: %w", location, err)
+		u, parseErr := url.Parse(location)
+		if parseErr != nil {
+			return fmt.Errorf("bad redirect location %q: %w", location, parseErr)
 		}
 		newBase := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 

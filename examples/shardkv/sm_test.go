@@ -25,6 +25,16 @@ func applyKv(t *testing.T, sm *KvSM, cmd kvCmd) error {
 	return err
 }
 
+// mustApplyKv applies cmd and fails the test if it is rejected. Use it for
+// setup steps: a silently failing one would leave the state machine in a state
+// the test is not actually asserting against.
+func mustApplyKv(t *testing.T, sm *KvSM, cmd kvCmd) {
+	t.Helper()
+	if err := applyKv(t, sm, cmd); err != nil {
+		t.Fatalf("apply %+v: %v", cmd, err)
+	}
+}
+
 // --- Set ---
 
 func TestKvSM_Set(t *testing.T) {
@@ -40,8 +50,8 @@ func TestKvSM_Set(t *testing.T) {
 
 func TestKvSM_SetOverwrites(t *testing.T) {
 	sm := newKvSM()
-	applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "first"})
-	applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "second"})
+	mustApplyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "first"})
+	mustApplyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "second"})
 	if v, _ := sm.Get("k"); v != "second" {
 		t.Errorf("overwrite: Get = %q, want second", v)
 	}
@@ -51,7 +61,7 @@ func TestKvSM_SetOverwrites(t *testing.T) {
 
 func TestKvSM_Delete(t *testing.T) {
 	sm := newKvSM()
-	applyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "v"})
+	mustApplyKv(t, sm, kvCmd{Op: opSet, Key: "k", Value: "v"})
 	if err := applyKv(t, sm, kvCmd{Op: opDel, Key: "k"}); err != nil {
 		t.Fatalf("del: %v", err)
 	}
@@ -81,9 +91,9 @@ func TestKvSM_GetMissing(t *testing.T) {
 
 func TestKvSM_KeysAreIsolated(t *testing.T) {
 	sm := newKvSM()
-	applyKv(t, sm, kvCmd{Op: opSet, Key: "a", Value: "1"})
-	applyKv(t, sm, kvCmd{Op: opSet, Key: "b", Value: "2"})
-	applyKv(t, sm, kvCmd{Op: opDel, Key: "a"})
+	mustApplyKv(t, sm, kvCmd{Op: opSet, Key: "a", Value: "1"})
+	mustApplyKv(t, sm, kvCmd{Op: opSet, Key: "b", Value: "2"})
+	mustApplyKv(t, sm, kvCmd{Op: opDel, Key: "a"})
 
 	if _, ok := sm.Get("a"); ok {
 		t.Error("a should be absent after delete")
@@ -107,8 +117,8 @@ func TestKvSM_UnknownOp(t *testing.T) {
 
 func TestKvSM_SnapshotRestore(t *testing.T) {
 	src := newKvSM()
-	applyKv(t, src, kvCmd{Op: opSet, Key: "x", Value: "10"})
-	applyKv(t, src, kvCmd{Op: opSet, Key: "y", Value: "20"})
+	mustApplyKv(t, src, kvCmd{Op: opSet, Key: "x", Value: "10"})
+	mustApplyKv(t, src, kvCmd{Op: opSet, Key: "y", Value: "20"})
 
 	var buf bytes.Buffer
 	if err := src.Snapshot(context.Background(), &buf); err != nil {
@@ -129,10 +139,10 @@ func TestKvSM_SnapshotRestore(t *testing.T) {
 
 func TestKvSM_RestoreClearsExistingState(t *testing.T) {
 	sm := newKvSM()
-	applyKv(t, sm, kvCmd{Op: opSet, Key: "stale", Value: "old"})
+	mustApplyKv(t, sm, kvCmd{Op: opSet, Key: "stale", Value: "old"})
 
 	fresh := newKvSM()
-	applyKv(t, fresh, kvCmd{Op: opSet, Key: "fresh", Value: "new"})
+	mustApplyKv(t, fresh, kvCmd{Op: opSet, Key: "fresh", Value: "new"})
 	var buf bytes.Buffer
 	_ = fresh.Snapshot(context.Background(), &buf)
 
@@ -153,7 +163,7 @@ func TestKvSM_RestoreEmptySnapshot(t *testing.T) {
 	_ = sm.Snapshot(context.Background(), &buf)
 
 	dst := newKvSM()
-	applyKv(t, dst, kvCmd{Op: opSet, Key: "old", Value: "v"})
+	mustApplyKv(t, dst, kvCmd{Op: opSet, Key: "old", Value: "v"})
 	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, &buf); err != nil {
 		t.Fatalf("Restore from empty: %v", err)
 	}

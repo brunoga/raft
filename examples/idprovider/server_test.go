@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +25,6 @@ import (
 	"github.com/brunoga/raft"
 	"github.com/brunoga/raft/storage/memstore"
 	"github.com/brunoga/raft/transport/memtransport"
-	"net/url"
 )
 
 // testElectionTimeout is the maximum time WaitLeader will poll before giving up.
@@ -47,7 +47,7 @@ type idpCluster struct {
 // newIDPCluster creates an n-node idprovider cluster backed by in-process
 // transports. opts are applied to every node's Config before New is called,
 // allowing per-test overrides (e.g. SnapshotThreshold).
-func newIDPCluster(t *testing.T, n int, opts ...func(*raft.Config)) *idpCluster { //nolint:unparam
+func newIDPCluster(t *testing.T, n int, opts ...func(*raft.Config)) *idpCluster {
 	t.Helper()
 
 	network := memtransport.NewNetwork()
@@ -171,22 +171,22 @@ func (c *idpCluster) FollowerURL() string { return c.servers[c.FollowerIdx()].UR
 
 // ---- HTTP helpers ----
 
-// do sends a method+url request with optional headers, and returns the
+// do sends a method+URL request with optional headers, and returns the
 // status code, response body, and headers.
-func do(t *testing.T, method, url string, headers map[string]string) (code int, body []byte, hdr http.Header) {
+func do(t *testing.T, method, reqURL string, headers map[string]string) (code int, body []byte, hdr http.Header) {
 	t.Helper()
-	r, err := http.NewRequest(method, url, nil)
+	r, err := http.NewRequest(method, reqURL, http.NoBody)
 	if err != nil {
-		t.Fatalf("new request %s %s: %v", method, url, err)
+		t.Fatalf("new request %s %s: %v", method, reqURL, err)
 	}
 	for k, v := range headers {
 		r.Header.Set(k, v)
 	}
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, url, err)
+		t.Fatalf("%s %s: %v", method, reqURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, b, resp.Header
 }
@@ -200,24 +200,34 @@ func mustDecodeAlloc(t *testing.T, body []byte) allocResult {
 	return r
 }
 
+// mustDecode unmarshals body into v, failing the test if the payload is not
+// valid JSON. Skipping the error check here would leave v zeroed and turn a
+// bad response into a confusing assertion failure further down.
+func mustDecode(t *testing.T, body []byte, v any) {
+	t.Helper()
+	if err := json.Unmarshal(body, v); err != nil {
+		t.Fatalf("decode %T: %v\nbody: %s", v, err, body)
+	}
+}
+
 // ---- Domain management tests ----
 
 func TestHTTP_CreateDomain(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	code, _, _ := do(t, http.MethodPost, url+"/domains/orders", nil)
+	code, _, _ := do(t, http.MethodPost, base+"/domains/orders", nil)
 	if code != http.StatusOK {
 		t.Fatalf("POST /domains/orders = %d, want 200", code)
 	}
 
 	// Verify domain appears in GET /domains.
-	code, body, _ := do(t, http.MethodGet, url+"/domains", nil)
+	code, body, _ := do(t, http.MethodGet, base+"/domains", nil)
 	if code != http.StatusOK {
 		t.Fatalf("GET /domains = %d", code)
 	}
 	var domains map[string]uint64
-	json.Unmarshal(body, &domains)
+	mustDecode(t, body, &domains)
 	if _, ok := domains["orders"]; !ok {
 		t.Errorf("'orders' missing from GET /domains: %v", domains)
 	}
@@ -225,23 +235,23 @@ func TestHTTP_CreateDomain(t *testing.T) {
 
 func TestHTTP_CreateDomainIdempotent(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
 	// Create domain, allocate 1 ID to set counter, then create again.
-	do(t, http.MethodPost, url+"/domains/d", nil)
-	do(t, http.MethodPost, url+"/domains/d/next", nil)
+	do(t, http.MethodPost, base+"/domains/d", nil)
+	do(t, http.MethodPost, base+"/domains/d/next", nil)
 
-	code, _, _ := do(t, http.MethodPost, url+"/domains/d", nil)
+	code, _, _ := do(t, http.MethodPost, base+"/domains/d", nil)
 	if code != http.StatusOK {
 		t.Fatalf("second POST /domains/d = %d, want 200", code)
 	}
 
 	// Counter must be unchanged.
-	_, body, _ := do(t, http.MethodGet, url+"/domains/d/current", nil)
+	_, body, _ := do(t, http.MethodGet, base+"/domains/d/current", nil)
 	var resp struct {
 		Current uint64 `json:"current"`
 	}
-	json.Unmarshal(body, &resp)
+	mustDecode(t, body, &resp)
 	if resp.Current != 1 {
 		t.Errorf("current after idempotent create = %d, want 1", resp.Current)
 	}
@@ -249,16 +259,16 @@ func TestHTTP_CreateDomainIdempotent(t *testing.T) {
 
 func TestHTTP_DeleteDomain(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/tmp", nil)
-	code, _, _ := do(t, http.MethodDelete, url+"/domains/tmp", nil)
+	do(t, http.MethodPost, base+"/domains/tmp", nil)
+	code, _, _ := do(t, http.MethodDelete, base+"/domains/tmp", nil)
 	if code != http.StatusNoContent {
 		t.Fatalf("DELETE /domains/tmp = %d, want 204", code)
 	}
 
 	// Allocating from a deleted domain must return 404.
-	code, _, _ = do(t, http.MethodPost, url+"/domains/tmp/next", nil)
+	code, _, _ = do(t, http.MethodPost, base+"/domains/tmp/next", nil)
 	if code != http.StatusNotFound {
 		t.Errorf("POST /domains/tmp/next after delete = %d, want 404", code)
 	}
@@ -281,7 +291,7 @@ func TestHTTP_ListDomains_Empty(t *testing.T) {
 		t.Fatalf("GET /domains = %d", code)
 	}
 	var domains map[string]uint64
-	json.Unmarshal(body, &domains)
+	mustDecode(t, body, &domains)
 	if len(domains) != 0 {
 		t.Errorf("expected empty map, got %v", domains)
 	}
@@ -289,16 +299,16 @@ func TestHTTP_ListDomains_Empty(t *testing.T) {
 
 func TestHTTP_ListDomains_ShowsAllCounters(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/a", nil)
-	do(t, http.MethodPost, url+"/domains/b", nil)
-	do(t, http.MethodPost, url+"/domains/a/next?count=3", nil)
-	do(t, http.MethodPost, url+"/domains/b/next?count=7", nil)
+	do(t, http.MethodPost, base+"/domains/a", nil)
+	do(t, http.MethodPost, base+"/domains/b", nil)
+	do(t, http.MethodPost, base+"/domains/a/next?count=3", nil)
+	do(t, http.MethodPost, base+"/domains/b/next?count=7", nil)
 
-	_, body, _ := do(t, http.MethodGet, url+"/domains", nil)
+	_, body, _ := do(t, http.MethodGet, base+"/domains", nil)
 	var domains map[string]uint64
-	json.Unmarshal(body, &domains)
+	mustDecode(t, body, &domains)
 	if domains["a"] != 3 {
 		t.Errorf("a = %d, want 3", domains["a"])
 	}
@@ -311,10 +321,10 @@ func TestHTTP_ListDomains_ShowsAllCounters(t *testing.T) {
 
 func TestHTTP_AllocSingleID(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/ids", nil)
-	code, body, _ := do(t, http.MethodPost, url+"/domains/ids/next", nil)
+	do(t, http.MethodPost, base+"/domains/ids", nil)
+	code, body, _ := do(t, http.MethodPost, base+"/domains/ids/next", nil)
 	if code != http.StatusOK {
 		t.Fatalf("POST /domains/ids/next = %d\n%s", code, body)
 	}
@@ -327,10 +337,10 @@ func TestHTTP_AllocSingleID(t *testing.T) {
 
 func TestHTTP_AllocBatch(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/batch", nil)
-	_, body, _ := do(t, http.MethodPost, url+"/domains/batch/next?count=100", nil)
+	do(t, http.MethodPost, base+"/domains/batch", nil)
+	_, body, _ := do(t, http.MethodPost, base+"/domains/batch/next?count=100", nil)
 
 	r := mustDecodeAlloc(t, body)
 	if r.Start != 1 || r.Count != 100 {
@@ -340,11 +350,11 @@ func TestHTTP_AllocBatch(t *testing.T) {
 
 func TestHTTP_AllocSequentialRangesAreContiguous(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/seq", nil)
-	_, b1, _ := do(t, http.MethodPost, url+"/domains/seq/next?count=10", nil)
-	_, b2, _ := do(t, http.MethodPost, url+"/domains/seq/next?count=5", nil)
+	do(t, http.MethodPost, base+"/domains/seq", nil)
+	_, b1, _ := do(t, http.MethodPost, base+"/domains/seq/next?count=10", nil)
+	_, b2, _ := do(t, http.MethodPost, base+"/domains/seq/next?count=5", nil)
 
 	r1 := mustDecodeAlloc(t, b1)
 	r2 := mustDecodeAlloc(t, b2)
@@ -365,11 +375,11 @@ func TestHTTP_AllocNonExistentDomain(t *testing.T) {
 
 func TestHTTP_AllocBadCount(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/x", nil)
+	do(t, http.MethodPost, base+"/domains/x", nil)
 	for _, bad := range []string{"0", "-1", "abc"} {
-		code, _, _ := do(t, http.MethodPost, url+"/domains/x/next?count="+bad, nil)
+		code, _, _ := do(t, http.MethodPost, base+"/domains/x/next?count="+bad, nil)
 		if code != http.StatusBadRequest {
 			t.Errorf("count=%q: got %d, want 400", bad, code)
 		}
@@ -378,14 +388,14 @@ func TestHTTP_AllocBadCount(t *testing.T) {
 
 func TestHTTP_AllocProposeOnce_Idempotent(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/idem", nil)
+	do(t, http.MethodPost, base+"/domains/idem", nil)
 
 	hdrs := map[string]string{"X-Client-ID": "svc-1", "X-Seq-Num": "42"}
 
-	_, b1, _ := do(t, http.MethodPost, url+"/domains/idem/next", hdrs)
-	_, b2, _ := do(t, http.MethodPost, url+"/domains/idem/next", hdrs) // retry
+	_, b1, _ := do(t, http.MethodPost, base+"/domains/idem/next", hdrs)
+	_, b2, _ := do(t, http.MethodPost, base+"/domains/idem/next", hdrs) // retry
 
 	r1 := mustDecodeAlloc(t, b1)
 	r2 := mustDecodeAlloc(t, b2)
@@ -396,13 +406,13 @@ func TestHTTP_AllocProposeOnce_Idempotent(t *testing.T) {
 
 func TestHTTP_AllocProposeOnce_NewSeqNum(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/seq2", nil)
+	do(t, http.MethodPost, base+"/domains/seq2", nil)
 
-	_, b1, _ := do(t, http.MethodPost, url+"/domains/seq2/next",
+	_, b1, _ := do(t, http.MethodPost, base+"/domains/seq2/next",
 		map[string]string{"X-Client-ID": "c", "X-Seq-Num": "1"})
-	_, b2, _ := do(t, http.MethodPost, url+"/domains/seq2/next",
+	_, b2, _ := do(t, http.MethodPost, base+"/domains/seq2/next",
 		map[string]string{"X-Client-ID": "c", "X-Seq-Num": "2"})
 
 	r1 := mustDecodeAlloc(t, b1)
@@ -414,10 +424,10 @@ func TestHTTP_AllocProposeOnce_NewSeqNum(t *testing.T) {
 
 func TestHTTP_AllocBadSeqNum(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/x", nil)
-	code, _, _ := do(t, http.MethodPost, url+"/domains/x/next", map[string]string{
+	do(t, http.MethodPost, base+"/domains/x", nil)
+	code, _, _ := do(t, http.MethodPost, base+"/domains/x/next", map[string]string{
 		"X-Client-ID": "svc",
 		"X-Seq-Num":   "not-a-number",
 	})
@@ -428,18 +438,18 @@ func TestHTTP_AllocBadSeqNum(t *testing.T) {
 
 func TestHTTP_AllocObsoleteSeqNum(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/obs", nil)
+	do(t, http.MethodPost, base+"/domains/obs", nil)
 
 	// Issue seq=2 first, then retry seq=1 (obsolete).
-	do(t, http.MethodPost, url+"/domains/obs/next",
+	do(t, http.MethodPost, base+"/domains/obs/next",
 		map[string]string{"X-Client-ID": "c", "X-Seq-Num": "2"})
 
 	// The raft layer rejects obsolete seqNums — the handler propagates the error.
 	// The SM does not apply the command, so the response is an error (non-2xx).
 	// ErrObsoleteSeqNum is not NotLeaderError, so we expect 500.
-	code, _, _ := do(t, http.MethodPost, url+"/domains/obs/next",
+	code, _, _ := do(t, http.MethodPost, base+"/domains/obs/next",
 		map[string]string{"X-Client-ID": "c", "X-Seq-Num": "1"})
 	if code == http.StatusOK {
 		t.Fatal("expected non-200 for obsolete seqNum")
@@ -450,12 +460,12 @@ func TestHTTP_AllocObsoleteSeqNum(t *testing.T) {
 
 func TestHTTP_GetCurrentDomain(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/cur", nil)
-	do(t, http.MethodPost, url+"/domains/cur/next?count=7", nil)
+	do(t, http.MethodPost, base+"/domains/cur", nil)
+	do(t, http.MethodPost, base+"/domains/cur/next?count=7", nil)
 
-	code, body, _ := do(t, http.MethodGet, url+"/domains/cur/current", nil)
+	code, body, _ := do(t, http.MethodGet, base+"/domains/cur/current", nil)
 	if code != http.StatusOK {
 		t.Fatalf("GET /domains/cur/current = %d\n%s", code, body)
 	}
@@ -486,19 +496,19 @@ func TestHTTP_GetCurrentNonExistentDomain(t *testing.T) {
 
 func TestHTTP_GetCurrentReflectsLatestAlloc(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/live", nil)
+	do(t, http.MethodPost, base+"/domains/live", nil)
 
 	for i := range 5 {
-		do(t, http.MethodPost, fmt.Sprintf(url+"/domains/live/next?count=%d", i+1), nil)
+		do(t, http.MethodPost, fmt.Sprintf(base+"/domains/live/next?count=%d", i+1), nil)
 	}
 	// sum(1..5) = 15
-	_, body, _ := do(t, http.MethodGet, url+"/domains/live/current", nil)
+	_, body, _ := do(t, http.MethodGet, base+"/domains/live/current", nil)
 	var resp struct {
 		Current uint64 `json:"current"`
 	}
-	json.Unmarshal(body, &resp)
+	mustDecode(t, body, &resp)
 	if resp.Current != 15 {
 		t.Errorf("current = %d, want 15", resp.Current)
 	}
@@ -556,7 +566,7 @@ func TestHTTP_NonLeaderProposalRedirectsToLeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST to follower: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusTemporaryRedirect {
 		t.Fatalf("POST to follower = %d, want 307", resp.StatusCode)
@@ -618,7 +628,7 @@ func TestHTTP_FollowerCurrentForwardedToLeader(t *testing.T) {
 	var resp struct {
 		Current uint64 `json:"current"`
 	}
-	json.Unmarshal(body, &resp)
+	mustDecode(t, body, &resp)
 	if resp.Current != 99 {
 		t.Errorf("follower current = %d, want 99", resp.Current)
 	}
@@ -628,20 +638,20 @@ func TestHTTP_FollowerCurrentForwardedToLeader(t *testing.T) {
 
 func TestHTTP_MultiDomainIsolation(t *testing.T) {
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/alpha", nil)
-	do(t, http.MethodPost, url+"/domains/beta", nil)
-	do(t, http.MethodPost, url+"/domains/alpha/next?count=100", nil)
-	do(t, http.MethodPost, url+"/domains/beta/next?count=5", nil)
+	do(t, http.MethodPost, base+"/domains/alpha", nil)
+	do(t, http.MethodPost, base+"/domains/beta", nil)
+	do(t, http.MethodPost, base+"/domains/alpha/next?count=100", nil)
+	do(t, http.MethodPost, base+"/domains/beta/next?count=5", nil)
 
 	var ra, rb struct {
 		Current uint64 `json:"current"`
 	}
-	_, ba, _ := do(t, http.MethodGet, url+"/domains/alpha/current", nil)
-	_, bb, _ := do(t, http.MethodGet, url+"/domains/beta/current", nil)
-	json.Unmarshal(ba, &ra)
-	json.Unmarshal(bb, &rb)
+	_, ba, _ := do(t, http.MethodGet, base+"/domains/alpha/current", nil)
+	_, bb, _ := do(t, http.MethodGet, base+"/domains/beta/current", nil)
+	mustDecode(t, ba, &ra)
+	mustDecode(t, bb, &rb)
 
 	if ra.Current != 100 {
 		t.Errorf("alpha = %d, want 100", ra.Current)
@@ -654,17 +664,17 @@ func TestHTTP_MultiDomainIsolation(t *testing.T) {
 func TestHTTP_MultiDomainAllocationsDontInterfere(t *testing.T) {
 	// Interleave allocs across two domains and verify ranges are independent.
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/x", nil)
-	do(t, http.MethodPost, url+"/domains/y", nil)
+	do(t, http.MethodPost, base+"/domains/x", nil)
+	do(t, http.MethodPost, base+"/domains/y", nil)
 
 	type rangeSet [][2]uint64 // each element is [start, end)
 	collectRanges := func(domain string, counts []uint64) rangeSet {
 		var rs rangeSet
 		for _, cnt := range counts {
 			_, body, _ := do(t, http.MethodPost,
-				fmt.Sprintf(url+"/domains/%s/next?count=%d", domain, cnt), nil)
+				fmt.Sprintf(base+"/domains/%s/next?count=%d", domain, cnt), nil)
 			r := mustDecodeAlloc(t, body)
 			rs = append(rs, [2]uint64{r.Start, r.Start + r.Count})
 		}
@@ -701,26 +711,27 @@ func TestHTTP_SnapshotPreservesDomains(t *testing.T) {
 	c := newIDPCluster(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 2
 	})
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/snap", nil)
+	do(t, http.MethodPost, base+"/domains/snap", nil)
 
 	// Commit 6 allocs — well past the snapshot threshold.
 	want := uint64(0)
 	for i := uint64(1); i <= 6; i++ {
-		do(t, http.MethodPost, fmt.Sprintf(url+"/domains/snap/next?count=%d", i), nil)
-		want += i // 1+2+3+4+5+6 = 21
+		do(t, http.MethodPost, fmt.Sprintf(base+"/domains/snap/next?count=%d", i), nil)
+		// The six allocations sum to 21.
+		want += i
 	}
 
 	// After snapshots, the counter must be correct and readable.
-	code, body, _ := do(t, http.MethodGet, url+"/domains/snap/current", nil)
+	code, body, _ := do(t, http.MethodGet, base+"/domains/snap/current", nil)
 	if code != http.StatusOK {
 		t.Fatalf("GET /domains/snap/current = %d\n%s", code, body)
 	}
 	var resp struct {
 		Current uint64 `json:"current"`
 	}
-	json.Unmarshal(body, &resp)
+	mustDecode(t, body, &resp)
 	if resp.Current != want {
 		t.Errorf("after snapshots: current = %d, want %d", resp.Current, want)
 	}
@@ -730,20 +741,20 @@ func TestHTTP_SnapshotPreservesMultipleDomains(t *testing.T) {
 	c := newIDPCluster(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 3
 	})
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
 	// Create two domains and alloc into both, forcing snapshots.
-	do(t, http.MethodPost, url+"/domains/m1", nil)
-	do(t, http.MethodPost, url+"/domains/m2", nil)
+	do(t, http.MethodPost, base+"/domains/m1", nil)
+	do(t, http.MethodPost, base+"/domains/m2", nil)
 	for i := uint64(1); i <= 4; i++ {
-		do(t, http.MethodPost, fmt.Sprintf(url+"/domains/m1/next?count=%d", i), nil)
-		do(t, http.MethodPost, fmt.Sprintf(url+"/domains/m2/next?count=%d", i*10), nil)
+		do(t, http.MethodPost, fmt.Sprintf(base+"/domains/m1/next?count=%d", i), nil)
+		do(t, http.MethodPost, fmt.Sprintf(base+"/domains/m2/next?count=%d", i*10), nil)
 	}
 	// m1 counter: 1+2+3+4 = 10; m2: 10+20+30+40 = 100
 
-	_, body, _ := do(t, http.MethodGet, url+"/domains", nil)
+	_, body, _ := do(t, http.MethodGet, base+"/domains", nil)
 	var domains map[string]uint64
-	json.Unmarshal(body, &domains)
+	mustDecode(t, body, &domains)
 	if domains["m1"] != 10 {
 		t.Errorf("m1 = %d, want 10", domains["m1"])
 	}
@@ -757,20 +768,20 @@ func TestHTTP_SnapshotPreservesMultipleDomains(t *testing.T) {
 func TestHTTP_CreateDomainProposeOnce(t *testing.T) {
 	// Create must be idempotent at the SM level AND at the ProposeOnce level.
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
 	hdrs := map[string]string{"X-Client-ID": "admin", "X-Seq-Num": "1"}
 
-	code1, _, _ := do(t, http.MethodPost, url+"/domains/idem", hdrs)
-	code2, _, _ := do(t, http.MethodPost, url+"/domains/idem", hdrs) // same seqNum
+	code1, _, _ := do(t, http.MethodPost, base+"/domains/idem", hdrs)
+	code2, _, _ := do(t, http.MethodPost, base+"/domains/idem", hdrs) // same seqNum
 	if code1 != http.StatusOK || code2 != http.StatusOK {
 		t.Fatalf("create codes = %d, %d; want 200, 200", code1, code2)
 	}
 
 	// Verify domain exists exactly once.
-	_, body, _ := do(t, http.MethodGet, url+"/domains", nil)
+	_, body, _ := do(t, http.MethodGet, base+"/domains", nil)
 	var domains map[string]uint64
-	json.Unmarshal(body, &domains)
+	mustDecode(t, body, &domains)
 	if _, ok := domains["idem"]; !ok {
 		t.Error("domain 'idem' should exist")
 	}
@@ -782,13 +793,13 @@ func TestHTTP_DeleteDomainProposeOnce(t *testing.T) {
 	// A delete replayed with the same (clientID, seqNum) must return the
 	// cached result rather than re-running the delete (which would 404).
 	c := newIDPCluster(t, 3)
-	url := c.LeaderURL()
+	base := c.LeaderURL()
 
-	do(t, http.MethodPost, url+"/domains/del", nil)
+	do(t, http.MethodPost, base+"/domains/del", nil)
 
 	hdrs := map[string]string{"X-Client-ID": "admin", "X-Seq-Num": "10"}
-	code1, _, _ := do(t, http.MethodDelete, url+"/domains/del", hdrs)
-	code2, _, _ := do(t, http.MethodDelete, url+"/domains/del", hdrs)
+	code1, _, _ := do(t, http.MethodDelete, base+"/domains/del", hdrs)
+	code2, _, _ := do(t, http.MethodDelete, base+"/domains/del", hdrs)
 	if code1 != http.StatusNoContent {
 		t.Fatalf("first delete = %d, want 204", code1)
 	}
