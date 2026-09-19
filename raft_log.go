@@ -154,8 +154,23 @@ func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
 	return nil
 }
 
+// canDescribe reports whether this log can describe the entry at index: either
+// it is still present, or it is the snapshot boundary, or it is the empty
+// position before the first entry. Replication needs this for the entry before
+// the one it is about to send; when the answer is no, the peer has fallen
+// behind what the log still holds and needs a snapshot instead.
+func (rl *raftLog) canDescribe(index Index) bool {
+	if index == 0 || index == rl.snapMeta.LastIncludedIndex {
+		return true
+	}
+	return rl.first != 0 && index >= rl.first && index <= rl.last
+}
+
 // truncatePrefix removes entries at index < toIndex and updates the cache.
 func (rl *raftLog) truncatePrefix(ctx context.Context, toIndex Index) error {
+	if rl.first != 0 && toIndex <= rl.first {
+		return nil // nothing to reclaim
+	}
 	if err := rl.storage.TruncatePrefix(ctx, toIndex); err != nil {
 		return err
 	}

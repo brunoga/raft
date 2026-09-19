@@ -406,7 +406,18 @@ func (n *Node) handleSnapshotResult(sr snapshotResult) {
 		return
 	}
 
-	if err := n.log.truncatePrefix(n.stopCtx, sr.meta.LastIncludedIndex+1); err != nil {
+	// Keep a tail of entries behind the snapshot point so that a follower which
+	// is slightly behind can still be caught up from the log rather than needing
+	// the whole state machine shipped to it.
+	keepFrom := sr.meta.LastIncludedIndex + 1
+	if trailing := n.trailingLogs(); trailing > 0 {
+		if trailing >= keepFrom {
+			keepFrom = 1
+		} else {
+			keepFrom -= trailing
+		}
+	}
+	if err := n.log.truncatePrefix(n.stopCtx, keepFrom); err != nil {
 		n.logger.Error("snapshot: truncatePrefix", "err", err)
 		return
 	}

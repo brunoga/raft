@@ -124,8 +124,11 @@ func (n *Node) replicateToFollowers() {
 func (n *Node) replicateToPeer(peer NodeID) {
 	nextIdx := n.nextIndex[peer]
 
-	// The follower needs entries we no longer have — send the snapshot.
-	if nextIdx <= n.log.snapMeta.LastIncludedIndex {
+	// The follower needs entries we no longer have — send the snapshot. The
+	// test is what the log still holds, not where the snapshot boundary is:
+	// with TrailingLogs set, entries below that boundary are often still
+	// present and a snapshot would be wasted work.
+	if !n.log.canDescribe(nextIdx - 1) {
 		n.sendSnapshotToPeer(peer)
 		return
 	}

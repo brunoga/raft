@@ -104,6 +104,30 @@ type Config struct {
 	// Default: 10 000.
 	SnapshotThreshold uint64
 
+	// TrailingLogs is the number of log entries retained behind the snapshot
+	// point when the log is compacted.
+	//
+	// Compaction that keeps nothing behind the snapshot point makes a full
+	// state transfer the only way to catch up a follower that was even one
+	// entry behind at that instant, and with automatic snapshots that instant
+	// comes round again and again. Retaining a tail lets those followers catch
+	// up from the log instead, which on a large state machine is the difference
+	// between shipping a few entries and shipping the whole thing.
+	//
+	// Size it to cover how far a healthy follower can fall behind: a brief
+	// pause, a garbage collection, a slow disk. The cost is disk space for that
+	// many entries.
+	//
+	// A value at or above SnapshotThreshold would leave compaction with nothing
+	// to reclaim, so it is capped at SnapshotThreshold-1 in use; New logs a
+	// warning when that cap applies. Lowering SnapshotThreshold without
+	// lowering this therefore still works, it just retains less.
+	//
+	// Set to 0 to retain nothing.
+	//
+	// Default: 1024.
+	TrailingLogs uint64
+
 	// SnapshotSemaphore is an optional semaphore used to limit the number of
 	// concurrent snapshots across multiple Raft nodes on a single physical
 	// machine. If nil, snapshots are not throttled.
@@ -296,6 +320,7 @@ func DefaultConfig() Config {
 		HeartbeatInterval:   50 * time.Millisecond,
 		MaxLogEntriesPerRPC: 64,
 		SnapshotThreshold:   10_000,
+		TrailingLogs:        1024,
 		MaxInflightRPCs:     4,
 		CheckQuorum:         true,
 		MaxClientTableSize:  100_000,
