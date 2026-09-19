@@ -2,11 +2,15 @@ package easyraft
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,43 +78,113 @@ type batchOp struct {
 	MutateArgs json.RawMessage `json:"mutate_args,omitempty"`
 }
 
+// ---- Authorization middleware ----------------------------------------------
+
+// authorized wraps h with the configured authorization hook. Every easyraft
+// route goes through it, so a single hook covers reads, writes, and the
+// cluster-mutating endpoints alike.
+//
+// A nil hook admits everything; that configuration is reported once at startup
+// by warnIfHTTPUnauthenticated.
+func authorized(auth func(*http.Request) error, logger *slog.Logger, h http.HandlerFunc) http.HandlerFunc {
+	if auth == nil {
+		return h
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := auth(r); err != nil {
+			code := authStatus(err)
+			logger.Warn("easyraft: HTTP request denied",
+				"method", r.Method, "path", r.URL.Path, "status", code, "err", err)
+			// Report the status only: the hook's message may describe why the
+			// credential failed, which is not the caller's business.
+			writeError(w, code, http.StatusText(code), logger)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// warnIfHTTPUnauthenticated logs, once per store or manager, that the HTTP API
+// is being served without an authorization hook. The API can add and remove
+// cluster members, so an unauthenticated listener is a cluster-control plane
+// open to anyone who can reach it.
+func warnIfHTTPUnauthenticated(cfg *Config, logger *slog.Logger) {
+	if cfg.HTTPAuth != nil || cfg.AcknowledgeInsecureHTTP {
+		return
+	}
+	logger.Warn("easyraft: the HTTP API is being served WITHOUT authentication. "+
+		"Anyone who can reach this listener can add or remove cluster members, "+
+		"transfer leadership, and write to every collection. "+
+		"Configure easyraft.WithHTTPAuth or easyraft.WithBearerTokenAuth, "+
+		"or acknowledge the exposure with easyraft.WithInsecureHTTPAcknowledged.",
+		"addr", cfg.HTTPAddr)
+}
+
 // ---- Store HTTP server -----------------------------------------------------
 
 // registerRoutes registers all Store management and CRUD routes on mux.
+// Every route is wrapped with the configured authorization hook.
 func (s *Store) registerRoutes(mux *http.ServeMux) {
+	logger := s.logger()
+	guard := func(h http.HandlerFunc) http.HandlerFunc {
+		return authorized(s.cfg.HTTPAuth, logger, h)
+	}
+
 	// Cluster management — registered before wildcards to take priority.
-	mux.HandleFunc("POST /join", s.handleJoin)
-	mux.HandleFunc("GET /members", s.handleMembers)
-	mux.HandleFunc("DELETE /members/{id}", s.handleRemoveMember)
-	mux.HandleFunc("POST /transfer-leadership", s.handleTransferLeadership)
-	mux.HandleFunc("POST /batch", s.handleBatch)
+	mux.HandleFunc("POST /join", guard(s.handleJoin))
+	mux.HandleFunc("GET /members", guard(s.handleMembers))
+	mux.HandleFunc("DELETE /members/{id}", guard(s.handleRemoveMember))
+	mux.HandleFunc("POST /transfer-leadership", guard(s.handleTransferLeadership))
+	mux.HandleFunc("POST /batch", guard(s.handleBatch))
 
 	// Multi-collection routing: /{collection}/{key}
-	mux.HandleFunc("POST /{collection}/{key}", s.handleCreate)
-	mux.HandleFunc("GET /{collection}/{key}", s.handleRead)
-	mux.HandleFunc("PUT /{collection}/{key}", s.handleUpdate)
-	mux.HandleFunc("PATCH /{collection}/{key}", s.handleUpsert)
-	mux.HandleFunc("DELETE /{collection}/{key}", s.handleDelete)
-	mux.HandleFunc("GET /{collection}", s.handleList)
-	mux.HandleFunc("POST /{collection}/{key}/mutate", s.handleMutate)
+	mux.HandleFunc("POST /{collection}/{key}", guard(s.handleCreate))
+	mux.HandleFunc("GET /{collection}/{key}", guard(s.handleRead))
+	mux.HandleFunc("PUT /{collection}/{key}", guard(s.handleUpdate))
+	mux.HandleFunc("PATCH /{collection}/{key}", guard(s.handleUpsert))
+	mux.HandleFunc("DELETE /{collection}/{key}", guard(s.handleDelete))
+	mux.HandleFunc("GET /{collection}", guard(s.handleList))
+	mux.HandleFunc("POST /{collection}/{key}/mutate", guard(s.handleMutate))
 
-	mux.HandleFunc("GET /status", s.handleStatus)
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /status", guard(s.handleStatus))
+	mux.HandleFunc("GET /health", guard(s.handleHealth))
+	mux.Handle("GET /metrics", guard(promhttp.Handler().ServeHTTP))
 }
 
-func (s *Store) serveHTTP() error {
+// initHTTP binds the HTTP listener so a bad or busy address fails at
+// construction time rather than disappearing into a background goroutine.
+// It does nothing when the caller supplied their own mux or no address.
+func (s *Store) initHTTP() error {
+	if s.cfg.HTTPMux != nil || s.cfg.HTTPAddr == "" {
+		return nil
+	}
+	ln, err := net.Listen("tcp", s.cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("easyraft: listen http %s: %w", s.cfg.HTTPAddr, err)
+	}
+	s.httpListener = ln
+	return nil
+}
+
+// serveHTTP starts serving the routes registered for this store. The listener
+// was already bound by initHTTP, so the only failures left here are
+// serve-time ones, which are logged.
+func (s *Store) serveHTTP() {
+	logger := s.logger()
+
 	// If the caller provided their own mux, register routes there and let them
 	// start the server. This avoids a port conflict when the application runs
 	// its own HTTP server on the same address.
 	if s.cfg.HTTPMux != nil {
+		warnIfHTTPUnauthenticated(&s.cfg, logger)
 		s.registerRoutes(s.cfg.HTTPMux)
-		return nil
+		return
 	}
 
-	if s.cfg.HTTPAddr == "" {
-		return nil
+	if s.httpListener == nil {
+		return
 	}
+	warnIfHTTPUnauthenticated(&s.cfg, logger)
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
@@ -118,29 +192,53 @@ func (s *Store) serveHTTP() error {
 	s.httpServer = &http.Server{
 		Addr:         s.cfg.HTTPAddr,
 		Handler:      mux,
+		TLSConfig:    s.cfg.HTTPTLS,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
 	}
 
+	ln := s.httpListener
+	server := s.httpServer
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			if s.cfg.Logger != nil {
-				s.cfg.Logger.Error("HTTP server failed", "err", err)
-			}
+		if err := serveOn(server, ln, s.cfg.HTTPTLS); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("easyraft: HTTP server stopped", "addr", server.Addr, "err", err)
 		}
 	}()
+}
 
-	return nil
+// serveOn serves srv on ln, over TLS when a config is supplied. Certificates
+// come from the tls.Config, so no certificate file paths are needed.
+func serveOn(srv *http.Server, ln net.Listener, tlsCfg *tls.Config) error {
+	if tlsCfg != nil {
+		return srv.ServeTLS(ln, "", "")
+	}
+	return srv.Serve(ln)
+}
+
+// collectionParam returns the validated {collection} path value. Reserved
+// collections are refused outright: they hold easyraft's own cluster metadata,
+// and letting a client write one would let it choose where leader redirects
+// point.
+func (s *Store) collectionParam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name := r.PathValue("collection")
+	if isReservedCollection(name) {
+		writeError(w, http.StatusForbidden, ErrReservedCollection.Error(), s.logger())
+		return "", false
+	}
+	return name, true
 }
 
 func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 
 	var val json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 
@@ -158,12 +256,15 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Store) handleRead(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 	stale := r.URL.Query().Get("consistency") == "stale"
 
 	if !stale {
-		if _, err := s.node.ReadIndexLease(r.Context()); err != nil {
+		if err := s.readIndex(r.Context()); err != nil {
 			s.handleRPCError(w, r, err)
 			return
 		}
@@ -174,25 +275,28 @@ func (s *Store) handleRead(w http.ResponseWriter, r *http.Request) {
 
 	coll := s.collections[collection]
 	if coll == nil {
-		writeError(w, http.StatusNotFound, "collection not found", s.cfg.Logger)
+		writeError(w, http.StatusNotFound, "collection not found", s.logger())
 		return
 	}
-	raw, ok := coll[key]
-	if !ok {
-		writeError(w, http.StatusNotFound, ErrKeyNotFound.Error(), s.cfg.Logger)
+	raw, found := coll[key]
+	if !found {
+		writeError(w, http.StatusNotFound, ErrKeyNotFound.Error(), s.logger())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, raw, s.cfg.Logger)
+	writeJSON(w, http.StatusOK, raw, s.logger())
 }
 
 func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 
 	var val json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 
@@ -210,12 +314,15 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 
 	var val json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&val); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 
@@ -233,7 +340,10 @@ func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 
 	_, err := s.propose(r.Context(), &command{
@@ -249,11 +359,14 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	stale := r.URL.Query().Get("consistency") == "stale"
 
 	if !stale {
-		if _, err := s.node.ReadIndexLease(r.Context()); err != nil {
+		if err := s.readIndex(r.Context()); err != nil {
 			s.handleRPCError(w, r, err)
 			return
 		}
@@ -264,11 +377,11 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 
 	coll := s.collections[collection]
 	if coll == nil {
-		writeJSON(w, http.StatusOK, make(map[string]json.RawMessage), s.cfg.Logger)
+		writeJSON(w, http.StatusOK, make(map[string]json.RawMessage), s.logger())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, coll, s.cfg.Logger)
+	writeJSON(w, http.StatusOK, coll, s.logger())
 }
 
 type mutateRequest struct {
@@ -277,12 +390,15 @@ type mutateRequest struct {
 }
 
 func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
-	collection := r.PathValue("collection")
+	collection, ok := s.collectionParam(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 
 	var req mutateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 
@@ -308,16 +424,23 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 // the current cluster peer list (IDs + Raft addresses) is returned so the
 // joiner can bootstrap its own transport.
 //
+// Adding a member changes the quorum, so this endpoint must be protected by an
+// authorization hook; see [WithHTTPAuth].
+//
 // If this node is not the leader the request is redirected to the leader
 // exactly like any other write operation.
 func (s *Store) handleJoin(w http.ResponseWriter, r *http.Request) {
 	var req joinRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 	if req.ID == "" || req.RaftAddr == "" {
-		writeError(w, http.StatusBadRequest, "id and raft_addr are required", s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "id and raft_addr are required", s.logger())
+		return
+	}
+	if _, ok := normalizeHostPort(req.RaftAddr); !ok {
+		writeError(w, http.StatusBadRequest, "raft_addr must be host:port", s.logger())
 		return
 	}
 
@@ -346,7 +469,8 @@ func (s *Store) handleJoin(w http.ResponseWriter, r *http.Request) {
 	peers := s.currentPeers()
 	s.mu.Unlock()
 
-	writeJSON(w, http.StatusOK, joinResponse{Peers: peers}, s.cfg.Logger)
+	s.logger().Info("easyraft: member joined", "id", req.ID, "raft_addr", req.RaftAddr, "voter", voter)
+	writeJSON(w, http.StatusOK, joinResponse{Peers: peers}, s.logger())
 }
 
 // currentPeers returns a snapshot of all known peers including self.
@@ -369,7 +493,7 @@ func (s *Store) currentPeers() []joinPeer {
 // handleMembers handles GET /members. Returns all committed cluster members
 // (from Node.Members(), which reflects the last applied config entry) with
 // their Raft addresses, voter status, and whether each is the current leader.
-func (s *Store) handleMembers(w http.ResponseWriter, r *http.Request) {
+func (s *Store) handleMembers(w http.ResponseWriter, _ *http.Request) {
 	leaderID := s.node.Leader()
 	raftMembers := s.node.Members() // authoritative: committed membership only
 
@@ -392,15 +516,18 @@ func (s *Store) handleMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	writeJSON(w, http.StatusOK, membersResponse{Members: members}, s.cfg.Logger)
+	writeJSON(w, http.StatusOK, membersResponse{Members: members}, s.logger())
 }
 
 // handleRemoveMember handles DELETE /members/{id}. Removes the named node from
 // the Raft cluster. Must be called on the leader; followers redirect.
+//
+// Removing a member shrinks the quorum, so this endpoint must be protected by
+// an authorization hook; see [WithHTTPAuth].
 func (s *Store) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	id := raft.NodeID(r.PathValue("id"))
 	if id == "" {
-		writeError(w, http.StatusBadRequest, "id is required", s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "id is required", s.logger())
 		return
 	}
 
@@ -410,6 +537,7 @@ func (s *Store) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		s.handleRPCError(w, r, err)
 		return
 	}
+	s.logger().Info("easyraft: member removed", "id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -418,11 +546,11 @@ func (s *Store) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 func (s *Store) handleTransferLeadership(w http.ResponseWriter, r *http.Request) {
 	var req transferLeadershipRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 	if req.To == "" {
-		writeError(w, http.StatusBadRequest, "to is required", s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "to is required", s.logger())
 		return
 	}
 
@@ -445,16 +573,20 @@ func (s *Store) handleTransferLeadership(w http.ResponseWriter, r *http.Request)
 func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 	var ops []batchOp
 	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.cfg.Logger)
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
 		return
 	}
 	if len(ops) == 0 {
-		writeJSON(w, http.StatusOK, []json.RawMessage{}, s.cfg.Logger)
+		writeJSON(w, http.StatusOK, []json.RawMessage{}, s.logger())
 		return
 	}
 
 	cmds := make([]command, len(ops))
 	for i, op := range ops {
+		if isReservedCollection(op.Collection) {
+			writeError(w, http.StatusForbidden, ErrReservedCollection.Error(), s.logger())
+			return
+		}
 		cmds[i] = command{
 			Op:         op.Op,
 			Collection: op.Collection,
@@ -478,7 +610,7 @@ func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Store) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	status := s.node.Status()
-	writeJSON(w, http.StatusOK, status, s.cfg.Logger)
+	writeJSON(w, http.StatusOK, status, s.logger())
 }
 
 func (s *Store) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -486,58 +618,146 @@ func (s *Store) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("OK"))
 }
 
+// normalizeHostPort parses addr as an optionally scheme-prefixed host:port and
+// returns the canonical "host:port" form plus the scheme found, if any.
+// It rejects anything that is not a bare address — no path, no userinfo, no
+// stray whitespace — so an address learned from cluster state can never be
+// turned into an arbitrary URL.
+func normalizeHostPort(addr string) (hostPort string, ok bool) {
+	hostPort, _, ok = normalizeHostPortScheme(addr)
+	return hostPort, ok
+}
+
+func normalizeHostPortScheme(addr string) (hostPort, scheme string, ok bool) {
+	addr = strings.TrimSpace(addr)
+	switch {
+	case strings.HasPrefix(addr, "http://"):
+		scheme = "http"
+		addr = strings.TrimPrefix(addr, "http://")
+	case strings.HasPrefix(addr, "https://"):
+		scheme = "https"
+		addr = strings.TrimPrefix(addr, "https://")
+	}
+	if addr == "" || strings.ContainsAny(addr, "/\\@?#") {
+		return "", "", false
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || port == "" {
+		return "", "", false
+	}
+	// A redirect target must name a host; ":8001" is not routable by a client.
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return "", "", false
+	}
+	for _, r := range host {
+		if r < 0x21 || r > 0x7e {
+			return "", "", false // control characters, spaces, non-ASCII
+		}
+	}
+	return net.JoinHostPort(host, port), scheme, true
+}
+
+// leaderURL builds an absolute URL for path on leaderID's advertised HTTP
+// address, or "" when no usable address is known.
+//
+// The host comes only from the internal metadata collection, which HTTP
+// clients cannot write, and is re-validated as a bare host:port before use, so
+// no caller-supplied text ever reaches a Location header or an outbound
+// request. Path and query are carried verbatim from the request being
+// redirected; the host is never taken from it.
+func (s *Store) leaderURL(leaderID raft.NodeID, path, rawQuery string) string {
+	s.mu.RLock()
+	var advertised string
+	if coll := s.collections[metadataCollection]; coll != nil {
+		if raw, ok := coll[string(leaderID)]; ok {
+			_ = json.Unmarshal(raw, &advertised)
+		}
+	}
+	s.mu.RUnlock()
+
+	if advertised == "" {
+		return ""
+	}
+	hostPort, scheme, ok := normalizeHostPortScheme(advertised)
+	if !ok {
+		s.logger().Warn("easyraft: refusing to use an unusable leader address",
+			"leader", leaderID, "advertised", advertised)
+		return ""
+	}
+	if scheme == "" {
+		scheme = "http"
+		if s.cfg.HTTPTLS != nil {
+			scheme = "https"
+		}
+	}
+	u := url.URL{
+		Scheme:   scheme,
+		Host:     hostPort,
+		Path:     path,
+		RawQuery: rawQuery,
+	}
+	return u.String()
+}
+
+// leaderRedirectURL is leaderURL for the path and query of r.
+func (s *Store) leaderRedirectURL(r *http.Request, leaderID raft.NodeID) string {
+	return s.leaderURL(leaderID, r.URL.Path, r.URL.RawQuery)
+}
+
 func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error) {
+	logger := s.logger()
+
 	if errors.Is(err, ErrNotLeader) {
 		leaderID := s.node.Leader()
 		if leaderID == "" {
-			writeError(w, http.StatusServiceUnavailable, "no leader currently elected", s.cfg.Logger)
+			writeError(w, http.StatusServiceUnavailable, "no leader currently elected", logger)
 			return
 		}
 
-		s.mu.RLock()
-		var leaderAddr string
-		if coll := s.collections["__easyraft_metadata__"]; coll != nil {
-			if raw, ok := coll[string(leaderID)]; ok {
-				_ = json.Unmarshal(raw, &leaderAddr)
-			}
-		}
-		s.mu.RUnlock()
-
-		if leaderAddr != "" {
-			url := leaderAddr
-			if !strings.HasPrefix(url, "http") {
-				url = "http://" + url
-			}
-			url += r.URL.Path
-			if r.URL.RawQuery != "" {
-				url += "?" + r.URL.RawQuery
-			}
-			w.Header().Set("Location", url)
-			writeError(w, http.StatusTemporaryRedirect, fmt.Sprintf("not leader; redirecting to %s", url), s.cfg.Logger)
+		if target := s.leaderRedirectURL(r, leaderID); target != "" {
+			w.Header().Set("Location", target)
+			writeError(w, http.StatusTemporaryRedirect,
+				fmt.Sprintf("not leader; redirecting to %s", leaderID), logger)
 			return
 		}
 
 		// Leader is known but its HTTP address has not been advertised yet.
-		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("not leader; leader is %s but its HTTP address is not yet known", leaderID), s.cfg.Logger)
+		writeError(w, http.StatusServiceUnavailable,
+			fmt.Sprintf("not leader; leader is %s but its HTTP address is not yet known", leaderID), logger)
 		return
 	}
 
-	if errors.Is(err, ErrKeyNotFound) {
-		writeError(w, http.StatusNotFound, err.Error(), s.cfg.Logger)
-		return
-	}
+	writeError(w, statusForError(err), err.Error(), logger)
+}
 
-	if errors.Is(err, ErrKeyExists) {
-		writeError(w, http.StatusConflict, err.Error(), s.cfg.Logger)
-		return
-	}
+// statusForError maps an error returned by the Raft or easyraft layers to an
+// HTTP status code. Matching is done with errors.Is against the sentinels the
+// two packages export, so wrapped errors are classified correctly.
+func statusForError(err error) int {
+	switch {
+	case errors.Is(err, ErrKeyNotFound), errors.Is(err, raft.ErrGroupNotFound),
+		errors.Is(err, raft.ErrNotFound):
+		return http.StatusNotFound
 
-	if errors.Is(err, context.DeadlineExceeded) {
-		writeError(w, http.StatusRequestTimeout, err.Error(), s.cfg.Logger)
-		return
-	}
+	case errors.Is(err, ErrKeyExists), errors.Is(err, raft.ErrObsoleteSeqNum),
+		errors.Is(err, raft.ErrConfigChangeInProgress),
+		errors.Is(err, raft.ErrLeadershipTransferInProgress):
+		return http.StatusConflict
 
-	writeError(w, http.StatusInternalServerError, err.Error(), s.cfg.Logger)
+	case errors.Is(err, ErrReservedCollection):
+		return http.StatusForbidden
+
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusRequestTimeout
+
+	case errors.Is(err, raft.ErrLeaseExpired), errors.Is(err, raft.ErrStopped),
+		errors.Is(err, context.Canceled):
+		return http.StatusServiceUnavailable
+
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // ---- Manager HTTP server ---------------------------------------------------
@@ -546,42 +766,57 @@ func (m *Manager) serveHTTP() error {
 	if m.cfg.HTTPAddr == "" {
 		return nil
 	}
+	logger := m.logger()
+	warnIfHTTPUnauthenticated(&m.cfg, logger)
+
+	guard := func(h http.HandlerFunc) http.HandlerFunc {
+		return authorized(m.cfg.HTTPAuth, logger, h)
+	}
 
 	mux := http.NewServeMux()
 
 	// Cluster management per Raft group.
-	mux.HandleFunc("POST /groups/{groupID}/join", m.handleJoin)
-	mux.HandleFunc("GET /groups/{groupID}/members", m.handleMembers)
-	mux.HandleFunc("DELETE /groups/{groupID}/members/{id}", m.handleRemoveMember)
-	mux.HandleFunc("POST /groups/{groupID}/transfer-leadership", m.handleTransferLeadership)
-	mux.HandleFunc("POST /groups/{groupID}/batch", m.handleBatch)
+	mux.HandleFunc("POST /groups/{groupID}/join", guard(m.handleJoin))
+	mux.HandleFunc("GET /groups/{groupID}/members", guard(m.handleMembers))
+	mux.HandleFunc("DELETE /groups/{groupID}/members/{id}", guard(m.handleRemoveMember))
+	mux.HandleFunc("POST /groups/{groupID}/transfer-leadership", guard(m.handleTransferLeadership))
+	mux.HandleFunc("POST /groups/{groupID}/batch", guard(m.handleBatch))
 
 	// Multi-Raft routing: /groups/{groupID}/{collection}/{key}
-	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", m.handleCreate)
-	mux.HandleFunc("GET /groups/{groupID}/{collection}/{key}", m.handleRead)
-	mux.HandleFunc("PUT /groups/{groupID}/{collection}/{key}", m.handleUpdate)
-	mux.HandleFunc("PATCH /groups/{groupID}/{collection}/{key}", m.handleUpsert)
-	mux.HandleFunc("DELETE /groups/{groupID}/{collection}/{key}", m.handleDelete)
-	mux.HandleFunc("GET /groups/{groupID}/{collection}", m.handleList)
-	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}/mutate", m.handleMutate)
+	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", guard(m.handleCreate))
+	mux.HandleFunc("GET /groups/{groupID}/{collection}/{key}", guard(m.handleRead))
+	mux.HandleFunc("PUT /groups/{groupID}/{collection}/{key}", guard(m.handleUpdate))
+	mux.HandleFunc("PATCH /groups/{groupID}/{collection}/{key}", guard(m.handleUpsert))
+	mux.HandleFunc("DELETE /groups/{groupID}/{collection}/{key}", guard(m.handleDelete))
+	mux.HandleFunc("GET /groups/{groupID}/{collection}", guard(m.handleList))
+	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}/mutate", guard(m.handleMutate))
 
-	mux.HandleFunc("GET /status", m.handleStatus)
-	mux.HandleFunc("GET /health", m.handleHealth)
-	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.HandleFunc("GET /status", guard(m.handleStatus))
+	mux.HandleFunc("GET /health", guard(m.handleHealth))
+	mux.Handle("GET /metrics", guard(promhttp.Handler().ServeHTTP))
 
-	m.httpServer = &http.Server{
+	ln, err := net.Listen("tcp", m.cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("easyraft: listen http %s: %w", m.cfg.HTTPAddr, err)
+	}
+
+	server := &http.Server{
 		Addr:         m.cfg.HTTPAddr,
 		Handler:      mux,
+		TLSConfig:    m.cfg.HTTPTLS,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
 	}
+	// Stop reads httpServer under the lock, so publish it under the lock too.
+	m.mu.Lock()
+	m.httpServer = server
+	m.mu.Unlock()
 
+	tlsCfg := m.cfg.HTTPTLS
 	go func() {
-		if err := m.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			if m.cfg.Logger != nil {
-				m.cfg.Logger.Error("Manager HTTP server failed", "err", err)
-			}
+		if serveErr := serveOn(server, ln, tlsCfg); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			logger.Error("easyraft: Manager HTTP server stopped", "addr", server.Addr, "err", serveErr)
 		}
 	}()
 
@@ -590,9 +825,9 @@ func (m *Manager) serveHTTP() error {
 
 func (m *Manager) getStore(r *http.Request) (*Store, error) {
 	gidStr := r.PathValue("groupID")
-	var gid uint64
-	if _, err := fmt.Sscanf(gidStr, "%d", &gid); err != nil {
-		return nil, fmt.Errorf("invalid groupID: %w", err)
+	gid, err := strconv.ParseUint(gidStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid groupID %q: %w", gidStr, err)
 	}
 
 	m.mu.RLock()
@@ -604,117 +839,67 @@ func (m *Manager) getStore(r *http.Request) (*Store, error) {
 	return s, nil
 }
 
-func (m *Manager) handleCreate(w http.ResponseWriter, r *http.Request) {
+// withStore resolves the group from the request path and hands off to the
+// matching Store handler.
+func (m *Manager) withStore(w http.ResponseWriter, r *http.Request, h func(*Store, http.ResponseWriter, *http.Request)) {
 	s, err := m.getStore(r)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
+		writeError(w, http.StatusNotFound, err.Error(), m.logger())
 		return
 	}
-	s.handleCreate(w, r)
+	h(s, w, r)
+}
+
+func (m *Manager) handleCreate(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleCreate)
 }
 
 func (m *Manager) handleRead(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleRead(w, r)
+	m.withStore(w, r, (*Store).handleRead)
 }
 
 func (m *Manager) handleUpdate(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleUpdate(w, r)
+	m.withStore(w, r, (*Store).handleUpdate)
 }
 
 func (m *Manager) handleUpsert(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleUpsert(w, r)
+	m.withStore(w, r, (*Store).handleUpsert)
 }
 
 func (m *Manager) handleDelete(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleDelete(w, r)
+	m.withStore(w, r, (*Store).handleDelete)
 }
 
 func (m *Manager) handleList(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleList(w, r)
+	m.withStore(w, r, (*Store).handleList)
 }
 
 func (m *Manager) handleMutate(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleMutate(w, r)
+	m.withStore(w, r, (*Store).handleMutate)
 }
 
 func (m *Manager) handleJoin(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleJoin(w, r)
+	m.withStore(w, r, (*Store).handleJoin)
 }
 
 func (m *Manager) handleMembers(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleMembers(w, r)
+	m.withStore(w, r, (*Store).handleMembers)
 }
 
 func (m *Manager) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleRemoveMember(w, r)
+	m.withStore(w, r, (*Store).handleRemoveMember)
 }
 
 func (m *Manager) handleTransferLeadership(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleTransferLeadership(w, r)
+	m.withStore(w, r, (*Store).handleTransferLeadership)
 }
 
 func (m *Manager) handleBatch(w http.ResponseWriter, r *http.Request) {
-	s, err := m.getStore(r)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error(), m.cfg.Logger)
-		return
-	}
-	s.handleBatch(w, r)
+	m.withStore(w, r, (*Store).handleBatch)
 }
 
 func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
-	status := m.mgr.StatusAll(r.Context())
-	writeJSON(w, http.StatusOK, status, m.cfg.Logger)
+	writeJSON(w, http.StatusOK, m.StatusAll(r.Context()), m.logger())
 }
 
 func (m *Manager) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -727,7 +912,7 @@ func writeJSON(w http.ResponseWriter, code int, val any, logger *slog.Logger) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(val); err != nil && logger != nil {
-		logger.Error("HTTP encode failed", "err", err)
+		logger.Error("easyraft: HTTP encode failed", "err", err)
 	}
 }
 
