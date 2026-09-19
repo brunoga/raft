@@ -30,6 +30,7 @@ package prommetrics
 import (
 	"errors"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -56,7 +57,84 @@ type Metrics struct {
 
 	proposalLatency *prometheus.HistogramVec // submission to applied, by outcome
 	proposalsTotal  *prometheus.CounterVec   // total proposals, by outcome
+
+	storageLatency *prometheus.HistogramVec // durable write duration, by op and outcome
+	storageWrites  *prometheus.CounterVec   // durable writes, by op and outcome
+
+	// tracked holds the nodes whose live indices are read at scrape time.
+	// Gauges like the apply lag have no natural event to hang off: they are a
+	// question about the present, so they are answered when asked.
+	trackedMu sync.Mutex
+	tracked   []NodeSource
 }
+
+// NodeSource is what the collector needs from a node to report its progress.
+// *raft.Node satisfies it.
+type NodeSource interface {
+	ID() raft.NodeID
+	CommitIndex() raft.Index
+	LastApplied() raft.Index
+}
+
+// Track reports n's progress on every scrape: its commit index, its applied
+// index, and the gap between them.
+//
+// That gap is the one number that says whether a node is keeping up. It cannot
+// be derived from the event-driven metrics -- those say what happened, not how
+// far behind the state machine is right now -- and a node that commits happily
+// while its state machine falls further behind looks healthy in every other
+// series.
+//
+// Track may be called for several nodes; each reports under its own node label.
+func (m *Metrics) Track(n NodeSource) {
+	if n == nil {
+		return
+	}
+	m.trackedMu.Lock()
+	defer m.trackedMu.Unlock()
+	m.tracked = append(m.tracked, n)
+}
+
+// Describe implements prometheus.Collector. It deliberately sends nothing,
+// which registers this as an unchecked collector.
+//
+// Several Metrics instances share one registry when a process runs several
+// groups, and they all report the same three descriptors, differing only in a
+// label value. Describing them would make the second registration a duplicate
+// and fail. An unchecked collector skips that check, at the cost of the
+// registry not being able to police these series -- an acceptable trade for
+// metrics whose label values are known only at scrape time.
+func (m *Metrics) Describe(chan<- *prometheus.Desc) {}
+
+// Collect implements prometheus.Collector.
+func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
+	m.trackedMu.Lock()
+	tracked := make([]NodeSource, len(m.tracked))
+	copy(tracked, m.tracked)
+	m.trackedMu.Unlock()
+
+	for _, n := range tracked {
+		node := string(n.ID())
+		commit := n.CommitIndex()
+		applied := n.LastApplied()
+		var lag raft.Index
+		if commit > applied {
+			lag = commit - applied
+		}
+		ch <- prometheus.MustNewConstMetric(commitIndexDesc, prometheus.GaugeValue, float64(commit), m.group, node)
+		ch <- prometheus.MustNewConstMetric(lastAppliedDesc, prometheus.GaugeValue, float64(applied), m.group, node)
+		ch <- prometheus.MustNewConstMetric(applyLagDesc, prometheus.GaugeValue, float64(lag), m.group, node)
+	}
+}
+
+var (
+	commitIndexDesc = prometheus.NewDesc("raft_progress_commit_index",
+		"Highest log index known to be committed, read at scrape time.", commonLabels, nil)
+	lastAppliedDesc = prometheus.NewDesc("raft_progress_last_applied",
+		"Highest log index applied to the state machine, read at scrape time.", commonLabels, nil)
+	applyLagDesc = prometheus.NewDesc("raft_apply_lag",
+		"Entries committed but not yet applied to the state machine.", commonLabels, nil)
+)
 
 // New returns a Metrics instance whose series carry an empty "group" label.
 // Use it for single-group deployments; use [NewForGroup] when one process runs
@@ -86,10 +164,25 @@ var commonLabels = []string{"group", "node"}
 // that a rise in failures is visible without a second metric.
 var outcomeLabels = []string{"group", "node", "outcome"}
 
+// storageLabels separates the durable writes from one another, since a slow
+// log append and a slow hard-state write point at different problems.
+var storageLabels = []string{"group", "node", "op", "outcome"}
+
 // transitionLabels extends commonLabels with the from/to states.
 var transitionLabels = []string{"group", "node", "from", "to"}
 
 func newMetrics(reg prometheus.Registerer, group string) *Metrics {
+	m := newMetricVecs(reg, group)
+	if reg != nil {
+		// Registered so that the gauges read at scrape time (see Collect) are
+		// exported. An error here means an identical collector is already
+		// present, which is not possible for a freshly built value.
+		_ = reg.Register(m)
+	}
+	return m
+}
+
+func newMetricVecs(reg prometheus.Registerer, group string) *Metrics {
 	return &Metrics{
 		group: group,
 
@@ -159,6 +252,26 @@ func newMetrics(reg prometheus.Registerer, group string) *Metrics {
 			Name:      "proposals_total",
 			Help:      "Total proposals resolved, labelled by outcome.",
 		}, outcomeLabels)),
+
+		// A durable write that has become slow is the usual explanation for a
+		// rise in proposal latency that nothing in the Raft state accounts
+		// for, so the buckets start far below a healthy fsync and run well
+		// past an unhealthy one.
+		storageLatency: registerOrGet(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "raft",
+			Name:      "storage_write_duration_seconds",
+			Help:      "Time spent in a durable storage write, by operation.",
+			Buckets: []float64{
+				0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+				0.025, 0.05, 0.1, 0.25, 0.5, 1, 5,
+			},
+		}, storageLabels)),
+
+		storageWrites: registerOrGet(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "raft",
+			Name:      "storage_writes_total",
+			Help:      "Total durable storage writes, labelled by operation and outcome.",
+		}, storageLabels)),
 	}
 }
 
@@ -208,6 +321,17 @@ func (m *Metrics) SnapshotTaken(id raft.NodeID, lastIncludedIndex raft.Index, si
 	m.snapshotsTotal.WithLabelValues(m.group, node).Inc()
 	m.snapshotBytes.WithLabelValues(m.group, node).Add(float64(sizeBytes))
 	m.snapshotIndex.WithLabelValues(m.group, node).Set(float64(lastIncludedIndex))
+}
+
+// StorageWrite implements raft.StorageMetrics.
+func (m *Metrics) StorageWrite(id raft.NodeID, op string, d time.Duration, err error) {
+	node := string(id)
+	outcome := "ok"
+	if err != nil {
+		outcome = "failed"
+	}
+	m.storageLatency.WithLabelValues(m.group, node, op, outcome).Observe(d.Seconds())
+	m.storageWrites.WithLabelValues(m.group, node, op, outcome).Inc()
 }
 
 // ProposalCompleted implements raft.ProposalMetrics.

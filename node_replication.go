@@ -45,7 +45,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 		existingTerm, err := n.log.termAt(n.stopCtx, e.Index)
 		if err != nil {
 			// Entry doesn't exist — append from here onward.
-			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
+			if appendErr := n.appendEntries(n.stopCtx, req.Entries[i:]); appendErr != nil {
 				// Acknowledging entries that are not durable would let the
 				// leader count this node towards a commit quorum for entries
 				// that can still vanish.
@@ -69,7 +69,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 					return resp, rebuildErr
 				}
 			}
-			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
+			if appendErr := n.appendEntries(n.stopCtx, req.Entries[i:]); appendErr != nil {
 				n.fail(appendErr, "append replicated entries")
 				return resp, appendErr
 			}

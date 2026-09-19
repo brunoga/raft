@@ -443,6 +443,10 @@ func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 		}
 	}()
 
+	// Reported whether or not it succeeded: a snapshot that fails slowly is
+	// worth seeing, and a rise in failures is worth alerting on.
+	n.reportStorageWrite("snapshot", sr.duration, sr.err)
+
 	if sr.err != nil {
 		n.logger.Error("snapshot goroutine failed", "err", sr.err)
 		return
