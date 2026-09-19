@@ -62,10 +62,20 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 		}
 	}
 
-	// Advance commitIndex.
-	if req.LeaderCommit > n.commitIndex {
-		n.setCommitIndex(min(req.LeaderCommit, n.log.lastLogIndex()))
-
+	// Advance commitIndex, but never past the last index this request actually
+	// covers. The leader's LeaderCommit refers to ITS log; it says nothing about
+	// entries this follower holds beyond the range the request establishes as
+	// matching. Clamping to our own last index instead would commit whatever
+	// uncommitted suffix we still carry from a previous leader — entries the
+	// current leader is about to overwrite — and applying those violates State
+	// Machine Safety, permanently, because an applied index is never revisited.
+	//
+	// PrevLogIndex + len(Entries) is exactly the range the leader has vouched
+	// for: the prefix matched the PrevLog check above, and the entries are the
+	// leader's own.
+	lastCovered := req.PrevLogIndex + Index(len(req.Entries))
+	if newCommit := min(req.LeaderCommit, lastCovered); newCommit > n.commitIndex {
+		n.setCommitIndex(newCommit)
 		n.notifyApply()
 	}
 

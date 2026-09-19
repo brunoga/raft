@@ -830,7 +830,14 @@ func (n *Node) setLeaderID(id NodeID) {
 }
 
 // setCommitIndex updates n.commitIndex and its atomic mirror. Event-loop only.
+//
+// commitIndex is monotonic: an entry, once committed, stays committed. A
+// request that would move it backwards (a reordered or delayed RPC carrying an
+// older LeaderCommit) is ignored rather than trusted.
 func (n *Node) setCommitIndex(idx Index) {
+	if idx <= n.commitIndex {
+		return
+	}
 	n.commitIndex = idx
 	n.atomicCommitIndex.Store(uint64(idx))
 }
