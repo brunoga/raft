@@ -36,8 +36,12 @@ func NewHTTPNodeProvider(baseURL string, client *http.Client) *HTTPNodeProvider 
 // StatusAll implements NodeProvider by calling GET <baseURL>/status and
 // decoding the JSON response. Returns nil on any error (the BalanceController
 // skips nodes with empty status).
-func (p *HTTPNodeProvider) StatusAll() []GroupStatus {
-	resp, err := p.client.Get(p.baseURL + "/status")
+func (p *HTTPNodeProvider) StatusAll(ctx context.Context) []GroupStatus {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/status", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := p.client.Do(req)
 	if err != nil {
 		return nil
 	}

@@ -472,12 +472,20 @@ func (n *Node) isSingleVoter() bool {
 // GroupStatus. It is a convenience wrapper that performs the same atomic reads
 // as Manager.StatusAll and is useful when you hold a *Node directly.
 func (n *Node) Status() GroupStatus {
+	voter := false
+	for _, m := range n.Members() {
+		if m.ID == n.cfg.ID {
+			voter = m.Voter
+			break
+		}
+	}
 	return GroupStatus{
 		GroupID:     n.cfg.GroupID,
 		NodeID:      n.cfg.ID,
 		State:       n.State(),
 		Term:        n.Term(),
 		LastApplied: n.LastApplied(),
+		Voter:       voter,
 	}
 }
 
