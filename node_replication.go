@@ -55,6 +55,14 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 			if truncErr := n.log.truncateSuffix(n.stopCtx, e.Index); truncErr != nil {
 				return resp, truncErr
 			}
+			// The membership in effect may have come from an entry that was
+			// just discarded. Recompute it from the snapshot base and what is
+			// left of the log before adopting anything new.
+			if n.configIndex >= e.Index {
+				if rebuildErr := n.rebuildMembership(n.stopCtx); rebuildErr != nil {
+					return resp, rebuildErr
+				}
+			}
 			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
 				return resp, appendErr
 			}
@@ -327,7 +335,7 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		if n.jointOld == nil {
 			confirmed = hasMajorityAck(n.readBatchAcks, n.cfg.Peers, true, n.cfg.Voter)
 		} else {
-			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true, true) &&
+			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true, n.jointSelfVoterOld) &&
 				hasMajorityAck(n.readBatchAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 		if confirmed {
@@ -386,9 +394,9 @@ func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, sel
 //	N=4 (3 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
 //	N=5 (4 peers, self):    total/2 = 2, count > 2 means count >= 3  ✓
 //	N=2 (2 peers, no self): total/2 = 1, count > 1 means count >= 2  ✓
-func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf bool) bool {
+func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf, selfVoter bool) bool {
 	count := 0
-	if includeSelf && n.cfg.Voter {
+	if includeSelf && selfVoter {
 		count = 1
 	}
 	for _, p := range members {
@@ -402,7 +410,7 @@ func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf
 			total++
 		}
 	}
-	if includeSelf && n.cfg.Voter {
+	if includeSelf && selfVoter {
 		total++
 	}
 	return count > total/2
@@ -422,15 +430,15 @@ func (n *Node) maybeAdvanceCommit() {
 		var committed bool
 		if n.jointOld == nil {
 			// Normal single-config majority. Self is always a member.
-			committed = n.replicatedOnMajority(idx, n.cfg.Peers, true)
+			committed = n.replicatedOnMajority(idx, n.cfg.Peers, true, n.cfg.Voter)
 		} else {
 			// Joint consensus: both C_old and C_new must independently have a
 			// majority (Raft §6). jointOld and jointNew never include self.
 			// Self is always in C_old (it is the leader); for C_new it is
 			// only counted when jointIncludeSelf is true (i.e. self is
 			// retained in the new membership).
-			committed = n.replicatedOnMajority(idx, n.jointOld, true) &&
-				n.replicatedOnMajority(idx, n.jointNew, n.jointIncludeSelf)
+			committed = n.replicatedOnMajority(idx, n.jointOld, true, n.jointSelfVoterOld) &&
+				n.replicatedOnMajority(idx, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 		if committed {
 			n.setCommitIndex(idx)

@@ -66,7 +66,7 @@ func (n *Node) run() {
 			n.handleApplyResult(&ar)
 
 		case sr := <-n.snapshotResultCh:
-			n.handleSnapshotResult(sr)
+			n.handleSnapshotResult(&sr)
 		}
 	}
 }
@@ -144,7 +144,7 @@ func (n *Node) tick() {
 				if n.jointOld == nil {
 					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
 				} else {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, true) &&
+					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, n.jointSelfVoterOld) &&
 						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 				}
 				if !hasQuorum {
@@ -293,7 +293,7 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 
 	// Apply config changes to Raft's own peer list.
 	if ar.configCmd != nil {
-		n.applyConfigChange(ar.configCmd)
+		n.applyConfigChange(ar.configCmd, ar.index)
 		if n.pendingConfigIndex == ar.index {
 			n.pendingConfigIndex = 0
 		}
