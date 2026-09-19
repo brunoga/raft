@@ -1282,7 +1282,7 @@ func (n *Node) resetElectionTimeout() {
 // writeSnapshot streams a snapshot into storage and reports what it cost.
 // write does the state-machine half; everything around it is the same whether
 // the state was captured first or is being serialised in place.
-func (n *Node) writeSnapshot(trig snapshotTrigger, write func(context.Context, io.Writer) error) snapshotResult {
+func (n *Node) writeSnapshot(trig *snapshotTrigger, write func(context.Context, io.Writer) error) snapshotResult {
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
@@ -1587,7 +1587,7 @@ func (n *Node) applyLoop() {
 				go func(trig snapshotTrigger, captured Snapshot) {
 					defer n.snapshotWriteWg.Done()
 					defer captured.Release()
-					res := n.writeSnapshot(trig, captured.Write)
+					res := n.writeSnapshot(&trig, captured.Write)
 					select {
 					case n.snapshotResultCh <- res:
 					case <-n.stopCh:
@@ -1596,7 +1596,7 @@ func (n *Node) applyLoop() {
 				continue
 			}
 
-			res := n.writeSnapshot(trig, func(wctx context.Context, w io.Writer) error {
+			res := n.writeSnapshot(&trig, func(wctx context.Context, w io.Writer) error {
 				return n.cfg.StateMachine.Snapshot(wctx, w)
 			})
 			select {
