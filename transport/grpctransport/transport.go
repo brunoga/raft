@@ -111,6 +111,10 @@ type GRPCTransport struct {
 	strictValidation bool
 	// closeTimeout bounds how long Close waits for in-flight handlers.
 	closeTimeout time.Duration
+	// maxMessageSize is the largest message this transport will send or
+	// receive, reported through MaxMessageBytes so the node can refuse a
+	// proposal it could never replicate.
+	maxMessageSize int
 
 	// afterDial, when non-nil, runs in clientFor between the dial and the
 	// decision to keep the resulting connection. It exists so tests can hold a
@@ -533,6 +537,7 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 		peerAuth:         o.peerAuth,
 		strictValidation: o.strictValidation || o.peerAuth != nil,
 		closeTimeout:     closeTimeout,
+		maxMessageSize:   maxMsgSize,
 		hbWindow:         hbWin,
 		hbRPCTimeout:     hbRPCTimeout,
 		hbChanSize:       hbChanSize,
@@ -667,6 +672,11 @@ func (t *GRPCTransport) SetGroupLookup(fn func(uint64) (raft.Handler, bool)) {
 	}
 	t.mu.Unlock()
 }
+
+// MaxMessageBytes implements raft.MessageSizeLimiter. It reports the largest
+// message this transport will carry, so that the node can refuse a proposal it
+// could never replicate rather than appending one that jams the log.
+func (t *GRPCTransport) MaxMessageBytes() int { return t.maxMessageSize }
 
 // Close shuts down the server and closes all cached client connections. It
 // marks the transport closed first, so any concurrent or subsequent send
