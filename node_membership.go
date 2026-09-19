@@ -129,21 +129,9 @@ func (n *Node) rebuildMembership(ctx context.Context) error {
 	return nil
 }
 
-// adoptConfigEntries puts into effect the last config entry in entries, if any.
-// Called immediately after entries are appended to the log, by leader and
-// follower alike.
-func (n *Node) adoptConfigEntries(entries []LogEntry) {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if isConfigEntry(entries[i].Command) {
-			n.adoptConfigEntry(entries[i].Command, entries[i].Index)
-			return
-		}
-	}
-}
-
-// adoptConfigEntry puts a single config entry into effect. It changes the
-// membership only; the lifecycle consequences of a config entry committing are
-// handled in applyConfigChange.
+// adoptConfigEntry puts a single config entry into effect, changing the
+// membership only. applyConfigChange calls it on the apply path; rebuildMembership
+// calls it for each entry when recovering.
 func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 	op, peer, ok := decodeConfigEntry(configCmd)
 	if !ok {
@@ -250,15 +238,16 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 	}
 }
 
-// applyConfigChange handles the consequences of a config entry committing. The
-// membership itself was already put into effect when the entry was appended;
-// what has to wait for the commit is everything that would be unsafe or wrong
-// to do on an entry that might still be discarded.
-func (n *Node) applyConfigChange(configCmd []byte) {
+// applyConfigChange puts a committed config entry into effect and handles the
+// consequences of it having committed. Membership changes here rather than at
+// append time so that a change cannot enlarge the quorum before the cluster has
+// agreed to it.
+func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 	op, peer, ok := decodeConfigEntry(configCmd)
 	if !ok {
 		return
 	}
+	n.adoptConfigEntry(configCmd, index)
 
 	switch op {
 	case configOpRemove:
@@ -327,7 +316,6 @@ func (n *Node) appendFinaliseEntry(newPeers []PeerConfig, includeSelf, selfVoter
 	// never written. The caller will retry on the next becomeLeader invocation
 	// if the node wins a subsequent election.
 	n.pendingConfigIndex = idx
-	n.adoptConfigEntry(entry.Command, idx)
 	n.replicateToFollowers()
 	n.maybeAdvanceCommit()
 }

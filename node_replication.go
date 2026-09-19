@@ -48,7 +48,6 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
 				return resp, appendErr
 			}
-			n.adoptConfigEntries(req.Entries[i:])
 			break
 		}
 		if existingTerm != e.Term {
@@ -67,7 +66,6 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest) (*AppendEntriesRes
 			if appendErr := n.log.append(n.stopCtx, req.Entries[i:]); appendErr != nil {
 				return resp, appendErr
 			}
-			n.adoptConfigEntries(req.Entries[i:])
 			break
 		}
 	}

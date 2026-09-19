@@ -118,7 +118,7 @@ func TestMembership_TruncationRevertsToPreviousConfiguration(t *testing.T) {
 	if err := node.log.append(ctx, entries); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	node.adoptConfigEntries(entries)
+	node.applyConfigChange(addB.Command, addB.Index)
 
 	if got := memberIDs(node.cfg.Peers); !slices.Equal(got, []string{"a", "b"}) {
 		t.Fatalf("peers after adopting the change = %v, want [a b]", got)
