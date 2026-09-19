@@ -243,9 +243,26 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		return
 	}
 	if !r.success {
+		// A rejection with no conflict hint at all is not a log mismatch: a
+		// follower that genuinely disagrees always reports where. An empty hint
+		// means the response was synthesised somewhere between the peer and
+		// here — a transport that reported a routing or handler failure as a
+		// failed append, for instance. Treating it as a mismatch would drive
+		// nextIndex to 1, which is at or below the snapshot boundary on any
+		// leader that has ever compacted, so the leader would ship its entire
+		// state machine to a follower that may be perfectly up to date. Leave
+		// the peer's progress alone and let the next heartbeat retry.
+		if r.conflictIndex == 0 && r.conflictTerm == 0 {
+			n.logger.Warn("append rejected without a conflict hint; ignoring",
+				"peer", r.peer, "term", r.term)
+			return
+		}
+
 		// Back-track nextIndex using conflict hints.
 		if r.conflictTerm != 0 {
-			// Find last entry with conflictTerm in our log.
+			// Find the last entry with conflictTerm in our log. Terms never
+			// decrease with index, so the scan can stop as soon as it passes
+			// below conflictTerm: no earlier entry can match.
 			newNext := r.conflictIndex
 			for i := n.log.lastLogIndex(); i >= n.log.first; i-- {
 				t, err := n.log.termAt(n.stopCtx, i)
@@ -254,6 +271,9 @@ func (n *Node) handleAppendResult(r *appendResult) {
 				}
 				if t == r.conflictTerm {
 					newNext = i + 1
+					break
+				}
+				if t < r.conflictTerm {
 					break
 				}
 			}

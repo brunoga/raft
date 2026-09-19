@@ -1056,10 +1056,12 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 		}
 		select {
 		case n.rpcCh <- rpcEnvelope{req: &appendResult{
-			peer:    peer,
-			term:    resp.Term,
-			success: resp.Success,
-			req:     req,
+			peer:          peer,
+			term:          resp.Term,
+			success:       resp.Success,
+			req:           req,
+			conflictIndex: resp.ConflictIndex,
+			conflictTerm:  resp.ConflictTerm,
 		}}:
 		case <-stop:
 			return
