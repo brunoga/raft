@@ -82,18 +82,32 @@ func (n *Node) handleReadIndex(msg readIndexMsg) {
 		return
 	}
 
-	n.pendingReads = append(n.pendingReads, msg.resolver)
-	if len(n.pendingReads) == 1 {
-		// Start a new barrier batch.
-		n.readBatchGen++
-		n.readBatchAcks = make(map[NodeID]bool)
-		n.readBatchIndex = n.commitIndex
-		n.broadcastReadBarrier()
-	} else if n.commitIndex > n.readBatchIndex {
-		// Advance the batch index to the latest commitIndex so returning
-		// clients always see at least as fresh a view as the most recent commit.
-		n.readBatchIndex = n.commitIndex
+	// A read may only be answered by a confirmation round that started after it
+	// arrived. The replies to a round already in flight say the node was leader
+	// when that round went out, which is a moment that had already passed when
+	// this request was made; leadership may have moved in between, and
+	// answering from those replies would return a commit index from a leader
+	// that had already been replaced.
+	//
+	// So a request that arrives mid-round waits for the next one. Requests that
+	// arrive together still share a round, which is what keeps ReadIndex cheap
+	// under load: the cost is one round per round-trip, not one per read.
+	if n.readBatchAcks != nil {
+		n.waitingReads = append(n.waitingReads, msg.resolver)
+		return
 	}
+
+	n.pendingReads = append(n.pendingReads, msg.resolver)
+	n.startReadBatch()
+}
+
+// startReadBatch begins a leadership-confirmation round for the reads in
+// pendingReads. Leader only.
+func (n *Node) startReadBatch() {
+	n.readBatchGen++
+	n.readBatchAcks = make(map[NodeID]bool)
+	n.readBatchIndex = n.commitIndex
+	n.broadcastReadBarrier()
 }
 
 func (n *Node) handleReadIndexRPC(req *ReadIndexRequest, respCh chan rpcResponse) {
@@ -199,4 +213,13 @@ func (n *Node) confirmReadBatch() {
 	}
 	n.pendingReads = n.pendingReads[:0]
 	n.readBatchAcks = nil
+
+	// Reads that arrived while that round was in flight get a round of their
+	// own, started now.
+	if len(n.waitingReads) > 0 {
+		n.pendingReads = append(n.pendingReads, n.waitingReads...)
+		clear(n.waitingReads)
+		n.waitingReads = n.waitingReads[:0]
+		n.startReadBatch()
+	}
 }

@@ -245,7 +245,12 @@ type Node struct {
 	readBatchGen       uint64              // incremented each time a new barrier is broadcast
 	readBatchAcks      map[NodeID]bool     // peers that ACKed the current barrier heartbeat
 	readBatchIndex     Index               // commitIndex captured when the batch started
-	pendingReads       []readIndexResolver // clients waiting for read-index confirmation
+	pendingReads       []readIndexResolver // clients waiting for the round in flight
+	// waitingReads holds requests that arrived while a confirmation round was
+	// already in flight. They cannot be answered by that round -- it proves
+	// leadership as of a moment before they arrived -- so they wait for the
+	// next one, started as soon as the current round completes.
+	waitingReads []readIndexResolver
 	// leaseExpiry is the wall-clock time until which the leader holds a valid
 	// read lease. Zero means no lease. Set in confirmReadBatch; cleared in
 	// becomeFollower. Used by ReadIndexLease to skip the heartbeat round-trip.
