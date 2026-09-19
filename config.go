@@ -162,13 +162,24 @@ type Config struct {
 	// MaxClientTableSize caps the number of entries in the client dedup table
 	// used by ProposeOnce. Each entry records the latest (seqNum, result) pair
 	// for one client NodeID. When the table would exceed this size, the entry
-	// with the smallest seqNum (least recently active client) is evicted.
+	// written longest ago is evicted. Eviction order depends only on the order
+	// entries were written, which is the order of the log, so every replica
+	// evicts the same entry at the same point.
 	//
-	// In long-running clusters with many ephemeral client IDs the table grows
-	// without bound if this is zero, consuming memory indefinitely.
-	// DefaultConfig sets this to 100_000, which comfortably covers typical
-	// client populations while bounding the per-node overhead to a few tens
-	// of MiB.
+	// MUST be the same on every node in a group. A node with a smaller table
+	// forgets requests its peers still remember, so a client retry is
+	// re-executed there and skipped elsewhere, and the replicas diverge.
+	//
+	// Eviction is a real limit on the exactly-once guarantee: a client that
+	// retries a request after its entry has been evicted has that request
+	// executed a second time. Size the table so that it comfortably outlives
+	// the retry window of the slowest client.
+	//
+	// The bound is on entry count, not bytes; each entry also retains the
+	// result the state machine returned, so a state machine with large results
+	// needs a smaller table. In long-running clusters with many ephemeral
+	// client IDs the table grows without bound if this is zero, consuming
+	// memory indefinitely. DefaultConfig sets this to 100_000.
 	//
 	// Set to 0 to disable eviction (not recommended in production).
 	//
@@ -285,6 +296,19 @@ type Config struct {
 	// Inject a fake clock in tests to make lease expiry fully deterministic
 	// without relying on wall-clock timing.
 	Clock Clock
+
+	// OnFatal is an optional callback invoked once, from its own goroutine, when
+	// this node stops because a durable write failed. The error it receives is
+	// the same one FatalError reports, and it matches ErrNodeFailed.
+	//
+	// A node in this state has already stopped; the callback exists so that a
+	// process running many groups can raise an alarm, or tear down and rebuild
+	// the affected group, rather than discovering the failure by noticing that
+	// one group has gone quiet. Do not call Stop on the node from here: it has
+	// stopped itself.
+	//
+	// Default: nil (the failure is logged at error level and nothing else).
+	OnFatal func(error)
 
 	// PreferredLeader is an optional node ID that should hold leadership
 	// whenever possible. When a node that is not the preferred leader wins an
