@@ -185,7 +185,11 @@ func (n *Node) becomeLeader() {
 	// progress (jointOld != nil), the previous leader may not have appended
 	// the finalise entry yet. Re-append it to ensure the second phase
 	// completes. Duplicates are harmless — applyConfigChange is idempotent.
-	if n.jointOld != nil {
+	// Only once the joint entry itself has committed: appending C_new on top of
+	// a joint configuration that might still be discarded would skip the phase
+	// that makes the change safe. If it is not committed yet, the apply path
+	// will trigger the finalise entry when it is.
+	if n.jointOld != nil && n.configIndex <= n.commitIndex {
 		n.appendFinaliseEntry(n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 	}
 }

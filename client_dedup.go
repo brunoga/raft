@@ -144,25 +144,40 @@ type clientEntry struct {
 
 // ---- Snapshot framing ---------------------------------------------------------
 //
-// When taking a snapshot, the event loop wraps the state-machine data with the
-// client dedup table so that both can be restored atomically on restart or after
-// an InstallSnapshot RPC.
+// A snapshot replaces the log prefix it covers, so everything that prefix
+// carried has to be inside it. That is the state machine, the client dedup
+// table, and the cluster membership agreed by the config entries the snapshot
+// subsumes. The event loop wraps all three so they are restored atomically on
+// restart or after an InstallSnapshot RPC.
 //
 // Wire format:
-//   [8-byte snapFrameMagic][4-byte tableLen][table bytes][smData bytes]
+//
+//	[8-byte snapFrameMagicV2][4-byte tableLen][4-byte membershipLen]
+//	[table bytes][membership bytes][smData bytes]
 //
 // Table format:
-//   [4-byte N] repeated N times: [2-byte idLen][id][8-byte seqNum][4-byte resLen][res]
+//
+//	[4-byte N] repeated N times: [2-byte idLen][id][8-byte seqNum][4-byte resLen][res]
+//
+// snapFrameMagicV1 is the original layout, which had no membership section. It
+// is still read so that a node can start on a snapshot written by an older
+// build; such a snapshot yields no membership and the node falls back to the
+// peer list supplied in its Config.
+const (
+	snapFrameMagicV1 uint64 = 0xCAFEDEAD_BEEFD00D
+	snapFrameMagicV2 uint64 = 0xCAFEDEAD_BEEFD00E
+)
 
-const snapFrameMagic uint64 = 0xCAFEDEAD_BEEFD00D
-
-// writeWrappedSnapshot writes the client dedup table followed by the
-// state-machine data (via smSnapshot func) to w.
-func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, smSnapshot func(io.Writer) error) error {
+// writeWrappedSnapshot writes the client dedup table and the cluster
+// membership, followed by the state-machine data (via smSnapshot), to w.
+func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, ms membershipState, smSnapshot func(io.Writer) error) error {
 	tableBytes := encodeClientTable(table)
-	var hdr [12]byte
-	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagic)
-	binary.LittleEndian.PutUint32(hdr[8:], uint32(len(tableBytes)))
+	membershipBytes := encodeMembership(ms)
+
+	var hdr [16]byte
+	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagicV2)
+	binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(tableBytes)))
+	binary.LittleEndian.PutUint32(hdr[12:], uint32(len(membershipBytes)))
 
 	if _, err := w.Write(hdr[:]); err != nil {
 		return fmt.Errorf("write snap header: %w", err)
@@ -170,41 +185,72 @@ func writeWrappedSnapshot(w io.Writer, table map[NodeID]clientEntry, smSnapshot 
 	if _, err := w.Write(tableBytes); err != nil {
 		return fmt.Errorf("write snap table: %w", err)
 	}
+	if _, err := w.Write(membershipBytes); err != nil {
+		return fmt.Errorf("write snap membership: %w", err)
+	}
 	if err := smSnapshot(w); err != nil {
 		return fmt.Errorf("write snap sm data: %w", err)
 	}
 	return nil
 }
 
-// readWrappedSnapshot reads the client table from r and returns it along with
-// a reader for the remaining state-machine data.
-func readWrappedSnapshot(r io.Reader) (table map[NodeID]clientEntry, smDataReader io.Reader, err error) {
-	var hdr [12]byte
-	if _, readErr := io.ReadFull(r, hdr[:]); readErr != nil {
+// readWrappedSnapshot reads the client table and membership from r and returns
+// them along with a reader positioned at the state-machine data.
+//
+// hasMembership is false for a snapshot written before the membership section
+// existed; the caller must then keep whatever membership it already has rather
+// than treating the zero value as an empty cluster.
+func readWrappedSnapshot(r io.Reader) (table map[NodeID]clientEntry, ms membershipState, hasMembership bool, smDataReader io.Reader, err error) {
+	var hdr [16]byte
+
+	// The two layouts share a leading magic and table length; only V2 has the
+	// membership length, so read the common prefix first.
+	if _, readErr := io.ReadFull(r, hdr[:12]); readErr != nil {
 		if readErr == io.EOF {
-			return nil, nil, fmt.Errorf("read snap header: empty file")
+			return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: empty file")
 		}
-		return nil, nil, fmt.Errorf("read snap header: %w", readErr)
+		return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: %w", readErr)
 	}
 
-	if binary.LittleEndian.Uint64(hdr[:8]) != snapFrameMagic {
-		// Legacy snapshot or different format: the entire reader is SM data.
-		// We return a multi-reader that puts back the header bytes.
-		return make(map[NodeID]clientEntry), io.MultiReader(bytes.NewReader(hdr[:]), r), nil
+	magic := binary.LittleEndian.Uint64(hdr[:8])
+	if magic != snapFrameMagicV1 && magic != snapFrameMagicV2 {
+		// A snapshot from a different producer entirely: treat the whole
+		// reader as state-machine data, putting back the bytes consumed.
+		return make(map[NodeID]clientEntry), membershipState{}, false,
+			io.MultiReader(bytes.NewReader(hdr[:12]), r), nil
 	}
 
-	tableLen := int(binary.LittleEndian.Uint32(hdr[8:]))
+	membershipLen := 0
+	if magic == snapFrameMagicV2 {
+		if _, readErr := io.ReadFull(r, hdr[12:]); readErr != nil {
+			return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: %w", readErr)
+		}
+		membershipLen = int(binary.LittleEndian.Uint32(hdr[12:]))
+	}
+
+	tableLen := int(binary.LittleEndian.Uint32(hdr[8:12]))
 	tableBytes := make([]byte, tableLen)
 	if _, readErr := io.ReadFull(r, tableBytes); readErr != nil {
-		return nil, nil, fmt.Errorf("read snap table: %w", readErr)
+		return nil, membershipState{}, false, nil, fmt.Errorf("read snap table: %w", readErr)
 	}
-
 	table, err = decodeClientTable(tableBytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("decode snap table: %w", err)
+		return nil, membershipState{}, false, nil, fmt.Errorf("decode snap table: %w", err)
 	}
 
-	return table, r, nil
+	if membershipLen > 0 {
+		membershipBytes := make([]byte, membershipLen)
+		if _, readErr := io.ReadFull(r, membershipBytes); readErr != nil {
+			return nil, membershipState{}, false, nil, fmt.Errorf("read snap membership: %w", readErr)
+		}
+		decoded, ok := decodeMembership(membershipBytes)
+		if !ok {
+			return nil, membershipState{}, false, nil, fmt.Errorf("decode snap membership: malformed")
+		}
+		ms, hasMembership = decoded, true
+	}
+
+	return table, ms, hasMembership, r, nil
 }
 
 func encodeClientTable(table map[NodeID]clientEntry) []byte {
@@ -249,8 +295,9 @@ func decodeClientTable(buf []byte) (map[NodeID]clientEntry, error) {
 		if len(buf) < idLen+12 {
 			return nil, fmt.Errorf("client table: entry %d: truncated id+seq+resLen", i)
 		}
-		id := NodeID(make([]byte, idLen))
-		copy([]byte(id), buf[:idLen])
+		// NodeID is a string type, so this conversion copies; the bytes are not
+		// aliased to buf.
+		id := NodeID(buf[:idLen])
 		buf = buf[idLen:]
 		seqNum := binary.LittleEndian.Uint64(buf)
 		buf = buf[8:]

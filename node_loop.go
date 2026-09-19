@@ -144,7 +144,7 @@ func (n *Node) tick() {
 				if n.jointOld == nil {
 					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
 				} else {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, true) &&
+					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, n.jointSelfVoterOld) &&
 						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 				}
 				if !hasQuorum {
@@ -269,6 +269,10 @@ func (n *Node) handleProposals(props []proposeMsg) {
 			}
 			return
 		}
+		// A config entry takes effect as soon as it is in the log, committed or
+		// not: a node always decides quorums by the latest configuration it has
+		// (Raft dissertation section 4.1).
+		n.adoptConfigEntries(entries)
 		n.replicateToFollowers()
 		// For single-node clusters (no peers) the entry is immediately replicated
 		// on a majority (self), so try to advance commitIndex right away.
