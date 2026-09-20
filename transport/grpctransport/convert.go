@@ -2,7 +2,7 @@ package grpctransport
 
 import (
 	"github.com/brunoga/raft"
-	pb "github.com/brunoga/raft/transport/grpctransport/raftpb"
+	pb "github.com/brunoga/raft/transport/grpctransport/internal/raftpb"
 )
 
 // ---- RequestVote -----------------------------------------------------------
