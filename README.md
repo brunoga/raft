@@ -1148,6 +1148,36 @@ Five fully-worked examples are provided, each targeting a different deployment p
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
 
+## Applying entries in batches
+
+A `StateMachine` that also implements `BatchApplier` is handed runs of
+committed entries in one call instead of one at a time:
+
+```go
+func (sm *MySM) ApplyBatch(ctx context.Context, entries []raft.LogEntry) ([]raft.ApplyOutcome, error) {
+    tx := sm.db.Begin()
+    out := make([]raft.ApplyOutcome, len(entries))
+    for i, e := range entries {
+        v, err := sm.applyTo(tx, e)
+        out[i] = raft.ApplyOutcome{Value: v, Err: err}
+    }
+    return out, tx.Commit()   // one transaction, one fsync
+}
+```
+
+The entries already arrive in runs: the apply loop is handed everything
+committed since it last looked, which under load is dozens at a time. A state
+machine backed by storage almost always has a way to group that work, and
+applying one entry at a time denies it that.
+
+The returned error is for the batch failing as a whole, such as a transaction
+that would not commit, and is reported to every entry in it. A single command
+the state machine rejects is not that: report it as the `Err` of its own
+outcome, and the entries around it still apply.
+
+A state machine that does not implement it is called through `Apply`, exactly
+as before.
+
 ## Watching what a node does
 
 `Node.Events` reports the things a metric cannot carry: which peer joined,

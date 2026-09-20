@@ -2105,6 +2105,26 @@ func (n *Node) applyLoop() {
 					entries = append(entries, e)
 				}
 			}
+			// pending collects a run of entries the state machine can be given
+			// in one call, when it can take them that way. Anything the Raft
+			// layer answers itself -- a config entry, a duplicate whose result
+			// is already known -- interrupts the run, so results still leave
+			// this loop in index order.
+			var (
+				pending      []LogEntry
+				pendingRaw   []LogEntry
+				pendingDedup []dedupNote
+			)
+			flush := func() bool {
+				if len(pending) == 0 {
+					return true
+				}
+				ok := n.applyPending(ctx, pending, pendingRaw, pendingDedup,
+					localClientTable, &localLastApplied)
+				pending, pendingRaw, pendingDedup = nil, nil, nil
+				return ok
+			}
+
 			for _, entry := range entries {
 				i := entry.Index
 				// Config entries are handled by the Raft layer; do not forward
@@ -2112,6 +2132,9 @@ func (n *Node) applyLoop() {
 				var ar applyResult
 				switch {
 				case isConfigEntry(entry.Command):
+					if !flush() {
+						return
+					}
 					ar = applyResult{index: i, configCmd: entry.Command, cmd: entry.Command}
 				case isDedupCmd(entry.Command):
 					// ProposeOnce command: enforce exactly-once by checking the
@@ -2120,28 +2143,38 @@ func (n *Node) applyLoop() {
 					// original committed entry has not yet been applied, resulting
 					// in two log entries with the same (clientID, seqNum).
 					clientID, seqNum, payload, decErr := decodeDedupCmd(entry.Command)
-					if decErr != nil {
+					switch {
+					case decErr != nil:
 						// Malformed dedup header; apply as-is.
-						val, applyErr := n.cfg.StateMachine.Apply(ctx, entry)
-						ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
-					} else if cached, ok := localClientTable.get(clientID); ok && seqNum == cached.seqNum {
-						// Exact duplicate: return the cached result without re-applying.
-						ar = applyResult{index: i, val: cached.result, cmd: entry.Command}
-					} else {
-						// New (seqNum > cached) or first-seen: strip header, apply.
+						pending = append(pending, entry)
+						pendingRaw = append(pendingRaw, entry)
+						pendingDedup = append(pendingDedup, dedupNote{})
+						continue
+					default:
+						if cached, ok := localClientTable.get(clientID); ok && seqNum == cached.seqNum {
+							// Exact duplicate: the answer is already known, so
+							// the state machine must not see it again.
+							if !flush() {
+								return
+							}
+							ar = applyResult{index: i, val: cached.result, cmd: entry.Command}
+							break
+						}
+						// New or first-seen: strip the header and queue it.
 						smEntry := entry
 						smEntry.Command = payload
-						val, applyErr := n.cfg.StateMachine.Apply(ctx, smEntry)
-						ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
-						// Update the local table immediately so subsequent entries
-						// in this batch see the up-to-date dedup state.
-						if applyErr == nil {
-							localClientTable.put(clientID, clientEntry{seqNum: seqNum, result: val})
-						}
+						pending = append(pending, smEntry)
+						pendingRaw = append(pendingRaw, entry)
+						pendingDedup = append(pendingDedup, dedupNote{
+							set: true, clientID: clientID, seqNum: seqNum,
+						})
+						continue
 					}
 				default:
-					val, applyErr := n.cfg.StateMachine.Apply(ctx, entry)
-					ar = applyResult{index: i, val: val, err: applyErr, cmd: entry.Command}
+					pending = append(pending, entry)
+					pendingRaw = append(pendingRaw, entry)
+					pendingDedup = append(pendingDedup, dedupNote{})
+					continue
 				}
 				select {
 				case n.applyResultCh <- ar:
@@ -2149,6 +2182,9 @@ func (n *Node) applyLoop() {
 				case <-n.stopCh:
 					return
 				}
+			}
+			if !flush() {
+				return
 			}
 
 		case <-n.stopCh:
