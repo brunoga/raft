@@ -435,10 +435,10 @@ func TestSnapshotRestore_RoundTripsAndIsDeterministic(t *testing.T) {
 	}
 
 	var first, second bytes.Buffer
-	if err := src.Snapshot(context.Background(), &first); err != nil {
+	if err := src.snapshot(&first); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	if err := src.Snapshot(context.Background(), &second); err != nil {
+	if err := src.snapshot(&second); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	if !bytes.Equal(first.Bytes(), second.Bytes()) {
@@ -446,12 +446,12 @@ func TestSnapshotRestore_RoundTripsAndIsDeterministic(t *testing.T) {
 	}
 
 	dst := newTestStore(t, &config{ID: "n2"})
-	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, bytes.NewReader(first.Bytes())); err != nil {
+	if err := dst.restore(bytes.NewReader(first.Bytes())); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 
 	var again bytes.Buffer
-	if err := dst.Snapshot(context.Background(), &again); err != nil {
+	if err := dst.snapshot(&again); err != nil {
 		t.Fatalf("Snapshot after restore: %v", err)
 	}
 	if !bytes.Equal(first.Bytes(), again.Bytes()) {
@@ -476,7 +476,7 @@ func TestRestore_AcceptsEmptyAndNullSnapshots(t *testing.T) {
 			s := newTestStore(t, &config{ID: "n1"})
 			s.collections["stale"] = map[string]json.RawMessage{"k": json.RawMessage(`1`)}
 
-			if err := s.Restore(context.Background(), raft.SnapshotMeta{}, bytes.NewReader([]byte(tt.body))); err != nil {
+			if err := s.restore(bytes.NewReader([]byte(tt.body))); err != nil {
 				t.Fatalf("Restore: %v", err)
 			}
 			if len(s.collections) != 0 {
@@ -594,7 +594,7 @@ func BenchmarkSnapshot(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := s.Snapshot(context.Background(), io.Discard); err != nil {
+				if err := s.snapshot(io.Discard); err != nil {
 					b.Fatal(err)
 				}
 			}

@@ -489,7 +489,7 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	rCfg.Peers = peerConfigs
 	rCfg.Transport = tr
 	rCfg.Storage = st
-	rCfg.StateMachine = s
+	rCfg.StateMachine = storeFSM{s: s}
 	rCfg.Logger = s.cfg.Logger
 	rCfg.TickInterval = s.raftTickInterval() // Or 0 to use Manager.RunTicker
 	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
