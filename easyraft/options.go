@@ -19,13 +19,19 @@ import (
 // nowhere to be passed in, and one that could not be added to without breaking
 // anyone who built it as a literal.
 type config struct {
-	ID        raft.NodeID
-	RaftAddr  string
-	HTTPAddr  string
-	DataDir   string
-	Peers     map[raft.NodeID]string
-	Logger    *slog.Logger
-	SnapCount uint64
+	ID       raft.NodeID
+	RaftAddr string
+	HTTPAddr string
+	// AdvertiseRaftAddr and AdvertiseHTTPAddr are what peers are told to use
+	// to reach this node, when that differs from what it binds. Set via
+	// [WithAdvertiseRaftAddr] and [WithAdvertiseHTTPAddr]; each defaults to
+	// the corresponding bind address.
+	AdvertiseRaftAddr string
+	AdvertiseHTTPAddr string
+	DataDir           string
+	Peers             map[raft.NodeID]string
+	Logger            *slog.Logger
+	SnapCount         uint64
 
 	Discovery         discovery.Discovery
 	DiscoveryInterval time.Duration
@@ -120,13 +126,42 @@ func WithRaftAddr(addr string) Option {
 	return func(c *config) { c.RaftAddr = addr }
 }
 
+// WithAdvertiseRaftAddr sets the address peers are told to dial to reach this
+// node's Raft port, when that differs from the address it binds.
+//
+// A node binding 0.0.0.0:7001 to accept connections on every interface cannot
+// tell a peer to dial "0.0.0.0:7001", and one binding ":7001" cannot tell it to
+// dial ":7001" either: neither names a host. Whatever a peer is given has to be
+// reachable from that peer, which only the operator knows -- a hostname, a
+// service address, a pod IP.
+//
+// Defaults to [WithRaftAddr]. That default is right when the bind address
+// already names a reachable host, which for a local cluster means
+// "127.0.0.1:7001" rather than ":7001".
+func WithAdvertiseRaftAddr(addr string) Option {
+	return func(c *config) { c.AdvertiseRaftAddr = addr }
+}
+
+// WithAdvertiseHTTPAddr sets the address peers are told to redirect clients to
+// in order to reach this node's HTTP API, when that differs from the address it
+// binds.
+//
+// This is what a follower puts in a 307 when a write arrives and this node is
+// the leader. A node whose advertised address names no host cannot be
+// redirected to at all: the follower answers 503 and says so.
+//
+// Defaults to [WithHTTPAddr].
+func WithAdvertiseHTTPAddr(addr string) Option {
+	return func(c *config) { c.AdvertiseHTTPAddr = addr }
+}
+
 // WithHTTPAddr sets the optional listen address for the HTTP API (e.g., ":8001").
 //
 // The HTTP API can reshape cluster membership, so the listener must not be
 // reachable by untrusted clients. Bind it to a management interface (or
 // "127.0.0.1:8001") and pair it with [WithHTTPAuth] or [WithBearerTokenAuth].
 // The address is also advertised to the rest of the cluster as this node's URL
-// for leader redirects.
+// for leader redirects, unless [WithAdvertiseHTTPAddr] overrides it.
 func WithHTTPAddr(addr string) Option {
 	return func(c *config) { c.HTTPAddr = addr }
 }
