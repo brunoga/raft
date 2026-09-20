@@ -27,6 +27,36 @@ type StateMachine interface {
 	Restore(ctx context.Context, meta SnapshotMeta, r io.Reader) error
 }
 
+// DurableStateMachine is an optional interface a StateMachine may implement
+// when it keeps its own state on durable storage rather than rebuilding it in
+// memory.
+//
+// Without it, a node coming back from a restart has to reconstruct the state
+// machine from a snapshot and then replay every entry after it, because the
+// engine has no way to know what the state machine already has. For a state
+// machine that is itself a database, that work has already been done and is
+// sitting on the disk: what is missing is a way for it to say so.
+//
+// Implementing it is a promise about durability, and it is the whole of the
+// contract. The index reported must be one whose effect, and the effect of
+// every entry before it, is on stable storage. What must never happen is a
+// gap: an index reported as applied while the effect of some earlier entry was
+// lost. The engine will not replay anything at or below the reported index
+// again -- that is the point -- so a gap becomes permanent divergence from
+// every other replica, with nothing in the log to explain it.
+//
+// A state machine that batches its writes satisfies this by making them
+// durable before ApplyBatch returns, which is one sync per batch rather than
+// one per entry.
+type DurableStateMachine interface {
+	// AppliedIndex returns the highest log index whose effect is durable in
+	// this state machine's own storage, or zero if it has applied nothing.
+	//
+	// It is called once, while the node is being constructed, before anything
+	// is applied.
+	AppliedIndex(ctx context.Context) (Index, error)
+}
+
 // ApplyOutcome is what a BatchApplier reports for one entry: the result to
 // hand back to whoever proposed it, and the error if the state machine
 // rejected it.

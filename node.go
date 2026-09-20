@@ -700,9 +700,24 @@ func New(cfg *Config) (*Node, error) {
 	n.stopCtx, n.stopCancel = stopCtx, stopCancel
 	n.handler = &nodeHandler{n: n}
 
+	// A state machine that keeps its own durable state is asked what it
+	// already has. Anything at or below that index has been applied and made
+	// durable, so replaying it would be work at best and, for a state machine
+	// whose operations are not idempotent, wrong.
+	durableApplied, err := n.durableAppliedIndex()
+	if err != nil {
+		stopCancel()
+		return nil, err
+	}
+	if durableApplied > n.lastApplied {
+		n.lastApplied = durableApplied
+		n.applyBaseIndex = durableApplied
+	}
+
 	// If a snapshot exists, seed initialSnap so applyLoop can restore the
-	// state machine on its first iteration.
-	if rl.snapMeta.LastIncludedIndex > 0 {
+	// state machine on its first iteration. A state machine already past the
+	// snapshot point does not want it: restoring would put it back.
+	if rl.snapMeta.LastIncludedIndex > 0 && durableApplied < rl.snapMeta.LastIncludedIndex {
 		n.clientTable.loadFrom(rl.snapClientTable)
 		// We don't load the SM data here; applyLoop will call LoadSnapshot.
 		n.initialSnap = &snapshotInstall{
@@ -731,6 +746,16 @@ func New(cfg *Config) (*Node, error) {
 	}
 
 	// Initialise atomic mirrors so external readers never see a nil value.
+	if durableApplied > 0 && rl.snapMeta.LastIncludedIndex > 0 &&
+		durableApplied >= rl.snapMeta.LastIncludedIndex {
+		// The client dedup table lives in the snapshot rather than in the
+		// state machine, so it is still needed even when the state itself is
+		// not: without it a client whose command was applied before the
+		// restart gets it applied a second time on retry.
+		n.clientTable.loadFrom(rl.snapClientTable)
+		rl.snapClientTable = nil
+	}
+
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
 	n.leadership.Store(LeadershipChange{Term: n.currentTerm})
@@ -1394,6 +1419,29 @@ func (n *Node) Handler() Handler {
 // Term returns the current term of this node. Safe for concurrent use.
 func (n *Node) Term() Term {
 	return Term(n.atomicTerm.Load())
+}
+
+// durableAppliedIndex asks a state machine that keeps its own durable state
+// how far it has already got, and checks the answer is one this node can act
+// on.
+func (n *Node) durableAppliedIndex() (Index, error) {
+	durable, ok := n.cfg.StateMachine.(DurableStateMachine)
+	if !ok {
+		return 0, nil
+	}
+	idx, err := durable.AppliedIndex(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("raft.New: state machine applied index: %w", err)
+	}
+	if last := n.log.lastLogIndex(); idx > last {
+		// The state machine claims entries this node does not have. Replaying
+		// is impossible and ignoring it would apply those indices a second
+		// time when the log catches up, so there is nothing safe to do.
+		return 0, fmt.Errorf(
+			"raft.New: state machine reports applied index %d but the log ends at %d; "+
+				"its storage is ahead of this node's log", idx, last)
+	}
+	return idx, nil
 }
 
 // saveTerm records currentTerm and votedFor and queues the write that makes
