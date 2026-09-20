@@ -61,6 +61,8 @@ type Metrics struct {
 	storageLatency *prometheus.HistogramVec // durable write duration, by op and outcome
 	storageWrites  *prometheus.CounterVec   // durable writes, by op and outcome
 
+	applySaturation *prometheus.GaugeVec // fraction of the apply loop spent working
+
 	// tracked holds the nodes whose live indices are read at scrape time.
 	// Gauges like the apply lag have no natural event to hang off: they are a
 	// question about the present, so they are answered when asked.
@@ -253,6 +255,18 @@ func newMetricVecs(reg prometheus.Registerer, group string) *Metrics {
 			Help:      "Total proposals resolved, labelled by outcome.",
 		}, outcomeLabels)),
 
+		// The number that says where a slow write is slow. Proposal latency
+		// covers consensus and the state machine together, so a rise in it
+		// does not say which to fix; this does. Near 1 the apply loop never
+		// gets to wait, so the state machine is the constraint and faster
+		// consensus buys nothing.
+		applySaturation: registerOrGet(reg, prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "raft",
+			Name:      "apply_saturation",
+			Help: "Fraction of the recent window the apply loop spent applying rather " +
+				"than waiting for committed entries, in [0,1].",
+		}, commonLabels)),
+
 		// A durable write that has become slow is the usual explanation for a
 		// rise in proposal latency that nothing in the Raft state accounts
 		// for, so the buckets start far below a healthy fsync and run well
@@ -332,6 +346,11 @@ func (m *Metrics) StorageWrite(id raft.NodeID, op string, d time.Duration, err e
 	}
 	m.storageLatency.WithLabelValues(m.group, node, op, outcome).Observe(d.Seconds())
 	m.storageWrites.WithLabelValues(m.group, node, op, outcome).Inc()
+}
+
+// ApplySaturation implements raft.ApplyMetrics.
+func (m *Metrics) ApplySaturation(id raft.NodeID, saturation float64) {
+	m.applySaturation.WithLabelValues(m.group, string(id)).Set(saturation)
 }
 
 // ProposalCompleted implements raft.ProposalMetrics.

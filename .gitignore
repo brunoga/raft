@@ -8,6 +8,7 @@
 /examples/*/raftctl
 /examples/*/ratelimiter
 /examples/*/shardkv
+/examples/*/watchtower
 /cmd/kvd/kvd
 *.exe
 *.exe~

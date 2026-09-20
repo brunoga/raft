@@ -1,6 +1,6 @@
 # Examples
 
-Six fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. A seventh example, `raftctl`, is an operator tool rather than a service.
+Seven fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. An eighth example, `raftctl`, is an operator tool rather than a service.
 
 ---
 
@@ -162,6 +162,39 @@ go build -o durablekv ./durablekv
 The README works through why the applied index is a promise about durability,
 what the two ways of breaking it cost, and why the entry with no command that
 arrives on every election is neither an error nor a write.
+
+---
+
+## `watchtower` — what the library can tell you about itself
+
+See [`watchtower/`](watchtower/) for the two observability seams nothing else
+here uses.
+
+- **`Node.Events`**: what happened, to whom, and when. A counter of
+  configuration changes does not name the peer that joined, and a replication
+  histogram does not say which follower went quiet -- the only fact that decides
+  whether the next failure costs the cluster its quorum. Streamed as SSE on
+  `/events`, and turned into state on `/observed`, because the node reports
+  transitions and the question is "who is down *now*".
+- **`Event.Dropped`**: delivery is bounded and lossy so the node never blocks
+  on a slow consumer. An observer that ignores the dropped count presents a
+  clean history it does not have.
+- **`ApplyMetrics`**: how much of its time the apply loop spends applying
+  rather than waiting. Proposal latency covers consensus and the state machine
+  together; this says which of the two to fix.
+
+```bash
+go build -o watchtower ./watchtower
+./watchtower/cluster.sh --apply-delay 2ms
+```
+
+The example's own test drives one cluster twice, changing only the state
+machine:
+
+```
+apply delay 0s:   230000 proposals in 2s, saturation 0.452
+apply delay 2ms:     896 proposals in 2s, saturation 0.906
+```
 
 ---
 
