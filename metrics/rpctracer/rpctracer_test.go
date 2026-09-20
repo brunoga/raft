@@ -1,6 +1,7 @@
 package rpctracer_test
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"testing"
@@ -11,19 +12,19 @@ import (
 
 func TestSlogTracer_FinishCalledOnce(t *testing.T) {
 	tr := rpctracer.New(slog.Default())
-	finish := tr.StartRPC(raft.NodeID("n1"), raft.NodeID("n2"), "AppendEntries")
+	_, finish := tr.StartRPC(context.Background(), raft.NodeID("n1"), raft.NodeID("n2"), raft.RPCAppendEntries)
 	finish(nil) // success path
 }
 
 func TestSlogTracer_FinishWithError(t *testing.T) {
 	tr := rpctracer.New(slog.Default())
-	finish := tr.StartRPC(raft.NodeID("n1"), raft.NodeID("n2"), "RequestVote")
+	_, finish := tr.StartRPC(context.Background(), raft.NodeID("n1"), raft.NodeID("n2"), raft.RPCRequestVote)
 	finish(errors.New("connection refused")) // error path
 }
 
 func TestSlogTracer_NilLoggerUsesDefault(t *testing.T) {
 	tr := rpctracer.New(nil) // should not panic
-	finish := tr.StartRPC(raft.NodeID("n1"), raft.NodeID("n2"), "TimeoutNow")
+	_, finish := tr.StartRPC(context.Background(), raft.NodeID("n1"), raft.NodeID("n2"), raft.RPCTimeoutNow)
 	finish(nil)
 }
 

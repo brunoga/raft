@@ -16,13 +16,19 @@
 // directly using the same StartRPC / finish-func pattern:
 //
 //	type OtelTracer struct{ tracer trace.Tracer }
-//	func (t *OtelTracer) StartRPC(nodeID, peer raft.NodeID, rpcType string) func(error) {
-//	    _, span := t.tracer.Start(context.Background(), rpcType,
+//
+//	func (t *OtelTracer) StartRPC(ctx context.Context, nodeID, peer raft.NodeID,
+//	    rpcType raft.RPCType) (context.Context, func(error)) {
+//
+//	    ctx, span := t.tracer.Start(ctx, string(rpcType),
 //	        trace.WithAttributes(
 //	            attribute.String("raft.node", string(nodeID)),
 //	            attribute.String("raft.peer", string(peer)),
 //	        ))
-//	    return func(err error) {
+//	    // Returning ctx is what makes the span a parent of anything the
+//	    // transport does, and what lets a propagator put the trace context
+//	    // on the wire.
+//	    return ctx, func(err error) {
 //	        if err != nil { span.RecordError(err) }
 //	        span.End()
 //	    }
@@ -30,6 +36,7 @@
 package rpctracer
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -51,15 +58,18 @@ func New(logger *slog.Logger) *SlogTracer {
 
 // StartRPC implements raft.Tracer. It records the start time and returns a
 // finish func that logs the completed RPC with its duration and outcome.
-func (t *SlogTracer) StartRPC(nodeID, peer raft.NodeID, rpcType string) func(err error) {
+//
+// The context is returned unchanged: this tracer measures, and has nothing to
+// attach to the outbound call.
+func (t *SlogTracer) StartRPC(ctx context.Context, nodeID, peer raft.NodeID, rpcType raft.RPCType) (rpcCtx context.Context, finish func(err error)) {
 	start := time.Now()
-	return func(err error) {
+	return ctx, func(err error) {
 		ms := time.Since(start).Milliseconds()
 		if err != nil {
 			t.logger.Warn("raft rpc failed",
 				"node", string(nodeID),
 				"peer", string(peer),
-				"rpc", rpcType,
+				"rpc", string(rpcType),
 				"duration_ms", ms,
 				"err", err,
 			)
@@ -67,7 +77,7 @@ func (t *SlogTracer) StartRPC(nodeID, peer raft.NodeID, rpcType string) func(err
 			t.logger.Debug("raft rpc ok",
 				"node", string(nodeID),
 				"peer", string(peer),
-				"rpc", rpcType,
+				"rpc", string(rpcType),
 				"duration_ms", ms,
 			)
 		}

@@ -32,7 +32,7 @@ type NodeProvider interface {
 // transfer are skipped in subsequent intervals until the transfer completes (or
 // fails). Failed transfers are logged and retried on the next interval.
 type BalanceController struct {
-	providers map[NodeID]NodeProvider // physID → provider
+	providers map[HostID]NodeProvider // host → provider
 	balancer  Balancer
 	interval  time.Duration
 	logger    *slog.Logger
@@ -104,10 +104,9 @@ func WithGroupCooldown(d time.Duration) BalanceOption {
 }
 
 // NewBalanceController creates a BalanceController that rebalances leaders
-// across providers every interval using b. providers maps each physical-node
-// identifier (used as the view key in Balancer.Plan) to the NodeProvider for
-// that node.
-func NewBalanceController(providers map[NodeID]NodeProvider, b Balancer, interval time.Duration, opts ...BalanceOption) *BalanceController {
+// across hosts every interval using b. providers maps each HostID, which is
+// the view key Balancer.Plan sees, to the NodeProvider for that host.
+func NewBalanceController(providers map[HostID]NodeProvider, b Balancer, interval time.Duration, opts ...BalanceOption) *BalanceController {
 	c := &BalanceController{
 		providers:       providers,
 		balancer:        b,
@@ -154,10 +153,10 @@ func (c *BalanceController) runOnce(ctx context.Context) {
 		viewMu sync.Mutex
 		wg     sync.WaitGroup
 	)
-	view := make(map[NodeID][]GroupStatus, len(c.providers))
-	for physID, p := range c.providers {
+	view := make(map[HostID][]GroupStatus, len(c.providers))
+	for hostID, p := range c.providers {
 		wg.Add(1)
-		go func(id NodeID, prov NodeProvider) {
+		go func(id HostID, prov NodeProvider) {
 			defer wg.Done()
 			statuses := prov.StatusAll(statusCtx)
 			if statuses == nil {
@@ -166,7 +165,7 @@ func (c *BalanceController) runOnce(ctx context.Context) {
 			viewMu.Lock()
 			view[id] = statuses
 			viewMu.Unlock()
-		}(physID, p)
+		}(hostID, p)
 	}
 	wg.Wait()
 
@@ -183,11 +182,12 @@ func (c *BalanceController) runOnce(ctx context.Context) {
 		return
 	}
 
-	// Build a reverse index: Raft NodeID → physID, for quick provider lookup.
-	nodeToPhys := make(map[NodeID]NodeID)
-	for physID, statuses := range view {
+	// Build a reverse index: Raft node → the host running it, for quick
+	// provider lookup.
+	nodeToHost := make(map[NodeID]HostID)
+	for hostID, statuses := range view {
 		for _, s := range statuses {
-			nodeToPhys[s.NodeID] = physID
+			nodeToHost[s.NodeID] = hostID
 		}
 	}
 
@@ -209,7 +209,7 @@ func (c *BalanceController) runOnce(ctx context.Context) {
 		c.mu.Unlock()
 
 		// Locate the provider that currently hosts the leader.
-		physID, ok := nodeToPhys[tr.From]
+		hostID, ok := nodeToHost[tr.From]
 		if !ok {
 			c.mu.Lock()
 			delete(c.inflight, tr.GroupID)
@@ -218,13 +218,13 @@ func (c *BalanceController) runOnce(ctx context.Context) {
 				"group", tr.GroupID, "from", tr.From)
 			continue
 		}
-		provider, ok := c.providers[physID]
+		provider, ok := c.providers[hostID]
 		if !ok {
 			c.mu.Lock()
 			delete(c.inflight, tr.GroupID)
 			c.mu.Unlock()
-			c.logger.Warn("balance: no provider for physical node; skipping",
-				"group", tr.GroupID, "physID", physID)
+			c.logger.Warn("balance: no provider for host; skipping",
+				"group", tr.GroupID, "host", string(hostID))
 			continue
 		}
 

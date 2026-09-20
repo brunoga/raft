@@ -159,7 +159,7 @@ func (n *Node) broadcastRequestVote(preVote bool) {
 			ctx, cancel := context.WithTimeout(n.stopCtx, n.rpcTimeout())
 			defer cancel()
 
-			finish := n.traceRPC(p, "RequestVote")
+			ctx, finish := n.traceRPC(ctx, p, RPCRequestVote)
 			resp, err := n.cfg.Transport.RequestVote(ctx, p, req)
 			finish(err)
 			if err != nil || resp == nil {

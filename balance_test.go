@@ -16,7 +16,7 @@ import (
 // TestLeastLeadersBalancer_AlreadyBalanced verifies that a perfectly balanced
 // view (equal leader count on every physical node) produces no transfers.
 func TestLeastLeadersBalancer_AlreadyBalanced(t *testing.T) {
-	view := map[raft.NodeID][]raft.GroupStatus{
+	view := map[raft.HostID][]raft.GroupStatus{
 		"phys0": {
 			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
 			{GroupID: 2, NodeID: "g2-p0", State: raft.Follower, Voter: true},
@@ -38,7 +38,7 @@ func TestLeastLeadersBalancer_AlreadyBalanced(t *testing.T) {
 func TestLeastLeadersBalancer_Rebalance(t *testing.T) {
 	// 2 physical nodes, 3 groups, all leaders on phys0.
 	// Expected: 1 transfer (phys0→2, phys1→1; difference is 1).
-	view := map[raft.NodeID][]raft.GroupStatus{
+	view := map[raft.HostID][]raft.GroupStatus{
 		"phys0": {
 			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
 			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader, Voter: true},
@@ -74,9 +74,9 @@ func TestLeastLeadersBalancer_Rebalance(t *testing.T) {
 // all initially on phys0 should produce 3 transfers (3/3/3).
 func TestLeastLeadersBalancer_ThreeNodes(t *testing.T) {
 	const nGroups = 9
-	view := map[raft.NodeID][]raft.GroupStatus{}
+	view := map[raft.HostID][]raft.GroupStatus{}
 	for p := range 3 {
-		physID := raft.NodeID(fmt.Sprintf("phys%d", p))
+		hostID := raft.HostID(fmt.Sprintf("phys%d", p))
 		statuses := make([]raft.GroupStatus, nGroups)
 		for g := range nGroups {
 			state := raft.Follower
@@ -90,7 +90,7 @@ func TestLeastLeadersBalancer_ThreeNodes(t *testing.T) {
 				Voter:   true,
 			}
 		}
-		view[physID] = statuses
+		view[hostID] = statuses
 	}
 
 	plan := raft.LeastLeadersBalancer{}.Plan(view)
@@ -123,7 +123,7 @@ func TestLeastLeadersBalancer_ThreeNodes(t *testing.T) {
 // TestLeastLeadersBalancer_SingleNode verifies that a single physical node
 // (no peers) produces no transfers — nothing to balance across.
 func TestLeastLeadersBalancer_SingleNode(t *testing.T) {
-	view := map[raft.NodeID][]raft.GroupStatus{
+	view := map[raft.HostID][]raft.GroupStatus{
 		"phys0": {
 			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
 			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader, Voter: true},
@@ -186,9 +186,9 @@ func TestBalanceController_ConvergesUniform(t *testing.T) {
 	}
 
 	// Build the providers map for the BalanceController.
-	providers := make(map[raft.NodeID]raft.NodeProvider, numPhysical)
+	providers := make(map[raft.HostID]raft.NodeProvider, numPhysical)
 	for p := range numPhysical {
-		providers[raft.NodeID(fmt.Sprintf("phys%d", p))] = c.mgrs[p]
+		providers[raft.HostID(fmt.Sprintf("phys%d", p))] = c.mgrs[p]
 	}
 
 	ctrl := raft.NewBalanceController(providers, raft.LeastLeadersBalancer{}, 20*time.Millisecond)

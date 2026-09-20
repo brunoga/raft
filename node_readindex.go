@@ -161,7 +161,7 @@ func (n *Node) broadcastReadBarrier() {
 		go func(p NodeID, r *AppendEntriesRequest) {
 			ctx, cancel := context.WithTimeout(n.stopCtx, n.rpcTimeout())
 			defer cancel()
-			finish := n.traceRPC(p, "AppendEntries")
+			ctx, finish := n.traceRPC(ctx, p, RPCAppendEntries)
 			resp, err := n.cfg.Transport.AppendEntries(ctx, p, r)
 			finish(err)
 			if err != nil || resp == nil {

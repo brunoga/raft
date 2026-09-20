@@ -98,7 +98,7 @@ func (n *Node) sendTimeoutNow(target NodeID) {
 		ctx, cancel := context.WithTimeout(n.stopCtx,
 			n.cfg.ElectionTimeoutMin)
 		defer cancel()
-		finish := n.traceRPC(p, "TimeoutNow")
+		ctx, finish := n.traceRPC(ctx, p, RPCTimeoutNow)
 		_, err := n.cfg.Transport.TimeoutNow(ctx, p, r)
 		finish(err)
 	}(target, req)

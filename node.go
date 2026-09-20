@@ -750,7 +750,10 @@ func (n *Node) Start() {
 }
 
 // Stop signals the node to shut down and waits for all goroutines to exit,
-// including the apply goroutine and any in-flight runSnapshotInstall goroutines.
+// including the apply goroutine and any in-flight runSnapshotInstall
+// goroutines. It is safe to call more than once and from any goroutine.
+//
+// Use Shutdown instead where the wait has to be bounded.
 //
 // Storage writes that have been accepted but not yet carried out are finished
 // first, rather than abandoned. Dropping them would be safe -- nothing was
@@ -774,6 +777,34 @@ func (n *Node) Stop() {
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
 	})
+}
+
+// Shutdown stops the node like Stop, but gives up waiting when ctx is done and
+// returns ctx.Err().
+//
+// It exists because Stop finishes the storage writes the node accepted before
+// returning, which is what makes an orderly restart keep the tail of its log
+// rather than fetching it back from the leader -- and which means a storage
+// backend that has hung rather than failed holds Stop there indefinitely. A
+// process that has to come down on a deadline needs a way to say so.
+//
+// Giving up does not cancel the shutdown. It carries on in the background, so
+// a node Shutdown returned an error for is neither running nor finished, and
+// its storage should not be reopened by another process. Prefer Stop where
+// there is no deadline to meet.
+func (n *Node) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.Stop()
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		n.logger.Warn("shutdown deadline passed; the node is still stopping")
+		return ctx.Err()
+	}
 }
 
 // Tick advances the node's logical clock by one unit. Called automatically
@@ -1386,14 +1417,15 @@ func (n *Node) sendGate(writeSeq uint64) uint64 {
 	return writeSeq
 }
 
-// traceRPC calls cfg.Tracer.StartRPC if a tracer is configured and returns the
-// finish func. When no tracer is set it returns a no-op func so callers don't
-// need a nil check. Safe to call from any goroutine.
-func (n *Node) traceRPC(peer NodeID, rpcType string) func(error) {
+// traceRPC calls cfg.Tracer.StartRPC if a tracer is configured, returning the
+// context to make the RPC with and the finish func. When no tracer is set it
+// returns the context unchanged and a no-op func, so callers need no nil
+// check. Safe to call from any goroutine.
+func (n *Node) traceRPC(ctx context.Context, peer NodeID, rpcType RPCType) (rpcCtx context.Context, finish func(error)) {
 	if n.cfg.Tracer == nil {
-		return func(error) {}
+		return ctx, func(error) {}
 	}
-	return n.cfg.Tracer.StartRPC(n.cfg.ID, peer, rpcType)
+	return n.cfg.Tracer.StartRPC(ctx, n.cfg.ID, peer, rpcType)
 }
 
 // now returns the current wall-clock time, delegating to cfg.Clock when set.
@@ -1792,7 +1824,7 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 			return
 		}
 		ctx, cancel := context.WithTimeout(n.stopCtx, n.rpcTimeout())
-		finish := n.traceRPC(peer, "AppendEntries")
+		ctx, finish := n.traceRPC(ctx, peer, RPCAppendEntries)
 		resp, err := n.cfg.Transport.AppendEntries(ctx, peer, req)
 		finish(err)
 		cancel()
