@@ -17,6 +17,7 @@ func (n *Node) run() {
 			n.writer.close()
 			n.handleWriteCompletions()
 			n.failDeferredWrites(ErrStopped)
+			n.failSnapInstallAck(ErrStopped)
 			// Drain any results that applyLoop already sent but the event loop
 			// has not yet processed. Without this, the clientTable and
 			// pendingConfigIndex updates for applied entries are lost, and

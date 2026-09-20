@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -125,6 +126,15 @@ type installSnapshotResult struct {
 	dropped bool
 }
 
+// errSnapshotNeedsRestart tells a leader that this node did not take the chunk
+// it sent and that the transfer has to begin again. It has to be an error
+// rather than an unsuccessful-looking response, because the response to the
+// final chunk is what a leader turns into this node's match index.
+var errSnapshotNeedsRestart = errors.New("raft: snapshot chunk not accepted; restart the transfer from the beginning")
+
+// errSnapshotSuperseded answers a held reply whose transfer has been replaced.
+var errSnapshotSuperseded = errors.New("raft: snapshot install superseded by a new transfer")
+
 // handleInstallSnapshot implements the receiver side of the InstallSnapshot RPC.
 // Each call enqueues one chunk of snapshot data to a background goroutine that
 // streams it directly to storage, preventing full-snapshot buffering in memory.
@@ -135,19 +145,18 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rp
 	// The reply carries this node's term, so it waits for the hard-state write
 	// when stepping down produced one. Every exit from this function goes
 	// through it.
-	reply := func() {
+	reply := func(err error) {
 		if respCh == nil || answered {
 			return
 		}
 		answered = true
-		gate := n.sendGate(0)
-		n.afterWrite(gate,
-			func() { respCh <- rpcResponse{resp: resp} },
-			func(err error) { respCh <- rpcResponse{resp: resp, err: err} })
+		n.afterWrite(n.sendGate(0),
+			func() { respCh <- rpcResponse{resp: resp, err: err} },
+			func(werr error) { respCh <- rpcResponse{resp: resp, err: werr} })
 	}
 
 	if req.Term < n.currentTerm {
-		reply()
+		reply(nil)
 		return
 	}
 	if req.Term > n.currentTerm {
@@ -164,7 +173,7 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rp
 
 	// If the snapshot is old, discard it.
 	if req.LastIncludedIndex <= n.lastApplied {
-		reply()
+		reply(nil)
 		return
 	}
 
@@ -181,10 +190,27 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rp
 	// Start a new streaming install goroutine if needed.
 	if n.pendingSnap == nil {
 		if req.Offset != 0 {
-			// Cannot resume an install without its beginning; wait for chunk 0.
-			reply()
+			// Cannot resume an install without its beginning. Answering with
+			// an error rather than a bare response matters for the final
+			// chunk: a plain response is what the leader turns into a match
+			// index, and this node has taken nothing.
+			reply(errSnapshotNeedsRestart)
 			return
 		}
+		if n.installingSnap == req.LastIncludedIndex {
+			// The previous transfer of this same snapshot reached the end and
+			// is being written now; the leader gave up waiting for the answer
+			// and started again. Writing it a second time would only queue
+			// behind the first. Wait on the write already running.
+			n.failSnapInstallAck(errSnapshotSuperseded)
+			n.snapInstallAck = &snapshotAck{index: req.LastIncludedIndex, answer: reply}
+			return
+		}
+		// A leader starting from the beginning has given up on any previous
+		// transfer. If that one's final chunk is still waiting to be written,
+		// its answer is now meaningless, and holding it would only make the
+		// leader wait out its own timeout before trying again.
+		n.failSnapInstallAck(errSnapshotSuperseded)
 		meta := SnapshotMeta{
 			LastIncludedIndex: req.LastIncludedIndex,
 			LastIncludedTerm:  req.LastIncludedTerm,
@@ -205,7 +231,7 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rp
 
 	// Verify the expected byte offset to detect out-of-order delivery.
 	if req.Offset != n.pendingSnap.expectedOff {
-		reply()
+		reply(errSnapshotNeedsRestart)
 		return
 	}
 
@@ -228,18 +254,28 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rp
 			"peer", req.LeaderID, "offset", req.Offset)
 		n.pendingSnap.cancelFn()
 		n.pendingSnap = nil
-		reply()
+		reply(errSnapshotNeedsRestart)
 		return
 	}
 	n.pendingSnap.expectedOff += int64(len(req.Data))
 
 	if req.Done {
 		// Closing the channel signals io.EOF to the chunkReader inside SaveSnapshot.
+		last := n.pendingSnap.meta.LastIncludedIndex
 		close(n.pendingSnap.installCh)
 		n.pendingSnap = nil // goroutine owns installCh from here; posts result via rpcCh
+
+		// Hold the answer until the snapshot has been written. This is the
+		// chunk the leader turns into a match index for this node, so it has
+		// to mean the snapshot is on disk and not merely that the bytes
+		// arrived.
+		n.failSnapInstallAck(errSnapshotSuperseded)
+		n.snapInstallAck = &snapshotAck{index: last, answer: reply}
+		n.installingSnap = last
+		return
 	}
 
-	reply()
+	reply(nil)
 }
 
 // runSnapshotInstall is the background goroutine for a streaming snapshot
@@ -325,7 +361,11 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 // It updates log state, the client dedup table, and signals the apply goroutine
 // to restore the state machine from the newly installed snapshot.
 func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
+	if n.installingSnap == r.meta.LastIncludedIndex {
+		n.installingSnap = 0
+	}
 	if r.err != nil {
+		n.answerSnapInstallAck(r.meta.LastIncludedIndex, r.err)
 		n.logger.Error("snapshot install failed", "err", r.err)
 		// Clear the stale pendingSnap reference so that any chunks arriving
 		// before the leader retries from Offset=0 are rejected immediately
@@ -335,6 +375,10 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 		}
 		return
 	}
+
+	// The snapshot is on disk from here on, whatever this node then does with
+	// it, so the leader can be told.
+	n.answerSnapInstallAck(r.meta.LastIncludedIndex, nil)
 
 	// Skip stale results: a newer snapshot may have already been applied.
 	if r.meta.LastIncludedIndex <= n.lastApplied {
@@ -427,7 +471,7 @@ func (n *Node) maybeSnapshot() {
 	}
 
 	snapAt := n.lastApplied
-	snapTerm, err := n.log.termAt(n.stopCtx, snapAt)
+	snapTerm, err := n.log.termAt(snapAt)
 	if err != nil {
 		n.logger.Error("maybeSnapshot: termAt", "index", snapAt, "err", err)
 		if n.cfg.SnapshotSemaphore != nil {

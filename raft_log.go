@@ -61,6 +61,21 @@ type raftLog struct {
 	// than the disk retires them have nowhere to live but memory.
 	unstableBytes int
 
+	// runs records where each term begins, oldest first. Terms never decrease
+	// with index, so the log is a short sequence of runs -- one per leadership
+	// epoch -- and that is the whole of what the consensus logic ever needs to
+	// know about an entry it is not about to send.
+	//
+	// It exists because the alternative was a storage read. Every heartbeat
+	// looks up the term of the entry before the one it would send, every
+	// inbound append checks the term at the index it starts from, and both
+	// sides of a log conflict used to walk backwards an index at a time
+	// reading each entry. Those reads sit on the event loop, and in a
+	// file-backed store they contend with the same lock the writer holds
+	// across its fsync, so the loop could still end up waiting for a disk it
+	// no longer writes to.
+	runs []termRun
+
 	// durable is the highest log index known to be on stable storage as of the
 	// most recent completed write. It is not by itself a statement about the
 	// current log: a queued truncation can leave storage holding entries this
@@ -72,6 +87,13 @@ type raftLog struct {
 	queuedDurable Index
 	// nextSeq is the sequence number handed to the next queued operation.
 	nextSeq uint64
+}
+
+// termRun records that the entry at start, and every entry after it up to the
+// start of the next run, carries this term.
+type termRun struct {
+	start Index
+	term  Term
 }
 
 // unstableSeg is one queued append: the entries it carried, and the sequence
@@ -119,17 +141,43 @@ func newRaftLog(s Storage, w *storageWriter) (*raftLog, error) {
 	rl.queuedDurable = last
 
 	if last > 0 {
-		e, err := s.GetLogEntry(ctx, last)
-		if err != nil {
-			return nil, fmt.Errorf("raftLog: read last entry: %w", err)
+		if err := rl.loadRuns(ctx); err != nil {
+			return nil, err
 		}
-		rl.lastTerm = e.Term
+		rl.lastTerm = rl.runs[len(rl.runs)-1].term
 	} else {
 		// No entries; last term comes from the snapshot (or 0).
 		rl.lastTerm = rl.snapMeta.LastIncludedTerm
 	}
 
 	return rl, nil
+}
+
+// loadRuns rebuilds the run index by reading the log once.
+//
+// This is the only place that reads every entry, and it happens while the node
+// is being constructed rather than while it is serving, which is the whole
+// point: paying for the scan once at startup is what makes every later term
+// lookup free. Node.New already reads the same entries a second time to
+// recover the cluster membership, so the log length a node can start with is
+// unchanged by this.
+func (rl *raftLog) loadRuns(ctx context.Context) error {
+	const batch = 1024
+	for lo := rl.first; lo <= rl.last; lo += batch {
+		hi := min(lo+batch, rl.last+1)
+		entries, err := rl.storage.GetLogEntries(ctx, lo, hi)
+		if err != nil {
+			return fmt.Errorf("raftLog: read terms [%d,%d): %w", lo, hi, err)
+		}
+		if len(entries) == 0 {
+			return fmt.Errorf("raftLog: read terms [%d,%d): no entries returned", lo, hi)
+		}
+		rl.extendRuns(entries)
+	}
+	if len(rl.runs) == 0 {
+		return fmt.Errorf("raftLog: log holds entries up to %d but no terms were read", rl.last)
+	}
+	return nil
 }
 
 // lastLogIndex returns the index of the most recent entry, falling back to the
@@ -195,23 +243,6 @@ func (rl *raftLog) unstableFirst() Index {
 // unstableSize returns the total size of the commands held in memory pending a
 // write.
 func (rl *raftLog) unstableSize() int { return rl.unstableBytes }
-
-// unstableAt returns the entry at index if it is still only in memory.
-func (rl *raftLog) unstableAt(index Index) (LogEntry, bool) {
-	for i := range rl.segs {
-		es := rl.segs[i].entries
-		if len(es) == 0 {
-			continue
-		}
-		if index < es[0].Index {
-			return LogEntry{}, false // segments are ordered; it is not here
-		}
-		if index <= es[len(es)-1].Index {
-			return es[index-es[0].Index], true
-		}
-	}
-	return LogEntry{}, false
-}
 
 // unstableSlice returns the entries in [lo, hi) that are still only in memory.
 // The caller must have established that the whole range is unstable.
@@ -288,6 +319,34 @@ func commandBytes(entries []LogEntry) int {
 	return total
 }
 
+// writeSeqCovering returns the sequence number of the queued write that will
+// put the entry at index on stable storage, or 0 when it is already there.
+//
+// It exists for the request that needs no append at all. A leader that has not
+// yet been acknowledged re-sends the same entries, and a follower still
+// holding them unwritten finds every one of them already in its log and
+// queues nothing -- so the write it must wait for is one queued by an earlier
+// request, not by this one. Answering such a request immediately would tell
+// the leader those entries were durable when nothing had reached the disk.
+func (rl *raftLog) writeSeqCovering(index Index) uint64 {
+	if index == 0 || index <= rl.stableIndex() {
+		return 0
+	}
+	for i := range rl.segs {
+		es := rl.segs[i].entries
+		if len(es) == 0 {
+			continue
+		}
+		if index >= es[0].Index && index <= es[len(es)-1].Index {
+			return rl.segs[i].seq
+		}
+	}
+	// Above the durable point but in no segment: a queued truncation has moved
+	// the durable point without an append to carry it. Wait for everything
+	// queued so far, which is never wrong and only ever too patient.
+	return rl.nextSeq
+}
+
 // stabilize records a completed write. Segments whose write has landed are
 // released, and the durable point moves to where that operation left it.
 func (rl *raftLog) stabilize(d writeDone) {
@@ -338,6 +397,7 @@ func (rl *raftLog) append(entries []LogEntry) uint64 {
 	if rl.first == 0 {
 		rl.first = buf[0].Index
 	}
+	rl.extendRuns(buf)
 	rl.last = last.Index
 	rl.lastTerm = last.Term
 	rl.queuedDurable = last.Index
@@ -353,27 +413,121 @@ func (rl *raftLog) append(entries []LogEntry) uint64 {
 
 // termAt returns the term of the entry at index, consulting the snapshot when
 // the entry has been compacted.
-func (rl *raftLog) termAt(ctx context.Context, index Index) (Term, error) {
+//
+// It never reads storage. The run index holds every term in the log in a
+// handful of entries, one per leadership epoch, however long the log is; that
+// is what lets the hot paths calling it stay on the event loop.
+func (rl *raftLog) termAt(index Index) (Term, error) {
 	if index == 0 {
 		return 0, nil
 	}
 	if index == rl.snapMeta.LastIncludedIndex {
 		return rl.snapMeta.LastIncludedTerm, nil
 	}
-	if e, ok := rl.unstableAt(index); ok {
-		return e.Term, nil
-	}
-	// Outside the range this log describes, storage may still hold an entry:
-	// a queued truncation has already taken effect here and not yet there.
-	// Reading it would resurrect an entry the log has discarded.
+	// Outside the range this log describes there is no answer to give. Storage
+	// may still hold an entry there -- a queued truncation has already taken
+	// effect here and not yet on disk -- and reporting its term would
+	// resurrect an entry the log has discarded.
 	if rl.first == 0 || index < rl.first || index > rl.last {
 		return 0, fmt.Errorf("raft: log entry %d is not in the log", index)
 	}
-	e, err := rl.storage.GetLogEntry(ctx, index)
-	if err != nil {
-		return 0, err
+	i := rl.runIndexFor(index)
+	if i < 0 {
+		return 0, fmt.Errorf("raft: log entry %d is not in the log", index)
 	}
-	return e.Term, nil
+	return rl.runs[i].term, nil
+}
+
+// runIndexFor returns the position in runs of the run covering index, or -1
+// when no run does.
+func (rl *raftLog) runIndexFor(index Index) int {
+	// The last run whose start is at or below index. Runs are ordered and
+	// short, so a descending scan is as good as a search and easier to read;
+	// the loop runs once for the common case of an index in the newest term.
+	for i := len(rl.runs) - 1; i >= 0; i-- {
+		if rl.runs[i].start <= index {
+			return i
+		}
+	}
+	return -1
+}
+
+// termRunStart returns the first index of the run of entries sharing the term
+// at index, or 0 when index is not in the log.
+//
+// It answers the question a follower asks when it rejects an append: the
+// leader wants to know how far back the disagreement goes, and the useful
+// answer is the start of the term it disagreed in. That used to be a walk
+// backwards with a storage read per index, bounded only by the length of a
+// term.
+func (rl *raftLog) termRunStart(index Index) Index {
+	i := rl.runIndexFor(index)
+	if i < 0 || index > rl.last {
+		return 0
+	}
+	return rl.runs[i].start
+}
+
+// lastIndexOfTerm returns the highest index whose entry carries term, and
+// whether the log holds any entry with it.
+//
+// It answers the question a leader asks when a follower rejects an append and
+// names the term it disagreed in. That used to be a walk down from the end of
+// the log with a storage read per index, bounded only by how far behind the
+// follower had fallen.
+func (rl *raftLog) lastIndexOfTerm(term Term) (Index, bool) {
+	for i := len(rl.runs) - 1; i >= 0; i-- {
+		if rl.runs[i].term != term {
+			continue
+		}
+		if i+1 < len(rl.runs) {
+			return rl.runs[i+1].start - 1, true
+		}
+		return rl.last, true
+	}
+	// A log with nothing left in it still describes one index: the snapshot
+	// boundary. A leader that has compacted everything away can still tell a
+	// follower where the term it asked about ended.
+	if rl.first == 0 && rl.snapMeta.LastIncludedIndex != 0 &&
+		rl.snapMeta.LastIncludedTerm == term {
+		return rl.snapMeta.LastIncludedIndex, true
+	}
+	return 0, false
+}
+
+// extendRuns records the terms of newly appended entries. The entries are
+// contiguous, start one past the end of the log, and carry terms no lower
+// than the one already at the end of it.
+func (rl *raftLog) extendRuns(entries []LogEntry) {
+	for i := range entries {
+		if n := len(rl.runs); n > 0 && rl.runs[n-1].term == entries[i].Term {
+			continue
+		}
+		rl.runs = append(rl.runs, termRun{start: entries[i].Index, term: entries[i].Term})
+	}
+}
+
+// truncateRunsFrom drops the record of every term beginning at or after
+// fromIndex, and is how the run index follows a suffix truncation.
+func (rl *raftLog) truncateRunsFrom(fromIndex Index) {
+	for len(rl.runs) > 0 && rl.runs[len(rl.runs)-1].start >= fromIndex {
+		rl.runs = rl.runs[:len(rl.runs)-1]
+	}
+	if len(rl.runs) == 0 {
+		rl.runs = nil
+	}
+}
+
+// truncateRunsBelow follows a prefix truncation: runs that ended before
+// toIndex are gone, and the one that spans it now starts there.
+func (rl *raftLog) truncateRunsBelow(toIndex Index) {
+	i := rl.runIndexFor(toIndex)
+	if i < 0 {
+		rl.runs = nil
+		return
+	}
+	rl.runs = append(rl.runs[:0], rl.runs[i:]...)
+	rl.runs[0].start = toIndex
 }
 
 // entries returns the log entries in [lo, hi), reading from storage and from
@@ -410,18 +564,19 @@ func (rl *raftLog) entries(ctx context.Context, lo, hi Index) ([]LogEntry, error
 
 // truncateSuffix removes entries at index >= fromIndex and queues the write.
 func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
-	// The term of the new last entry has to be read before anything is
+	// The term of the new last entry has to be taken before anything is
 	// discarded, while the log can still describe it.
 	newLast := fromIndex - 1
 	newLastTerm := rl.snapMeta.LastIncludedTerm
 	if fromIndex > rl.first && newLast > 0 {
-		t, err := rl.termAt(ctx, newLast)
+		t, err := rl.termAt(newLast)
 		if err != nil {
 			return err
 		}
 		newLastTerm = t
 	}
 
+	rl.truncateRunsFrom(fromIndex)
 	rl.dropUnstableFrom(fromIndex)
 	if fromIndex > 0 && fromIndex-1 < rl.queuedDurable {
 		rl.queuedDurable = fromIndex - 1
@@ -437,6 +592,7 @@ func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
 		rl.first = 0
 		rl.last = 0
 		rl.lastTerm = rl.snapMeta.LastIncludedTerm
+		rl.runs = nil
 		return nil
 	}
 	rl.last = newLast
@@ -476,7 +632,9 @@ func (rl *raftLog) truncatePrefix(toIndex Index) {
 		rl.first = 0
 		rl.last = 0
 		rl.lastTerm = rl.snapMeta.LastIncludedTerm
+		rl.runs = nil
 	} else {
+		rl.truncateRunsBelow(toIndex)
 		rl.first = toIndex
 	}
 }
@@ -491,7 +649,7 @@ func (rl *raftLog) truncatePrefix(toIndex Index) {
 // with the leader's state and continues with somebody else's.
 func (rl *raftLog) installSnapshot(ctx context.Context, meta SnapshotMeta) error {
 	agrees := false
-	if t, err := rl.termAt(ctx, meta.LastIncludedIndex); err == nil && t == meta.LastIncludedTerm {
+	if t, err := rl.termAt(meta.LastIncludedIndex); err == nil && t == meta.LastIncludedTerm {
 		agrees = true
 	}
 
@@ -509,6 +667,7 @@ func (rl *raftLog) installSnapshot(ctx context.Context, meta SnapshotMeta) error
 		// Nothing survived: the snapshot boundary is now the end of the log.
 		rl.first = 0
 		rl.lastTerm = meta.LastIncludedTerm
+		rl.runs = nil
 	}
 	return nil
 }

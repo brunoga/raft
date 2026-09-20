@@ -147,6 +147,24 @@ func lastIndexOf(t *testing.T, store raft.Storage) raft.Index {
 	return idx
 }
 
+// awaitLastIndexAtMost waits for the store to hold nothing past want.
+//
+// Log writes are carried out behind the event loop, so a truncation takes
+// effect in the node's own view of its log before it reaches the disk. A test
+// reading the store directly is looking at the disk and has to wait for it;
+// everything that reads the node instead sees the truncation immediately.
+func awaitLastIndexAtMost(t *testing.T, store raft.Storage, want raft.Index, timeout time.Duration) raft.Index {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		got := lastIndexOf(t, store)
+		if got <= want || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestInstallSnapshot_DiscardsLogThatDivergesFromTheSnapshot asserts that when
 // the follower's entry at the snapshot's last-included index does not match the
 // snapshot, the whole log is discarded rather than just the prefix.
@@ -177,7 +195,7 @@ func TestInstallSnapshot_DiscardsLogThatDivergesFromTheSnapshot(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	if got := lastIndexOf(t, store); got > 3 {
+	if got := awaitLastIndexAtMost(t, store, 3, 3*time.Second); got > 3 {
 		t.Errorf("log still ends at index %d after installing a snapshot through index 3 "+
 			"that disagrees with it; entries from the abandoned history were kept", got)
 	}

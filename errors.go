@@ -55,12 +55,20 @@ var (
 	// of the cluster.
 	ErrNotMember = errors.New("raft: node is not a member of this cluster")
 
-	// ErrWriteBacklogFull is returned by Propose and ProposeOnce when the
-	// leader is already holding Config.MaxUnstableLogBytes of log entries that
-	// storage has not caught up with. It means the disk is behind, not that
-	// anything is wrong with the proposal: retry, after a pause or against
-	// another node.
-	ErrWriteBacklogFull = errors.New("raft: log writes are behind; proposal refused")
+	// ErrWriteBacklogFull means a node is already holding
+	// Config.MaxUnstableLogBytes of log entries that storage has not caught up
+	// with, and will not take on more until it has.
+	//
+	// Propose and ProposeOnce return it to the caller. A follower also refuses
+	// an AppendEntries with it, which the leader sees as a failed RPC and
+	// retries; in ordinary operation that cannot happen, because what a leader
+	// sends before being acknowledged is already bounded by MaxInflightRPCs
+	// and MaxBytesPerRPC, and the limit exists for the leader that does not
+	// respect them.
+	//
+	// It means the disk is behind, not that anything is wrong with the
+	// request: retry, after a pause or against another node.
+	ErrWriteBacklogFull = errors.New("raft: log writes are behind")
 
 	// ErrProposalTooLarge is returned by Propose and ProposeOnce for a command
 	// that could never be replicated, because the resulting log entry would

@@ -43,6 +43,14 @@ type rpcResponse struct {
 	err  error
 }
 
+// snapshotAck is an InstallSnapshot response held back until the snapshot it
+// completes has been written. answer is safe to call more than once; only the
+// first call is delivered.
+type snapshotAck struct {
+	index  Index
+	answer func(error)
+}
+
 // applyResult is sent by the apply goroutine to the event loop after each
 // state-machine application so that promise resolution stays in one goroutine.
 // configCmd is non-nil when the applied entry was a cluster-membership change;
@@ -80,6 +88,10 @@ type Node struct {
 	lastApplied Index
 
 	// Atomic mirrors for safe external reads.
+	// atomicDurableTerm mirrors the highest term whose hard state is known to
+	// be on disk. It is what goes out on a message built outside the event
+	// loop, where there is no write to defer against; see ReadIndex.
+	atomicDurableTerm   atomic.Uint64
 	atomicState         atomic.Uint32 // mirrors state
 	atomicLeader        atomic.Value  // mirrors leaderID; stores string
 	atomicLastApplied   atomic.Uint64 // mirrors lastApplied
@@ -117,6 +129,10 @@ type Node struct {
 	// that has not completed, or 0 when the term and vote on disk are the ones
 	// this node is using. See sendGate.
 	unsafeTermSeq uint64
+	// completedWriteSeq is the highest sequence number whose write has
+	// completed and been processed. Work handed to afterWrite for a write at
+	// or below it has nothing left to wait for.
+	completedWriteSeq uint64
 
 	// --- Timing (in ticks) --------------------------------------------------
 	electionElapsed  int
@@ -247,6 +263,28 @@ type Node struct {
 	// without going through the RPC envelope machinery.
 	snapshotResultCh chan snapshotResult
 	snapshotting     bool // true while a snapshot is in progress
+
+	// snapInstallAck answers the InstallSnapshot RPC that delivered the final
+	// chunk of a snapshot, and is held until that snapshot is on disk.
+	//
+	// The leader records the acknowledgement as this node's match index, which
+	// is its statement of what this node durably holds. Answering when the
+	// last chunk merely arrived would make that statement false for as long as
+	// the write took, and permanently false if this node died during it: the
+	// match index is never lowered. Nothing unsafe follows, because a snapshot
+	// never covers anything past the leader's commit index and so cannot
+	// advance one -- but the same number decides whether a learner has caught
+	// up enough to become a voter, and promoting one that has not costs the
+	// cluster a voter that cannot vote.
+	snapInstallAck *snapshotAck
+	// installingSnap is the last-included index of the snapshot currently
+	// being written, or 0 when none is. A leader whose per-chunk deadline
+	// expires while that write is in progress restarts the transfer from the
+	// beginning; starting a second write of the same snapshot would queue
+	// behind the first inside the storage backend and make the next deadline
+	// harder to meet than the last. The retry waits on the write already
+	// running instead.
+	installingSnap Index
 
 	// pendingSnap holds chunks of an in-progress multi-chunk snapshot install
 	// on this follower. It is populated by handleInstallSnapshot as chunks
@@ -665,6 +703,8 @@ func New(cfg *Config) (*Node, error) {
 	n.atomicLeader.Store(string(NodeID("")))
 	n.leadership.Store(LeadershipChange{Term: n.currentTerm})
 	n.atomicTerm.Store(uint64(n.currentTerm))
+	// Whatever survived a restart is on disk by definition.
+	n.atomicDurableTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
 	n.storePeers()
@@ -697,6 +737,14 @@ func (n *Node) Start() {
 
 // Stop signals the node to shut down and waits for all goroutines to exit,
 // including the apply goroutine and any in-flight runSnapshotInstall goroutines.
+//
+// Storage writes that have been accepted but not yet carried out are finished
+// first, rather than abandoned. Dropping them would be safe -- nothing was
+// acknowledged on their behalf -- but it would mean an orderly restart
+// routinely threw away the tail of the log and fetched it back from the
+// leader. The consequence is that Stop waits for the storage backend: one that
+// has hung rather than failed will hold it there, as it would have held the
+// event loop before shutdown was asked for.
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		n.stopCancel() // unblock any in-progress StateMachine operations
@@ -885,7 +933,15 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 		if leaderID == "" {
 			return 0, &NotLeaderError{}
 		}
-		req := &ReadIndexRequest{GroupID: n.cfg.GroupID, Term: n.Term()}
+		// The durable term, not the current one. This request is built off the
+		// event loop, so there is no write for it to be deferred against, and
+		// the receiver steps down when it sees a term above its own. Sending a
+		// term this node might forget in a crash would make a healthy leader
+		// abandon its term for one that never existed.
+		req := &ReadIndexRequest{
+			GroupID: n.cfg.GroupID,
+			Term:    Term(n.atomicDurableTerm.Load()),
+		}
 		resp, err := n.cfg.Transport.ReadIndex(ctx, leaderID, req)
 		if err != nil {
 			return 0, err
@@ -1420,9 +1476,12 @@ type deferredWrite struct {
 // has completed, or to be failed if it does not. Either may be nil.
 //
 // A seq of 0 means there was no write to wait for -- an append of no entries --
-// and the work runs immediately.
+// and the work runs immediately. So does a write that has already completed:
+// waiting is driven by completions, so work queued behind one that has been
+// and gone would sit there until some later write happened to arrive, and
+// would sit there for ever if none did.
 func (n *Node) afterWrite(seq uint64, run func(), fail func(error)) {
-	if seq == 0 {
+	if seq == 0 || seq <= n.completedWriteSeq {
 		if run != nil {
 			run()
 		}
@@ -1446,13 +1505,23 @@ func (n *Node) handleWriteCompletions() {
 			// failed leaves storage in a state this node cannot describe.
 			// Everything waiting on a write fails with it, so no caller is
 			// left holding a request that will never be answered.
+			if d.seq > n.completedWriteSeq {
+				n.completedWriteSeq = d.seq
+			}
 			n.fail(d.err, "durable "+d.kind.String())
 			n.failDeferredWrites(d.err)
 			continue
 		}
 		n.log.stabilize(*d)
+		if d.seq > n.completedWriteSeq {
+			n.completedWriteSeq = d.seq
+		}
 		if n.unsafeTermSeq != 0 && d.seq >= n.unsafeTermSeq {
+			// The most recent hard-state write has landed, and no later one
+			// has been queued or this would have been set again, so the term
+			// the node is using is now the term on disk.
 			n.unsafeTermSeq = 0
+			n.atomicDurableTerm.Store(uint64(n.currentTerm))
 		}
 		n.runDeferredWrites(d.seq)
 	}
@@ -1500,6 +1569,29 @@ func (n *Node) failDeferredWrites(err error) {
 			f(err)
 		}
 	}
+}
+
+// answerSnapInstallAck releases the held InstallSnapshot response, if the
+// snapshot it was waiting on is the one that just finished.
+func (n *Node) answerSnapInstallAck(index Index, err error) {
+	ack := n.snapInstallAck
+	if ack == nil || ack.index != index {
+		return
+	}
+	n.snapInstallAck = nil
+	ack.answer(err)
+}
+
+// failSnapInstallAck reports err to a held InstallSnapshot response that will
+// never be completed, so the leader learns at once rather than waiting out its
+// own timeout.
+func (n *Node) failSnapInstallAck(err error) {
+	ack := n.snapInstallAck
+	if ack == nil {
+		return
+	}
+	n.snapInstallAck = nil
+	ack.answer(err)
 }
 
 // onDurableAdvanced reacts to the durable point having moved.

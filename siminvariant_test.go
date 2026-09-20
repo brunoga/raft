@@ -384,12 +384,13 @@ func entryAt(log []raft.LogEntry, idx raft.Index) (raft.LogEntry, bool) {
 
 // nodeSnapshot is one node's state as read by a single sweep.
 type nodeSnapshot struct {
-	cn     *checkedNode
-	log    []raft.LogEntry
-	snapAt raft.Index
-	commit raft.Index
-	term   raft.Term
-	leader bool
+	cn      *checkedNode
+	log     []raft.LogEntry
+	snapAt  raft.Index
+	commit  raft.Index
+	applied raft.Index
+	term    raft.Term
+	leader  bool
 }
 
 // sweep performs one full pass: refresh every log, then check the properties
@@ -398,20 +399,33 @@ func (c *invariantChecker) sweep() {
 	nodes := c.nodeList()
 	views := make([]nodeSnapshot, 0, len(nodes))
 	for _, cn := range nodes {
-		// Read the volatile state first and the log second. A log read after a
-		// commit-index read can only be newer, never older, so an entry at or
-		// below the recorded commit index is guaranteed to be in the slice.
-		var commit raft.Index
+		// Read the volatile state first and the log second, so the log can
+		// only be newer than the indices recorded with it, never older.
+		//
+		// The log on disk is not a statement about how far the node has got.
+		// Writes are carried out behind the event loop, so an entry can be in
+		// the log, replicated and counted as committed while the disk still
+		// holds what it replaced. Only what the node has applied is bounded by
+		// what the disk holds, which is why the checks below are stated over
+		// that rather than over the commit index.
+		var commit, applied raft.Index
 		var term raft.Term
 		leader := false
 		if n := cn.current(); n != nil {
+			// Read what has been applied before what has been committed, so
+			// the pair can only understate how far the node has got, never
+			// overstate it.
+			applied = n.LastApplied()
 			commit = n.CommitIndex()
 			term = n.Term()
 			leader = n.State() == raft.Leader
 			c.noteCommit(cn.id, commit)
 		}
 		log, snapAt := readLog(cn.store)
-		views = append(views, nodeSnapshot{cn: cn, log: log, snapAt: snapAt, commit: commit, term: term, leader: leader})
+		views = append(views, nodeSnapshot{
+			cn: cn, log: log, snapAt: snapAt,
+			commit: commit, applied: applied, term: term, leader: leader,
+		})
 	}
 
 	// Log Matching.
@@ -430,7 +444,7 @@ func (c *invariantChecker) sweep() {
 	}
 	for _, v := range views {
 		if !v.leader {
-			c.checkCommittedPrefix(v.cn.id, v.log, v.commit)
+			c.checkCommittedPrefix(v.cn.id, v.log, v.commit, v.applied)
 		}
 	}
 
@@ -521,10 +535,28 @@ func (c *invariantChecker) recordCommitted(id raft.NodeID, term raft.Term, log [
 }
 
 // checkCommittedPrefix holds a follower's committed prefix against what leaders
-// have committed. A follower must never consider an entry committed unless it
-// is the entry the leader committed at that index: the entry it holds is the
-// one it will hand to its state machine.
-func (c *invariantChecker) checkCommittedPrefix(id raft.NodeID, log []raft.LogEntry, commit raft.Index) {
+// have committed. A follower must never hand its state machine anything but
+// the entry the leader committed at that index.
+//
+// The bound is what the node has applied, not what it considers committed, and
+// the difference is the whole of what asynchronous log writes changed. A
+// follower takes an entry that replaces one it already had and learns in the
+// same breath that the new entry is committed; the commit index moves at once,
+// because the entry is in the log at once, while the disk still holds the
+// entry that was replaced until the queued truncation and append reach it.
+// Reading only the disk and the commit index, that node looks as though it
+// considers committed an entry it does not hold.
+//
+// Nothing acts on that view. Applying reads from storage and stops at the
+// point storage is known to hold the log's current entries, so the replaced
+// entry is never handed over; and a commit index is not persisted, so a crash
+// in that window brings the node back with none at all. What must be true,
+// and is what this checks, is that everything it did hand over was the
+// committed entry.
+func (c *invariantChecker) checkCommittedPrefix(id raft.NodeID, log []raft.LogEntry, commit, applied raft.Index) {
+	if applied < commit {
+		commit = applied
+	}
 	for idx := commit; idx >= 1; idx-- {
 		e, ok := entryAt(log, idx)
 		if !ok {
@@ -538,7 +570,7 @@ func (c *invariantChecker) checkCommittedPrefix(id raft.NodeID, log []raft.LogEn
 		}
 		if got.id != idOf(e) {
 			c.fail("State Machine Safety",
-				"node %s considers index %d committed holding %s (%q), but the committed entry there is %s",
+				"node %s applied index %d holding %s (%q), but the committed entry there is %s",
 				id, idx, idOf(e), truncateCmd(e.Command), got.id)
 			return
 		}
