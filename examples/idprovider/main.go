@@ -336,6 +336,19 @@ func run() error {
 		go func() { _ = agent.Run(ctx) }() //nolint:errcheck // Run returns ctx.Err(); unactionable in a background goroutine.
 	}
 
+	// A follower can only redirect a write if it knows where the leader serves
+	// its HTTP API. Without that it has to refuse the write and name the leader
+	// by node ID, which the client has no way to dial. Say so once at startup:
+	// a cluster configured this way works when the client happens to reach the
+	// leader and fails otherwise, which is not a failure anyone enjoys
+	// diagnosing from the client side.
+	if len(peerIDs) > 0 && len(peerHTTPAddrs) == 0 {
+		slog.Warn("idprovider: no peer HTTP addresses configured, so writes reaching this node "+
+			"while it is a follower will be refused rather than redirected to the leader. "+
+			"Pass --peer id=raft_addr,http_addr to enable redirects.",
+			"peers", len(peerIDs))
+	}
+
 	srv := &http.Server{
 		Addr:         *httpAddr,
 		Handler:      buildMux(*id, node, sm, peerHTTPAddrs),

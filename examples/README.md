@@ -19,8 +19,14 @@ See [`idprovider/`](idprovider/) for a production-ready distributed monotonic ID
 ```bash
 go build -o idprovider ./idprovider
 ./idprovider --id n1 --raft-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 --data-dir /tmp/n1 \
-             --peer n2=localhost:7002 --peer n3=localhost:7003
+             --peer n2=localhost:7002,localhost:8002 \
+             --peer n3=localhost:7003,localhost:8003
 ```
+
+Each `--peer` is `id=raft_addr[,http_addr]`. The HTTP address is what lets a
+follower redirect a write to the leader; leave it out and the follower answers
+`503` with an `X-Raft-Leader` header naming the leader's node ID, which a
+client cannot dial.
 
 ---
 
@@ -154,8 +160,10 @@ to be accepted and then rejected by the node being joined, thirty seconds
 later, as a timeout.
 
 The examples that take a static peer list (`idprovider`, `shardkv`) are told
-every peer's address up front with `--peer id=host:port`, so their own
-`--raft-addr` is only a bind address and `:7001` is fine there.
+every peer's address up front with `--peer id=raft_addr[,http_addr]`, so their
+own `--raft-addr` is only a bind address and `:7001` is fine there. Give each
+peer its HTTP address as well, or a follower cannot redirect a write to the
+leader -- it knows which node leads, but not where to send the client.
 
 In a deployment where a node cannot know its own reachable address from what it
 binds — behind a load balancer, in a container with a published port —
