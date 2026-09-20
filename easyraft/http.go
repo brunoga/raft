@@ -803,21 +803,32 @@ func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, ErrKeyNotFound), errors.Is(err, raft.ErrGroupNotFound),
-		errors.Is(err, raft.ErrNotFound):
+		errors.Is(err, raft.ErrNotFound), errors.Is(err, raft.ErrNotMember):
 		return http.StatusNotFound
 
 	case errors.Is(err, ErrKeyExists), errors.Is(err, raft.ErrObsoleteSeqNum),
 		errors.Is(err, raft.ErrConfigChangeInProgress),
-		errors.Is(err, raft.ErrLeadershipTransferInProgress):
+		errors.Is(err, raft.ErrLeadershipTransferInProgress),
+		errors.Is(err, raft.ErrMemberNotCaughtUp),
+		errors.Is(err, raft.ErrGroupExists):
 		return http.StatusConflict
 
 	case errors.Is(err, ErrReservedCollection):
 		return http.StatusForbidden
 
+	case errors.Is(err, raft.ErrProposalTooLarge):
+		return http.StatusRequestEntityTooLarge
+
 	case errors.Is(err, context.DeadlineExceeded):
 		return http.StatusRequestTimeout
 
+	// Everything the node will recover from on its own. 503 is the one status
+	// a client may retry unchanged, and these are exactly the conditions where
+	// retrying is the right thing: a backlog drains, a lease is renewed, a
+	// stopped node is restarted.
 	case errors.Is(err, raft.ErrLeaseExpired), errors.Is(err, raft.ErrStopped),
+		errors.Is(err, raft.ErrWriteBacklogFull), errors.Is(err, raft.ErrNodeFailed),
+		errors.Is(err, raft.ErrManagerStopping),
 		errors.Is(err, context.Canceled):
 		return http.StatusServiceUnavailable
 

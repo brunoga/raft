@@ -620,5 +620,38 @@ func writeProposalError(w http.ResponseWriter, r *http.Request, err error, httpA
 		http.Error(w, "not leader", http.StatusServiceUnavailable)
 		return
 	}
-	http.Error(w, err.Error(), http.StatusInternalServerError)
+	http.Error(w, err.Error(), statusForProposalError(err))
+}
+
+// statusForProposalError classifies the errors the Raft layer raises.
+//
+// They were all reported as 500, which is the one answer that is wrong for
+// nearly all of them. A client retries a 500, and ErrObsoleteSeqNum means a
+// retry can never succeed -- the sequence number went backwards, and the whole
+// point of the exactly-once protocol is that the client must advance it rather
+// than send the same request again. ErrWriteBacklogFull is the opposite
+// mistake: it means "the disk is behind, come back", and a 500 tells the
+// caller their request was malformed or the service is broken.
+func statusForProposalError(err error) int {
+	switch {
+	case errors.Is(err, raft.ErrObsoleteSeqNum):
+		// Permanent. The client must advance its sequence number; retrying
+		// this request unchanged will fail forever.
+		return http.StatusConflict
+
+	case errors.Is(err, raft.ErrProposalTooLarge):
+		return http.StatusRequestEntityTooLarge
+
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout
+
+	// Transient: the node recovers on its own and the same request will work.
+	case errors.Is(err, raft.ErrWriteBacklogFull), errors.Is(err, raft.ErrLeaseExpired),
+		errors.Is(err, raft.ErrStopped), errors.Is(err, raft.ErrNodeFailed),
+		errors.Is(err, context.Canceled):
+		return http.StatusServiceUnavailable
+
+	default:
+		return http.StatusInternalServerError
+	}
 }

@@ -11,6 +11,7 @@ package main
 // ticker.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -833,5 +834,63 @@ func TestErrDomainNotFound_IsComparable(t *testing.T) {
 	wrapped := fmt.Errorf("outer: %w", ErrDomainNotFound)
 	if !errors.Is(wrapped, ErrDomainNotFound) {
 		t.Error("errors.Is(wrapped, ErrDomainNotFound) should be true")
+	}
+}
+
+// TestStatusForProposalError_DoesNotTellClientsToRetryTheImpossible pins the
+// classification of the errors the Raft layer raises.
+//
+// Everything used to be a 500. That is the one answer that is wrong for nearly
+// all of them, and wrong in both directions at once: a client retries a 500,
+// and ErrObsoleteSeqNum means a retry can never succeed, while
+// ErrWriteBacklogFull means it will succeed shortly and should be retried but
+// reads as "this service is broken".
+func TestStatusForProposalError_DoesNotTellClientsToRetryTheImpossible(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"obsolete sequence number is permanent", raft.ErrObsoleteSeqNum, http.StatusConflict},
+		{"oversized proposal is the client's fault", raft.ErrProposalTooLarge, http.StatusRequestEntityTooLarge},
+		{"write backlog drains on its own", raft.ErrWriteBacklogFull, http.StatusServiceUnavailable},
+		{"expired lease is retried", raft.ErrLeaseExpired, http.StatusServiceUnavailable},
+		{"stopped node is retried elsewhere", raft.ErrStopped, http.StatusServiceUnavailable},
+		{"failed node is retried elsewhere", raft.ErrNodeFailed, http.StatusServiceUnavailable},
+		{"deadline is a gateway timeout", context.DeadlineExceeded, http.StatusGatewayTimeout},
+		{"anything unrecognised stays a server error", errors.New("boom"), http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusForProposalError(tc.err); got != tc.want {
+				t.Errorf("statusForProposalError(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStatusForProposalError_SeesThroughWrapping checks that classification
+// survives an error being wrapped on the way up, which is how these arrive:
+// the propose path adds context before the handler ever sees them.
+func TestStatusForProposalError_SeesThroughWrapping(t *testing.T) {
+	wrapped := fmt.Errorf("allocate range: %w", raft.ErrObsoleteSeqNum)
+	if got := statusForProposalError(wrapped); got != http.StatusConflict {
+		t.Errorf("wrapped ErrObsoleteSeqNum = %d, want %d", got, http.StatusConflict)
+	}
+}
+
+// TestWriteProposalError_UsesTheClassification checks the wiring, not just the
+// table: the handler path has to actually consult it. A classification nothing
+// calls is worth nothing, and swapping the call back for a constant 500 is a
+// one-character change that the table test alone would not notice.
+func TestWriteProposalError_UsesTheClassification(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/domains/orders/next", http.NoBody)
+
+	writeProposalError(rec, req, fmt.Errorf("allocate: %w", raft.ErrObsoleteSeqNum), nil)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("writeProposalError wrote %d for ErrObsoleteSeqNum, want %d; a client "+
+			"retrying a 500 here retries forever", rec.Code, http.StatusConflict)
 	}
 }
