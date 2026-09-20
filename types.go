@@ -149,6 +149,10 @@ type Tracer interface {
 // fields were different kinds of name that happened to share a type.
 type HostID string
 
+// ZoneID names a failure domain: a rack, an availability zone, a datacentre.
+// It is whatever unit of infrastructure is expected to fail as one.
+type ZoneID string
+
 // RPCType names one of the Raft RPCs, as reported to a Tracer.
 type RPCType string
 

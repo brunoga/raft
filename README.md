@@ -1169,6 +1169,38 @@ Five fully-worked examples are provided, each targeting a different deployment p
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
 
+## Placement-aware commits
+
+A majority says nothing about where the replicas are. Three replicas in one
+availability zone are a quorum, and losing that zone loses every write they
+acknowledged.
+
+```go
+cfg.Zones = map[raft.NodeID]raft.ZoneID{
+    "n1": "eu-west-1a", "n2": "eu-west-1a", "n3": "eu-west-1b",
+}
+cfg.MinCommitZones = 2
+```
+
+An entry now has to reach two distinct zones before it counts as committed, in
+addition to reaching a majority. An acknowledged write is on hardware in two
+failure domains before anyone is told it succeeded.
+
+The cost is liveness, and it is the point rather than a side effect: if the
+second zone is unreachable, nothing commits. A cluster that would rather keep
+taking writes into one zone should leave `MinCommitZones` unset.
+
+`Zones` is local to each node and never replicated. Placement is a fact about
+infrastructure rather than about consensus: it changes when machines move
+rather than when the cluster agrees on something, so it costs nothing on the
+wire and is corrected by a restart rather than a configuration change. A node
+absent from the map is in no known zone and does not count towards the spread,
+because a node nobody placed cannot be evidence that a write survived the loss
+of a zone.
+
+`Validate` refuses a configuration whose voters do not span the required number
+of zones, since it could never commit anything.
+
 ## State machines that keep their own state
 
 A state machine that is itself a database already holds, on its own disk, the
