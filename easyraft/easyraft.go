@@ -199,3 +199,24 @@ func (e *EasyRaft[T]) TransferLeadership(ctx context.Context, to raft.NodeID) er
 func (e *EasyRaft[T]) Leave(ctx context.Context) error {
 	return e.store.Leave(ctx)
 }
+
+// Store returns the [Store] underneath this wrapper.
+//
+// EasyRaft forwards the single-collection API and nothing else, which is the
+// point of it: one entity type, no Store and Collection to keep track of. The
+// cost is that outgrowing it -- a transaction across two keys, a second
+// collection, anything added to Store later -- would otherwise mean rewriting
+// the construction as NewStore plus AddCollection, and with it every call site
+// that went through the wrapper.
+//
+// This is the seam that makes that unnecessary. The returned Store is the one
+// this instance is running on, not a copy:
+//
+//	audit := easyraft.AddCollection[AuditRecord](app.Store(), "audit")
+//	_, err := app.Store().Txn(ctx, func(tx *easyraft.Txn) error { ... })
+//
+// The default collection this wrapper owns is named "default"; reach it
+// through the wrapper rather than adding a second view of it.
+func (e *EasyRaft[T]) Store() *Store {
+	return e.store
+}

@@ -27,6 +27,24 @@ go get github.com/brunoga/raft/easyraft
 
 Both share the same options, the same `Collection[T]` API, and the same underlying `Store`.
 
+Starting with `New[T]` does not close the other door. `EasyRaft[T].Store()`
+returns the `Store` the wrapper is running on, so a service that later needs a
+second collection or a transaction across two keys reaches for it rather than
+rewriting its construction:
+
+```go
+audit := easyraft.AddCollection[AuditRecord](app.Store(), "audit")
+
+_, err := app.Store().Txn(ctx, func(tx *easyraft.Txn) error {
+    if err := tx.Update("default", "acct-1", updated); err != nil {
+        return err
+    }
+    return tx.Create("audit", eventID, AuditRecord{Actor: who})
+})
+```
+
+The wrapper's own collection is named `default`.
+
 ---
 
 ## Quick start — single collection
