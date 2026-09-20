@@ -395,3 +395,84 @@ func TestAsyncHardState_ASettledTermCostsNothing(t *testing.T) {
 		}
 	}
 }
+
+// TestAsyncHardState_AForwardedReadCarriesOnlyADurableTerm closes the one
+// message built off the event loop.
+//
+// A follower forwards a read to its leader from the caller's goroutine, so
+// there is no write for the answer to be deferred against and the ordinary
+// gate cannot apply. The message still carries a term, and the receiver steps
+// down when it sees one above its own. A term this node might forget in a
+// crash would make a healthy leader abandon its own for one that never
+// existed, so what goes out is the term on disk rather than the term in use.
+func TestAsyncHardState_AForwardedReadCarriesOnlyADurableTerm(t *testing.T) {
+	seen := make(chan raft.Term, 8)
+	store := newGateStore()
+
+	cfg := raft.DefaultConfig()
+	cfg.ID = "n1"
+	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+	cfg.Storage = store
+	cfg.StateMachine = idleSM{}
+	cfg.Transport = &readIndexSpyTransport{seen: seen}
+	cfg.TickInterval = 0
+
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	node.Start()
+	t.Cleanup(node.Stop)
+
+	// Adopt term 2 from a leader and let the write land, so the node has a
+	// durable term and a known leader to forward to.
+	if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+		Term:     2,
+		LeaderID: "n2",
+	}); err != nil {
+		t.Fatalf("first heartbeat: %v", err)
+	}
+
+	// Now move to term 7 with the hard-state write held open.
+	release := store.holdHardState(t)
+	go func() {
+		_, _ = node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+			Term:     7,
+			LeaderID: "n2",
+		})
+	}()
+	store.awaitHeld(t)
+
+	if got := node.Term(); got != 7 {
+		t.Fatalf("Term() = %d, want 7: the term takes effect immediately", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, _ = node.ReadIndex(ctx)
+	cancel()
+
+	select {
+	case got := <-seen:
+		if got != 2 {
+			t.Errorf("the forwarded read carried term %d, which is not on disk; want the durable term 2", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no read was forwarded to the leader")
+	}
+
+	release()
+}
+
+// readIndexSpyTransport reports the term on each forwarded read.
+type readIndexSpyTransport struct {
+	echoTransport
+	seen chan raft.Term
+}
+
+func (t *readIndexSpyTransport) ReadIndex(_ context.Context, _ raft.NodeID, req *raft.ReadIndexRequest) (*raft.ReadIndexResponse, error) {
+	select {
+	case t.seen <- req.Term:
+	default:
+	}
+	return &raft.ReadIndexResponse{Index: 0}, nil
+}

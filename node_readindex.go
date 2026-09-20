@@ -148,7 +148,7 @@ func (n *Node) broadcastReadBarrier() {
 	for _, peer := range n.cfg.Peers {
 		id := peer.ID
 		prevIdx := n.nextIndex[id] - 1
-		prevTerm, _ := n.log.termAt(n.stopCtx, prevIdx)
+		prevTerm, _ := n.log.termAt(prevIdx)
 		req := &AppendEntriesRequest{
 			GroupID:      n.cfg.GroupID,
 			Term:         n.currentTerm,

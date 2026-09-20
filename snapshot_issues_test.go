@@ -396,13 +396,18 @@ func TestInstallSnapshot_ChunkFullCancelsGoroutine(t *testing.T) {
 	// Send one more chunk that finds the channel full.
 	// Before fix: chunk is dropped with a log warning; goroutine stays stuck.
 	// After fix:  installCtx is cancelled; goroutine exits.
+	//
+	// The chunk is refused rather than silently dropped. The leader has to
+	// learn that this node took nothing, because the response to a final
+	// chunk is what it turns into this node's match index, and a response
+	// that merely looks unremarkable would be read as an installed snapshot.
 	_, err = n.Handler().HandleInstallSnapshot(ctx, &InstallSnapshotRequest{
 		Term: 1, LeaderID: "leader",
 		LastIncludedIndex: snapIdx, LastIncludedTerm: 1,
 		Offset: 8, Data: []byte("x"), Done: false,
 	})
-	if err != nil {
-		t.Fatalf("chunk 8 (overflow): HandleInstallSnapshot: %v", err)
+	if !errors.Is(err, errSnapshotNeedsRestart) {
+		t.Fatalf("chunk 8 (overflow): HandleInstallSnapshot returned %v, want errSnapshotNeedsRestart", err)
 	}
 
 	// Allow the goroutine a generous window to exit after ctx cancellation.

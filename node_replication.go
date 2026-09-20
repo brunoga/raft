@@ -52,7 +52,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 
 	// Verify prevLog matches.
 	if req.PrevLogIndex > 0 {
-		prevTerm, _ := n.log.termAt(n.stopCtx, req.PrevLogIndex)
+		prevTerm, _ := n.log.termAt(req.PrevLogIndex)
 		// prevTerm == 0 means the entry is not in our log; all valid Raft
 		// terms are ≥ 1, so 0 reliably signals "not found" and the
 		// mismatch check below handles both cases uniformly.
@@ -61,15 +61,20 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 				// Entry not in our log — give the leader a conflict hint.
 				resp.ConflictIndex = n.log.lastLogIndex() + 1
 			} else {
-				// Term mismatch — help the leader back-track by term.
+				// Term mismatch — help the leader back-track by term. The
+				// useful answer is where the term this node disagreed in
+				// begins, which the run index gives directly; walking back an
+				// index at a time to find it meant a storage read per entry,
+				// on the event loop, bounded only by the length of a term.
 				resp.ConflictTerm = prevTerm
-				resp.ConflictIndex = req.PrevLogIndex
-				for resp.ConflictIndex > n.log.first {
-					t, _ := n.log.termAt(n.stopCtx, resp.ConflictIndex-1)
-					if t != prevTerm {
-						break
-					}
-					resp.ConflictIndex--
+				resp.ConflictIndex = n.log.termRunStart(req.PrevLogIndex)
+				if resp.ConflictIndex == 0 {
+					// The index is the snapshot boundary rather than an entry
+					// the log still holds, so the run is that one index. A
+					// zero here would reach the leader as a hint to resume
+					// from the very beginning, and it would ship its entire
+					// state machine to a follower that needs almost none of it.
+					resp.ConflictIndex = req.PrevLogIndex
 				}
 			}
 			replyWhenDurable(0)
@@ -77,13 +82,30 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 		}
 	}
 
+	// A follower holds entries in memory until storage has written them, just
+	// as a leader does, and needs the same bound. Its backlog is normally kept
+	// small by what the leader will send before being acknowledged, which
+	// MaxInflightRPCs and MaxBytesPerRPC limit -- but that is the leader's
+	// restraint, not this node's, and a node should not be able to be driven
+	// out of memory by a peer.
+	//
+	// Refusing outright rather than rejecting the append is deliberate: a
+	// rejection is a statement about this node's log that would send the
+	// leader hunting backwards through it for a disagreement that does not
+	// exist. A failed RPC is retried from where it was.
+	if limit := n.unstableLimit(); limit > 0 && len(req.Entries) > 0 &&
+		n.log.unstableSize() >= limit {
+		reply(ErrWriteBacklogFull)
+		return
+	}
+
 	// Append new entries, truncating any conflicting suffix first. writeSeq is
-	// the write the acknowledgement waits on; it stays 0 for a heartbeat or a
-	// request whose entries this node already has, which needs no write and so
-	// can be answered at once.
+	// the write this request queued, and stays 0 when it queued none: a
+	// heartbeat, or a request whose entries this node already holds. What the
+	// acknowledgement waits on is decided below, and is not always this.
 	var writeSeq uint64
 	for i, e := range req.Entries {
-		existingTerm, err := n.log.termAt(n.stopCtx, e.Index)
+		existingTerm, err := n.log.termAt(e.Index)
 		if err != nil {
 			// Entry doesn't exist — append from here onward.
 			writeSeq = n.log.append(req.Entries[i:])
@@ -132,10 +154,32 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 	}
 
 	resp.Success = true
-	// Gated on the log write, and on the hard-state write when stepping up to
-	// this leader's term produced one: an acknowledgement is a statement both
-	// that the entries are on disk and that this node is at that term.
-	replyWhenDurable(writeSeq)
+	// Gated on whatever write will put the entries this request vouches for on
+	// disk, and on the hard-state write when stepping up to this leader's term
+	// produced one: an acknowledgement is a statement both that the entries
+	// are on disk and that this node is at that term.
+	//
+	// That write is not always the one queued above. When a leader re-sends a
+	// range it has not been acknowledged for -- after its own RPC timed out,
+	// or because the entry cap makes the next batch identical to the last --
+	// a follower still holding those entries unwritten finds every one of them
+	// already in its log and appends nothing. The write to wait for is then
+	// the one the first delivery queued, which is what writeSeqCovering finds.
+	gate := writeSeq
+	if len(req.Entries) > 0 {
+		// Only for a request that actually carries entries. A heartbeat's
+		// lastCovered is just its PrevLogIndex, which it makes no claim about
+		// -- the leader never turns a heartbeat's acknowledgement into a match
+		// index -- and after an election or a snapshot install that index can
+		// sit in the part of the log still being written. Waiting for it would
+		// put a follower's disk inside every heartbeat and every read barrier,
+		// which is how a slow disk would come to cause the step-down that the
+		// whole of this work exists to prevent.
+		if covering := n.log.writeSeqCovering(lastCovered); covering > gate {
+			gate = covering
+		}
+	}
+	replyWhenDurable(gate)
 }
 
 // broadcastHeartbeat sends empty AppendEntries to all peers.
@@ -146,7 +190,7 @@ func (n *Node) broadcastHeartbeat() {
 		id := peer.ID
 		// Build the request in the event-loop goroutine (safe: n is single-threaded here).
 		prevIdx := n.nextIndex[id] - 1
-		prevTerm, _ := n.log.termAt(n.stopCtx, prevIdx)
+		prevTerm, _ := n.log.termAt(prevIdx)
 		req := &AppendEntriesRequest{
 			GroupID:      n.cfg.GroupID,
 			Term:         n.currentTerm,
@@ -204,7 +248,7 @@ func (n *Node) replicateToPeer(peer NodeID) {
 	}
 
 	prevIdx := nextIdx - 1
-	prevTerm, _ := n.log.termAt(n.stopCtx, prevIdx)
+	prevTerm, _ := n.log.termAt(prevIdx)
 
 	var entries []LogEntry
 	if n.log.lastLogIndex() >= nextIdx {
@@ -343,22 +387,15 @@ func (n *Node) handleAppendResult(r *appendResult) {
 
 		// Back-track nextIndex using conflict hints.
 		if r.conflictTerm != 0 {
-			// Find the last entry with conflictTerm in our log. Terms never
-			// decrease with index, so the scan can stop as soon as it passes
-			// below conflictTerm: no earlier entry can match.
+			// Resume just past the last entry this leader holds in the term
+			// the follower disagreed in, or at the follower's own hint when
+			// the leader has nothing in that term at all. This used to walk
+			// down from the end of the log reading each entry back from
+			// storage, on the event loop, for as far as the follower had
+			// fallen behind.
 			newNext := r.conflictIndex
-			for i := n.log.lastLogIndex(); i >= n.log.first; i-- {
-				t, err := n.log.termAt(n.stopCtx, i)
-				if err != nil {
-					break
-				}
-				if t == r.conflictTerm {
-					newNext = i + 1
-					break
-				}
-				if t < r.conflictTerm {
-					break
-				}
+			if idx, ok := n.log.lastIndexOfTerm(r.conflictTerm); ok {
+				newNext = idx + 1
 			}
 			n.nextIndex[r.peer] = newNext
 		} else {

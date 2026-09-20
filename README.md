@@ -495,7 +495,7 @@ cfg.Transport = tr                          // required
 | `MaxLogEntriesPerRPC` | `64` | Maximum entries per AppendEntries RPC. |
 | `MaxBytesPerRPC` | `1 MiB` | Maximum total payload per AppendEntries RPC. A count limit alone says nothing about message size. `0` means no byte limit. |
 | `MaxInflightRPCs` | `4` | Per-peer pipeline depth (concurrent unacknowledged AppendEntries RPCs). |
-| `MaxUnstableLogBytes` | `64 MiB` | Log entries a leader will hold in memory waiting on storage. Past it, `Propose` returns `ErrWriteBacklogFull`. This is the backpressure that replaces waiting for the disk. |
+| `MaxUnstableLogBytes` | `64 MiB` | Log entries a node will hold in memory waiting on storage. Past it, `Propose` returns `ErrWriteBacklogFull` on a leader, and a follower refuses an AppendEntries with it. This is the backpressure that replaces waiting for the disk. |
 | `SnapshotThreshold` | `10000` | Entries past the last snapshot that trigger an automatic snapshot. `0` disables auto-snapshots. |
 | `TrailingLogs` | `1024` | Entries retained behind the snapshot point, so a slightly-behind follower catches up from the log instead of needing a full state transfer. Capped at `SnapshotThreshold-1` in use. |
 | `SnapshotChunkSize` | `1 MiB` | Maximum bytes per InstallSnapshot chunk. Leave room for framing: a chunk sized at exactly the transport's message limit does not fit. `0` sends snapshots as a single RPC. |
@@ -964,7 +964,9 @@ What that costs has changed. Every mutating storage call — log entries, trunca
 
 A disk backlog now delays *commits* and *replies*, rather than stopping a group from running. Entries are not counted towards a quorum until they are written, and a reply that carries this node's term waits for the term to be written — because an acknowledgement or a granted vote that did not survive a crash is how one term ends up with two leaders. What no longer happens is a healthy group looking dead to its peers and losing an election it would then have to fight.
 
-A leader whose storage falls far enough behind refuses proposals with `ErrWriteBacklogFull` rather than growing its backlog without limit; see `MaxUnstableLogBytes`.
+Reads were the other half. A node used to ask storage for an entry's term on every heartbeat, on every inbound append, and once per index while working out where two logs diverge, all on the event loop. In a file-backed store those reads take the same lock the writer holds across its fsync, so a loop that no longer writes to the disk could still end up waiting for one. Terms never decrease with index, so the whole log is a short sequence of runs, one per leadership epoch; those are kept in memory and answer every one of those questions without touching storage. The only storage read left on the event loop is fetching entries for a follower that is genuinely behind, which is the data being sent rather than metadata about it.
+
+A node whose storage falls far enough behind refuses new entries with `ErrWriteBacklogFull` rather than growing its backlog without limit; see `MaxUnstableLogBytes`. A leader returns it to the caller of `Propose`, and a follower returns it to its leader, which retries.
 
 Disk throughput is still the binding constraint on write rate, and these remain the ways to spend less of it:
 

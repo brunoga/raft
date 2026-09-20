@@ -783,3 +783,414 @@ func TestAsyncPersistence_ALeaderReplicatesWhileItsOwnWriteIsStillOutstanding(t 
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// snapGateStore holds SaveSnapshot open, so a test can watch what a node says
+// while a snapshot it has been sent is still being written.
+type snapGateStore struct {
+	raft.Storage
+
+	mu      sync.Mutex
+	gate    chan struct{}
+	entered chan struct{}
+}
+
+func newSnapGateStore() *snapGateStore {
+	return &snapGateStore{Storage: memstore.New(), entered: make(chan struct{}, 8)}
+}
+
+func (s *snapGateStore) hold(t *testing.T) (release func()) {
+	t.Helper()
+
+	gate := make(chan struct{})
+	s.mu.Lock()
+	s.gate = gate
+	s.mu.Unlock()
+
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if s.gate == gate {
+				s.gate = nil
+			}
+			s.mu.Unlock()
+			close(gate)
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func (s *snapGateStore) SaveSnapshot(ctx context.Context, meta raft.SnapshotMeta, r io.Reader) error {
+	s.mu.Lock()
+	gate := s.gate
+	s.mu.Unlock()
+	if gate != nil {
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
+	return s.Storage.SaveSnapshot(ctx, meta, r)
+}
+
+func (s *snapGateStore) awaitHeld(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no snapshot write arrived at the gate")
+	}
+}
+
+// TestAsyncPersistence_ASnapshotIsAcknowledgedOnlyAfterItIsWritten holds the
+// snapshot path to the same standard as the log.
+//
+// The leader turns the response to a snapshot's final chunk into this node's
+// match index, which is its statement of what this node durably holds. So the
+// response has to wait for the write. Answering when the bytes merely arrived
+// makes that statement false for as long as the write takes, and permanently
+// false if this node dies during it, because a match index is never lowered.
+//
+// Nothing unsafe follows from the stale figure, since a snapshot never covers
+// anything past the leader's commit index and so cannot advance one. But the
+// same number decides whether a learner has caught up enough to be made a
+// voter, and a cluster that promotes one which has not has given itself a
+// voter that cannot vote.
+func TestAsyncPersistence_ASnapshotIsAcknowledgedOnlyAfterItIsWritten(t *testing.T) {
+	payload := snapshotPayload(t)
+	store := newSnapGateStore()
+
+	cfg := raft.DefaultConfig()
+	cfg.ID = "f1"
+	cfg.Peers = []raft.PeerConfig{{ID: "l1", Voter: true}, {ID: "f2", Voter: true}}
+	cfg.Storage = store
+	cfg.StateMachine = &echoSM{}
+	cfg.Transport = memtransport.NewNetwork().NewTransport("f1")
+	cfg.TickInterval = 0
+
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	node.Start()
+	t.Cleanup(node.Stop)
+
+	release := store.hold(t)
+
+	type ack struct {
+		resp *raft.InstallSnapshotResponse
+		err  error
+	}
+	acked := make(chan ack, 1)
+	go func() {
+		resp, ackErr := node.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
+			Term:              3,
+			LeaderID:          "l1",
+			LastIncludedIndex: 3,
+			LastIncludedTerm:  3,
+			Offset:            0,
+			Data:              payload,
+			Done:              true,
+		})
+		acked <- ack{resp, ackErr}
+	}()
+	store.awaitHeld(t)
+
+	select {
+	case got := <-acked:
+		t.Fatalf("the snapshot was acknowledged before it was written: %+v (err %v)", got.resp, got.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case got := <-acked:
+		if got.err != nil {
+			t.Fatalf("snapshot acknowledgement returned an error: %v", got.err)
+		}
+		if got.resp == nil {
+			t.Fatal("nil snapshot response")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no snapshot acknowledgement after the write was released")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for node.SnapshotIndex() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("the snapshot was never installed after it was written")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestAsyncPersistence_AFollowerRefusesEntriesItCannotBuffer is the follower's
+// half of the backpressure.
+//
+// A follower holds entries in memory until storage has written them, just as a
+// leader does. Its backlog is normally kept small by what the leader will send
+// before being acknowledged, but that is the leader's restraint and not this
+// node's: a node should not be able to be driven out of memory by a peer.
+//
+// It refuses outright rather than rejecting the append, because a rejection is
+// a statement about this node's log and would send the leader hunting
+// backwards through it for a disagreement that does not exist.
+func TestAsyncPersistence_AFollowerRefusesEntriesItCannotBuffer(t *testing.T) {
+	node, store := newGatedFollower(t, func(cfg *raft.Config) {
+		cfg.MaxUnstableLogBytes = 1 << 10 // 1 KiB, so one batch overshoots it
+	})
+
+	release := store.hold(t)
+	defer release()
+
+	cmd := make([]byte, 1<<10) // 1 KiB per entry
+	batch := func(from raft.Index) *raft.AppendEntriesRequest {
+		entries := make([]raft.LogEntry, 0, 4)
+		for i := range 4 {
+			entries = append(entries, raft.LogEntry{Index: from + raft.Index(i), Term: 1, Command: cmd})
+		}
+		req := &raft.AppendEntriesRequest{
+			Term:         1,
+			LeaderID:     "n2",
+			PrevLogIndex: from - 1,
+			PrevLogTerm:  1,
+			Entries:      entries,
+		}
+		if from == 1 {
+			req.PrevLogTerm = 0
+		}
+		return req
+	}
+
+	// The first batch is taken: a node with nothing outstanding always accepts,
+	// whatever the size, so that an entry larger than the budget is never
+	// refused for ever. Its acknowledgement waits for the write, which is held,
+	// so this call does not return.
+	go func() {
+		_, _ = node.Handler().HandleAppendEntries(context.Background(), batch(1))
+	}()
+	store.awaitHeld(t)
+
+	// The second finds four kilobytes already waiting against a one-kilobyte
+	// budget and is refused outright, rather than queued or rejected.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := node.Handler().HandleAppendEntries(ctx, batch(5))
+	if !errors.Is(err, raft.ErrWriteBacklogFull) {
+		t.Fatalf("second batch returned (%+v, %v); want raft.ErrWriteBacklogFull", resp, err)
+	}
+	if node.FatalError() != nil {
+		t.Errorf("refusing entries stopped the node: %v", node.FatalError())
+	}
+
+	// Once the backlog clears the follower takes entries again.
+	release()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := node.Handler().HandleAppendEntries(ctx, batch(5))
+		cancel()
+		if err == nil && resp != nil && resp.Success {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the follower never took entries again after its backlog drained: (%+v, %v)", resp, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestAsyncPersistence_ARetransmittedRangeIsNotAcknowledgedEarly closes the
+// gap between "this request queued a write" and "these entries are on disk".
+//
+// A leader that has not been acknowledged re-sends the same entries: its own
+// RPC timed out, or the per-request entry cap makes the next batch identical
+// to the last. A follower still holding those entries unwritten finds every
+// one of them already in its log and has nothing to append, so there is no
+// write of its own to wait for. Answering at that point reports entries as
+// durable when nothing has reached the disk, and the leader turns that into a
+// match index and a commit.
+//
+// The entries are already in the log, so the answer is not wrong about what
+// this node holds. It is wrong about what this node would still hold after a
+// crash, and that is the only thing the answer is for.
+func TestAsyncPersistence_ARetransmittedRangeIsNotAcknowledgedEarly(t *testing.T) {
+	node, store := newGatedFollower(t, nil)
+
+	release := store.hold(t)
+
+	first := make(chan *raft.AppendEntriesResponse, 1)
+	go func() {
+		resp, _ := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+		first <- resp
+	}()
+	store.awaitHeld(t)
+
+	// The same range again, while the first delivery's write is still held.
+	second := make(chan *raft.AppendEntriesResponse, 1)
+	go func() {
+		resp, _ := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+		second <- resp
+	}()
+
+	select {
+	case got := <-second:
+		t.Fatalf("the retransmission was acknowledged with nothing written: %+v; storage has %v",
+			got, store.logOperations())
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	release()
+
+	for _, ch := range []chan *raft.AppendEntriesResponse{first, second} {
+		select {
+		case got := <-ch:
+			if got == nil || !got.Success {
+				t.Fatalf("acknowledgement after the write landed = %+v, want success", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no acknowledgement after the write was released")
+		}
+	}
+
+	if ops := store.logOperations(); len(ops) != 1 || ops[0] != "append(1..3)" {
+		t.Errorf("storage operations = %v, want a single append of 1..3", ops)
+	}
+}
+
+// TestAsyncPersistence_AHeartbeatIsNotGatedOnTheFollowersDisk is the limit on
+// how far the durability gate reaches.
+//
+// A heartbeat carries no entries and claims nothing about any, and a leader
+// never turns its acknowledgement into a match index. Making it wait for a
+// write would put a follower's disk inside every heartbeat and every read
+// barrier -- and after an election or a snapshot install the index a heartbeat
+// names can sit in the part of the log still being written, so this is not a
+// rare shape. A follower that cannot answer a heartbeat is one its leader
+// stands down for, which is the failure this whole design exists to prevent.
+func TestAsyncPersistence_AHeartbeatIsNotGatedOnTheFollowersDisk(t *testing.T) {
+	node, store := newGatedFollower(t, nil)
+
+	release := store.hold(t)
+	defer release()
+
+	// Entries 1..3 go into the log and their write is held open.
+	go func() {
+		_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+	}()
+	store.awaitHeld(t)
+
+	// A heartbeat naming the last of those entries must still be answered,
+	// even though that entry is not on disk.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := node.Handler().HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     "n2",
+		PrevLogIndex: 3,
+		PrevLogTerm:  1,
+	})
+	if err != nil {
+		t.Fatalf("a heartbeat was not answered while a log write was outstanding: %v", err)
+	}
+	if resp == nil || !resp.Success {
+		t.Fatalf("heartbeat response = %+v, want success", resp)
+	}
+}
+
+// TestAsyncPersistence_ACommitIndexMayOutrunTheDisk pins the transient state
+// that asynchronous writes make possible, and the reason it is harmless.
+//
+// A follower takes an entry that replaces one it already had, and its leader
+// tells it in the same breath that the new entry is committed. The commit
+// index moves at once, because the entry is in the log at once. The disk still
+// holds the entry that was replaced, and will until the queued truncation and
+// append reach it.
+//
+// So a reader looking only at the disk and the commit index sees a node that
+// "considers committed" an entry it does not hold. Nothing acts on that view.
+// The node applies from storage and only up to the point storage is known to
+// hold the log's current entries, so the replaced entry is never applied; and
+// the commit index is not persisted, so a crash here brings the node back with
+// no commit index at all and the leader brings it up to date again.
+func TestAsyncPersistence_ACommitIndexMayOutrunTheDisk(t *testing.T) {
+	applied := make(chan raft.Index, 16)
+	node, store := newGatedFollower(t, func(cfg *raft.Config) {
+		cfg.StateMachine = &indexReportingSM{applied: applied}
+	})
+
+	// Entries 1 and 2 in term 1, written and applied.
+	if _, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 2, 1)); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	select {
+	case idx := <-applied:
+		if idx != 1 {
+			t.Fatalf("applied index %d, want 1", idx)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("entry 1 was never applied")
+	}
+
+	// A leader in term 2 replaces index 2 and says it is committed. Its write
+	// is held, so the disk keeps the term-1 entry there.
+	release := store.hold(t)
+
+	replace := &raft.AppendEntriesRequest{
+		Term:         2,
+		LeaderID:     "n2",
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries:      []raft.LogEntry{{Index: 2, Term: 2, Command: []byte("replacement")}},
+		LeaderCommit: 2,
+	}
+	go func() {
+		_, _ = node.Handler().HandleAppendEntries(context.Background(), replace)
+	}()
+	store.awaitHeld(t)
+
+	// The commit index has moved past what the disk holds. That is the state
+	// the durable log alone cannot explain.
+	deadline := time.Now().Add(5 * time.Second)
+	for node.CommitIndex() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the commit index never reached 2")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	got, err := store.GetLogEntry(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("read index 2 from the store: %v", err)
+	}
+	if got.Term != 1 {
+		t.Fatalf("the store holds term %d at index 2; the test needs the replacement to still be pending", got.Term)
+	}
+
+	// Nothing is applied there while that is true.
+	select {
+	case idx := <-applied:
+		t.Fatalf("index %d was applied while the disk still held the entry it replaced", idx)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	release()
+
+	select {
+	case idx := <-applied:
+		if idx != 2 {
+			t.Fatalf("applied index %d, want 2", idx)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("index 2 was never applied after the write landed")
+	}
+	final, err := store.GetLogEntry(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("re-read index 2: %v", err)
+	}
+	if final.Term != 2 {
+		t.Errorf("the store holds term %d at index 2 after the write landed, want 2", final.Term)
+	}
+}

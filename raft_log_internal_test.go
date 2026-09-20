@@ -300,7 +300,7 @@ func TestRaftLog_ReplacedEntriesAreNotStableBecauseTheOldOnesWere(t *testing.T) 
 		t.Errorf("storage holds %v, want 1..6", got)
 	}
 	// And the entries at the replaced indices are the second leader's.
-	term, err := rl.termAt(context.Background(), 5)
+	term, err := rl.termAt(5)
 	if err != nil {
 		t.Fatalf("termAt(5): %v", err)
 	}
@@ -334,7 +334,7 @@ func TestRaftLog_ReadsSeeEntriesThatAreOnlyInMemory(t *testing.T) {
 		}
 	}
 
-	term, err := rl.termAt(context.Background(), 3)
+	term, err := rl.termAt(3)
 	if err != nil {
 		t.Fatalf("termAt(3): %v", err)
 	}
@@ -402,7 +402,7 @@ func TestRaftLog_ReadsRefuseIndicesTheLogHasDiscarded(t *testing.T) {
 		t.Fatalf("storage holds %v; the test needs the truncation to still be pending", got)
 	}
 
-	if _, err := rl.termAt(context.Background(), 5); err == nil {
+	if _, err := rl.termAt(5); err == nil {
 		t.Error("termAt returned a discarded entry that storage had not removed yet")
 	}
 	if got, err := rl.entries(context.Background(), 4, 7); err == nil && len(got) != 0 {
