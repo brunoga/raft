@@ -1,5 +1,12 @@
 # Binaries
 /idprovider
+# Example binaries, built in place by each cluster.sh.
+/examples/*/configsvc
+/examples/*/idprovider
+/examples/*/ledger
+/examples/*/raftctl
+/examples/*/ratelimiter
+/examples/*/shardkv
 /cmd/kvd/kvd
 *.exe
 *.exe~
