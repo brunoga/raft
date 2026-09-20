@@ -12,6 +12,7 @@ package raft_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -32,6 +33,23 @@ import (
 // heartbeat, and a node that is never ticked never sends one. That makes such a
 // test a race between the RPC and its own deadline, which is fine on a fast
 // machine and flaky on a busy one.
+// tuneForManualTicks widens the timeouts for a test that drives ticks itself.
+//
+// Timeouts are converted to tick counts at construction, against a 10ms tick
+// when TickInterval is left at zero. A test that then ticks every millisecond
+// is running the cluster ten times faster than it was configured for, which
+// turns the default 150-300ms election timeout into 15-30ms of wall clock.
+// A heartbeat round-trip under -race on a loaded machine does not reliably fit
+// in that, so check-quorum steps a perfectly healthy leader down.
+//
+// These values leave a 100-200ms election window at a one-millisecond tick,
+// which is the headroom the defaults were meant to have.
+func tuneForManualTicks(cfg *raft.Config) {
+	cfg.HeartbeatInterval = 100 * time.Millisecond
+	cfg.ElectionTimeoutMin = 1000 * time.Millisecond
+	cfg.ElectionTimeoutMax = 2000 * time.Millisecond
+}
+
 func tickWhile(nodes ...*raft.Node) (stop func()) {
 	done := make(chan struct{})
 	finished := make(chan struct{})
@@ -424,6 +442,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 		cfg.StateMachine = sms[i]
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 0
+		tuneForManualTicks(&cfg)
 		n, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("New %s: %v", ids[i], err)
@@ -465,16 +484,53 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	followerIdx := (leaderIdx + 1) % 3
 	nodes[followerIdx].Stop()
 
-	// Commit 5 entries while the follower is down.
-	propCtx, propCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// Commit 5 entries while the follower is down, against whichever live node
+	// is leading at the time.
+	//
+	// Ticks are the clock here and the test drives them at a fixed rate, so a
+	// busy machine can hand the leader election timeouts faster than its
+	// heartbeat round-trips complete and check-quorum steps it down -- with
+	// nothing actually wrong with the cluster, and the survivors electing one
+	// of themselves a moment later. Pinning the proposals to the node that led
+	// at the start makes the test fail on that, and what it is about is
+	// whether a restarted follower catches up.
+	propCtx, propCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer propCancel()
-	leader := nodes[leaderIdx]
-	stopTicking := tickWhile(nodes[leaderIdx], nodes[(leaderIdx+2)%3])
+	live := []*raft.Node{nodes[leaderIdx], nodes[(leaderIdx+2)%3]}
+	currentLeader := func() *raft.Node {
+		for _, n := range live {
+			if n.State() == raft.Leader {
+				return n
+			}
+		}
+		return nil
+	}
+	stopTicking := tickWhile(live...)
 	for i := 1; i <= 5; i++ {
 		cmd := []byte(fmt.Sprintf("x%d=y%d", i, i))
-		if _, err := leader.Propose(propCtx, cmd); err != nil {
+		proposeDeadline := time.Now().Add(10 * time.Second)
+		var proposeErr error
+		for {
+			n := currentLeader()
+			if n != nil {
+				if _, proposeErr = n.Propose(propCtx, cmd); proposeErr == nil {
+					break
+				}
+				if !errors.Is(proposeErr, raft.ErrNotLeader) {
+					break
+				}
+			}
+			if time.Now().After(proposeDeadline) {
+				if proposeErr == nil {
+					proposeErr = fmt.Errorf("no leader among the live nodes")
+				}
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if proposeErr != nil {
 			stopTicking()
-			t.Fatalf("Propose %d: %v", i, err)
+			t.Fatalf("Propose %d: %v", i, proposeErr)
 		}
 	}
 	stopTicking()
@@ -490,6 +546,7 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	cfg.StateMachine = newSM
 	cfg.Transport = transports[followerIdx]
 	cfg.TickInterval = 0
+	tuneForManualTicks(&cfg)
 	restartedNode, err := raft.New(&cfg)
 	if err != nil {
 		t.Fatalf("raft.New restart follower: %v", err)
@@ -500,8 +557,13 @@ func TestRestart_FollowerCatchesUpAfterRestart(t *testing.T) {
 	nodes[followerIdx] = restartedNode
 	sms[followerIdx] = newSM
 
-	// Tick all nodes until the restarted follower catches up.
-	wantIdx := leader.LastApplied()
+	// Tick all nodes until the restarted follower catches up. The target is
+	// the furthest any live node got, since leadership may have moved between
+	// them while the entries were being committed.
+	var wantIdx raft.Index
+	for _, n := range live {
+		wantIdx = max(wantIdx, n.LastApplied())
+	}
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, n := range nodes {
@@ -711,6 +773,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 5
 		cfg.SnapshotChunkSize = 64 // forces ~3-4 chunks for a 10-entry kvSM snapshot (~100-200 bytes)
+		tuneForManualTicks(&cfg)
 
 		n, err := raft.New(&cfg)
 		if err != nil {
