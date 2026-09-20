@@ -1,0 +1,47 @@
+name: Soak
+
+# The deterministic simulation harness is the strongest safety net in this
+# repository: it runs the cluster against a seeded network that drops,
+# reorders, delays and partitions, and checks the Raft invariants after every
+# step. CI runs it at its minimum -- one iteration per profile -- because the
+# whole suite is expected to finish in about a minute on every push.
+#
+# This runs it properly, on a schedule, where taking half an hour costs
+# nothing. A failure prints the seed, and RAFT_SIM_SEED replays that exact run.
+on:
+  schedule:
+    # 04:00 UTC daily.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Iterations per chaos profile'
+        required: false
+        default: '25'
+
+jobs:
+  soak:
+    name: Deterministic simulation soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+
+      - name: Run the simulation soak
+        env:
+          RAFT_SIM_LONG: '1'
+          RAFT_SIM_ITERS: ${{ github.event.inputs.iterations || '25' }}
+        run: go test -race -count=1 -timeout 45m -run 'TestSim' .
+
+      # Not part of the soak proper, but the same reasoning: a test that fails
+      # one run in four is invisible to a suite that runs once per push, and
+      # two such tests reached main before this existed.
+      - name: Repeat the fast suite to surface flakes
+        run: go test -race -count=5 -timeout 30m ./...
