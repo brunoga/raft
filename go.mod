@@ -1,6 +1,6 @@
 module github.com/brunoga/raft
 
-go 1.26.2
+go 1.26
 
 require (
 	github.com/anishathalye/porcupine v1.3.0
