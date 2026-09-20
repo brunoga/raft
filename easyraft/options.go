@@ -387,3 +387,38 @@ func WithPrometheus(reg prometheus.Registerer) Option {
 		c.PromRegisterer = reg
 	}
 }
+
+// applySnapshotSettings puts SnapCount into a raft.Config, keeping the two
+// settings that govern compaction consistent with each other.
+//
+// SnapshotThreshold is how many entries pass before a snapshot is taken;
+// TrailingLogs is how many are kept after one. If the second is not smaller
+// than the first, compacting reclaims nothing, and the engine says so with a
+// warning and caps it.
+//
+// That warning used to fire on every easyraft node with default settings,
+// because this package defaulted the threshold to 1000 while leaving
+// TrailingLogs at the engine's 1024. A warning everyone sees on a correct
+// configuration is worse than no warning: it is the one that teaches people
+// their logs are full of warnings they are supposed to ignore.
+//
+// So the default is now the engine's own, which is already consistent, and an
+// explicitly chosen SnapCount brings TrailingLogs down with it rather than
+// leaving the engine to notice.
+func applySnapshotSettings(rCfg *raft.Config, snapCount uint64) {
+	if snapCount > 0 {
+		rCfg.SnapshotThreshold = snapCount
+	}
+	if rCfg.SnapshotThreshold > 0 && rCfg.TrailingLogs >= rCfg.SnapshotThreshold {
+		// Half, so compaction reclaims something every time it runs, and at
+		// least one entry where there is room for one, so a follower barely
+		// behind is caught up from the log rather than a whole snapshot. A
+		// threshold of 1 leaves no room, and keeping nothing is then the only
+		// consistent answer.
+		trailing := rCfg.SnapshotThreshold / 2
+		if trailing == 0 && rCfg.SnapshotThreshold > 1 {
+			trailing = 1
+		}
+		rCfg.TrailingLogs = trailing
+	}
+}

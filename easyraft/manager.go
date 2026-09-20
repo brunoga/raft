@@ -495,10 +495,7 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
 	rCfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
 	rCfg.HeartbeatInterval = s.raftHeartbeatInterval()
-	rCfg.SnapshotThreshold = s.cfg.SnapCount
-	if rCfg.SnapshotThreshold == 0 {
-		rCfg.SnapshotThreshold = 1000
-	}
+	applySnapshotSettings(&rCfg, s.cfg.SnapCount)
 
 	// Every group shares the caller's registry, so the collectors are
 	// registered once and each group's series carry its own "group" label.

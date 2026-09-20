@@ -623,10 +623,7 @@ func (s *Store) initRaft() error {
 	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
 	rCfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
 	rCfg.HeartbeatInterval = s.raftHeartbeatInterval()
-	rCfg.SnapshotThreshold = s.cfg.SnapCount
-	if rCfg.SnapshotThreshold == 0 {
-		rCfg.SnapshotThreshold = 1000
-	}
+	applySnapshotSettings(&rCfg, s.cfg.SnapCount)
 
 	// 4. Metrics — must be set before raft.New so the node is constructed with metrics wired in.
 	if s.cfg.PromRegisterer != nil {

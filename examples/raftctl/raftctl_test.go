@@ -115,7 +115,10 @@ func startCluster(t *testing.T, snapshot bool) (dirs []string, ids []raft.NodeID
 		cfg.Transport = net.NewTransport(id)
 		cfg.TickInterval = 0
 		if snapshot {
+			// TrailingLogs has to come down with the threshold, or compaction
+			// reclaims nothing and the engine says so on every start.
 			cfg.SnapshotThreshold = 2
+			cfg.TrailingLogs = 1
 		} else {
 			cfg.SnapshotThreshold = 0
 		}
