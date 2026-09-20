@@ -1,3 +1,12 @@
+// Package memstore provides an in-memory implementation of raft.Storage.
+//
+// Nothing it holds survives the process. It exists for tests and for
+// deployments whose state can be rebuilt from somewhere else, and it is the
+// wrong choice anywhere the Raft safety argument is being relied on: that
+// argument assumes a node's term, vote and log entries outlive a crash, and
+// here they do not. Use storage/filestore for anything durable.
+//
+// Safe for concurrent use.
 package memstore
 
 import (

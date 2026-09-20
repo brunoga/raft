@@ -12,8 +12,15 @@ type PeerConfig struct {
 	ID NodeID
 
 	// Voter indicates whether this peer participates in elections and counts
-	// toward the commit quorum. Witnesses (non-voting members) replicate the
-	// log and receive snapshots but do not vote or contribute to quorums.
+	// toward the commit quorum. A non-voter, usually called a learner,
+	// replicates the log and receives snapshots but does not vote or
+	// contribute to any quorum, so adding one never weakens the cluster while
+	// it catches up. Promote it with Node.PromoteMember once it has.
+	//
+	// This is not a witness in the sense of the Raft dissertation §11.7.2. A
+	// witness there votes but does not store the full log; a learner here
+	// stores the full log but does not vote. They are opposites, and witnesses
+	// are not implemented.
 	Voter bool
 }
 
@@ -31,9 +38,10 @@ type Config struct {
 	ID NodeID
 
 	// Voter indicates whether this node is a voting member of the cluster.
-	// Non-voters (witnesses) replicate the log and can be promoted to voters
-	// via configuration changes, but they do not vote in elections or count
-	// toward quorums.
+	// A non-voter, usually called a learner, replicates the log and can be
+	// promoted to a voter through a configuration change, but does not vote in
+	// elections or count toward any quorum. See PeerConfig.Voter for why this
+	// is not what Raft calls a witness.
 	Voter bool
 
 	// GroupID identifies the Raft group this node belongs to. It is stamped on
