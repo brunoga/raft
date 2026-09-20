@@ -4,14 +4,52 @@ import "context"
 
 // ---- Election -----------------------------------------------------------------
 
-func (n *Node) handleRequestVote(req *RequestVoteRequest) (*RequestVoteResponse, error) {
+// handleRequestVote processes one RequestVote request and answers it on
+// respCh, which may happen after this function has returned.
+//
+// A granted vote is a promise that this node will not vote for anybody else in
+// this term, and the only thing that can hold the promise across a crash is
+// the hard-state write. So the answer waits for it. A pre-vote changes no
+// persistent state and is answered at once, which is what keeps a cluster with
+// a slow disk able to hold an election at all.
+func (n *Node) handleRequestVote(req *RequestVoteRequest, respCh chan rpcResponse) {
+	var resp *RequestVoteResponse
+	answered := false
+	// The response channel holds one value and the caller reads it once.
+	// Answering twice would block the event loop on the second send, which is
+	// worse than whatever bug caused it.
+	reply := func(r *RequestVoteResponse, err error) {
+		if respCh == nil || answered {
+			return
+		}
+		answered = true
+		respCh <- rpcResponse{resp: r, err: err}
+	}
+	// replyWhenDurable holds the answer back until this node's term and vote
+	// are on disk. Every answer below goes through it except the pre-vote,
+	// because every answer states this node's term, and a term it could forget
+	// in a crash is one it could make a second and different decision in.
+	replyWhenDurable := func(r *RequestVoteResponse) {
+		n.afterWrite(n.sendGate(0),
+			func() { reply(r, nil) },
+			func(err error) { reply(r, err) })
+	}
+
 	// Pre-vote: the sender is testing whether it COULD win an election in the
 	// next term. We must not update any persistent state; just report whether
 	// we would vote.
+	//
+	// This is the one answer that is not held back, and it is safe precisely
+	// because it promises nothing: a pre-vote grant is not recorded anywhere,
+	// so there is nothing for a crash to lose. It is also the answer that most
+	// needs not to wait. Pre-vote exists to keep a node that cannot win from
+	// disrupting a healthy cluster, and it can only do that if a cluster whose
+	// disks are busy can still work out who should stand.
 	if req.PreVote {
-		resp := &RequestVoteResponse{Term: n.currentTerm}
+		resp = &RequestVoteResponse{Term: n.currentTerm}
 		if !n.cfg.Voter {
-			return resp, nil
+			reply(resp, nil)
+			return
 		}
 		// Grant pre-vote if: their next-term would be higher than ours, their log
 		// is up-to-date, and we have not heard from a valid leader recently.
@@ -30,17 +68,17 @@ func (n *Node) handleRequestVote(req *RequestVoteRequest) (*RequestVoteResponse,
 		if req.Term > n.currentTerm && logOK && !heardFromLeader {
 			resp.VoteGranted = true
 		}
-		return resp, nil
+		reply(resp, nil)
+		return
 	}
 
 	// Real vote: step down if we see a higher term.
 	if req.Term > n.currentTerm {
 		if !n.cfg.Voter {
-			if err := n.saveTerm(req.Term, ""); err != nil {
-				return &RequestVoteResponse{Term: n.currentTerm}, err
-			}
+			n.saveTerm(req.Term, "")
 			n.applyFollowerTransition("")
-			return &RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}, nil
+			replyWhenDurable(&RequestVoteResponse{Term: n.currentTerm, VoteGranted: false})
+			return
 		}
 		// Determine the vote decision now, before stepping down, so we can
 		// merge the term-update and vote-grant into a single fsync. When the
@@ -51,35 +89,34 @@ func (n *Node) handleRequestVote(req *RequestVoteRequest) (*RequestVoteResponse,
 		if logOK {
 			votedFor = req.CandidateID
 		}
-		if err := n.saveTerm(req.Term, votedFor); err != nil {
-			return &RequestVoteResponse{Term: n.currentTerm}, err
-		}
+		n.saveTerm(req.Term, votedFor)
 		n.applyFollowerTransition("") // resets election timeout unconditionally
-		return &RequestVoteResponse{Term: n.currentTerm, VoteGranted: logOK}, nil
+		replyWhenDurable(&RequestVoteResponse{Term: n.currentTerm, VoteGranted: logOK})
+		return
 	}
 
-	resp := &RequestVoteResponse{Term: n.currentTerm}
+	resp = &RequestVoteResponse{Term: n.currentTerm}
 
 	// Deny if request is from an older term.
 	if req.Term < n.currentTerm {
-		return resp, nil
+		replyWhenDurable(resp)
+		return
 	}
 
 	// Grant vote if we haven't voted yet (or already voted for this candidate)
 	// and the candidate's log is at least as up-to-date as ours.
 	if !n.cfg.Voter {
-		return resp, nil
+		replyWhenDurable(resp)
+		return
 	}
 	alreadyVoted := n.votedFor != "" && n.votedFor != req.CandidateID
 	logOK := n.log.isUpToDate(req.LastLogIndex, req.LastLogTerm)
 	if !alreadyVoted && logOK {
-		if err := n.saveTerm(req.Term, req.CandidateID); err != nil {
-			return resp, err
-		}
+		n.saveTerm(req.Term, req.CandidateID)
 		n.resetElectionTimeout()
 		resp.VoteGranted = true
 	}
-	return resp, nil
+	replyWhenDurable(resp)
 }
 
 // triggerElection starts an election. If the caller is a follower, it first

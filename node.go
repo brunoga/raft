@@ -113,6 +113,10 @@ type Node struct {
 	// tells another node, or this node's own commit accounting, that something
 	// is on disk belongs here.
 	deferredWrites []deferredWrite
+	// unsafeTermSeq is the sequence number of the most recent hard-state write
+	// that has not completed, or 0 when the term and vote on disk are the ones
+	// this node is using. See sendGate.
+	unsafeTermSeq uint64
 
 	// --- Timing (in ticks) --------------------------------------------------
 	electionElapsed  int
@@ -1254,40 +1258,51 @@ func (n *Node) Term() Term {
 	return Term(n.atomicTerm.Load())
 }
 
-// saveTerm persists currentTerm+votedFor atomically then updates the cache.
+// saveTerm records currentTerm and votedFor and queues the write that makes
+// them durable, returning the sequence number of that write.
+//
+// The term and the vote take effect here and now. What the caller must not do
+// is act on them where another node can see it: the whole of Raft's
+// one-vote-per-term rule is that a node which votes, crashes, and comes back
+// having forgotten the vote can vote again in the same term, and two leaders
+// in one term follows. So nothing this node sends may carry the new term until
+// the returned write has completed -- see sendGate, which every handler that
+// answers an RPC passes through.
+//
 // Must be called from the event-loop goroutine only.
-func (n *Node) saveTerm(term Term, votedFor NodeID) error {
-	started := n.now()
-	// Through the writer, and waited on. The write itself is still synchronous
-	// -- a node may not act on a term or a vote it has not persisted, and the
-	// deferral that would let it queue this one and carry on has to hold back
-	// every message carrying the new term, which is a separate piece of work.
-	// Going through the queue rather than round it keeps storage seeing one
-	// goroutine, and keeps this write ordered against the log writes around it.
-	err := n.writer.writeSync(&writeOp{
-		seq:          n.log.nextWriteSeq(),
+func (n *Node) saveTerm(term Term, votedFor NodeID) uint64 {
+	seq := n.log.nextWriteSeq()
+	n.writer.enqueue(&writeOp{
+		seq:          seq,
 		kind:         writeHardState,
 		hs:           HardState{CurrentTerm: term, VotedFor: votedFor},
 		durableAfter: n.log.queuedDurable,
 	})
-	n.reportStorageWriteSince("hardstate", started, err)
-	if err != nil {
-		if errors.Is(err, ErrStopped) {
-			// The node is already shutting down and the writer has closed.
-			// Reporting that as a storage failure would leave FatalError
-			// claiming a disk problem on a node that stopped normally.
-			return err
-		}
-		n.fail(err, "persist term and vote")
-		return fmt.Errorf("saveTerm: %w", err)
-	}
+	n.unsafeTermSeq = seq
+
 	if n.currentTerm != term {
 		n.leadershipDirty = true
 	}
 	n.currentTerm = term
 	n.votedFor = votedFor
 	n.atomicTerm.Store(uint64(term))
-	return nil
+	return seq
+}
+
+// sendGate returns the write a message produced in this turn has to wait for.
+//
+// A reply carries this node's term, and sending it is a statement that the
+// node is at that term: a leader counts an acknowledgement, a candidate counts
+// a vote. If the term were not yet durable, a crash would take the node back
+// to an earlier one, free to make a second and different decision in a term it
+// had already decided. So a reply waits for whichever is later of the log
+// write it depends on and the hard-state write, which in practice is the log
+// write when there is one, because the hard state is always queued first.
+func (n *Node) sendGate(writeSeq uint64) uint64 {
+	if n.unsafeTermSeq > writeSeq {
+		return n.unsafeTermSeq
+	}
+	return writeSeq
 }
 
 // traceRPC calls cfg.Tracer.StartRPC if a tracer is configured and returns the
@@ -1386,12 +1401,6 @@ func (n *Node) reportStorageWrite(op string, d time.Duration, err error) {
 	sm.StorageWrite(n.cfg.ID, op, d, err)
 }
 
-// reportStorageWriteSince is reportStorageWrite for a write that has just
-// finished and whose start time the caller holds.
-func (n *Node) reportStorageWriteSince(op string, started time.Time, err error) {
-	n.reportStorageWrite(op, n.now().Sub(started), err)
-}
-
 // deferredWrite is work that must not happen until a queued storage write has
 // completed: an acknowledgement to a leader, a promise resolved for a client,
 // anything whose meaning is "this is on disk".
@@ -1442,25 +1451,41 @@ func (n *Node) handleWriteCompletions() {
 			continue
 		}
 		n.log.stabilize(*d)
+		if n.unsafeTermSeq != 0 && d.seq >= n.unsafeTermSeq {
+			n.unsafeTermSeq = 0
+		}
 		n.runDeferredWrites(d.seq)
 	}
 	n.onDurableAdvanced()
 }
 
 // runDeferredWrites releases the work waiting on writes up to and including
-// seq. Writes complete in the order they were queued, so the waiting work is
-// already in that order too.
+// seq.
+//
+// The whole list is scanned rather than a leading run of it, because the list
+// is not sorted. Work registered in one turn can wait on a write queued in an
+// earlier one -- an acknowledgement that needs only the term this node adopted
+// two turns ago, say -- and would otherwise sit behind an unrelated append
+// that happened to be queued later, which is exactly the delay this change
+// exists to remove.
+//
+// The list is taken before the callbacks run so that anything they register
+// waits for its own write rather than being released by this one.
 func (n *Node) runDeferredWrites(seq uint64) {
-	i := 0
-	for ; i < len(n.deferredWrites); i++ {
-		if n.deferredWrites[i].seq > seq {
-			break
+	pending := n.deferredWrites
+	n.deferredWrites = nil
+
+	kept := pending[:0]
+	for i := range pending {
+		if pending[i].seq > seq {
+			kept = append(kept, pending[i])
+			continue
 		}
-		if r := n.deferredWrites[i].run; r != nil {
+		if r := pending[i].run; r != nil {
 			r()
 		}
 	}
-	n.deferredWrites = n.deferredWrites[i:]
+	n.deferredWrites = append(kept, n.deferredWrites...)
 	if len(n.deferredWrites) == 0 {
 		n.deferredWrites = nil
 	}
@@ -1468,12 +1493,13 @@ func (n *Node) runDeferredWrites(seq uint64) {
 
 // failDeferredWrites reports err to everything still waiting on a write.
 func (n *Node) failDeferredWrites(err error) {
-	for i := range n.deferredWrites {
-		if f := n.deferredWrites[i].fail; f != nil {
+	pending := n.deferredWrites
+	n.deferredWrites = nil
+	for i := range pending {
+		if f := pending[i].fail; f != nil {
 			f(err)
 		}
 	}
-	n.deferredWrites = nil
 }
 
 // onDurableAdvanced reacts to the durable point having moved.

@@ -65,11 +65,6 @@ type writeOp struct {
 	index   Index      // writeTruncateSuffix, writeTruncatePrefix
 	hs      HardState  // writeHardState
 
-	// done, when non-nil, makes this a synchronous operation: the writer
-	// reports its outcome here rather than in the completion list, and the
-	// caller waits. See writeSync.
-	done chan error
-
 	// durableAfter is the highest log index that is on stable storage once
 	// this operation has completed, given that every operation queued before
 	// it also completed. It is computed when the operation is queued, which is
@@ -148,29 +143,16 @@ func newStorageWriter(s Storage) *storageWriter {
 // operations have finished. It carries no value: the loop calls takeDone.
 func (w *storageWriter) completions() <-chan struct{} { return w.notify }
 
-// writeSync queues op and waits for it to complete.
-//
-// It is still the same queue, so ordering with the asynchronous operations is
-// preserved and storage still sees every mutating call from this one
-// goroutine. What it gives up is the point of the exercise -- the event loop
-// waits -- so it is for the writes that have no deferral yet, not for the log.
-func (w *storageWriter) writeSync(op *writeOp) error {
-	done := make(chan error, 1)
-	op.done = done
-	if !w.enqueue(op) {
-		return ErrStopped
-	}
-	return <-done
-}
-
-// enqueue hands one operation to the writer and reports whether it was
-// accepted; a closed writer accepts nothing. It never blocks. The operation is
+// enqueue hands one operation to the writer. It never blocks. The operation is
 // copied into the queue, so the caller's copy is its own afterwards.
-func (w *storageWriter) enqueue(op *writeOp) bool {
+//
+// A closed writer drops it. That only happens once the node is stopping, when
+// nothing is left to acknowledge on its behalf.
+func (w *storageWriter) enqueue(op *writeOp) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
-		return false
+		return
 	}
 	w.queue = append(w.queue, *op)
 	start := !w.started
@@ -185,7 +167,6 @@ func (w *storageWriter) enqueue(op *writeOp) bool {
 	case w.wake <- struct{}{}:
 	default:
 	}
-	return true
 }
 
 // takeDone collects every completion reported since the last call, in the
@@ -313,13 +294,7 @@ func (w *storageWriter) execute(batch []writeOp) {
 	if err != nil && w.failed == nil {
 		w.failed = err
 	}
-	reported := false
 	for i := range batch {
-		if ch := batch[i].done; ch != nil {
-			ch <- err // buffered; the caller is waiting
-			continue
-		}
-		reported = true
 		w.done = append(w.done, writeDone{
 			seq:          batch[i].seq,
 			kind:         batch[i].kind,
@@ -332,9 +307,6 @@ func (w *storageWriter) execute(batch []writeOp) {
 	}
 	w.mu.Unlock()
 
-	if !reported {
-		return
-	}
 	select {
 	case w.notify <- struct{}{}:
 	default:

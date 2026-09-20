@@ -32,12 +32,21 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 		answered = true
 		respCh <- rpcResponse{resp: resp, err: err}
 	}
+	// replyWhenDurable holds the answer back until everything this turn queued
+	// is on disk. Every answer here goes through it, a rejection included: an
+	// answer states this node's term whatever else it says.
+	replyWhenDurable := func(writeSeq uint64) {
+		n.afterWrite(n.sendGate(writeSeq), func() { reply(nil) }, reply)
+	}
 
 	if req.Term < n.currentTerm {
-		reply(nil)
+		replyWhenDurable(0)
 		return
 	}
-	// Valid leader contact — reset election timer.
+	// Valid leader contact — reset election timer. This may step the node up
+	// to the leader's term, which queues a hard-state write that every reply
+	// below has to wait for: a rejection carries this node's term just as an
+	// acknowledgement does.
 	n.becomeFollower(req.Term, req.LeaderID)
 	resp.Term = n.currentTerm
 
@@ -63,7 +72,7 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 					resp.ConflictIndex--
 				}
 			}
-			reply(nil)
+			replyWhenDurable(0)
 			return
 		}
 	}
@@ -123,7 +132,10 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 	}
 
 	resp.Success = true
-	n.afterWrite(writeSeq, func() { reply(nil) }, reply)
+	// Gated on the log write, and on the hard-state write when stepping up to
+	// this leader's term produced one: an acknowledgement is a statement both
+	// that the entries are on disk and that this node is at that term.
+	replyWhenDurable(writeSeq)
 }
 
 // broadcastHeartbeat sends empty AppendEntries to all peers.

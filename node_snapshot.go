@@ -129,11 +129,26 @@ type installSnapshotResult struct {
 // Each call enqueues one chunk of snapshot data to a background goroutine that
 // streams it directly to storage, preventing full-snapshot buffering in memory.
 // The goroutine posts a snapInstallResult to rpcCh when the install completes.
-func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rpcResponse) {
 	resp := &InstallSnapshotResponse{Term: n.currentTerm}
+	answered := false
+	// The reply carries this node's term, so it waits for the hard-state write
+	// when stepping down produced one. Every exit from this function goes
+	// through it.
+	reply := func() {
+		if respCh == nil || answered {
+			return
+		}
+		answered = true
+		gate := n.sendGate(0)
+		n.afterWrite(gate,
+			func() { respCh <- rpcResponse{resp: resp} },
+			func(err error) { respCh <- rpcResponse{resp: resp, err: err} })
+	}
 
 	if req.Term < n.currentTerm {
-		return resp, nil
+		reply()
+		return
 	}
 	if req.Term > n.currentTerm {
 		n.becomeFollower(req.Term, req.LeaderID)
@@ -149,7 +164,8 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 
 	// If the snapshot is old, discard it.
 	if req.LastIncludedIndex <= n.lastApplied {
-		return resp, nil
+		reply()
+		return
 	}
 
 	// Cancel any in-progress install that is for a different snapshot OR that
@@ -166,7 +182,8 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 	if n.pendingSnap == nil {
 		if req.Offset != 0 {
 			// Cannot resume an install without its beginning; wait for chunk 0.
-			return resp, nil
+			reply()
+			return
 		}
 		meta := SnapshotMeta{
 			LastIncludedIndex: req.LastIncludedIndex,
@@ -188,7 +205,8 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 
 	// Verify the expected byte offset to detect out-of-order delivery.
 	if req.Offset != n.pendingSnap.expectedOff {
-		return resp, nil
+		reply()
+		return
 	}
 
 	// Copy chunk data: the proto bytes backing req.Data may be reused by the
@@ -210,7 +228,8 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 			"peer", req.LeaderID, "offset", req.Offset)
 		n.pendingSnap.cancelFn()
 		n.pendingSnap = nil
-		return resp, nil
+		reply()
+		return
 	}
 	n.pendingSnap.expectedOff += int64(len(req.Data))
 
@@ -220,7 +239,7 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest) (*InstallSnaps
 		n.pendingSnap = nil // goroutine owns installCh from here; posts result via rpcCh
 	}
 
-	return resp, nil
+	reply()
 }
 
 // runSnapshotInstall is the background goroutine for a streaming snapshot

@@ -182,17 +182,17 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 	var resp rpcResponse
 	switch req := env.req.(type) {
 	case *RequestVoteRequest:
-		r, err := n.handleRequestVote(req)
-		resp = rpcResponse{resp: r, err: err}
+		n.handleRequestVote(req, env.respCh)
+		return // a granted vote waits for the hard-state write
 	case *AppendEntriesRequest:
 		n.handleAppendEntries(req, env.respCh)
 		return // the acknowledgement waits for the log write
 	case *InstallSnapshotRequest:
-		r, err := n.handleInstallSnapshot(req)
-		resp = rpcResponse{resp: r, err: err}
+		n.handleInstallSnapshot(req, env.respCh)
+		return // the reply carries this node's term
 	case *TimeoutNowRequest:
-		r, err := n.handleTimeoutNow(req)
-		resp = rpcResponse{resp: r, err: err}
+		n.handleTimeoutNow(req, env.respCh)
+		return // the reply carries this node's term
 	case *ReadIndexRequest:
 		n.handleReadIndexRPC(req, env.respCh)
 		return // response sent asynchronously
