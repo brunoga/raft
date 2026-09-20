@@ -1,6 +1,6 @@
 # Examples
 
-Five fully-worked examples are provided, each targeting a different deployment pattern. Every example ships with a `cluster.sh` script that starts a local 3-node cluster, and a REPL client for interactive exploration.
+Five fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster, and a REPL client for interactive exploration. A sixth example, `raftctl`, is an operator tool rather than a service.
 
 ---
 
@@ -134,6 +134,40 @@ go build -o shardkv ./shardkv
 
 # Node 2 and 3 follow the same pattern
 ```
+
+---
+
+## `raftctl` — offline operator tool
+
+See [`raftctl/`](raftctl/) for the tool an operator reaches for when a cluster
+has lost its quorum for good: two nodes of three gone, the data intact and
+permanently unreachable, and nothing the surviving node offers able to help
+because every operation on it needs a quorum.
+
+- **`InspectStorage`**: read a stopped node's term, log bounds, snapshot and
+  membership without changing anything.
+- **`UncommittedBand`**: which of its entries are not provably committed — the
+  ones a recovery has to guess about, shown while they can still be told apart
+  from the rest.
+- **`MoreRecentThan`**: choose which survivor's history to keep, by the rule
+  elections use.
+- **`RecoverCluster`**: rewrite one node's membership so it can elect itself,
+  with `--discard-uncommitted` and `--known-committed` to choose which way to
+  be wrong about the band, and a `RecoveryReport` recording what it did.
+- **`filestore.ErrLocked`**: "stop the node first" enforced by the store rather
+  than asked for in a README.
+
+```bash
+go build -o raftctl ./raftctl
+
+raftctl inspect --data-dir /var/lib/app/n1
+raftctl compare --data-dir /var/lib/app/n1 --data-dir /var/lib/app/n2
+raftctl recover --data-dir /var/lib/app/n1 --id n1 --learner n2 --learner n3 --confirm
+```
+
+It is the one operation in the library that can lose data. The example walks
+the whole procedure, including the steps that are easy to skip and expensive
+to skip.
 
 ---
 

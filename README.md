@@ -1228,7 +1228,7 @@ See [`easyraft/`](easyraft/) for the full API reference, option guide, and usage
 
 ## Reference implementation
 
-Five fully-worked examples are provided, each targeting a different deployment pattern — from a single-group service using the core `raft` package directly, to a multi-raft sharded store with automatic leader balancing.
+Five fully-worked services are provided, each targeting a different deployment pattern — from a single-group service using the core `raft` package directly, to a multi-raft sharded store with automatic leader balancing — plus `raftctl`, an offline operator tool for a cluster that has lost its quorum.
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
 
@@ -1457,7 +1457,11 @@ one that is merely slow or partitioned. The procedure:
 
 `InspectStorage` is read-only and safe to run on any stopped node, and
 `filestore` refuses to open a directory another store holds, so running it
-against a node that is still up fails rather than racing its writes. Its
+against a node that is still up fails rather than racing its writes.
+
+[`examples/raftctl`](examples/raftctl/) is a working operator tool built on
+this: `inspect` one node, `compare` the survivors, `recover` the one you keep.
+Its README walks the whole procedure. Its
 `Members` field is the membership that node would restart with — the one in its
 snapshot, advanced by every configuration entry in its log, committed or not,
 since §4.1 says a node uses the latest configuration it has rather than the
