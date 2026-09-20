@@ -229,12 +229,17 @@ Stated here rather than discovered later.
 
 - **No batched write across groups.** Each group writes and syncs its own log.
   At high group counts this is the binding constraint; see the scale notes in
-  the README.
-- **No on-disk state machine contract.** A state machine is rebuilt from a
-  snapshot plus log replay on restart, rather than reporting the index it has
-  already persisted.
-- **No batched apply.** Entries are applied one at a time.
-- **No flexible or weighted quorums**, and no placement awareness: a quorum is
-  a majority, wherever those replicas happen to be.
+  the README. Sharing one write-ahead log across groups needs a storage
+  abstraction that spans them rather than one per node, which is an
+  architectural change rather than a missing option.
+- **No flexible or weighted quorums.** A quorum is a majority. Placement can be
+  constrained -- `Config.MinCommitZones` requires a write to reach more than one
+  failure domain before it commits -- but the count itself is not configurable,
+  so there is no way to trade read quorum size against write quorum size.
+- **No witnesses.** A member either replicates the log in full or does not vote;
+  there is no member that votes without storing entries (dissertation §11.7.2).
 - **Lease reads assume bounded clock drift.** `ReadIndex` does not; prefer it
   unless you have measured your clocks.
+- **Recovering from permanent quorum loss is not a safe operation.** It cannot
+  be; see the divergence above. It is an operator action with data-loss
+  consequences, not something the cluster does for itself.

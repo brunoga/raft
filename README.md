@@ -1150,9 +1150,20 @@ after `Start()` has no effect.
 
 When using `filestore` with many simultaneously-active groups, each group issues its own `fsync` on every log append. G concurrent writers produce up to G fsyncs per replication round. On NVMe storage this is usually acceptable up to ~100–200 concurrent writers; on network-attached or spinning storage the accumulated latency spikes will cause election timeouts well below that threshold. For write-heavy deployments above ~200 groups, use a shared-WAL `Storage` implementation that amortises fsyncs across groups. See [Scale boundaries](#scale-boundaries) in the Multi-Raft section.
 
-### No proposal-level backpressure
+### Backpressure bounds the write backlog, not the proposal queue
 
-The internal `proposeCh` has a fixed capacity of 1,024 entries. When the leader's event loop falls behind — due to a slow state machine, a long-running snapshot, or heavy replication traffic — `Propose` blocks at channel entry until space becomes available. There is no admission-control mechanism that sheds load or returns an error proactively. Applications that need to bound proposal queue depth should implement their own semaphore or token-bucket before calling `Propose`.
+`Config.MaxUnstableLogBytes` caps how much log a leader will hold in memory
+waiting for storage; beyond it `Propose` and `ProposeOnce` are refused with
+`ErrWriteBacklogFull` rather than queued. That is the admission control for a
+disk that has fallen behind, and it is what keeps a node with stalled storage
+from growing its backlog until the process dies.
+
+It does not bound the proposal queue itself. The internal `proposeCh` has a
+fixed capacity of 1,024, and when the event loop falls behind for a reason
+other than the disk — a slow state machine, a long snapshot, heavy replication
+— `Propose` blocks at channel entry until space is available or `ctx` is
+cancelled. Cancel the context to bound the wait, and add a semaphore or token
+bucket ahead of `Propose` if you need to shed load rather than wait for it.
 
 ---
 
