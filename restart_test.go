@@ -94,7 +94,10 @@ func openFileStore(t *testing.T, dir string) *filestore.FileStore {
 }
 
 // newPersistentNode creates (or reopens) a node backed by a filestore at dir.
-func newPersistentNode(t *testing.T, id raft.NodeID, peers []raft.PeerConfig, dir string, tr raft.Transport, sm raft.StateMachine) *raft.Node {
+// The store is returned as well as the node: a node does not own its storage
+// and does not close it, so a test simulating a restart has to close the store
+// itself before reopening the directory.
+func newPersistentNode(t *testing.T, id raft.NodeID, peers []raft.PeerConfig, dir string, tr raft.Transport, sm raft.StateMachine) (*raft.Node, *filestore.FileStore) {
 	t.Helper()
 	fs := openFileStore(t, dir)
 	cfg := raft.DefaultConfig()
@@ -108,7 +111,7 @@ func newPersistentNode(t *testing.T, id raft.NodeID, peers []raft.PeerConfig, di
 	if err != nil {
 		t.Fatalf("raft.New(%s): %v", id, err)
 	}
-	return n
+	return n, fs
 }
 
 // TestRestart_TermPreservedAcrossRestart verifies that currentTerm is
@@ -120,7 +123,7 @@ func TestRestart_TermPreservedAcrossRestart(t *testing.T) {
 	sm1 := &kvSM{data: make(map[string]string)}
 
 	// Start a single-node cluster, let it elect itself (term=1).
-	n := newPersistentNode(t, "n1", nil, dir, tr, sm1)
+	n, fs1 := newPersistentNode(t, "n1", nil, dir, tr, sm1)
 	net.Register("n1", n.Handler())
 	n.Start()
 	deadline := time.Now().Add(3 * time.Second)
@@ -132,6 +135,9 @@ func TestRestart_TermPreservedAcrossRestart(t *testing.T) {
 		t.Fatal("did not become leader")
 	}
 	n.Stop()
+	// The node does not own its storage, so stopping it leaves the store open.
+	// Close it: the directory can only be opened once at a time.
+	_ = fs1.Close()
 
 	// Reopen the filestore (new instance) and create a fresh node.
 	// The node must start in term >= 1.
@@ -181,7 +187,7 @@ func TestRestart_CommittedEntriesSurviveCrash(t *testing.T) {
 	sm1 := &kvSM{data: make(map[string]string)}
 
 	// Phase 1: start a single-node cluster, commit a few entries.
-	n := newPersistentNode(t, "n1", nil, dir, tr, sm1)
+	n, fs1 := newPersistentNode(t, "n1", nil, dir, tr, sm1)
 	net.Register("n1", n.Handler())
 	n.Start()
 
@@ -210,6 +216,9 @@ func TestRestart_CommittedEntriesSurviveCrash(t *testing.T) {
 		}
 	}
 	n.Stop()
+	// The node does not own its storage, so stopping it leaves the store open.
+	// Close it: the directory can only be opened once at a time.
+	_ = fs1.Close()
 
 	// Phase 2: reopen from disk with a fresh state machine.
 	sm2 := &kvSM{data: make(map[string]string)}
@@ -323,6 +332,9 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	_ = r.Close()
 
 	n.Stop()
+	// The node does not own its storage, so stopping it leaves the store open.
+	// Close it: the directory can only be opened once at a time.
+	_ = fs.Close()
 
 	// Phase 2: restart with a fresh SM. It must restore from the snapshot.
 	sm2 := &kvSM{data: make(map[string]string)}
@@ -601,6 +613,9 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	applyCountOriginal := sm.count
 
 	n.Stop()
+	// The node does not own its storage, so stopping it leaves the store open.
+	// Close it: the directory can only be opened once at a time.
+	_ = fs.Close()
 
 	// ---- Restart ----
 	sm2 := &counterSM{}
