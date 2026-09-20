@@ -1,5 +1,3 @@
-// Package raft provides the core types and interfaces for the Raft consensus
-// algorithm implementation.
 package raft
 
 import (
