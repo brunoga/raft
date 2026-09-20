@@ -971,7 +971,7 @@ A node whose storage falls far enough behind refuses new entries with `ErrWriteB
 Disk throughput is still the binding constraint on write rate, and these remain the ways to spend less of it:
 
 - **Stagger write load**: spread groups so that only a fraction are actively receiving proposals at any instant. Read-heavy or idle groups do not amplify fsyncs.
-- **Use a shared-WAL storage backend**: the `Storage` interface is intentionally narrow (`SaveLog`, `SaveSnapshot`, `LoadLog`, `LoadSnapshot`). A production system at very high group counts should replace `filestore` with an implementation that batches writes from multiple groups into a single shared WAL and issues one `fsync` per batch. `filestore` is the reference implementation for correctness and single-group deployments, not for a 1,000-group write-heavy cluster.
+- **Use a shared-WAL storage backend**: `Storage` has twelve methods — `SaveHardState`, `LoadHardState`, `AppendLogEntries`, `GetLogEntry`, `GetLogEntries`, `FirstIndex`, `LastIndex`, `TruncateSuffix`, `TruncatePrefix`, `SaveSnapshot`, `LoadSnapshot` and `Close` — and only the four mutating ones need to reach the disk. A production system at very high group counts should replace `filestore` with an implementation that batches writes from multiple groups into a single shared write-ahead log and issues one `fsync` per batch. `filestore` is the reference implementation for correctness and single-group deployments, not for a 1,000-group write-heavy cluster.
 - **Use `memstore` for recoverable groups**: groups whose data can be rebuilt from an external source of truth (e.g. a sharded RDBMS) can use `memstore` without durability concerns.
 
 **No inter-group flow control**: all groups share the same gRPC connection(s) to each peer. A group under heavy replication load (large log entries, frequent snapshot installs) can consume a disproportionate share of the shared TCP bandwidth and delay heartbeats from other groups, triggering unnecessary elections. HTTP/2 multiplexing prevents TCP head-of-line blocking, but the library does not implement application-level priority scheduling or bandwidth allocation between groups.
@@ -1147,6 +1147,12 @@ See [`easyraft/`](easyraft/) for the full API reference, option guide, and usage
 Five fully-worked examples are provided, each targeting a different deployment pattern — from a single-group service using the core `raft` package directly, to a multi-raft sharded store with automatic leader balancing.
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
+
+## Divergence from the paper
+
+Every implementation departs from the Raft paper and dissertation somewhere.
+[`docs/divergence.md`](docs/divergence.md) lists every place this one does, the
+reason for each, and the known limitations.
 
 ## Licence
 

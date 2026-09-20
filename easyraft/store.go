@@ -1628,6 +1628,14 @@ func (s *Store) registerMutation(collection, name string, fn mutationFunc) {
 	s.mutations[collection][name] = fn
 }
 
+// Apply is the raft.StateMachine seam and is called by the Raft layer for
+// every committed entry. Do not call it.
+//
+// It is exported only because the interface requires it. Calling it directly
+// applies a mutation that consensus never agreed to, on this replica alone,
+// leaving this node's state permanently different from every other node's with
+// nothing in the log to explain the difference. The same applies to Snapshot
+// and Restore. Use Put, Delete, Txn or the Collection API instead.
 func (s *Store) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
 	var cmd command
 	if err := json.Unmarshal(entry.Command, &cmd); err != nil {

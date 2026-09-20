@@ -20,12 +20,22 @@ type Index uint64
 type State uint8
 
 const (
-	Follower     State = iota
-	Candidate    State = iota
-	Leader       State = iota
-	PreCandidate State = iota // running pre-vote round before incrementing term
+	// Follower replicates the leader's log and votes. It is where every node
+	// starts and where every node returns when it sees a higher term.
+	Follower State = iota
+	// Candidate is standing in an election, having raised its own term and
+	// voted for itself.
+	Candidate
+	// Leader is the single node in a term that accepts proposals and drives
+	// replication.
+	Leader
+	// PreCandidate is testing whether it could win an election before raising
+	// its term, so that a node which cannot win does not disrupt a healthy
+	// cluster by forcing everyone to a new term.
+	PreCandidate
 )
 
+// String returns the role's name, as it appears in logs and metrics.
 func (s State) String() string {
 	switch s {
 	case Follower:
@@ -66,22 +76,39 @@ func (s *State) UnmarshalText(text []byte) error {
 
 // LogEntry is a single record in the Raft log.
 type LogEntry struct {
-	Index   Index
-	Term    Term
+	// Index is the entry's position in the log, counting from 1.
+	Index Index
+	// Term is the term of the leader that created this entry. An index and a
+	// term together identify an entry uniquely across the whole cluster,
+	// which is what every consistency check in Raft compares.
+	Term Term
+	// Command is the opaque payload handed to StateMachine.Apply once the
+	// entry commits. The Raft layer never interprets it, except to recognise
+	// the entries it creates for itself.
 	Command []byte
 }
 
 // HardState is the persistent state that must be saved to stable storage
 // before responding to any RPC.
 type HardState struct {
+	// CurrentTerm is the highest term this node has seen.
 	CurrentTerm Term
-	VotedFor    NodeID // empty string means no vote cast
+	// VotedFor is the candidate this node voted for in CurrentTerm, or empty
+	// when it has not voted in that term. Losing this across a restart is how
+	// one term ends up with two leaders, which is why it is persisted before
+	// the node acts on it.
+	VotedFor NodeID
 }
 
 // SnapshotMeta carries the metadata associated with a state-machine snapshot.
 type SnapshotMeta struct {
+	// LastIncludedIndex is the last log index whose effect the snapshot
+	// contains. Everything at or below it may be compacted away.
 	LastIncludedIndex Index
-	LastIncludedTerm  Term
+	// LastIncludedTerm is the term of the entry at LastIncludedIndex. It is
+	// what lets a node that has compacted the entry itself still answer the
+	// consistency check for that position.
+	LastIncludedTerm Term
 }
 
 // Clock is an injectable time source. The default nil value uses time.Now.

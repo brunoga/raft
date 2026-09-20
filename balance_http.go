@@ -13,7 +13,7 @@ import (
 // HTTPNodeProvider implements NodeProvider by communicating with a remote
 // Manager over HTTP, using the endpoints exposed by Manager.Handler().
 //
-// It satisfies §22 Step 2: the BalanceController can manage leaders across
+// It is what lets the BalanceController manage leaders across
 // physical machines by pointing one HTTPNodeProvider at each machine's HTTP
 // listener.
 type HTTPNodeProvider struct {

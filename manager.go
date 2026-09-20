@@ -21,13 +21,19 @@ var ErrGroupExists = errors.New("raft: group already exists")
 
 // GroupStatus is a point-in-time snapshot of a single Raft group's state on
 // this physical node. It is used by Manager.StatusAll and by the leader
-// balancing controller (§22).
+// balancing controller.
 type GroupStatus struct {
-	GroupID     uint64 `json:"group_id"`
-	NodeID      NodeID `json:"node_id"`
-	State       State  `json:"state"`
-	Term        Term   `json:"term"`
-	LastApplied Index  `json:"last_applied"`
+	// GroupID identifies the Raft group this status describes.
+	GroupID uint64 `json:"group_id"`
+	// NodeID is the Raft node the status was read from, not the physical host
+	// it runs on.
+	NodeID NodeID `json:"node_id"`
+	// State is the role that node was playing when the status was taken.
+	State State `json:"state"`
+	// Term is the term it was in.
+	Term Term `json:"term"`
+	// LastApplied is how far its state machine had got.
+	LastApplied Index `json:"last_applied"`
 	// Voter reports whether this replica votes and counts towards quorums. A
 	// non-voter cannot become leader, so leadership planning must not target
 	// one.

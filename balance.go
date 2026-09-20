@@ -8,9 +8,14 @@ import (
 // Transfer describes a single leadership handoff: move the leader of GroupID
 // from the Raft node identified by From to the one identified by To.
 type Transfer struct {
+	// GroupID identifies the Raft group whose leadership should move.
 	GroupID uint64
-	From    NodeID // current leader's Raft NodeID
-	To      NodeID // transfer-target Raft NodeID
+	// From is the Raft node currently leading that group.
+	From NodeID
+	// To is the Raft node that should lead it instead. It must be a voter:
+	// leadership cannot be transferred to a member that cannot win an
+	// election.
+	To NodeID
 }
 
 // Balancer computes leadership transfers that improve distribution across

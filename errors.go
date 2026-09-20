@@ -96,6 +96,7 @@ type NotLeaderError struct {
 	Leader NodeID
 }
 
+// Error implements the error interface, naming the leader when one is known.
 func (e *NotLeaderError) Error() string {
 	if e.Leader == "" {
 		return "raft: node is not the leader"

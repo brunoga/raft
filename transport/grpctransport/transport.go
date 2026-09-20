@@ -12,12 +12,16 @@
 //	}
 //	defer t.Close()
 //
-//	node, err := raft.NewNode(raft.Config{
-//	    ID:        "node1",
-//	    Transport: t,
-//	    // ...
-//	})
-//	t.Register("node1", node)
+//	cfg := raft.DefaultConfig()
+//	cfg.ID = "node1"
+//	cfg.Transport = t
+//	// ... Storage, StateMachine, Peers ...
+//
+//	node, err := raft.New(&cfg)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	t.Register("node1", node.Handler())
 //	node.Start()
 //
 // # Security
