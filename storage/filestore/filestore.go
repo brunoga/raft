@@ -797,6 +797,32 @@ func (fs *FileStore) SaveHardState(_ context.Context, hs raft.HardState) error {
 	return fs.writeMeta(hs)
 }
 
+// SaveState implements raft.BatchWriter. It records the hard state and appends
+// the entries under a single acquisition of the store lock, in that order, and
+// returns only once both are durable.
+//
+// A store that kept its hard state inside the log itself could make this one
+// record and one fsync. This one keeps it in a separate file, so it is still
+// two syncs; what the batch buys here is that the log is not unlocked and
+// relocked between them, and that the engine issues one call where it used to
+// issue two. The ordering is the part that matters for correctness: a log
+// recovered after a crash must never hold entries from a term the node does
+// not believe it reached.
+func (fs *FileStore) SaveState(_ context.Context, hs *raft.HardState, entries []raft.LogEntry) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if hs != nil {
+		if err := fs.writeMeta(*hs); err != nil {
+			return err
+		}
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	return fs.appendLocked(entries)
+}
+
 // LoadHardState returns the last durably saved hard state. It returns a
 // zero-value HardState only when nothing has ever been saved; a record that
 // exists but fails verification is reported as an error.
@@ -940,7 +966,11 @@ func (fs *FileStore) AppendLogEntries(_ context.Context, entries []raft.LogEntry
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	return fs.appendLocked(entries)
+}
 
+// appendLocked is AppendLogEntries with the store lock already held.
+func (fs *FileStore) appendLocked(entries []raft.LogEntry) error {
 	firstDirtySegIdx := len(fs.segs)
 	if firstDirtySegIdx > 0 {
 		firstDirtySegIdx-- // active segment may already exist
@@ -1783,3 +1813,6 @@ func encodeEntry(e raft.LogEntry) (hdr [entryHeaderSize]byte, payload []byte) {
 
 	return hdr, e.Command
 }
+
+// Compile-time check that the batch seam is implemented.
+var _ raft.BatchWriter = (*FileStore)(nil)
