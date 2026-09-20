@@ -1472,6 +1472,14 @@ Every implementation departs from the Raft paper and dissertation somewhere.
 [`docs/divergence.md`](docs/divergence.md) lists every place this one does, the
 reason for each, and the known limitations.
 
+## Compatibility
+
+[`docs/compatibility.md`](docs/compatibility.md) states what a version number
+promises: which packages are covered, that a cluster can be upgraded one node
+at a time because the on-disk and wire formats are stable within a major
+version, what is deliberately not covered, and how new capability is added
+without breaking what exists.
+
 ## Licence
 
 Apache License 2.0. See [LICENSE](LICENSE).
