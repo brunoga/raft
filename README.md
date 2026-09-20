@@ -1169,6 +1169,36 @@ Five fully-worked examples are provided, each targeting a different deployment p
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
 
+## State machines that keep their own state
+
+A state machine that is itself a database already holds, on its own disk, the
+effect of every entry it has applied. Without a way to say so it is rebuilt
+from a snapshot and replayed over on every restart, which is work already done
+and, for operations that are not idempotent, work that must not be done twice.
+
+`DurableStateMachine` is that way:
+
+```go
+func (sm *MySM) AppliedIndex(ctx context.Context) (raft.Index, error) {
+    return sm.db.ReadAppliedIndex(ctx)   // persisted with the state itself
+}
+```
+
+The node asks once while starting, skips the snapshot restore if the state
+machine is already past it, and replays only what comes after.
+
+Implementing it is a promise about durability. The index reported must be one
+whose effect, and the effect of every entry before it, is on stable storage.
+The engine will never replay at or below it again, so a gap there becomes
+permanent divergence from every other replica with nothing in the log to
+explain it. A state machine that batches its writes satisfies this by making
+them durable before `ApplyBatch` returns, which is one sync per batch rather
+than one per entry.
+
+A state machine that reports an index higher than this node's log is refused
+at construction: it cannot be replayed up to, and ignoring it would apply those
+indices twice once the log caught up.
+
 ## Applying entries in batches
 
 A `StateMachine` that also implements `BatchApplier` is handed runs of
