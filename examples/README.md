@@ -1,6 +1,6 @@
 # Examples
 
-Five fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster, and a REPL client for interactive exploration. A sixth example, `raftctl`, is an operator tool rather than a service.
+Six fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. A seventh example, `raftctl`, is an operator tool rather than a service.
 
 ---
 
@@ -134,6 +134,34 @@ go build -o shardkv ./shardkv
 
 # Node 2 and 3 follow the same pattern
 ```
+
+---
+
+## `durablekv` — a state machine that keeps its own state on disk
+
+See [`durablekv/`](durablekv/) for the pattern to reach for when the state does
+not fit in memory. Every other example here holds its state in memory and lets
+Raft rebuild it on restart; a state machine that is itself a database has
+already done that work, and three optional interfaces are how it says so.
+
+- **`DurableStateMachine`**: report the index already applied, and a restart
+  replays nothing at or below it. The promise is only keepable if the index is
+  durable *with* the data, so every record carries the index that produced it.
+- **`BatchApplier`**: a run of committed entries becomes one write and one
+  `fsync` instead of one each — 200 entries in 7 calls, in the example's own
+  test.
+- **`SnapshotCapturer`**: take a cheap point-in-time handle on the apply
+  goroutine and serialise it on another, so a snapshot does not pause apply and
+  with it the latency of every proposal.
+
+```bash
+go build -o durablekv ./durablekv
+./durablekv/cluster.sh
+```
+
+The README works through why the applied index is a promise about durability,
+what the two ways of breaking it cost, and why the entry with no command that
+arrives on every election is neither an error nor a write.
 
 ---
 

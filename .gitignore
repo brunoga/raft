@@ -2,6 +2,7 @@
 /idprovider
 # Example binaries, built in place by each cluster.sh.
 /examples/*/configsvc
+/examples/*/durablekv
 /examples/*/idprovider
 /examples/*/ledger
 /examples/*/raftctl
