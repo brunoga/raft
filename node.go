@@ -1193,6 +1193,13 @@ func (n *Node) TransferLeadership(ctx context.Context, to NodeID) error {
 // Returns ErrNotLeader if called on a non-leader, or ErrConfigChangeInProgress
 // if another membership change is already in progress.
 //
+// Adding a peer with Voter true makes it count towards every quorum from the
+// moment the change commits, while its log may still be empty. A three-node
+// cluster becomes a four-node cluster needing three votes, one of which cannot
+// be given until the new node has caught up, so it tolerates no failures at
+// all until then. Use AddVoter unless that is what you meant: it stages the
+// same node in as a learner and promotes it once it is caught up.
+//
 // Safety: AddServer uses the single-server change protocol (Raft §4.2), which
 // is only safe when exactly one server is added or removed at a time. The
 // ErrConfigChangeInProgress gate prevents concurrent changes, but callers must

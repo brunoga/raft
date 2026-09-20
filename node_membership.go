@@ -2,7 +2,9 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 )
 
 // ---- Membership changes -----------------------------------------------------
@@ -474,6 +476,75 @@ func (n *Node) ReplicationProgress(ctx context.Context) ([]PeerProgress, error) 
 // has. Returns ErrMemberNotCaughtUp when the member is further behind than
 // that, ErrNotMember when it is not part of the cluster, and ErrNotLeader when
 // called on a node that is not the leader.
+// AddVoter brings a new node into the cluster as a voter without ever letting
+// it weaken the quorum on the way in.
+//
+// This is the safe way to grow a cluster, and the reason it exists is that the
+// obvious way is not. AddServer with Voter true makes the new node count
+// towards every quorum from the moment the change commits, while its log is
+// still empty: a three-node cluster becomes a four-node cluster needing three
+// votes, one of which cannot be given until the new node has caught up. The
+// cluster has gone from tolerating one failure to tolerating none, for however
+// long the catch-up takes, which on a large state machine is the worst moment
+// to have done it.
+//
+// So the node is added as a learner first, which costs nothing -- a learner
+// replicates the log and votes on nothing -- and promoted to voter only once
+// it is within maxLag entries of the leader. A maxLag of zero means it must
+// have replicated everything.
+//
+// It blocks until the promotion commits or ctx is cancelled, which for a node
+// starting from nothing can be a long time; the context is the caller's way of
+// bounding that. A node already a voter is left alone and nil is returned.
+//
+// If leadership moves while this is waiting, it returns ErrNotLeader and the
+// caller should call it again on the new leader. The work already done is not
+// lost: the learner is a committed member and stays one.
+func (n *Node) AddVoter(ctx context.Context, id NodeID, maxLag Index) error {
+	if id == "" {
+		return errors.New("raft: AddVoter: empty node ID")
+	}
+
+	// Add it as a learner unless it is already a member. A learner that is
+	// already there is exactly where this wants it.
+	member, voter := n.memberRole(id)
+	switch {
+	case member && voter:
+		return nil
+	case !member:
+		if err := n.AddServer(ctx, PeerConfig{ID: id, Voter: false}); err != nil {
+			return err
+		}
+	}
+
+	// Wait for it to catch up, then promote. PromoteMember re-checks the lag
+	// on the leader itself, so the decision is never made from a stale view.
+	for {
+		err := n.PromoteMember(ctx, id, maxLag)
+		if !errors.Is(err, ErrMemberNotCaughtUp) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-n.stopCh:
+			return n.stoppedErr()
+		case <-time.After(n.cfg.HeartbeatInterval):
+		}
+	}
+}
+
+// memberRole reports whether id is in the membership this node currently
+// believes in, and whether it votes. Safe for concurrent use.
+func (n *Node) memberRole(id NodeID) (member, voter bool) {
+	for _, m := range n.Members() {
+		if m.ID == id {
+			return true, m.Voter
+		}
+	}
+	return false, false
+}
+
 func (n *Node) PromoteMember(ctx context.Context, id NodeID, maxLag Index) error {
 	progress, err := n.ReplicationProgress(ctx)
 	if err != nil {

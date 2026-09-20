@@ -362,6 +362,27 @@ cfg.Clock = myClock // implements raft.Clock: Now() time.Time
 
 ## Cluster membership changes
 
+### Growing a cluster safely
+
+```go
+// Add a node as a voter without ever weakening the quorum on the way in.
+err := node.AddVoter(ctx, "node-4", 1024)
+```
+
+`AddVoter` adds the node as a learner, waits until it is within the given
+number of entries of the leader, and only then promotes it to voter.
+
+The reason to prefer it is that the direct route is not safe. `AddServer` with
+`Voter: true` makes the new node count towards every quorum from the moment the
+change commits, while its log may still be empty: a three-node cluster becomes
+a four-node cluster needing three votes, one of which cannot be given until the
+new node has caught up. For the length of that catch-up the cluster tolerates
+no failures at all, which on a large state machine is minutes, and is the worst
+possible moment to have spent the cluster's redundancy.
+
+A learner costs nothing while it catches up: it replicates the log and votes on
+nothing.
+
 ### Single-server changes
 
 ```go
