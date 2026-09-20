@@ -50,6 +50,18 @@
 // strict request validation (see WithStrictRequestValidation).
 //
 // A transport created without TLS logs a warning once at Listen time.
+//
+// # The wire format is not part of this package's API
+//
+// The generated protobuf and gRPC types live in an internal package. They are
+// how this transport happens to encode a Raft RPC today, not a contract: the
+// engine's own types are what the Transport interface is defined in, and the
+// encoding is free to change -- a new field, a different framing, a second
+// service -- without that being a breaking change for anyone.
+//
+// A caller who needs to speak the protocol from outside this package should
+// generate their own bindings from proto/raft.proto, which pins the version
+// they are speaking to.
 package grpctransport
 
 import (
@@ -73,7 +85,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/brunoga/raft"
-	pb "github.com/brunoga/raft/transport/grpctransport/raftpb"
+	pb "github.com/brunoga/raft/transport/grpctransport/internal/raftpb"
 )
 
 // Sentinel errors returned by GRPCTransport. Callers can test for them with

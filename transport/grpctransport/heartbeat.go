@@ -11,7 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/brunoga/raft"
-	pb "github.com/brunoga/raft/transport/grpctransport/raftpb"
+	pb "github.com/brunoga/raft/transport/grpctransport/internal/raftpb"
 )
 
 // errBatcherStopped is returned by peerBatcherFor when the heartbeatBatcher
