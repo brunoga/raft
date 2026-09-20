@@ -569,11 +569,33 @@ func TestStore_StopBeforeStartReleasesResources(t *testing.T) {
 
 	// Both listeners must be free again.
 	for _, addr := range []string{raftAddr, httpAddr} {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
+		if err := awaitBindable(addr, 5*time.Second); err != nil {
 			t.Errorf("port %s was not released by Stop: %v", addr, err)
-			continue
 		}
-		_ = ln.Close()
+	}
+}
+
+// awaitBindable waits for addr to accept a listener, and reports the last
+// failure if it never does.
+//
+// Binding once and failing is not evidence that Stop held on to the port. An
+// ephemeral port that was just released can be taken for a moment by anything
+// else asking the kernel for one -- including this package's own freePort,
+// which binds a port before it checks whether it has handed it out already --
+// and the kernel may still be holding it briefly itself. Retrying tells the
+// two apart: a port Stop really leaked stays unbindable for the whole window,
+// and the assertion still fails.
+func awaitBindable(addr string, within time.Duration) error {
+	deadline := time.Now().Add(within)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			_ = ln.Close()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
