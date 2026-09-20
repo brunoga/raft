@@ -1335,6 +1335,10 @@ configuration changes does not name the node that joined, and a replication
 histogram does not say which follower went quiet, which is the only fact that
 decides whether the next failure costs the cluster its quorum.
 
+[`examples/watchtower`](examples/watchtower/) is a working service built on
+this: an SSE event stream, the peer-health state assembled from it, and apply
+saturation exported to Prometheus.
+
 ```go
 events, stop := node.Events()
 defer stop()
