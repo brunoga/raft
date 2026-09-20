@@ -662,6 +662,22 @@ if server and client configs must differ.
 
 Default keepalive settings are applied automatically; override them the same way.
 
+**Wire compatibility across versions.** Nodes are upgraded one at a time, so
+every version has to talk to the one before it. Protobuf covers most of that —
+a field added with a fresh number is ignored by a peer that does not know it —
+but not a field number changing meaning: renumber a field, reuse a deleted
+one's number, or retype one in place, and both sides still parse the message
+into different values. A `leader_commit` read as a `prev_log_index` does not
+fail a request; it commits the wrong entries, with nothing to see for as long
+as the upgrade window lasts.
+
+The rules are stated at the top of
+[`proto/raft.proto`](transport/grpctransport/proto/raft.proto), and
+`wire_compat_internal_test.go` pins the current field numbers, types and RPC
+method set so that breaking any of them fails a test rather than a rolling
+upgrade. The generated bindings live in an internal package: the encoding is
+how this transport happens to carry a Raft RPC, not part of its API.
+
 ---
 
 ## Observability — metrics and tracing
