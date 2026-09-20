@@ -5,6 +5,33 @@ import (
 	"io"
 )
 
+// BatchWriter is an optional interface a Storage may implement to make the
+// hard state and a run of log entries durable in a single operation.
+//
+// It exists because the two arrive together. A follower that learns of a new
+// term and receives entries in the same message records the term and appends
+// the entries back to back, and a store that keeps both in one log can write
+// them as one record and pay one fsync instead of two. The engine cannot use
+// such a store without a way to say "these belong together", and adding that
+// to Storage itself later would break every implementation that exists by
+// then, so the seam is here from the start.
+//
+// A Storage that does not implement it is called as before, one method at a
+// time, in the same order.
+type BatchWriter interface {
+	// SaveState persists hs and appends entries as one durable operation, and
+	// must fsync before returning.
+	//
+	// hs is nil when the batch carries no hard state, and entries is empty
+	// when it carries none; both are never empty at once. When both are
+	// present the hard state must be made durable no later than the entries,
+	// so that a log recovered after a crash never contains entries from a term
+	// the node does not believe it reached.
+	//
+	// The same contiguity rule as AppendLogEntries applies to entries.
+	SaveState(ctx context.Context, hs *HardState, entries []LogEntry) error
+}
+
 // Storage is the persistence seam between the Raft engine and any storage
 // backend. All mutating methods must durably persist their data (fsync) before
 // returning so that the Raft safety invariants hold across crashes.

@@ -94,6 +94,10 @@ type writeDone struct {
 // unacknowledged log entries in raftLog.
 type storageWriter struct {
 	storage Storage
+	// batch is storage again when it can write the hard state and a run of
+	// entries as one durable operation, and nil when it cannot. See
+	// BatchWriter.
+	batch BatchWriter
 
 	// maxBatchEntries caps how many entries a single coalesced append may
 	// carry. See take.
@@ -130,8 +134,10 @@ type storageWriter struct {
 const defaultWriteBatchEntries = 4096
 
 func newStorageWriter(s Storage) *storageWriter {
+	batch, _ := s.(BatchWriter)
 	return &storageWriter{
 		storage:         s,
+		batch:           batch,
 		maxBatchEntries: defaultWriteBatchEntries,
 		wake:            make(chan struct{}, 1),
 		notify:          make(chan struct{}, 1),
@@ -262,17 +268,33 @@ func (w *storageWriter) take() (batch []writeOp, stop bool) {
 
 	w.executing = true
 
-	if w.queue[0].kind != writeAppend {
+	// A hard-state write followed by appends is the shape a follower makes
+	// every time it learns of a new term and takes entries in the same
+	// message. A store that can write both as one record is given the chance
+	// to; one that cannot sees them separately, as before.
+	//
+	// Opportunistic, like the append coalescing below it: the two are queued
+	// a moment apart, so a writer that happens to look in between takes the
+	// hard state on its own and the entries follow. Nothing depends on the
+	// pairing, which is why the ordering rather than the grouping is what the
+	// interface documents.
+	first := 0
+	if w.batch != nil && w.queue[0].kind == writeHardState &&
+		len(w.queue) > 1 && w.queue[1].kind == writeAppend {
+		first = 1
+	}
+
+	if first == 0 && w.queue[0].kind != writeAppend {
 		op := w.queue[0]
 		w.queue = w.queue[1:]
 		return []writeOp{op}, false
 	}
 
 	entries := 0
-	end := 0
+	end := first
 	for end < len(w.queue) && w.queue[end].kind == writeAppend {
 		next := entries + len(w.queue[end].entries)
-		if end > 0 && next > w.maxBatchEntries {
+		if end > first && next > w.maxBatchEntries {
 			break
 		}
 		entries = next
@@ -329,17 +351,29 @@ func (w *storageWriter) run(batch []writeOp) error {
 		return failed
 	}
 
-	if batch[0].kind == writeAppend {
-		entries := batch[0].entries
-		if len(batch) > 1 {
+	// A leading hard state means the store implements BatchWriter and take
+	// put the two together; without one, a run of appends is still one call.
+	var hs *HardState
+	appends := batch
+	if batch[0].kind == writeHardState && len(batch) > 1 {
+		hs = &batch[0].hs
+		appends = batch[1:]
+	}
+
+	if appends[0].kind == writeAppend {
+		entries := appends[0].entries
+		if len(appends) > 1 {
 			total := 0
-			for i := range batch {
-				total += len(batch[i].entries)
+			for i := range appends {
+				total += len(appends[i].entries)
 			}
 			entries = make([]LogEntry, 0, total)
-			for i := range batch {
-				entries = append(entries, batch[i].entries...)
+			for i := range appends {
+				entries = append(entries, appends[i].entries...)
 			}
+		}
+		if hs != nil {
+			return w.batch.SaveState(context.Background(), hs, entries)
 		}
 		if len(entries) == 0 {
 			return nil
