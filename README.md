@@ -575,6 +575,7 @@ Features:
 - **Automatic segment rotation** at 64 MiB (configurable via `OpenWithSegmentSize`).
 - **Crash recovery**: on open, the tail of the last segment is scanned and any partial write is truncated.
 - **Context-aware**: pre-flight `ctx.Err()` checks at entry and between write/sync steps prevent starting new I/O when the node is shutting down.
+- **Exclusive directory lock**: `Open` fails with `ErrLocked` if another store already holds the directory.
 
 ```go
 // For tests: use small segments to exercise rotation.
@@ -584,6 +585,7 @@ store, err := filestore.OpenWithSegmentSize("/tmp/test-raft", 4096)
 **On-disk layout:**
 ```
 /var/lib/myapp/raft/
+  LOCK              — empty; the exclusive lock on it is what one store holds
   meta              — term + votedFor (fixed 266 bytes, overwritten in-place)
   seg-00000.log     — first log segment (binary, CRC32-protected entries)
   seg-00000.idx     — dense array of uint64 byte offsets (one per entry)
@@ -594,6 +596,26 @@ store, err := filestore.OpenWithSegmentSize("/tmp/test-raft", 4096)
   seg-NNNNN.idx.tmp   atomically then cleaned up; both are removed on next open
                        if a crash interrupted the rename sequence
 ```
+
+**One writer per directory.** Two `FileStore`s on one directory share nothing:
+each keeps its own segment list, its own hard-state sequence number, and its
+own idea of where the log ends. They overwrite each other's records, and what
+survives is a log with two writers' entries interleaved or a hard state that
+has gone backwards — which is how a node votes twice in one term. Nothing
+reports it at the time; it is found on the next restart, or never.
+
+`Open` therefore takes an exclusive lock on the directory and returns
+`ErrLocked` if another store holds it. The lock lives for the life of the
+store, is released by `Close`, and is dropped by the kernel if the process
+dies, so a crash leaves nothing to clean up. It is advisory: it stops another
+`FileStore`, not another program writing into the directory, and on NFS it may
+not stop anything at all.
+
+A node does not own its storage and does not close it, so a restart in the same
+process means closing the store yourself after `Node.Stop` and opening a fresh
+one. This is also what makes `RecoverCluster`'s precondition — the node stopped
+and no other handle open — something the store enforces rather than something
+the documentation asks for.
 
 ---
 

@@ -295,8 +295,11 @@ func (s *segment) close() error {
 
 // FileStore is the file-backed raft.Storage implementation.
 type FileStore struct {
-	mu      sync.Mutex
-	dir     string
+	mu  sync.Mutex
+	dir string
+	// lockF holds the directory's exclusive lock for as long as this store is
+	// open. See lock.go for what it prevents.
+	lockF   *os.File
 	metaF   *os.File
 	hsSeq   uint64 // sequence number of the newest hard-state record on disk
 	segs    []*segment
@@ -331,6 +334,22 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 		return nil, err
 	}
 
+	// Claim the directory before touching anything in it. Everything below
+	// this point reads the directory's state and then writes based on what it
+	// read -- recovering truncations, migrating the hard-state layout,
+	// rebuilding the segment list -- and a second store doing the same
+	// concurrently would have both act on a directory the other is changing.
+	lockF, lockErr := acquireDirLock(dir)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	// Every failure from here on releases it; success hands it to the store.
+	defer func() {
+		if lockF != nil {
+			_ = releaseDirLock(lockF)
+		}
+	}()
+
 	// Complete or roll back any interrupted TruncatePrefix Phase 2 operations
 	// before loading segments. This must happen before loadSegments so that
 	// the segment files are in a consistent state when we read firstID/lastID.
@@ -364,12 +383,19 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 
 	fs := &FileStore{
 		dir:     dir,
+		lockF:   lockF,
 		metaF:   metaF,
 		segSize: segSize,
 	}
+	// The store owns the lock now: closeAll releases it, and the deferred
+	// release above must not.
+	lockF = nil
 
 	if err = fs.loadSegments(); err != nil {
-		_ = metaF.Close()
+		// closeAll rather than closing metaF alone: the store owns the
+		// directory lock from here, and abandoning it would leave the
+		// directory unopenable until the process exits.
+		_ = fs.closeAll()
 		return nil, fmt.Errorf("filestore: load segments: %w", err)
 	}
 
@@ -1605,7 +1631,8 @@ func (fs *FileStore) Close() error {
 	return fs.closeAll()
 }
 
-// closeAll closes all open file handles. Must be called with mu held.
+// closeAll closes all open file handles and releases the directory lock. Must
+// be called with mu held.
 func (fs *FileStore) closeAll() error {
 	var errs []error
 	if fs.metaF != nil {
@@ -1618,6 +1645,14 @@ func (fs *FileStore) closeAll() error {
 		if err := s.close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// Released after the data files, so the directory never becomes claimable
+	// while this store still holds a descriptor that could write to it.
+	if fs.lockF != nil {
+		if err := releaseDirLock(fs.lockF); err != nil {
+			errs = append(errs, err)
+		}
+		fs.lockF = nil
 	}
 	return errors.Join(errs...)
 }

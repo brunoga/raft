@@ -317,8 +317,10 @@ func removePeer(peers []PeerConfig, id NodeID) []PeerConfig {
 // cluster's membership however the log ended.
 //
 // The node must be stopped and this must be the only open handle on its
-// storage. Running it against a live node races the node's own writes, and
-// neither the engine nor any Storage implementation can detect that.
+// storage. A Storage that can tell refuses to help you break that: filestore
+// takes an exclusive lock on its directory, so recovery run against a node
+// that is still up fails at the open rather than racing its writes. A Storage
+// that cannot tell offers no such protection.
 func RecoverCluster(ctx context.Context, store Storage, self NodeID, members []PeerConfig) error {
 	if err := validateRecoveryMembers(self, members); err != nil {
 		return err
