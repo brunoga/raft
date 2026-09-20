@@ -528,7 +528,7 @@ func (s *Store) initRaft() error {
 	rCfg.Peers = peerConfigs
 	rCfg.Transport = tr
 	rCfg.Storage = st
-	rCfg.StateMachine = s
+	rCfg.StateMachine = storeFSM{s: s}
 	rCfg.Logger = s.cfg.Logger
 	rCfg.TickInterval = s.raftTickInterval()
 	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
@@ -1628,15 +1628,37 @@ func (s *Store) registerMutation(collection, name string, fn mutationFunc) {
 	s.mutations[collection][name] = fn
 }
 
-// Apply is the raft.StateMachine seam and is called by the Raft layer for
-// every committed entry. Do not call it.
+// storeFSM is the raft.StateMachine a Store hands to its Raft node.
 //
-// It is exported only because the interface requires it. Calling it directly
-// applies a mutation that consensus never agreed to, on this replica alone,
-// leaving this node's state permanently different from every other node's with
-// nothing in the log to explain the difference. The same applies to Snapshot
-// and Restore. Use Put, Delete, Txn or the Collection API instead.
-func (s *Store) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
+// It exists so that Store does not implement the interface itself. Apply,
+// Snapshot and Restore have to be exported to satisfy it, and on Store they
+// would sit among the methods an application is meant to call, with nothing to
+// tell them apart -- while calling any of them directly applies a change
+// consensus never agreed to, on this replica alone, leaving this node's state
+// permanently different from every other node's and nothing in the log to
+// explain it. A method that dangerous should not be reachable by autocomplete.
+//
+// The adapter costs one struct and gives Store a surface where everything
+// exported is safe to call. Use Txn or the Collection API to change state.
+type storeFSM struct {
+	s *Store
+}
+
+func (f storeFSM) Apply(_ context.Context, entry raft.LogEntry) ([]byte, error) {
+	return f.s.applyEntry(entry)
+}
+
+func (f storeFSM) Snapshot(_ context.Context, w io.Writer) error {
+	return f.s.snapshot(w)
+}
+
+func (f storeFSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
+	return f.s.restore(r)
+}
+
+// applyEntry puts one committed entry into effect. Reached only through
+// storeFSM, which is what the Raft layer holds.
+func (s *Store) applyEntry(entry raft.LogEntry) ([]byte, error) {
 	var cmd command
 	if err := json.Unmarshal(entry.Command, &cmd); err != nil {
 		return nil, fmt.Errorf("easyraft: decode cmd: %w", err)
@@ -1838,7 +1860,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 	}
 }
 
-// Snapshot streams the whole store to w as a JSON object of collections.
+// snapshot streams the whole store to w as a JSON object of collections.
 //
 // The encoding is written incrementally, so a snapshot costs one pass over the
 // state rather than a full in-memory copy plus a full encoded buffer. Keys are
@@ -1849,7 +1871,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 // snapshot is written; that is the price of not duplicating the state. Raft
 // calls Snapshot from the same goroutine that applies entries, so writes are
 // not additionally delayed by it.
-func (s *Store) Snapshot(_ context.Context, w io.Writer) error {
+func (s *Store) snapshot(w io.Writer) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 
 	s.mu.RLock()
@@ -1922,12 +1944,12 @@ func writeJSONString(w *bufio.Writer, s string) error {
 	return err
 }
 
-// Restore replaces the state machine contents with the snapshot in r.
+// restore replaces the state machine contents with the snapshot in r.
 //
 // The snapshot is decoded one collection at a time rather than as a single
 // value, so peak memory tracks the largest collection instead of the whole
 // store plus its encoded form.
-func (s *Store) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
+func (s *Store) restore(r io.Reader) error {
 	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
 
 	collections, err := decodeCollections(dec)
