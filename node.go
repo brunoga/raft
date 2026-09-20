@@ -140,6 +140,10 @@ type Node struct {
 	// completed and been processed. Work handed to afterWrite for a write at
 	// or below it has nothing left to wait for.
 	completedWriteSeq uint64
+	// recordedCommit is the commit index most recently handed to a
+	// CommitRecorder. It exists to throttle those writes; nothing in normal
+	// operation reads what they record. See maybeRecordCommit.
+	recordedCommit Index
 
 	// --- Timing (in ticks) --------------------------------------------------
 	electionElapsed  int
@@ -706,6 +710,19 @@ func New(cfg *Config) (*Node, error) {
 	n.cfg.Peers = peers
 	n.stopCtx, n.stopCancel = stopCtx, stopCancel
 	n.handler = &nodeHandler{n: n}
+
+	// Pick up where the last run left off, so that a restart does not record a
+	// lower index than the one already on disk and throw away proof it still
+	// has. Nothing else reads this value, so a store that cannot supply it, or
+	// fails to, costs only a wider band if this node is ever recovered.
+	if cr, ok := cfg.Storage.(CommitRecorder); ok {
+		if recorded, cerr := cr.LoadCommitIndex(stopCtx); cerr == nil {
+			n.recordedCommit = recorded
+		} else {
+			logger.Warn("could not read the recorded commit index; "+
+				"disaster recovery will have less to go on", "err", cerr)
+		}
+	}
 
 	// A state machine that keeps its own durable state is asked what it
 	// already has. Anything at or below that index has been applied and made
@@ -1341,6 +1358,53 @@ func (n *Node) setCommitIndex(idx Index) {
 	}
 	n.commitIndex = idx
 	n.atomicCommitIndex.Store(uint64(idx))
+	n.maybeRecordCommit()
+}
+
+// commitRecordInterval is how far the commit index must move before the node
+// writes it down again.
+//
+// It is the width of the band a recovery has to guess about, so smaller is
+// better, bounded by what the write costs. The write is one fixed-size record
+// rewritten in place with no fsync, which is a memcpy into the page cache; the
+// queue entry carrying it to the writer costs more than the write does. Set
+// against an append per proposal batch, one of these per 256 commits is noise,
+// and writing on every commit would be measurable for a value almost no node
+// ever reads.
+const commitRecordInterval = 256
+
+// maybeRecordCommit asks storage to remember how far the log has committed, if
+// it can and if enough has changed to be worth a write.
+//
+// The value is the lower of the commit index and what is actually on this
+// node's disk. Committed is not enough on its own: with asynchronous
+// persistence a follower's commit index runs ahead of its own writes, and
+// recording an index whose entries are still in memory would claim, to a
+// recovery that happens after a crash, that entries the disk never received
+// were committed.
+//
+// The queue gives the same guarantee by a longer route -- entries are handed
+// to the writer before the commit index that covers them moves, so this
+// operation is already ordered behind the writes it vouches for -- but that
+// depends on every caller of setCommitIndex keeping to it. The clamp is local
+// and does not.
+//
+// Event-loop only.
+func (n *Node) maybeRecordCommit() {
+	if n.writer == nil || n.writer.commits == nil {
+		return
+	}
+	idx := min(n.commitIndex, n.log.stableIndex())
+	if idx < n.recordedCommit+commitRecordInterval {
+		return
+	}
+	n.recordedCommit = idx
+	n.writer.enqueue(&writeOp{
+		seq:          n.log.nextWriteSeq(),
+		kind:         writeCommitIndex,
+		index:        idx,
+		durableAfter: n.log.queuedDurable,
+	})
 }
 
 // --- Handler implementation -------------------------------------------------
@@ -1745,6 +1809,10 @@ func (n *Node) onDurableAdvanced() {
 	if n.state == Leader {
 		n.maybeAdvanceCommit()
 	}
+	// A follower's commit index is usually ahead of its disk, so the value
+	// worth recording moves when the disk catches up rather than when the
+	// commit index does.
+	n.maybeRecordCommit()
 }
 
 // reportProposal tells a ProposalMetrics implementation how a proposal ended.

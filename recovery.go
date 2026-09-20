@@ -115,12 +115,12 @@ type RecoveryInfo struct {
 	// or was still in flight when it died, and nothing left behind can say
 	// which.
 	//
-	// It is the snapshot's last included index, because a snapshot is taken at
-	// an applied index and applying follows committing. That is a floor, often
-	// a distant one: a node that snapshots every 8192 entries leaves a band
-	// that wide. A state machine holding its own durable state knows better --
-	// its AppliedIndex is also proof -- and RecoverCluster takes that as
-	// WithKnownCommitted.
+	// It comes from the snapshot's last included index, because a snapshot is
+	// taken at an applied index and applying follows committing, and from the
+	// store's own record of how far the log had committed when it implements
+	// CommitRecorder -- a much tighter bound, since it tracks the commit index
+	// rather than compaction. A state machine holding its own durable state
+	// knows better still; RecoverCluster takes that as WithKnownCommitted.
 	KnownCommittedIndex Index
 
 	// Members is the membership the node would restart with: the one recorded
@@ -206,10 +206,23 @@ func InspectStorage(ctx context.Context, store Storage) (RecoveryInfo, error) {
 		info.Members = ms.members
 	}
 	info.MembersComplete = complete
-	// Storage on its own proves exactly one thing about commitment: whatever
-	// went into a snapshot was applied, and nothing is applied before it
-	// commits.
+
+	// Two things on disk prove commitment. Whatever went into a snapshot was
+	// applied, and nothing is applied before it commits. And a store that
+	// implements CommitRecorder has been told, as the node ran, how far the
+	// log had committed and reached this node's disk -- a much tighter bound,
+	// since it moves with the commit index rather than with compaction.
 	info.KnownCommittedIndex = info.SnapshotIndex
+	if cr, ok := store.(CommitRecorder); ok {
+		recorded, rerr := cr.LoadCommitIndex(ctx)
+		if rerr != nil {
+			return RecoveryInfo{}, fmt.Errorf("raft.InspectStorage: load commit index: %w", rerr)
+		}
+		// Clamped to the log: a recorded index above it would be a claim about
+		// entries this node does not have, which is the one thing a lower
+		// bound must never be.
+		info.KnownCommittedIndex = min(max(info.KnownCommittedIndex, recorded), info.LastIndex)
+	}
 	return info, nil
 }
 

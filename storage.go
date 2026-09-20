@@ -32,6 +32,40 @@ type BatchWriter interface {
 	SaveState(ctx context.Context, hs *HardState, entries []LogEntry) error
 }
 
+// CommitRecorder is an optional interface a Storage may implement to remember
+// how far the log had committed.
+//
+// Raft treats the commit index as volatile, and this engine agrees: a
+// restarting node learns it again from its leader, so nothing in normal
+// operation needs it on disk. Disaster recovery does. A node whose cluster
+// lost its quorum for good has a log that splits at the highest index it can
+// prove was committed, and everything above that split is a coin toss --
+// either it committed on the majority that died, or it was still in flight.
+// Without this interface the only proof left on disk is the snapshot's last
+// included index, so a node that snapshots every few thousand entries leaves
+// a band that wide for an operator to guess about. See RecoverCluster.
+//
+// The value recorded is always one the node could prove at the time: an index
+// that had committed and that this node's own log held durably. It is a lower
+// bound, never an estimate, so a value that is stale or lost costs nothing
+// beyond a wider band.
+//
+// A Storage that does not implement it works exactly as before.
+type CommitRecorder interface {
+	// SaveCommitIndex records index as committed and durable on this node.
+	//
+	// It need not fsync, and it need not be immediate: losing the most recent
+	// value to a crash only widens the band recovery has to guess about,
+	// whereas an fsync here would put a synchronous disk write on a path that
+	// runs every time the commit index moves. What it must never do is report
+	// a value it did not receive, or one larger.
+	SaveCommitIndex(ctx context.Context, index Index) error
+
+	// LoadCommitIndex returns the last recorded index, or 0 if none was ever
+	// recorded or the record did not survive.
+	LoadCommitIndex(ctx context.Context) (Index, error)
+}
+
 // Storage is the persistence seam between the Raft engine and any storage
 // backend. All mutating methods must durably persist their data (fsync) before
 // returning so that the Raft safety invariants hold across crashes.
