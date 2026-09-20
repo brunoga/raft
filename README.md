@@ -48,6 +48,7 @@ package main
 import (
     "context"
     "fmt"
+    "io"
     "log"
     "time"
 
@@ -63,11 +64,12 @@ func (s *CounterSM) Apply(_ context.Context, e raft.LogEntry) ([]byte, error) {
     s.value++
     return fmt.Appendf(nil, "%d", s.value), nil
 }
-func (s *CounterSM) Snapshot(_ context.Context) ([]byte, error) {
-    return fmt.Appendf(nil, "%d", s.value), nil
+func (s *CounterSM) Snapshot(_ context.Context, w io.Writer) error {
+    _, err := fmt.Fprintf(w, "%d", s.value)
+    return err
 }
-func (s *CounterSM) Restore(_ context.Context, _ raft.SnapshotMeta, data []byte) error {
-    _, err := fmt.Sscanf(string(data), "%d", &s.value)
+func (s *CounterSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) error {
+    _, err := fmt.Fscanf(r, "%d", &s.value)
     return err
 }
 
@@ -165,18 +167,19 @@ type StateMachine interface {
     // on every node.
     Apply(ctx context.Context, entry LogEntry) (result []byte, err error)
 
-    // Snapshot serialises the current state. Called from the apply loop
-    // after crossing SnapshotThreshold; must not block the event loop.
-    Snapshot(ctx context.Context) (data []byte, err error)
+    // Snapshot writes the current state to w. Called from the apply loop
+    // after crossing SnapshotThreshold.
+    Snapshot(ctx context.Context, w io.Writer) error
 
-    // Restore replaces the entire state with a snapshot received from the
-    // leader or loaded from disk on restart.
-    Restore(ctx context.Context, meta SnapshotMeta, data []byte) error
+    // Restore replaces the entire state with the snapshot read from r,
+    // received from the leader or loaded from disk on restart.
+    Restore(ctx context.Context, meta SnapshotMeta, r io.Reader) error
 }
 ```
 
 Key constraints:
 - **Determinism**: `Apply` must produce the same output for the same `LogEntry` on every node. Do not read wall-clock time, random numbers, or external state inside `Apply`.
+- **Streaming, not buffering**: `Snapshot` and `Restore` take an `io.Writer` and an `io.Reader`, so a large state is written and read incrementally rather than held in memory twice. A state machine that can hand over a cheap point-in-time copy can implement [`SnapshotCapturer`](#log-compaction-and-chunked-snapshot-transfer) as well, which moves the serialisation off the apply loop.
 - **No cross-calls**: the library serialises all three methods — `Snapshot` and `Apply` are never called concurrently.
 - **The context is `stopCtx`**: it is cancelled when `Stop()` is called. Long-running `Snapshot` or `Restore` operations should honour it.
 - **Log entries for config changes are filtered**: `Apply` only receives application-level entries. Internal membership-change entries are handled by the library.
