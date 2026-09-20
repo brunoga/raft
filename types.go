@@ -3,6 +3,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -122,13 +123,43 @@ type Clock interface {
 // Implementations must be safe for concurrent use from multiple goroutines
 // (there is one RPC goroutine per peer per outstanding RPC).
 type Tracer interface {
-	// StartRPC is called immediately before an outbound RPC is sent.
-	// nodeID is the local node, peer is the destination, rpcType is one of
-	// "RequestVote", "AppendEntries", "InstallSnapshot", "TimeoutNow".
+	// StartRPC is called immediately before an outbound RPC is sent. nodeID is
+	// the local node, peer is the destination.
+	//
+	// The context passed in is the one the RPC will be made with, and the
+	// context returned replaces it. That is what makes this usable for
+	// tracing rather than only for timing: a span created here can be a child
+	// of the caller's, and an implementation that propagates trace context
+	// over the wire can attach it to the returned context for the transport
+	// to carry. Returning ctx unchanged is fine for an implementation that
+	// only measures.
+	//
 	// The returned finish func must be called exactly once when the RPC
 	// completes; err is nil on success, non-nil on network error or timeout.
-	StartRPC(nodeID NodeID, peer NodeID, rpcType string) (finish func(err error))
+	StartRPC(ctx context.Context, nodeID, peer NodeID, rpcType RPCType) (rpcCtx context.Context, finish func(err error))
 }
+
+// HostID identifies a physical machine that hosts Raft nodes, as distinct from
+// NodeID, which identifies one Raft node within one group.
+//
+// The two are not interchangeable and the difference is the whole point of
+// leader balancing: the thing being balanced is the number of groups each
+// machine leads, and a machine runs many nodes. Both used to be NodeID, which
+// meant the balancing API took a map whose keys and whose values' NodeID
+// fields were different kinds of name that happened to share a type.
+type HostID string
+
+// RPCType names one of the Raft RPCs, as reported to a Tracer.
+type RPCType string
+
+// The RPCs a node sends. These are the only values passed to Tracer.StartRPC.
+const (
+	RPCRequestVote     RPCType = "RequestVote"
+	RPCAppendEntries   RPCType = "AppendEntries"
+	RPCInstallSnapshot RPCType = "InstallSnapshot"
+	RPCTimeoutNow      RPCType = "TimeoutNow"
+	RPCReadIndex       RPCType = "ReadIndex"
+)
 
 // Metrics is an optional observability hook. Implementations must be safe for
 // concurrent use from the event-loop goroutine.

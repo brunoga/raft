@@ -149,10 +149,15 @@ type recordTracer struct {
 	record func(rpcType string)
 }
 
-func (r *recordTracer) StartRPC(_, _ raft.NodeID, rpcType string) func(error) {
-	r.record(rpcType)
-	return func(error) {}
+func (r *recordTracer) StartRPC(ctx context.Context, _, _ raft.NodeID, rpcType raft.RPCType) (rpcCtx context.Context, finish func(error)) {
+	r.record(string(rpcType))
+	// A tracer that returns a context the caller can distinguish is how a real
+	// one would propagate a span; returning it unchanged is also legal.
+	return context.WithValue(ctx, tracedKey{}, rpcType), func(error) {}
 }
+
+// tracedKey marks a context that passed through recordTracer.
+type tracedKey struct{}
 
 // ---- Clock helpers ----------------------------------------------------------
 

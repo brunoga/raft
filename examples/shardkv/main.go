@@ -236,15 +236,15 @@ func run() error {
 	// via HTTP using the /raft/status and /raft/transfer endpoints that
 	// Manager.Handler() exposes (mounted at /raft/ in buildMux below).
 	if *balanceInterval > 0 {
-		providers := make(map[raft.NodeID]raft.NodeProvider, 1+len(peerMap))
-		providers[raft.NodeID(*id)] = mgr // local: in-process, no HTTP hop
-		for physID, pi := range peerMap {
+		providers := make(map[raft.HostID]raft.NodeProvider, 1+len(peerMap))
+		providers[raft.HostID(*id)] = mgr // local: in-process, no HTTP hop
+		for hostID, pi := range peerMap {
 			if pi.httpAddr != "" {
 				base := pi.httpAddr
 				if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 					base = "http://" + base
 				}
-				providers[raft.NodeID(physID)] = raft.NewHTTPNodeProvider(base+"/raft", nil)
+				providers[raft.HostID(hostID)] = raft.NewHTTPNodeProvider(base+"/raft", nil)
 			}
 		}
 		if len(providers) > 1 {

@@ -276,9 +276,9 @@ func TestBalanceController_HTTPProviders_ConvergesUniform(t *testing.T) {
 	})
 
 	// Wire BalanceController with HTTPNodeProviders.
-	providers := make(map[raft.NodeID]raft.NodeProvider, numPhysical)
+	providers := make(map[raft.HostID]raft.NodeProvider, numPhysical)
 	for p := range numPhysical {
-		providers[raft.NodeID(fmt.Sprintf("phys%d", p))] = raft.NewHTTPNodeProvider(servers[p].URL, nil)
+		providers[raft.HostID(fmt.Sprintf("phys%d", p))] = raft.NewHTTPNodeProvider(servers[p].URL, nil)
 	}
 
 	ctrl := raft.NewBalanceController(providers, raft.LeastLeadersBalancer{}, 20*time.Millisecond)

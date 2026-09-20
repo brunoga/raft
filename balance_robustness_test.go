@@ -56,7 +56,7 @@ func (p *stubProvider) seen() []raft.Transfer {
 // win an election, so the transfer fails, and it is retried on every interval
 // for as long as the imbalance lasts.
 func TestBalancer_NeverTargetsANonVoter(t *testing.T) {
-	view := map[raft.NodeID][]raft.GroupStatus{
+	view := map[raft.HostID][]raft.GroupStatus{
 		"phys0": {
 			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true},
 			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader, Voter: true},
@@ -79,7 +79,7 @@ func TestBalancer_NeverTargetsANonVoter(t *testing.T) {
 // to a replica that is far behind. Such a replica has to catch up before it can
 // serve anything, so a rebalance would turn into an outage for that group.
 func TestBalancer_NeverTargetsALaggingReplica(t *testing.T) {
-	view := map[raft.NodeID][]raft.GroupStatus{
+	view := map[raft.HostID][]raft.GroupStatus{
 		"phys0": {
 			{GroupID: 1, NodeID: "g1-p0", State: raft.Leader, Voter: true, LastApplied: 100_000},
 			{GroupID: 2, NodeID: "g2-p0", State: raft.Leader, Voter: true, LastApplied: 100_000},
@@ -100,7 +100,7 @@ func TestBalancer_NeverTargetsALaggingReplica(t *testing.T) {
 	for _, s := range view["phys1"] {
 		_ = s
 	}
-	caught := map[raft.NodeID][]raft.GroupStatus{
+	caught := map[raft.HostID][]raft.GroupStatus{
 		"phys0": view["phys0"],
 		"phys1": {
 			{GroupID: 1, NodeID: "g1-p1", State: raft.Follower, Voter: true, LastApplied: 100_000},
@@ -124,7 +124,7 @@ func TestBalanceController_UnresponsiveNodeDoesNotStallRebalancing(t *testing.T)
 	}}
 
 	c := raft.NewBalanceController(
-		map[raft.NodeID]raft.NodeProvider{"phys0": slow, "phys1": fast},
+		map[raft.HostID]raft.NodeProvider{"phys0": slow, "phys1": fast},
 		raft.LeastLeadersBalancer{},
 		10*time.Millisecond,
 		raft.WithStatusTimeout(50*time.Millisecond),
@@ -185,7 +185,7 @@ func TestBalanceController_RunWaitsForInFlightTransfers(t *testing.T) {
 	}}
 
 	c := raft.NewBalanceController(
-		map[raft.NodeID]raft.NodeProvider{"phys0": busy, "phys1": idle},
+		map[raft.HostID]raft.NodeProvider{"phys0": busy, "phys1": idle},
 		raft.LeastLeadersBalancer{},
 		5*time.Millisecond,
 	)
@@ -245,7 +245,7 @@ func TestBalanceController_CooldownStopsRepeatedMoves(t *testing.T) {
 	}}
 
 	c := raft.NewBalanceController(
-		map[raft.NodeID]raft.NodeProvider{"phys0": busy, "phys1": idle},
+		map[raft.HostID]raft.NodeProvider{"phys0": busy, "phys1": idle},
 		raft.LeastLeadersBalancer{},
 		5*time.Millisecond,
 		raft.WithGroupCooldown(10*time.Second),

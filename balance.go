@@ -19,11 +19,11 @@ type Transfer struct {
 }
 
 // Balancer computes leadership transfers that improve distribution across
-// physical nodes. view maps each physical-node identifier to the GroupStatus
-// slice reported by that node. Implementations must be stateless; the
-// BalanceController calls Plan on every rebalance interval.
+// physical hosts. view maps each host to the GroupStatus slice that host
+// reported. Implementations must be stateless; the BalanceController calls
+// Plan on every rebalance interval.
 type Balancer interface {
-	Plan(view map[NodeID][]GroupStatus) []Transfer
+	Plan(view map[HostID][]GroupStatus) []Transfer
 }
 
 // LeastLeadersBalancer is a greedy balancer that minimises the maximum number
@@ -59,16 +59,16 @@ func eligibleTarget(leader, candidate GroupStatus, maxLag Index) bool {
 }
 
 // Plan implements Balancer.
-func (b LeastLeadersBalancer) Plan(view map[NodeID][]GroupStatus) []Transfer {
+func (b LeastLeadersBalancer) Plan(view map[HostID][]GroupStatus) []Transfer {
 	if len(view) < 2 {
 		return nil
 	}
 
-	// Build an index: Raft NodeID → physical node ID.
-	nodeToPhys := make(map[NodeID]NodeID)
-	for physID, statuses := range view {
+	// Build an index: Raft node → the host running it.
+	nodeToHost := make(map[NodeID]HostID)
+	for hostID, statuses := range view {
 		for _, s := range statuses {
-			nodeToPhys[s.NodeID] = physID
+			nodeToHost[s.NodeID] = hostID
 		}
 	}
 
@@ -81,31 +81,31 @@ func (b LeastLeadersBalancer) Plan(view map[NodeID][]GroupStatus) []Transfer {
 	}
 
 	// Build a mutable per-physical-node leader list.
-	type physNode struct {
-		id      NodeID
-		leaders []GroupStatus // statuses where State == Leader on this physical node
+	type physHost struct {
+		id      HostID
+		leaders []GroupStatus // statuses where State == Leader on this host
 	}
-	nodes := make([]*physNode, 0, len(view))
-	for physID, statuses := range view {
-		pn := &physNode{id: physID}
+	hosts := make([]*physHost, 0, len(view))
+	for hostID, statuses := range view {
+		ph := &physHost{id: hostID}
 		for _, s := range statuses {
 			if s.State == Leader {
-				pn.leaders = append(pn.leaders, s)
+				ph.leaders = append(ph.leaders, s)
 			}
 		}
-		nodes = append(nodes, pn)
+		hosts = append(hosts, ph)
 	}
 
 	var transfers []Transfer
 
 	for {
 		// Sort: busiest first, least-busy last.
-		sort.Slice(nodes, func(i, j int) bool {
-			return len(nodes[i].leaders) > len(nodes[j].leaders)
+		sort.Slice(hosts, func(i, j int) bool {
+			return len(hosts[i].leaders) > len(hosts[j].leaders)
 		})
 
-		busiest := nodes[0]
-		leastBusy := nodes[len(nodes)-1]
+		busiest := hosts[0]
+		leastBusy := hosts[len(hosts)-1]
 
 		if len(busiest.leaders)-len(leastBusy.leaders) <= 1 {
 			break // balanced within ±1
@@ -116,7 +116,7 @@ func (b LeastLeadersBalancer) Plan(view map[NodeID][]GroupStatus) []Transfer {
 		moved := false
 		for i, leader := range busiest.leaders {
 			for _, candidate := range byGroup[leader.GroupID] {
-				if nodeToPhys[candidate.NodeID] != leastBusy.id {
+				if nodeToHost[candidate.NodeID] != leastBusy.id {
 					continue // not on leastBusy
 				}
 				if !eligibleTarget(leader, candidate, b.MaxLag) {
