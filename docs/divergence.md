@@ -120,11 +120,23 @@ with no commit index at all.
 If you inspect a node's durable log directly, this is the discrepancy you will
 see, and it is expected.
 
-### Commit index is not persisted
+### Commit index is not persisted, but it is recorded
 
-The paper treats `commitIndex` as volatile and this implementation agrees, but
-it is worth stating because some implementations persist it to shorten restart.
-Here a restarted node learns its commit index from the leader.
+The paper treats `commitIndex` as volatile and this implementation agrees for
+every purpose the protocol has: a restarted node learns its commit index from
+its leader, and nothing in normal operation reads what was written down.
+
+A `Storage` that implements `CommitRecorder` is nevertheless told, roughly
+every 256 commits, how far the log had committed *and* reached this node's
+disk. That record exists for the node with no leader left to learn from — the
+survivor of a permanent quorum loss, whose log splits into a provably committed
+prefix and a band that is a coin toss. Without it the only proof on disk is the
+snapshot boundary, which can be thousands of entries back.
+
+It is a lower bound, never an estimate. It is written without an fsync, since
+losing the newest value only widens the band, and checksummed, since a torn
+record could otherwise read back larger than anything that committed. A
+recorded index never moves backwards, and is clamped to the log on the way out.
 
 ### Terms are indexed in memory, not read from the log
 

@@ -34,6 +34,7 @@ const (
 	writeTruncateSuffix
 	writeTruncatePrefix
 	writeHardState
+	writeCommitIndex
 )
 
 func (k writeKind) String() string {
@@ -46,6 +47,8 @@ func (k writeKind) String() string {
 		return "truncate_prefix"
 	case writeHardState:
 		return "hardstate"
+	case writeCommitIndex:
+		return "commit_index"
 	default:
 		return "unknown"
 	}
@@ -62,7 +65,7 @@ type writeOp struct {
 	kind writeKind
 
 	entries []LogEntry // writeAppend
-	index   Index      // writeTruncateSuffix, writeTruncatePrefix
+	index   Index      // writeTruncateSuffix, writeTruncatePrefix, writeCommitIndex
 	hs      HardState  // writeHardState
 
 	// durableAfter is the highest log index that is on stable storage once
@@ -98,6 +101,9 @@ type storageWriter struct {
 	// entries as one durable operation, and nil when it cannot. See
 	// BatchWriter.
 	batch BatchWriter
+	// commits is storage again when it can remember how far the log had
+	// committed, and nil when it cannot. See CommitRecorder.
+	commits CommitRecorder
 
 	// maxBatchEntries caps how many entries a single coalesced append may
 	// carry. See take.
@@ -135,9 +141,11 @@ const defaultWriteBatchEntries = 4096
 
 func newStorageWriter(s Storage) *storageWriter {
 	batch, _ := s.(BatchWriter)
+	commits, _ := s.(CommitRecorder)
 	return &storageWriter{
 		storage:         s,
 		batch:           batch,
+		commits:         commits,
 		maxBatchEntries: defaultWriteBatchEntries,
 		wake:            make(chan struct{}, 1),
 		notify:          make(chan struct{}, 1),
@@ -389,6 +397,15 @@ func (w *storageWriter) run(batch []writeOp) error {
 		return w.storage.TruncatePrefix(context.Background(), op.index)
 	case writeHardState:
 		return w.storage.SaveHardState(context.Background(), op.hs)
+	case writeCommitIndex:
+		if w.commits == nil {
+			// Queued only when the store implements the interface, so this is
+			// unreachable; returning nil rather than an error keeps a future
+			// mistake from stopping the node over a value nothing reads in
+			// normal operation.
+			return nil
+		}
+		return w.commits.SaveCommitIndex(context.Background(), op.index)
 	default:
 		return fmt.Errorf("raft: unknown storage write kind %d", op.kind)
 	}

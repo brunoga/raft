@@ -576,6 +576,7 @@ Features:
 - **Crash recovery**: on open, the tail of the last segment is scanned and any partial write is truncated.
 - **Context-aware**: pre-flight `ctx.Err()` checks at entry and between write/sync steps prevent starting new I/O when the node is shutting down.
 - **Exclusive directory lock**: `Open` fails with `ErrLocked` if another store already holds the directory.
+- **Recorded commit index** (`raft.CommitRecorder`): a checksummed, unsynced record of how far the log had committed, so a disaster recovery has more to go on than the snapshot boundary.
 
 ```go
 // For tests: use small segments to exercise rotation.
@@ -586,6 +587,7 @@ store, err := filestore.OpenWithSegmentSize("/tmp/test-raft", 4096)
 ```
 /var/lib/myapp/raft/
   LOCK              — empty; the exclusive lock on it is what one store holds
+  commit            — recorded commit index (12 bytes, CRC32, rewritten in place)
   meta              — term + votedFor (fixed 266 bytes, overwritten in-place)
   seg-00000.log     — first log segment (binary, CRC32-protected entries)
   seg-00000.idx     — dense array of uint64 byte offsets (one per entry)
@@ -1392,7 +1394,9 @@ guarantee. The answer is not recovery but not needing it: more voters,
 cluster.
 
 **The second is bounded, and the API bounds it.** The log splits at the highest
-index the node can prove was committed — `RecoveryInfo.KnownCommittedIndex`.
+index the node can prove was committed — `RecoveryInfo.KnownCommittedIndex`,
+which comes from the snapshot and, for a store implementing `CommitRecorder`
+(`filestore` does), from the commit index the node wrote down as it ran.
 Below it, everything is certain. Above it, each entry either committed on the
 majority that died or was still in flight, and nothing that survives can say
 which. `RecoveryInfo.UncommittedBand()` names that range, and recovery has only

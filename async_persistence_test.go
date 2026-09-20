@@ -41,6 +41,10 @@ import (
 // keep working regardless.
 type gateStore struct {
 	raft.Storage
+	// commits is the inner store's raft.CommitRecorder. Embedding a Storage
+	// hides the optional interfaces the concrete store implements, and a
+	// harness that quietly dropped one would test a node running without it.
+	commits raft.CommitRecorder
 
 	mu      sync.Mutex
 	gate    chan struct{} // non-nil while log writes are held
@@ -50,7 +54,16 @@ type gateStore struct {
 }
 
 func newGateStore() *gateStore {
-	return &gateStore{Storage: memstore.New(), entered: make(chan struct{}, 64)}
+	inner := memstore.New()
+	return &gateStore{Storage: inner, commits: inner, entered: make(chan struct{}, 64)}
+}
+
+func (s *gateStore) SaveCommitIndex(ctx context.Context, index raft.Index) error {
+	return s.commits.SaveCommitIndex(ctx, index)
+}
+
+func (s *gateStore) LoadCommitIndex(ctx context.Context) (raft.Index, error) {
+	return s.commits.LoadCommitIndex(ctx)
 }
 
 // hold makes every subsequent log write block until the returned function is

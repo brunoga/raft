@@ -299,11 +299,16 @@ type FileStore struct {
 	dir string
 	// lockF holds the directory's exclusive lock for as long as this store is
 	// open. See lock.go for what it prevents.
-	lockF   *os.File
-	metaF   *os.File
-	hsSeq   uint64 // sequence number of the newest hard-state record on disk
-	segs    []*segment
-	segSize int64
+	lockF *os.File
+	metaF *os.File
+	// commitF holds the recorded commit index, and commitIdx is the value in
+	// it, so that a lower one is never written over a higher one. See
+	// commit.go.
+	commitF   *os.File
+	commitIdx raft.Index
+	hsSeq     uint64 // sequence number of the newest hard-state record on disk
+	segs      []*segment
+	segSize   int64
 
 	// snapMu serialises snapshot writers. It is deliberately separate from mu:
 	// snapshot data is streamed from a reader the caller controls (on a
@@ -381,10 +386,17 @@ func openWith(dir string, segSize int64) (*FileStore, error) {
 		}
 	}
 
+	commitF, commitErr := openCommitFile(dir)
+	if commitErr != nil {
+		_ = metaF.Close()
+		return nil, commitErr
+	}
+
 	fs := &FileStore{
 		dir:     dir,
 		lockF:   lockF,
 		metaF:   metaF,
+		commitF: commitF,
 		segSize: segSize,
 	}
 	// The store owns the lock now: closeAll releases it, and the deferred
@@ -1640,6 +1652,12 @@ func (fs *FileStore) closeAll() error {
 			errs = append(errs, err)
 		}
 		fs.metaF = nil
+	}
+	if fs.commitF != nil {
+		if err := fs.commitF.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		fs.commitF = nil
 	}
 	for _, s := range fs.segs {
 		if err := s.close(); err != nil {

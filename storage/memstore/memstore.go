@@ -42,6 +42,12 @@ type MemStore struct {
 	hasSnap  bool
 	snapMeta raft.SnapshotMeta
 	snapData []byte
+
+	// commitIndex is the last value SaveCommitIndex was given. It is kept so
+	// that a MemStore behaves like a store that implements raft.CommitRecorder
+	// -- tests of recovery need one -- even though nothing survives this
+	// process anyway.
+	commitIndex raft.Index
 }
 
 // New creates an empty MemStore.
@@ -62,6 +68,27 @@ func (m *MemStore) LoadHardState(_ context.Context) (raft.HardState, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.hs, nil
+}
+
+// --- Commit index -------------------------------------------------------------
+
+// SaveCommitIndex implements raft.CommitRecorder. The value only ever moves
+// forward: a caller that asks to record less than is already there has nothing
+// to add, and a recorded index is a claim that must stay true.
+func (m *MemStore) SaveCommitIndex(_ context.Context, index raft.Index) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if index > m.commitIndex {
+		m.commitIndex = index
+	}
+	return nil
+}
+
+// LoadCommitIndex implements raft.CommitRecorder.
+func (m *MemStore) LoadCommitIndex(_ context.Context) (raft.Index, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.commitIndex, nil
 }
 
 // --- Log --------------------------------------------------------------------
