@@ -11,8 +11,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Config holds the configuration for an EasyRaft node.
-type Config struct {
+// config holds everything the With* options set.
+//
+// It is deliberately unexported. Every constructor in this package -- New,
+// NewStore, NewManager, Manager.AddStore -- takes options and nothing else, so
+// an exported struct here would be a promise about a field set that has
+// nowhere to be passed in, and one that could not be added to without breaking
+// anyone who built it as a literal.
+type config struct {
 	ID        raft.NodeID
 	RaftAddr  string
 	HTTPAddr  string
@@ -99,17 +105,19 @@ type Config struct {
 	ElectionTimeoutMax time.Duration
 }
 
-// Option configures an EasyRaft node.
-type Option func(*Config)
+// Option configures an EasyRaft node, and is the only way to: the struct it
+// writes to is not exported, so what can be set is exactly the set of With*
+// functions below, and adding to that set is never a breaking change.
+type Option func(*config)
 
 // WithID sets the Raft node ID.
 func WithID(id raft.NodeID) Option {
-	return func(c *Config) { c.ID = id }
+	return func(c *config) { c.ID = id }
 }
 
 // WithRaftAddr sets the listen address for Raft RPCs (e.g., ":7001").
 func WithRaftAddr(addr string) Option {
-	return func(c *Config) { c.RaftAddr = addr }
+	return func(c *config) { c.RaftAddr = addr }
 }
 
 // WithHTTPAddr sets the optional listen address for the HTTP API (e.g., ":8001").
@@ -120,7 +128,7 @@ func WithRaftAddr(addr string) Option {
 // The address is also advertised to the rest of the cluster as this node's URL
 // for leader redirects.
 func WithHTTPAddr(addr string) Option {
-	return func(c *Config) { c.HTTPAddr = addr }
+	return func(c *config) { c.HTTPAddr = addr }
 }
 
 // WithHTTPMux registers the store's management routes on mux instead of
@@ -134,7 +142,7 @@ func WithHTTPAddr(addr string) Option {
 // The authorization hook from [WithHTTPAuth] still applies to the routes
 // easyraft registers; it does not affect the caller's own routes.
 func WithHTTPMux(mux *http.ServeMux) Option {
-	return func(c *Config) { c.HTTPMux = mux }
+	return func(c *config) { c.HTTPMux = mux }
 }
 
 // WithHTTPAuth installs an authorization hook that runs before every easyraft
@@ -152,7 +160,7 @@ func WithHTTPMux(mux *http.ServeMux) Option {
 // Without this option the HTTP API is open to anyone who can reach the
 // listener; see the security section of the package README.
 func WithHTTPAuth(fn func(*http.Request) error) Option {
-	return func(c *Config) { c.HTTPAuth = fn }
+	return func(c *config) { c.HTTPAuth = fn }
 }
 
 // WithBearerTokenAuth is the batteries-included form of [WithHTTPAuth]: it
@@ -164,7 +172,7 @@ func WithHTTPAuth(fn func(*http.Request) error) Option {
 // Use the same token on every node. An empty token is ignored, leaving the API
 // unauthenticated.
 func WithBearerTokenAuth(token string) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		if token == "" {
 			return
 		}
@@ -190,14 +198,14 @@ func WithBearerTokenAuth(token string) Option {
 //
 // Ignored when [WithHTTPMux] is used, since the caller owns that listener.
 func WithHTTPTLS(tlsCfg *tls.Config) Option {
-	return func(c *Config) { c.HTTPTLS = tlsCfg }
+	return func(c *config) { c.HTTPTLS = tlsCfg }
 }
 
 // WithInsecureHTTPAcknowledged suppresses the startup warning about serving the
 // HTTP API without an authorization hook. Use it only when the exposure is
 // mitigated elsewhere — a loopback-only bind, a service mesh, a network policy.
 func WithInsecureHTTPAcknowledged() Option {
-	return func(c *Config) { c.AcknowledgeInsecureHTTP = true }
+	return func(c *config) { c.AcknowledgeInsecureHTTP = true }
 }
 
 // WithLeaseReads lets linearizable reads be served from the leader's
@@ -211,12 +219,12 @@ func WithInsecureHTTPAcknowledged() Option {
 // Either way a caller never sees [raft.ErrLeaseExpired]: an expired lease
 // falls back to the quorum-confirmed path automatically.
 func WithLeaseReads() Option {
-	return func(c *Config) { c.LeaseReads = true }
+	return func(c *config) { c.LeaseReads = true }
 }
 
 // WithDataDir sets the directory for persistent log and snapshots.
 func WithDataDir(dir string) Option {
-	return func(c *Config) { c.DataDir = dir }
+	return func(c *config) { c.DataDir = dir }
 }
 
 // WithPeers adds a static list of initial peers. The map keys are node IDs
@@ -225,7 +233,7 @@ func WithDataDir(dir string) Option {
 // Peers are pre-populated as known Raft members, so discovery will not issue
 // redundant AddServer calls for them.
 func WithPeers(peers map[raft.NodeID]string) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		if c.Peers == nil {
 			c.Peers = make(map[raft.NodeID]string)
 		}
@@ -238,12 +246,12 @@ func WithPeers(peers map[raft.NodeID]string) Option {
 // WithLogger sets a custom logger. When unset, easyraft logs through
 // slog.Default() rather than staying silent.
 func WithLogger(logger *slog.Logger) Option {
-	return func(c *Config) { c.Logger = logger }
+	return func(c *config) { c.Logger = logger }
 }
 
 // WithSnapCount sets the number of log entries between snapshots.
 func WithSnapCount(count uint64) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		c.SnapCount = count
 	}
 }
@@ -265,7 +273,7 @@ func WithSnapCount(count uint64) Option {
 // Static peers from [WithPeers] are treated as already-known members and will
 // not trigger AddServer calls.
 func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		c.Discovery = d
 		c.DiscoveryInterval = interval
 	}
@@ -278,7 +286,7 @@ func WithDiscovery(d discovery.Discovery, interval time.Duration) Option {
 // quorum size, so enable it only when that source is authenticated — for
 // example udpbroadcast with a shared secret on a trusted subnet.
 func WithDiscoveryAsVoter() Option {
-	return func(c *Config) { c.DiscoveryAsVoter = true }
+	return func(c *config) { c.DiscoveryAsVoter = true }
 }
 
 // WithJoinAddr sets the HTTP address(es) of existing cluster nodes to contact
@@ -290,7 +298,7 @@ func WithDiscoveryAsVoter() Option {
 // multiple times; addresses are appended. If the seeds require authorization,
 // configure the matching credential with [WithBearerTokenAuth].
 func WithJoinAddr(addrs ...string) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		c.JoinAddrs = append(c.JoinAddrs, addrs...)
 	}
 }
@@ -300,7 +308,7 @@ func WithJoinAddr(addrs ...string) Option {
 // log but do not vote in elections or count toward commit quorum. Useful for
 // read-replica nodes or nodes that should be promoted to voter later.
 func WithJoinAsLearner() Option {
-	return func(c *Config) { c.JoinAsLearner = true }
+	return func(c *config) { c.JoinAsLearner = true }
 }
 
 // WithLeaveOnStop causes [Store.Stop] to remove this node from the cluster
@@ -313,13 +321,13 @@ func WithJoinAsLearner() Option {
 // path is available the reason is logged and shutdown continues. The whole
 // attempt is abandoned after 5 seconds.
 func WithLeaveOnStop() Option {
-	return func(c *Config) { c.LeaveOnStop = true }
+	return func(c *config) { c.LeaveOnStop = true }
 }
 
 // WithTLS sets the TLS configuration for Raft RPCs. It does not affect the
 // HTTP API; use [WithHTTPTLS] for that.
 func WithTLS(tlsCfg *tls.Config) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		c.TLS = tlsCfg
 	}
 }
@@ -328,7 +336,7 @@ func WithTLS(tlsCfg *tls.Config) Option {
 // Zero values are ignored and the easyraft defaults are used instead
 // (100 ms tick/heartbeat, 1 s / 2 s election timeout).
 func WithRaftTiming(tick, heartbeat, electionMin, electionMax time.Duration) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		c.TickInterval = tick
 		c.HeartbeatInterval = heartbeat
 		c.ElectionTimeoutMin = electionMin
@@ -340,7 +348,7 @@ func WithRaftTiming(tick, heartbeat, electionMin, electionMax time.Duration) Opt
 // registerer to every store in a [Manager]: collectors are registered once and
 // each group's series are distinguished by a "group" label.
 func WithPrometheus(reg prometheus.Registerer) Option {
-	return func(c *Config) {
+	return func(c *config) {
 		c.PromRegisterer = reg
 	}
 }

@@ -265,7 +265,7 @@ type Store struct {
 	stopOnce sync.Once
 	stopErr  error
 
-	cfg          Config
+	cfg          config
 	cancel       context.CancelFunc
 	stopCtx      context.Context
 	httpListener net.Listener
@@ -282,7 +282,7 @@ type Store struct {
 // that is malformed or already in use is reported as an error rather than
 // failing later inside a background goroutine.
 func NewStore(opts ...Option) (*Store, error) {
-	var c Config
+	var c config
 	for _, o := range opts {
 		o(&c)
 	}
@@ -522,7 +522,7 @@ func (s *Store) initRaft() error {
 		}
 	}
 
-	// 3. Raft Config
+	// 3. Raft config
 	rCfg := raft.DefaultConfig()
 	rCfg.ID = s.cfg.ID
 	rCfg.Peers = peerConfigs
