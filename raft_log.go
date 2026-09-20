@@ -342,7 +342,7 @@ func (rl *raftLog) append(entries []LogEntry) uint64 {
 	rl.lastTerm = last.Term
 	rl.queuedDurable = last.Index
 
-	_ = rl.w.enqueue(&writeOp{
+	rl.w.enqueue(&writeOp{
 		seq:          seq,
 		kind:         writeAppend,
 		entries:      buf,
@@ -426,7 +426,7 @@ func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
 	if fromIndex > 0 && fromIndex-1 < rl.queuedDurable {
 		rl.queuedDurable = fromIndex - 1
 	}
-	_ = rl.w.enqueue(&writeOp{
+	rl.w.enqueue(&writeOp{
 		seq:          rl.nextWriteSeq(),
 		kind:         writeTruncateSuffix,
 		index:        fromIndex,
@@ -465,7 +465,7 @@ func (rl *raftLog) truncatePrefix(toIndex Index) {
 	if toIndex > rl.last && toIndex > 0 && toIndex-1 < rl.queuedDurable {
 		rl.queuedDurable = toIndex - 1
 	}
-	_ = rl.w.enqueue(&writeOp{
+	rl.w.enqueue(&writeOp{
 		seq:          rl.nextWriteSeq(),
 		kind:         writeTruncatePrefix,
 		index:        toIndex,

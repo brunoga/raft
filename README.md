@@ -144,7 +144,7 @@ Each `*Node` runs the following persistent goroutines:
 | Apply loop | 1 | Delivers committed entries to `StateMachine.Apply`, manages snapshots |
 | Ticker | 0 or 1 | Fires `Tick()` at `TickInterval`; absent when `TickInterval == 0` |
 | Heartbeat pump | P (one per peer) | Keeps heartbeat RPCs off the event loop; size-1 channel drops redundant sends |
-| Storage writer | 1 | Carries out every mutating `Storage` call, in order, off the event loop; started on the node's first write |
+| Storage writer | 1 | Carries out every mutating `Storage` call — log, truncations, term and vote — in order, off the event loop; started on the node's first write |
 
 **Budget at scale**: with G groups and P peers per group, each physical node runs approximately `G × (3 + P)` persistent goroutines. At G = 1,000 and P = 3, that is ~6,000 goroutines — well within Go's scheduler capacity. `Manager.RunTicker` adds one additional goroutine and a pool of `min(GOMAXPROCS, G)` workers to fan-out `Tick()` across all groups in parallel.
 
@@ -960,7 +960,11 @@ and its README for a fuller discussion of the trade-offs.
 
 **fsync amplification (filestore)**: `filestore` issues an `fsync` after every mutating operation on each group's storage. Under write load, G simultaneously-active groups can issue G fsyncs within a single tick window. On a fast NVMe device (≈200 µs per fsync), 500 concurrent fsyncs consume roughly 100 ms of disk time.
 
-What that costs has changed. Log writes are carried out by each group's own storage-writer goroutine rather than on its event loop, so a group waiting on its own storage still counts election ticks, still answers heartbeats and vote requests, and still replicates the entries it has accepted. A disk backlog now delays *commits* — entries are not counted towards a quorum until they are written — instead of making a healthy group look dead to its peers and triggering elections it would then lose. A leader whose storage falls far enough behind refuses proposals with `ErrWriteBacklogFull` rather than growing its backlog without limit; see `MaxUnstableLogBytes`.
+What that costs has changed. Every mutating storage call — log entries, truncations, and the term and vote — is carried out by each group's own storage-writer goroutine rather than on its event loop, so a group waiting on its own storage still counts election ticks, still reads its inbound queue, still answers pre-votes, and still replicates the entries it has accepted.
+
+A disk backlog now delays *commits* and *replies*, rather than stopping a group from running. Entries are not counted towards a quorum until they are written, and a reply that carries this node's term waits for the term to be written — because an acknowledgement or a granted vote that did not survive a crash is how one term ends up with two leaders. What no longer happens is a healthy group looking dead to its peers and losing an election it would then have to fight.
+
+A leader whose storage falls far enough behind refuses proposals with `ErrWriteBacklogFull` rather than growing its backlog without limit; see `MaxUnstableLogBytes`.
 
 Disk throughput is still the binding constraint on write rate, and these remain the ways to spend less of it:
 

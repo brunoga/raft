@@ -10,11 +10,12 @@ import "time"
 // already been called by the caller (e.g. handleRequestVote).
 func (n *Node) becomeFollower(term Term, leaderID NodeID) {
 	if term > n.currentTerm {
-		if err := n.saveTerm(term, ""); err != nil {
-			// saveTerm has already stopped the node: it cannot step down to a
-			// term it may not remember after a restart. Do not transition.
-			return
-		}
+		// The step-down takes effect now; the write that records the new term
+		// is queued. Nothing this node sends will carry the new term until
+		// that write has completed -- every handler that answers an RPC gates
+		// on sendGate -- so a crash in between takes the node back to a term
+		// it never acted on outwardly.
+		n.saveTerm(term, "")
 	}
 	n.applyFollowerTransition(leaderID)
 }
@@ -107,12 +108,7 @@ func (n *Node) becomePreCandidate() {
 func (n *Node) becomeCandidate() {
 	prev := n.state
 	newTerm := n.currentTerm + 1
-	if err := n.saveTerm(newTerm, n.cfg.ID); err != nil {
-		// saveTerm has already stopped the node: standing for election in a
-		// term whose vote may not survive a restart is how one term ends up
-		// with two leaders.
-		return
-	}
+	seq := n.saveTerm(newTerm, n.cfg.ID)
 	n.setState(Candidate)
 	n.setLeaderID("")
 	n.nextIndex = nil
@@ -124,13 +120,33 @@ func (n *Node) becomeCandidate() {
 		n.cfg.Metrics.StateChange(n.cfg.ID, prev, Candidate, n.currentTerm)
 	}
 
-	// A single-node cluster wins immediately.
-	if n.isSingleVoter() {
-		n.becomeLeader()
-		return
-	}
-
-	n.broadcastRequestVote(false)
+	// Nothing may leave this node in the new term until the term and the
+	// self-vote are on disk, and the two ways out of a candidacy are the same
+	// in that respect.
+	//
+	// Soliciting votes is a vote for oneself, and asking for votes in a term
+	// whose self-vote may not survive a restart is precisely how one term ends
+	// up with two leaders: this node campaigns for the term, crashes, comes
+	// back having forgotten, and votes for somebody else in it.
+	//
+	// Winning outright, which a single voter does, is the same hazard wearing
+	// a different hat. Such a node would start replicating in a term it might
+	// forget; coming back it would win that same term again and replicate
+	// different entries at the same indices with the same term, which is a
+	// Log Matching violation no later replication repairs.
+	//
+	// The election timer keeps running throughout, so a write slow enough to
+	// matter simply means this node stands again later.
+	n.afterWrite(seq, func() {
+		if n.state != Candidate || n.currentTerm != newTerm {
+			return // overtaken by a later term or a step-down
+		}
+		if n.isSingleVoter() {
+			n.becomeLeader()
+			return
+		}
+		n.broadcastRequestVote(false)
+	}, nil)
 }
 
 // becomeLeader transitions this node to Leader, initialises per-peer tracking

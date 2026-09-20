@@ -14,12 +14,12 @@ import (
 // one goroutine and never overlap each other, but Snapshot operations may be
 // called from a separate goroutine and may overlap them.
 //
-// That one goroutine is no longer the goroutine that runs Raft itself. Log
-// writes are queued and carried out behind it, so that a slow disk delays only
-// what depends on the disk rather than stopping the node from counting
-// election ticks and answering its peers. Nothing about the order the calls
-// arrive in changes: they are made one at a time, in the order the engine
-// issued them.
+// That one goroutine is not the goroutine that runs Raft itself. Log and hard
+// state writes are queued and carried out behind it, so that a slow disk
+// delays only what depends on the disk rather than stopping the node from
+// counting election ticks and answering its peers. Nothing about the order the
+// calls arrive in changes: they are made one at a time, in the order the
+// engine issued them.
 //
 // Log indices are 1-based. Index 0 is reserved as a sentinel meaning "no
 // entry".

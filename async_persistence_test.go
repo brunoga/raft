@@ -43,7 +43,8 @@ type gateStore struct {
 	raft.Storage
 
 	mu      sync.Mutex
-	gate    chan struct{} // non-nil while writes are held
+	gate    chan struct{} // non-nil while log writes are held
+	hsGate  chan struct{} // non-nil while hard-state writes are held
 	ops     []string      // ordered log of the mutating calls that got through
 	entered chan struct{} // signalled each time a held call starts waiting
 }
@@ -82,7 +83,49 @@ func (s *gateStore) hold(t *testing.T) (release func()) {
 	return release
 }
 
-// wait blocks the calling storage operation for as long as writes are held.
+// holdHardState does for SaveHardState what hold does for the log.
+func (s *gateStore) holdHardState(t *testing.T) (release func()) {
+	t.Helper()
+
+	gate := make(chan struct{})
+	s.mu.Lock()
+	s.hsGate = gate
+	s.mu.Unlock()
+
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if s.hsGate == gate {
+				s.hsGate = nil
+			}
+			s.mu.Unlock()
+			close(gate)
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+func (s *gateStore) SaveHardState(ctx context.Context, hs raft.HardState) error {
+	s.mu.Lock()
+	gate := s.hsGate
+	s.mu.Unlock()
+	if gate != nil {
+		select {
+		case s.entered <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
+	if err := s.Storage.SaveHardState(ctx, hs); err != nil {
+		return err
+	}
+	s.record(fmt.Sprintf("hardstate(term=%d,vote=%s)", hs.CurrentTerm, hs.VotedFor))
+	return nil
+}
+
+// wait blocks the calling storage operation for as long as log writes are held.
 func (s *gateStore) wait() {
 	s.mu.Lock()
 	gate := s.gate
@@ -119,6 +162,18 @@ func (s *gateStore) operations() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.ops...)
+}
+
+// logOperations returns only the calls that touched the log, for assertions
+// about log ordering that should not have to restate every term change.
+func (s *gateStore) logOperations() []string {
+	var out []string
+	for _, op := range s.operations() {
+		if !strings.HasPrefix(op, "hardstate(") {
+			out = append(out, op)
+		}
+	}
+	return out
 }
 
 func (s *gateStore) AppendLogEntries(ctx context.Context, entries []raft.LogEntry) error {
@@ -275,7 +330,7 @@ func TestAsyncPersistence_AFollowerAcknowledgesOnlyAfterTheEntriesAreOnDisk(t *t
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	if ops := store.operations(); len(ops) != 0 {
+	if ops := store.logOperations(); len(ops) != 0 {
 		t.Fatalf("storage recorded %v before the write was released", ops)
 	}
 
@@ -293,7 +348,7 @@ func TestAsyncPersistence_AFollowerAcknowledgesOnlyAfterTheEntriesAreOnDisk(t *t
 		t.Fatal("no acknowledgement after the write was released")
 	}
 
-	if ops := store.operations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "append(1..3)") {
+	if ops := store.logOperations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "append(1..3)") {
 		t.Fatalf("storage operations = %v, want the append to have happened before the acknowledgement", ops)
 	}
 }
@@ -447,7 +502,7 @@ func TestAsyncPersistence_AConflictingSuffixIsRemovedBeforeItIsReplaced(t *testi
 	}
 
 	want := []string{"append(1..3)", "truncate_suffix(2)", "append(2..3)"}
-	got := store.operations()
+	got := store.logOperations()
 	if len(got) != len(want) {
 		t.Fatalf("storage operations = %v, want %v", got, want)
 	}

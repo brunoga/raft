@@ -16,16 +16,35 @@ type leadershipTransferMsg struct {
 
 // handleTimeoutNow handles a TimeoutNow RPC sent by the current leader to
 // trigger an immediate election on this node, skipping the pre-vote round.
-func (n *Node) handleTimeoutNow(req *TimeoutNowRequest) (*TimeoutNowResponse, error) {
+func (n *Node) handleTimeoutNow(req *TimeoutNowRequest, respCh chan rpcResponse) {
+	answered := false
+	reply := func(term Term, err error) {
+		if respCh == nil || answered {
+			return
+		}
+		answered = true
+		respCh <- rpcResponse{resp: &TimeoutNowResponse{Term: term}, err: err}
+	}
+	// The reply says which term this node is standing in, which is how the old
+	// leader knows the transfer took. Like every answer that carries a term it
+	// waits for that term to be on disk.
+	replyWhenDurable := func() {
+		term := n.currentTerm
+		n.afterWrite(n.sendGate(0),
+			func() { reply(term, nil) },
+			func(err error) { reply(term, err) })
+	}
+
 	if req.Term < n.currentTerm {
-		return &TimeoutNowResponse{Term: n.currentTerm}, nil
+		replyWhenDurable()
+		return
 	}
 	if req.Term > n.currentTerm {
 		n.becomeFollower(req.Term, "")
 	}
 	// Skip pre-vote: we were explicitly told to start an election immediately.
 	n.becomeCandidate()
-	return &TimeoutNowResponse{Term: n.currentTerm}, nil
+	replyWhenDurable()
 }
 
 // handleLeadershipTransfer initiates a leadership transfer to msg.target.
