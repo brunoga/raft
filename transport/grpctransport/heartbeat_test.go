@@ -319,7 +319,7 @@ func TestHeartbeatBatcher_DropsEntriesWhoseCallerGaveUp(t *testing.T) {
 	// Give the batcher time to close its window and decide what to flush.
 	time.Sleep(time.Second)
 
-	if got := recv.BatchHeartbeatEntriesServed(); got != 0 {
+	if got := recv.HeartbeatStats().EntriesServed; got != 0 {
 		t.Errorf("receiver processed %d heartbeat entries; a stale entry was sent anyway", got)
 	}
 	select {

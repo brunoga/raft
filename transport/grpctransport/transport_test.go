@@ -774,8 +774,9 @@ func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
 // registered via SetGroupLookup. We use a barrier to ensure all 10 sender
 // goroutines are ready before any send fires, then assert:
 //   - All 10 group handlers on the receiver receive a heartbeat (correctness).
-//   - BatchHeartbeatsServed() == 1 on the receiver (strict O(P) assertion).
-//   - BatchHeartbeatEntriesServed() == numGroups.
+//   - HeartbeatStats().BatchesServed == 1 on the receiver (strict O(P)
+//     assertion).
+//   - HeartbeatStats().EntriesServed == numGroups.
 func TestGRPC_HeartbeatBatching(t *testing.T) {
 	const numGroups = 10 // large enough that O(G×P) vs O(P) is unambiguous
 
@@ -838,13 +839,13 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 	}
 
 	// All 10 concurrent calls must have collapsed into exactly 1 RPC.
-	served := recv.BatchHeartbeatsServed()
+	served := recv.HeartbeatStats().BatchesServed
 	if served != 1 {
-		t.Errorf("BatchHeartbeatsServed = %d, want 1 (all %d groups must batch into one RPC)",
+		t.Errorf("HeartbeatStats().BatchesServed = %d, want 1 (all %d groups must batch into one RPC)",
 			served, numGroups)
 	}
-	if entries := recv.BatchHeartbeatEntriesServed(); entries != int64(numGroups) {
-		t.Errorf("BatchHeartbeatEntriesServed = %d, want %d", entries, numGroups)
+	if entries := recv.HeartbeatStats().EntriesServed; entries != int64(numGroups) {
+		t.Errorf("HeartbeatStats().EntriesServed = %d, want %d", entries, numGroups)
 	}
 	t.Logf("BatchHeartbeats RPCs: %d for %d groups (%.0f%% reduction)",
 		served, numGroups, 100*(1-float64(served)/float64(numGroups)))
@@ -852,8 +853,8 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 
 // ---- TestGRPC_HeartbeatObservabilityCounters ---------------------------------
 
-// TestGRPC_HeartbeatObservabilityCounters verifies that BatchHeartbeatEntriesServed
-// and BatchHeartbeatErrors are updated correctly:
+// TestGRPC_HeartbeatObservabilityCounters verifies that
+// HeartbeatStats().EntriesServed and .Errors are updated correctly:
 //   - Entries counter reflects the total individual heartbeats dispatched.
 //   - Errors counter increments for unknown groups, not for successful ones.
 func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
@@ -896,11 +897,11 @@ func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := recv.BatchHeartbeatEntriesServed(); got != 3 {
-		t.Errorf("BatchHeartbeatEntriesServed = %d, want 3", got)
+	if got := recv.HeartbeatStats().EntriesServed; got != 3 {
+		t.Errorf("HeartbeatStats().EntriesServed = %d, want 3", got)
 	}
-	if got := recv.BatchHeartbeatErrors(); got != 1 {
-		t.Errorf("BatchHeartbeatErrors = %d, want 1 (unknown group 3)", got)
+	if got := recv.HeartbeatStats().Errors; got != 1 {
+		t.Errorf("HeartbeatStats().Errors = %d, want 1 (unknown group 3)", got)
 	}
 }
 
@@ -961,7 +962,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 			t.Errorf("group %d handler not called with custom window", gid)
 		}
 	}
-	if served := recv.BatchHeartbeatsServed(); served == 0 {
+	if served := recv.HeartbeatStats().BatchesServed; served == 0 {
 		t.Error("BatchHeartbeats was never called")
 	}
 }
@@ -1508,27 +1509,25 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 	// 3 groups is well under the default hbChanSize of 1024; the backpressure
 	// counter must remain zero throughout the test.
 	//
-	// BatchHeartbeatsServed must be positive on every transport to confirm that
+	// HeartbeatStats().BatchesServed must be positive on every transport to confirm that
 	// the batching code path (not just direct AppendEntries) was exercised.
 
 	for p, tr := range transports {
-		if n := tr.HeartbeatSendBlocked(); n != 0 {
+		if n := tr.HeartbeatStats().SendBlocked; n != 0 {
 			t.Errorf("physical %d: HeartbeatSendBlocked = %d, want 0 (hbChan saturated under light load)", p, n)
 		}
-		if n := tr.BatchHeartbeatsServed(); n == 0 {
-			t.Errorf("physical %d: BatchHeartbeatsServed = 0, want >0 (batching path not exercised)", p)
+		if n := tr.HeartbeatStats().BatchesServed; n == 0 {
+			t.Errorf("physical %d: HeartbeatStats().BatchesServed = 0, want >0 (batching path not exercised)", p)
 		}
 	}
 }
 
 // ---- Issue 5: ResetHeartbeatSendBlocked enables rate monitoring -------------
 
-// TestGRPC_ResetHeartbeatSendBlocked verifies that ResetHeartbeatSendBlocked
-// atomically returns and clears the counter.
-//
-// FAILS before the fix: the method doesn't exist.
-// PASSES after the fix.
-func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
+// TestGRPC_ResetHeartbeatStats verifies that ResetHeartbeatStats returns the
+// counters and clears them, so that each call reports the interval since the
+// last one rather than a running total.
+func TestGRPC_ResetHeartbeatStats(t *testing.T) {
 	t1, err := grpctransport.Listen(":0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -1536,8 +1535,8 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	defer func() { _ = t1.Close() }()
 
 	// Initially zero.
-	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
-		t.Errorf("initial ResetHeartbeatSendBlocked() = %d, want 0", got)
+	if got := t1.ResetHeartbeatStats().SendBlocked; got != 0 {
+		t.Errorf("initial ResetHeartbeatStats().SendBlocked = %d, want 0", got)
 	}
 
 	// Force a blocked send by using a tiny channel (size 1) and sending more
@@ -1548,13 +1547,13 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	// Simpler approach: the transport exposes hbSendBlocked as an atomic; we
 	// can verify the Swap semantics without the full-cluster overhead by just
 	// checking that calling Reset twice returns 0 the second time.
-	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
-		t.Errorf("second ResetHeartbeatSendBlocked() = %d, want 0 (should be idempotent)", got)
+	if got := t1.ResetHeartbeatStats().SendBlocked; got != 0 {
+		t.Errorf("second ResetHeartbeatStats().SendBlocked = %d, want 0 (should be idempotent)", got)
 	}
 
-	// Verify that HeartbeatSendBlocked reflects the current state (0 after reset).
-	if got := t1.HeartbeatSendBlocked(); got != 0 {
-		t.Errorf("HeartbeatSendBlocked() after reset = %d, want 0", got)
+	// Verify that HeartbeatStats reflects the current state (0 after reset).
+	if got := t1.HeartbeatStats().SendBlocked; got != 0 {
+		t.Errorf("HeartbeatStats().SendBlocked after reset = %d, want 0", got)
 	}
 
 	// Build a tiny two-node cluster with a very small heartbeat channel (size 1)
@@ -1604,17 +1603,17 @@ func TestGRPC_ResetHeartbeatSendBlocked(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// After Reset, the cumulative total moves to the returned value
-	// and subsequent HeartbeatSendBlocked() returns 0.
-	delta := t1.ResetHeartbeatSendBlocked()
+	// and a subsequent read returns 0.
+	delta := t1.ResetHeartbeatStats().SendBlocked
 	// delta may be 0 (no saturation) or >0 (saturation observed) — both are fine.
 	if delta < 0 {
-		t.Errorf("ResetHeartbeatSendBlocked returned negative: %d", delta)
+		t.Errorf("ResetHeartbeatStats().SendBlocked returned negative: %d", delta)
 	}
-	if got := t1.HeartbeatSendBlocked(); got != 0 {
-		t.Errorf("HeartbeatSendBlocked() = %d after Reset, want 0", got)
+	if got := t1.HeartbeatStats().SendBlocked; got != 0 {
+		t.Errorf("HeartbeatStats().SendBlocked = %d after Reset, want 0", got)
 	}
 	// A second reset in the same interval must return 0.
-	if got := t1.ResetHeartbeatSendBlocked(); got != 0 {
-		t.Errorf("second ResetHeartbeatSendBlocked() = %d, want 0 (counter was already drained)", got)
+	if got := t1.ResetHeartbeatStats().SendBlocked; got != 0 {
+		t.Errorf("second ResetHeartbeatStats().SendBlocked = %d, want 0 (counter was already drained)", got)
 	}
 }
