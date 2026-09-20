@@ -949,8 +949,16 @@ After:                            3 BatchHeartbeats RPCs per tick
 
 The batcher opens a 1 ms collection window after the first heartbeat arrives so
 that all groups' heartbeats (which fire together via `RunTicker`) are coalesced
-before the RPC is sent. `BatchHeartbeatsServed()` on the receiving transport
-returns the cumulative count for monitoring.
+before the RPC is sent.
+
+`GRPCTransport.HeartbeatStats()` reports what that path has done — batches and
+entries served, dispatch errors, and sends that had to wait for space in a
+per-peer channel. `EntriesServed / BatchesServed` is the average batch size,
+which is the number batching exists to raise; a non-zero `SendBlocked` rate
+means more groups than the channel absorbs, so raise
+`WithHeartbeatChannelSize`. `ResetHeartbeatStats()` returns the same struct and
+clears the counters, so each call reports one interval rather than a running
+total.
 
 ### Industry context
 

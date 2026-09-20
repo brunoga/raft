@@ -159,58 +159,70 @@ type GRPCTransport struct {
 
 	// hbSendBlocked counts the number of times a heartbeat Send had to wait
 	// because the per-peer batcher channel was full. A sustained non-zero value
-	// means hbChanSize is too small for the current group count. Use
-	// HeartbeatSendBlocked to observe this counter.
+	// means hbChanSize is too small for the current group count. Reported as
+	// HeartbeatStats.SendBlocked.
 	hbSendBlocked atomic.Int64
 }
 
-// BatchHeartbeatsServed returns the number of BatchHeartbeats RPCs this
-// transport has served as a receiver. Intended for testing and monitoring.
-func (t *GRPCTransport) BatchHeartbeatsServed() int64 { return t.batchHBServed.Load() }
+// HeartbeatStats counts what the batched-heartbeat path has done. Every field
+// is cumulative since the transport was created, or since the last
+// ResetHeartbeatStats.
+//
+// They are one struct rather than one method each because they are read
+// together: a batch count means little without the entry count beside it, and
+// a caller sampling them one call at a time gets four numbers from four
+// different moments.
+type HeartbeatStats struct {
+	// BatchesServed is the number of BatchHeartbeats RPCs this transport has
+	// served as a receiver.
+	BatchesServed int64
 
-// ResetBatchHeartbeatsServed atomically resets the BatchHeartbeatsServed
-// counter to zero and returns the previous value. Use this for rate monitoring:
-// call once per reporting interval and treat the return as the count during
-// that interval.
-func (t *GRPCTransport) ResetBatchHeartbeatsServed() int64 { return t.batchHBServed.Swap(0) }
+	// EntriesServed is the number of individual heartbeat entries dispatched
+	// across those RPCs. EntriesServed divided by BatchesServed is the average
+	// batch size, which is the number batching exists to raise: one RPC
+	// carrying one heartbeat is the cost of not batching plus the framing.
+	EntriesServed int64
 
-// BatchHeartbeatEntriesServed returns the total number of individual heartbeat
-// entries dispatched across all BatchHeartbeats RPCs. Dividing by
-// BatchHeartbeatsServed gives the average batch size.
-func (t *GRPCTransport) BatchHeartbeatEntriesServed() int64 { return t.batchHBEntries.Load() }
+	// Errors is the number of entries that could not be dispatched: an
+	// unregistered group, a rejected authorization, a failing
+	// HandleAppendEntries, or a request context that was already cancelled.
+	// Each is reported to its sender as an error rather than as a failed
+	// AppendEntries, so a sustained non-zero value is worth investigating --
+	// the leader sees heartbeats that never reached a group.
+	Errors int64
 
-// ResetBatchHeartbeatEntriesServed atomically resets the
-// BatchHeartbeatEntriesServed counter to zero and returns the previous value.
-// Use this for rate monitoring: call once per reporting interval and treat the
-// return as the count during that interval.
-func (t *GRPCTransport) ResetBatchHeartbeatEntriesServed() int64 {
-	return t.batchHBEntries.Swap(0)
+	// SendBlocked is the number of times a heartbeat send had to wait for
+	// space in a per-peer batcher channel. A sustained non-zero rate means the
+	// node has more groups than the channel absorbs without back-pressure;
+	// raise it with WithHeartbeatChannelSize.
+	SendBlocked int64
 }
 
-// BatchHeartbeatErrors returns the number of heartbeat entries that could not
-// be dispatched: an unregistered group, a rejected authorization, a failing
-// HandleAppendEntries, or a request context that was already cancelled. Each
-// such entry is reported to its sender as an error rather than as a failed
-// AppendEntries. A sustained non-zero value warrants investigation.
-func (t *GRPCTransport) BatchHeartbeatErrors() int64 { return t.batchHBErrors.Load() }
+// HeartbeatStats returns the heartbeat counters as they stand.
+func (t *GRPCTransport) HeartbeatStats() HeartbeatStats {
+	return HeartbeatStats{
+		BatchesServed: t.batchHBServed.Load(),
+		EntriesServed: t.batchHBEntries.Load(),
+		Errors:        t.batchHBErrors.Load(),
+		SendBlocked:   t.hbSendBlocked.Load(),
+	}
+}
 
-// ResetBatchHeartbeatErrors atomically resets the BatchHeartbeatErrors counter
-// to zero and returns the previous value. Use this for rate monitoring: call
-// once per reporting interval and treat the return as the count during that
-// interval.
-func (t *GRPCTransport) ResetBatchHeartbeatErrors() int64 { return t.batchHBErrors.Swap(0) }
-
-// HeartbeatSendBlocked returns the cumulative number of times a heartbeat
-// Send had to block waiting for space in a per-peer batcher channel. A
-// sustained non-zero rate means the cluster has more groups than the channel
-// can absorb without back-pressure; increase WithHeartbeatChannelSize.
-func (t *GRPCTransport) HeartbeatSendBlocked() int64 { return t.hbSendBlocked.Load() }
-
-// ResetHeartbeatSendBlocked atomically resets the HeartbeatSendBlocked counter
-// to zero and returns the previous value. This enables rate monitoring: call
-// this method once per reporting interval and treat the return value as the
-// count of blocked sends during that interval, rather than the cumulative total.
-func (t *GRPCTransport) ResetHeartbeatSendBlocked() int64 { return t.hbSendBlocked.Swap(0) }
+// ResetHeartbeatStats returns the heartbeat counters and sets them back to
+// zero, so that each call reports the interval since the last one rather than
+// a cumulative total. Use it for rate monitoring: call once per reporting
+// interval and export what it returns.
+//
+// Counters are reset one at a time, so a heartbeat served during the reset is
+// counted in one interval or the next, never in both and never in neither.
+func (t *GRPCTransport) ResetHeartbeatStats() HeartbeatStats {
+	return HeartbeatStats{
+		BatchesServed: t.batchHBServed.Swap(0),
+		EntriesServed: t.batchHBEntries.Swap(0),
+		Errors:        t.batchHBErrors.Swap(0),
+		SendBlocked:   t.hbSendBlocked.Swap(0),
+	}
+}
 
 const (
 	defaultHeartbeatRPCTimeout = 5 * time.Second
