@@ -1148,6 +1148,38 @@ Five fully-worked examples are provided, each targeting a different deployment p
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
 
+## Watching what a node does
+
+`Node.Events` reports the things a metric cannot carry: which peer joined,
+which follower stopped answering, which snapshot failed and why. A counter of
+configuration changes does not name the node that joined, and a replication
+histogram does not say which follower went quiet, which is the only fact that
+decides whether the next failure costs the cluster its quorum.
+
+```go
+events, stop := node.Events()
+defer stop()
+for ev := range events {
+    switch ev.Type {
+    case raft.EventPeerUnresponsive:
+        openIncident(ev.Peer)
+    case raft.EventPeerResponsive:
+        closeIncident(ev.Peer)
+    }
+}
+```
+
+Delivery is bounded and lossy on purpose: a subscriber that stops receiving
+loses events rather than stalling consensus for everyone else. Nothing is lost
+silently, though. The next event a lagging subscriber receives carries the
+number discarded before it in `Event.Dropped`.
+
+If `Config.Metrics` also implements `ApplyMetrics`, the node reports what
+fraction of its time the apply loop spends working rather than waiting. That
+is the number that says where a slow write is slow: proposal latency covers
+consensus and the state machine together, and a saturation near 1 says the
+state machine is the constraint and faster consensus will not help.
+
 ## Divergence from the paper
 
 Every implementation departs from the Raft paper and dissertation somewhere.

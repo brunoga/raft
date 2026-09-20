@@ -360,8 +360,11 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		}
 	}
 	if r.dropped {
+		n.notePeerUnreachable(r.peer)
 		return
 	}
+	// The peer answered, whatever it said, so it is reachable.
+	n.notePeerResponded(r.peer)
 	if r.term > n.currentTerm {
 		n.becomeFollower(r.term, "")
 		return

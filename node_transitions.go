@@ -166,6 +166,7 @@ func (n *Node) becomeLeader() {
 	n.matchIndex = make(map[NodeID]Index, len(n.cfg.Peers))
 	n.inflight = make(map[NodeID]int, len(n.cfg.Peers))
 	n.snapshotInflight = make(map[NodeID]bool, len(n.cfg.Peers))
+	n.resetPeerHealth()
 	for _, peer := range n.cfg.Peers {
 		n.nextIndex[peer.ID] = nextIdx
 		n.matchIndex[peer.ID] = 0

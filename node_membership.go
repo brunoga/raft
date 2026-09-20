@@ -267,7 +267,20 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 	if !ok {
 		return
 	}
+	// Observers are told what the entry did by comparing the membership before
+	// it with the membership after, which is the one description that holds for
+	// every shape a config entry comes in. The report is deferred because self
+	// removal is only recognised further down, and because an entry that
+	// changed nothing must report nothing.
+	before := n.membershipRoles()
 	n.adoptConfigEntry(configCmd, index)
+	after := n.membershipRoles()
+	// Deferred, and after is amended rather than re-read, because a node that
+	// removes itself keeps its own ID in cfg -- it goes on running as a
+	// follower -- so the fact that it is no longer a member is recorded by the
+	// switch below deleting it from this map. Re-reading the membership here
+	// would put it back.
+	defer func() { n.emitMembershipChanges(before, after) }()
 
 	switch op {
 	case configOpRemove:
@@ -275,6 +288,9 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 		// it. Waiting for the commit matters: a removal that never commits must
 		// not take a healthy leader down.
 		if peer.ID == n.cfg.ID {
+			// Self-removal keeps this node's ID in cfg, since it goes on
+			// running; what changed is that it is no longer a member.
+			delete(after, n.cfg.ID)
 			n.logger.Info("config change: self removed, stepping down")
 			n.becomeFollower(n.currentTerm, "")
 		}
@@ -294,6 +310,7 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 			return
 		}
 		if !containsPeer(members, n.cfg.ID) {
+			delete(after, n.cfg.ID)
 			n.logger.Info("config change: self removed, stepping down")
 			n.becomeFollower(n.currentTerm, "")
 		}
