@@ -42,6 +42,14 @@ type Config struct {
 	// promoted to a voter through a configuration change, but does not vote in
 	// elections or count toward any quorum. See PeerConfig.Voter for why this
 	// is not what Raft calls a witness.
+	//
+	// Note that the zero value is false, so a Config assembled by hand rather
+	// than from DefaultConfig describes a non-voter. Validate refuses a
+	// configuration in which neither this node nor any peer votes, since no
+	// leader could ever be elected, but it cannot tell a deliberate learner
+	// from a forgotten field in a cluster that has voters elsewhere.
+	//
+	// Default: true, via DefaultConfig.
 	Voter bool
 
 	// GroupID identifies the Raft group this node belongs to. It is stamped on
@@ -61,8 +69,11 @@ type Config struct {
 	// acts as a fallback for the window between snapshot restore and applying
 	// subsequent config-change log entries.
 	//
-	// Peers is mutated in-place by the event loop as AddServer/RemoveServer
-	// entries are applied; callers must not touch it after Start is called.
+	// New copies this slice, so the node never writes to the caller's array
+	// and the caller is free to keep, read or reuse it. The node's own copy is
+	// rewritten by the event loop as configuration changes commit, so this
+	// field is the membership the node started from and not the membership it
+	// has. Read the current one with Node.Members.
 	Peers []PeerConfig
 
 	// ElectionTimeoutMin is the lower bound of the randomised election timeout.
@@ -154,6 +165,11 @@ type Config struct {
 	// A follower is not throttled this way and does not need to be: its
 	// backlog is bounded by what its leader will send before it acknowledges,
 	// which MaxInflightRPCs and MaxBytesPerRPC already limit.
+	//
+	// Zero is not "no limit" here, unlike MaxBytesPerRPC and
+	// MaxClientTableSize: it selects the default, because a node with no bound
+	// at all is a node that answers a slow disk by running out of memory. Set
+	// a negative value to say no limit and mean it.
 	//
 	// Default: 64 MiB.
 	MaxUnstableLogBytes int
@@ -486,6 +502,31 @@ func (c *Config) Validate() error {
 	// period would be TickInterval — silently far longer than configured.
 	if c.TickInterval > 0 && c.TickInterval > c.HeartbeatInterval {
 		return errors.New("raft: TickInterval must be ≤ HeartbeatInterval")
+	}
+	// A configuration that names peers but gives none of them, nor itself, a
+	// vote describes a cluster that can never elect a leader and so can never
+	// commit anything. It is easy to arrive at by accident, because the zero
+	// value of Voter is false: a peer list written as
+	// []PeerConfig{{ID: "n2"}, {ID: "n3"}} is a list of learners. Nothing
+	// about the resulting deployment looks broken -- every node starts, every
+	// node reports itself a follower, and no election is ever held.
+	//
+	// A node with no peers at all is left alone. That is how a node waits to
+	// be added to a cluster it has not been told about yet, and refusing it
+	// would refuse the join.
+	if !c.Voter && len(c.Peers) > 0 {
+		hasVoter := false
+		for _, p := range c.Peers {
+			if p.Voter {
+				hasVoter = true
+				break
+			}
+		}
+		if !hasVoter {
+			return errors.New("raft: no voters: Config.Voter is false and no peer in " +
+				"Config.Peers is a voter, so no leader can ever be elected " +
+				"(Voter defaults to false; DefaultConfig sets it true)")
+		}
 	}
 	return nil
 }

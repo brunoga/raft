@@ -55,6 +55,17 @@ var (
 	// of the cluster.
 	ErrNotMember = errors.New("raft: node is not a member of this cluster")
 
+	// ErrLeaseReadUnavailable is returned by ReadIndexLease when
+	// Config.CheckQuorum is disabled.
+	//
+	// A lease read assumes a leader that has lost contact with its cluster
+	// stops being one, and check-quorum is what makes that true. Without it a
+	// partitioned leader keeps its lease and serves reads from a state machine
+	// the rest of the cluster has moved past. Use ReadIndex, which pays for a
+	// round of heartbeats and needs no such assumption, or enable
+	// Config.CheckQuorum.
+	ErrLeaseReadUnavailable = errors.New("raft: lease reads require Config.CheckQuorum")
+
 	// ErrWriteBacklogFull means a node is already holding
 	// Config.MaxUnstableLogBytes of log entries that storage has not caught up
 	// with, and will not take on more until it has.
