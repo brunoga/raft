@@ -753,6 +753,24 @@ func (s *Store) leaderRedirectURL(r *http.Request, leaderID raft.NodeID) string 
 	return s.leaderURL(leaderID, r.URL.Path, r.URL.RawQuery)
 }
 
+// WriteHTTPError writes err to w the way this package's own handlers do, and
+// is exported for applications that bring their own mux with [WithHTTPMux].
+//
+// The part that matters is the leader redirect. A write that reaches a
+// follower has to be sent on to the leader, and doing that means knowing the
+// leader's advertised HTTP address, whether it has advertised one yet, and
+// whether the request can carry a 307 at all. An application handler that
+// answers ErrNotLeader with a bare 503 -- the obvious thing to write, and what
+// two of this repository's own examples wrote -- leaves every write to a
+// follower failing, so a client has to find the leader for itself.
+//
+// Everything else is classified too: ErrKeyNotFound to 404, ErrKeyExists and
+// ErrObsoleteSeqNum to 409, a deadline to 408, and so on. Errors the caller
+// wants to handle itself should be checked before calling this.
+func (s *Store) WriteHTTPError(w http.ResponseWriter, r *http.Request, err error) {
+	s.handleRPCError(w, r, err)
+}
+
 func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error) {
 	logger := s.logger()
 

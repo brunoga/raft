@@ -69,17 +69,18 @@ type ConfigEntry struct {
 
 // server wires together EasyRaft and the HTTP handlers.
 type server struct {
+	store   *easyraft.Store
 	configs *easyraft.Collection[ConfigEntry]
 	watcher *easyraft.Watcher[ConfigEntry]
 }
 
-func newServer(configs *easyraft.Collection[ConfigEntry]) *server {
+func newServer(store *easyraft.Store, configs *easyraft.Collection[ConfigEntry]) *server {
 	w := easyraft.NewWatcher[ConfigEntry]()
 	// Wire up the OnChange hook. This fires on every replica after each
 	// committed write — outside the Raft lock, in a dedicated dispatcher
 	// goroutine. We just fan out to local SSE subscribers.
 	configs.OnChange(w.Notify)
-	return &server{configs: configs, watcher: w}
+	return &server{store: store, configs: configs, watcher: w}
 }
 
 // setConfig upserts a config entry with the current timestamp as version.
@@ -106,11 +107,9 @@ func (s *server) handleSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.setConfig(r.Context(), key, body.Value); err != nil {
-		if errors.Is(err, easyraft.ErrNotLeader) {
-			http.Error(w, "not leader", http.StatusServiceUnavailable)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// The store knows the leader's advertised address and answers with a
+		// redirect, so a write that reached a follower still lands.
+		s.store.WriteHTTPError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -157,11 +156,9 @@ func (s *server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		if errors.Is(err, easyraft.ErrNotLeader) {
-			http.Error(w, "not leader", http.StatusServiceUnavailable)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// The store knows the leader's advertised address and answers with a
+		// redirect, so a write that reached a follower still lands.
+		s.store.WriteHTTPError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -240,7 +237,7 @@ func main() {
 	}
 
 	configs := easyraft.AddCollection[ConfigEntry](store, "configs")
-	srv := newServer(configs)
+	srv := newServer(store, configs)
 
 	// App-specific routes (registered before store.Start so everything is
 	// wired before the server accepts connections).

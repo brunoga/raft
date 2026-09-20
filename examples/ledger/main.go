@@ -168,7 +168,7 @@ func (s *server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "account already exists", http.StatusConflict)
 			return
 		}
-		s.writeErr(w, err)
+		s.writeErr(w, r, err)
 		return
 	}
 
@@ -184,7 +184,7 @@ func (s *server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		s.writeErr(w, err)
+		s.writeErr(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -194,7 +194,7 @@ func (s *server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	all, err := s.accounts.List(r.Context())
 	if err != nil {
-		s.writeErr(w, err)
+		s.writeErr(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -278,7 +278,7 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "account not found", http.StatusNotFound)
 			return
 		}
-		s.writeErr(w, txErr)
+		s.writeErr(w, r, txErr)
 		return
 	}
 
@@ -294,7 +294,7 @@ func (s *server) handleGetTransfer(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		s.writeErr(w, err)
+		s.writeErr(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -304,23 +304,22 @@ func (s *server) handleGetTransfer(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleListTransfers(w http.ResponseWriter, r *http.Request) {
 	all, err := s.transfers.List(r.Context())
 	if err != nil {
-		s.writeErr(w, err)
+		s.writeErr(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(all)
 }
 
-func (s *server) writeErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, easyraft.ErrNotLeader) {
-		http.Error(w, "not leader", http.StatusServiceUnavailable)
-		return
-	}
+func (s *server) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	if _, ok := errors.AsType[*errInsufficientFunds](err); ok {
+		// Application errors are classified here; everything the Raft layer
+		// raises is left to the store, which knows how to redirect a write
+		// that reached a follower to the leader.
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	http.Error(w, err.Error(), http.StatusInternalServerError)
+	s.store.WriteHTTPError(w, r, err)
 }
 
 func main() {

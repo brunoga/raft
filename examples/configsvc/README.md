@@ -168,20 +168,20 @@ Alternatively, start the nodes manually in separate terminals:
 **Terminal 1 — bootstrap node**
 
 ```bash
-./configsvc --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/cfg/n1
+./configsvc --id n1 --raft-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 --data-dir /tmp/cfg/n1
 ```
 
 **Terminal 2 — join**
 
 ```bash
-./configsvc --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/cfg/n2 \
+./configsvc --id n2 --raft-addr 127.0.0.1:7002 --http-addr 127.0.0.1:8002 --data-dir /tmp/cfg/n2 \
             --join localhost:8001
 ```
 
 **Terminal 3 — join**
 
 ```bash
-./configsvc --id n3 --raft-addr :7003 --http-addr :8003 --data-dir /tmp/cfg/n3 \
+./configsvc --id n3 --raft-addr 127.0.0.1:7003 --http-addr 127.0.0.1:8003 --data-dir /tmp/cfg/n3 \
             --join localhost:8001
 ```
 
