@@ -98,10 +98,17 @@ type Node struct {
 	atomicCommitIndex   atomic.Uint64 // mirrors commitIndex
 	atomicTerm          atomic.Uint64 // mirrors currentTerm
 	atomicSnapshotIndex atomic.Uint64 // mirrors log.snapMeta.LastIncludedIndex; updated by handleSnapshotResult
-	// atomicPeers mirrors cfg.Peers as a []PeerConfig snapshot; updated by
-	// applyConfigChange (event-loop only). Read by ReconfigureCluster and
-	// Members outside the event loop to avoid a data race on cfg.Peers.
+	// atomicPeers mirrors cfg.Peers as a []PeerConfig snapshot and atomicVoter
+	// mirrors cfg.Voter, this node's own role. Both are written by
+	// storeMembership from the event loop, and read by ReconfigureCluster,
+	// Members and Status from whatever goroutine calls them.
+	//
+	// cfg.Peers and cfg.Voter change together on every configuration change,
+	// so they are mirrored together: a reader that took the peer list from
+	// here and this node's role from cfg would be racing the event loop for
+	// one of the two values.
 	atomicPeers atomic.Value // stores []PeerConfig
+	atomicVoter atomic.Bool  // mirrors cfg.Voter
 
 	// --- Volatile state (leader only; nil when not leader) ------------------
 	nextIndex  map[NodeID]Index
@@ -764,7 +771,7 @@ func New(cfg *Config) (*Node, error) {
 	n.atomicDurableTerm.Store(uint64(n.currentTerm))
 	n.atomicLastApplied.Store(uint64(n.lastApplied))
 	n.atomicCommitIndex.Store(uint64(n.commitIndex))
-	n.storePeers()
+	n.storeMembership()
 	n.resetElectionTimeout()
 
 	// Register with the transport so we can receive inbound RPCs.
@@ -950,15 +957,16 @@ func (n *Node) Status() GroupStatus {
 // itself. The returned slice is a snapshot; it will not reflect future
 // membership changes.
 //
-// Safe for concurrent use; reads from the same atomic mirror that
-// ReconfigureCluster uses to avoid data races with the event loop.
+// Safe for concurrent use: both the peer list and this node's own role are
+// read from the atomic mirrors the event loop keeps in sync, not from the
+// Config it rewrites in place.
 func (n *Node) Members() []PeerConfig {
 	var peers []PeerConfig
 	if v := n.atomicPeers.Load(); v != nil {
 		peers = v.([]PeerConfig)
 	}
 	out := make([]PeerConfig, 0, len(peers)+1)
-	out = append(out, PeerConfig{ID: n.cfg.ID, Voter: n.cfg.Voter})
+	out = append(out, PeerConfig{ID: n.cfg.ID, Voter: n.atomicVoter.Load()})
 	out = append(out, peers...)
 	return out
 }

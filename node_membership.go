@@ -27,14 +27,16 @@ import (
 // being removed, and releasing the one-change-at-a-time gate. Those stay on the
 // apply path, in applyConfigChange.
 
-// storePeers snapshots the current cfg.Peers slice into atomicPeers so that
-// callers outside the event loop (e.g. ReconfigureCluster) can read the peer
-// list without a data race. Must be called from the event-loop goroutine after
-// every mutation to n.cfg.Peers.
-func (n *Node) storePeers() {
+// storeMembership snapshots the membership held in cfg -- the peer list and
+// this node's own role -- into the atomic mirrors, so that callers outside the
+// event loop (Members, Status, ReconfigureCluster) can read it without a data
+// race. Must be called from the event-loop goroutine after every mutation to
+// n.cfg.Peers or n.cfg.Voter.
+func (n *Node) storeMembership() {
 	snap := make([]PeerConfig, len(n.cfg.Peers))
 	copy(snap, n.cfg.Peers)
 	n.atomicPeers.Store(snap)
+	n.atomicVoter.Store(n.cfg.Voter)
 }
 
 // currentMembership returns the membership in effect in a form that does not
@@ -62,7 +64,7 @@ func (n *Node) restoreMembership(ms *membershipState) {
 		n.cfg.Voter = present && voter
 		n.jointOld, n.jointNew = nil, nil
 		n.jointIncludeSelf, n.jointSelfVoter, n.jointSelfVoterOld = false, false, false
-		n.storePeers()
+		n.storeMembership()
 		return
 	}
 
@@ -77,7 +79,7 @@ func (n *Node) restoreMembership(ms *membershipState) {
 	// changes when the finalise entry is adopted.
 	n.cfg.Voter = oldVoter
 	n.cfg.Peers = peerUnion(oldPeers, newPeers, n.cfg.ID)
-	n.storePeers()
+	n.storeMembership()
 }
 
 // withSelf returns peers plus the local node when present is true. The result
@@ -150,7 +152,11 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 	switch op {
 	case configOpAdd:
 		if peer.ID == n.cfg.ID {
+			// This node's own promotion or demotion. The peer list is
+			// unchanged, but the mirror still has to be refreshed: the role in
+			// it is what every reader outside the event loop sees.
 			n.cfg.Voter = peer.Voter
+			n.storeMembership()
 			return
 		}
 		if i := indexOfPeer(n.cfg.Peers, peer.ID); i >= 0 {
@@ -159,7 +165,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 			// as a no-op would silently ignore the change.
 			if n.cfg.Peers[i].Voter != peer.Voter {
 				n.cfg.Peers[i].Voter = peer.Voter
-				n.storePeers()
+				n.storeMembership()
 				n.logger.Info("config change: changed peer role",
 					"id", peer.ID, "voter", peer.Voter)
 				if n.state == Leader {
@@ -170,7 +176,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 			return
 		}
 		n.cfg.Peers = append(n.cfg.Peers, peer)
-		n.storePeers()
+		n.storeMembership()
 		if n.state == Leader {
 			n.nextIndex[peer.ID] = n.log.lastLogIndex() + 1
 			n.matchIndex[peer.ID] = 0
@@ -187,7 +193,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 			// Self-removal takes effect for quorum purposes immediately, but
 			// stepping down waits until the entry commits (applyConfigChange).
 			n.cfg.Voter = false
-			n.storePeers()
+			n.storeMembership()
 			n.logger.Info("config change: self removed from membership")
 			return
 		}
@@ -197,7 +203,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 				break
 			}
 		}
-		n.storePeers()
+		n.storeMembership()
 		if n.state == Leader {
 			n.stopHBPumpFor(id)
 			delete(n.nextIndex, id)
