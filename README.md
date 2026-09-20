@@ -34,6 +34,7 @@ Requires Go 1.26 or newer.
 18. [Caveats and known limitations](#caveats-and-known-limitations)
 19. [EasyRaft — high-level abstraction](#easyraft--high-level-abstraction)
 20. [Reference implementation](#reference-implementation)
+21. [Disaster recovery from permanent quorum loss](#disaster-recovery-from-permanent-quorum-loss)
 
 ---
 
@@ -1292,6 +1293,69 @@ fraction of its time the apply loop spends working rather than waiting. That
 is the number that says where a slow write is slow: proposal latency covers
 consensus and the state machine together, and a saturation near 1 says the
 state machine is the constraint and faster consensus will not help.
+
+## Disaster recovery from permanent quorum loss
+
+Raft keeps a cluster available while a minority is down and refuses to make
+progress when a majority is. That refusal is the whole point — a cluster that
+committed without a majority could lose the write — but it also means that
+losing two nodes of three, for good, leaves a cluster that cannot elect a
+leader, cannot commit, and so cannot commit the configuration change that would
+shrink it to a size the survivor is a majority of. The data is intact and
+permanently unreachable.
+
+`RecoverCluster` is the way out. It rewrites a stopped node's durable state so
+that, on restart, it belongs to a membership you name instead of the one its log
+records:
+
+```go
+// With the node stopped, and its storage opened by nothing else.
+info, err := raft.InspectStorage(ctx, store)   // what this node holds
+...
+err = raft.RecoverCluster(ctx, store, "n1", []raft.PeerConfig{
+    {ID: "n1", Voter: true},
+})
+```
+
+`self` must be the only voter in the new membership: a recovered node that is
+not a majority by itself cannot elect a leader either. Nodes that are to rejoin
+may be listed alongside it as non-voters, and are promoted with `PromoteMember`
+once they have caught up.
+
+This is not a consensus operation and it is not safe the way the rest of the
+package is. Two things can go wrong, and both are inherent:
+
+- Entries the recovered node holds but that were never committed **become**
+  committed, because the recovered cluster's history is whatever that node had.
+  A client told its write failed may find that it succeeded.
+- Entries committed by the lost majority that never reached this node are
+  **gone**, because nothing that remains has them. A client told its write
+  succeeded may find that it did not.
+
+So it is an operator action for a cluster that is already dead, not a way round
+one that is merely slow or partitioned. The procedure:
+
+1. Stop every surviving node.
+2. Run `InspectStorage` on each survivor and pick the most recent with
+   `RecoveryInfo.MoreRecentThan` — the §5.4.1 up-to-date rule, higher last term
+   first and longer log to break the tie. That node's history is the one kept.
+3. Run `RecoverCluster` on it.
+4. **Erase the storage of every other survivor.** Their logs are now divergent
+   history, and a node that restarts holding entries the recovered node does not
+   have can disrupt the elections of the cluster it is no longer part of.
+   Recovering more than one node has the same problem for the same reason.
+5. Restart the recovered node. It elects itself and serves.
+6. Add the wiped nodes back with `AddMember`. They receive a snapshot and catch
+   up the ordinary way.
+
+`InspectStorage` is read-only and safe to run on any stopped node. Its
+`Members` field is the membership that node would restart with — the one in its
+snapshot, advanced by every configuration entry in its log, committed or not,
+since §4.1 says a node uses the latest configuration it has rather than the
+latest it has agreed. `MembersComplete` reports whether that could be
+reconstructed at all: a cluster that has never snapshotted and never
+reconfigured knows its members only from the `Config.Peers` its operator passes
+to `New`, which storage has never seen.
 
 ## Divergence from the paper
 

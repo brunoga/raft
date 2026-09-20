@@ -200,6 +200,27 @@ than appended to a log it can never leave. Without this, the entry is retried
 for ever, every later proposal queues behind it, and the group stops making
 progress with nothing having reported an error.
 
+### Quorum loss has an escape hatch outside consensus
+
+The paper has no answer for a cluster that loses a majority of its voters
+permanently. There is none within consensus: every operation that could shrink
+the cluster back to a size the survivors are a majority of needs a majority to
+commit it.
+
+`RecoverCluster` rewrites a stopped node's durable state from outside the
+protocol, appending a configuration entry in a term above any the node has seen
+so that the restarted node adopts a membership it can form a quorum in. It is
+deliberately outside the safety argument: it can promote entries that were
+never committed, and it discards whatever the lost majority had that this node
+does not. Both are inherent to recovering a cluster whose majority is gone, and
+both are stated in the API documentation and in the README.
+
+The safeguards are that it refuses a membership the recovered node could not
+elect itself in, that it never rewrites or discards entries the node already
+has, and that the term it writes in is above the log's own last term as well as
+the hard state's, so it cannot create the one thing a crashed write would: an
+entry from a term the node does not believe it reached.
+
 ---
 
 ## Known limitations
