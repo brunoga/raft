@@ -4,7 +4,34 @@ package raft;
 
 option go_package = "github.com/brunoga/raft/transport/grpctransport/internal/raftpb";
 
-// RaftService exposes the four Raft RPCs over gRPC.
+// Wire compatibility
+//
+// Nodes are upgraded one at a time, so every version of this file has to talk
+// to the one before it. Protobuf handles most of that: a field added with a
+// fresh number is ignored by a peer that does not know it, and a field a peer
+// stops sending reads as its zero value.
+//
+// What it does not handle is a field number changing meaning. Renumber a
+// field, reuse the number of a deleted one, or change a type in place, and
+// both sides still parse the message -- into different values. A leader_commit
+// read as a prev_log_index does not fail a request; it commits the wrong
+// entries, with no error to see, for as long as the upgrade window lasts.
+//
+// So:
+//
+//   - Add fields with numbers never used before. Never renumber or retype one.
+//   - When deleting a field, mark its number `reserved` so nothing reuses it.
+//   - Adding an RPC is safe only against a peer that has it; one that does not
+//     answers Unimplemented, and the caller has to treat that as "this peer is
+//     older" rather than as a failed RPC.
+//   - Renaming or removing an RPC breaks every older peer: gRPC routes on the
+//     method name.
+//
+// wire_compat_internal_test.go holds the current contract and fails on any of
+// these, so that a breaking change costs a code review rather than a rolling
+// upgrade.
+
+// RaftService exposes the Raft RPCs over gRPC.
 service RaftService {
   rpc RequestVote(RequestVoteRequest)           returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest)        returns (AppendEntriesResponse);
