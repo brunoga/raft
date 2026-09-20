@@ -28,6 +28,19 @@ jobs:
       - name: Run tests with race detector
         run: go test -v -race ./...
 
+      # The repository ships platform-specific files -- the store's directory
+      # lock and the discovery socket options both have a Windows and a
+      # non-Windows implementation -- and none of them are compiled by the run
+      # above. Cross-building is cheap and is the only thing standing between a
+      # change to those files and a release that does not build.
+      - name: Cross-build other platforms
+        run: |
+          for target in windows/amd64 darwin/arm64 linux/arm64; do
+            echo "==> GOOS/GOARCH = $target"
+            GOOS=${target%/*} GOARCH=${target#*/} go build ./...
+            GOOS=${target%/*} GOARCH=${target#*/} go vet ./...
+          done
+
       # Pinned rather than @latest so a lint run is reproducible and picking up
       # a new release is a deliberate commit. Bump this together with
       # .golangci.yml when upgrading.
