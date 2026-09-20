@@ -120,6 +120,25 @@ func warnIfHTTPUnauthenticated(cfg *config, logger *slog.Logger) {
 		"addr", cfg.HTTPAddr)
 }
 
+// warnIfHTTPUnreachable logs that this node's HTTP API is served on an address
+// no peer can redirect a client to.
+//
+// A follower that receives a write answers 307 pointing at the leader's
+// advertised HTTP address. If that address names no host, there is no URL to
+// point at and the follower answers 503 instead -- so every write sent to a
+// follower fails, and only a client that already knows which node leads gets
+// through. It works on one node and stops working on three, which is the worst
+// time to find out.
+func warnIfHTTPUnreachable(addr string, logger *slog.Logger) {
+	if addr == "" || advertisableHost(addr) {
+		return
+	}
+	logger.Warn("easyraft: the HTTP API is advertised on an address peers cannot redirect to, "+
+		"so writes sent to a follower will fail with 503 rather than being forwarded to the "+
+		"leader. Give WithHTTPAddr a reachable host:port, or set WithAdvertiseHTTPAddr.",
+		"advertised", addr)
+}
+
 // ---- Store HTTP server -----------------------------------------------------
 
 // registerRoutes registers all Store management and CRUD routes on mux.
@@ -180,6 +199,7 @@ func (s *Store) serveHTTP() {
 	// its own HTTP server on the same address.
 	if s.cfg.HTTPMux != nil {
 		warnIfHTTPUnauthenticated(&s.cfg, logger)
+		warnIfHTTPUnreachable(s.resolvedHTTPAddr(), logger)
 		s.registerRoutes(s.cfg.HTTPMux)
 		return
 	}
@@ -188,6 +208,7 @@ func (s *Store) serveHTTP() {
 		return
 	}
 	warnIfHTTPUnauthenticated(&s.cfg, logger)
+	warnIfHTTPUnreachable(s.resolvedHTTPAddr(), logger)
 
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
@@ -659,6 +680,27 @@ func normalizeHostPortScheme(addr string) (hostPort, scheme string, ok bool) {
 		}
 	}
 	return net.JoinHostPort(host, port), scheme, true
+}
+
+// advertisableHost reports whether addr names a host a remote peer could dial.
+//
+// The port is not checked: a node may legitimately bind port 0 and learn its
+// real port from the listener. The host is what cannot be fixed up later --
+// an empty one or a wildcard says "every interface on whichever machine is
+// asking", which is never an answer to "where do I find you".
+func advertisableHost(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	addr = strings.TrimPrefix(addr, "http://")
+	addr = strings.TrimPrefix(addr, "https://")
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return false
+	}
+	return true
 }
 
 // leaderURL builds an absolute URL for path on leaderID's advertised HTTP

@@ -293,6 +293,9 @@ func NewStore(opts ...Option) (*Store, error) {
 	if c.DataDir == "" {
 		return nil, fmt.Errorf("easyraft: WithDataDir is required")
 	}
+	if err := validateAdvertised(&c); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
@@ -342,6 +345,92 @@ func (s *Store) closeAfterFailedInit() {
 
 // logger returns the configured logger, or slog.Default() so that problems are
 // reported somewhere rather than dropped when no logger was supplied.
+// validateAdvertised refuses a configuration whose node could not be reached by
+// the peers it is about to tell about itself.
+//
+// A joining node hands the cluster an address and is then dialled at it. If
+// that address names no host -- ":7002", or "0.0.0.0:7002" -- there is nothing
+// a remote peer can do with it, and the join is rejected at the far end with a
+// 400 that surfaces, thirty seconds later, as a timeout. Refusing here says
+// what is wrong while the operator is still looking at the command they typed.
+func validateAdvertised(c *config) error {
+	if len(c.JoinAddrs) == 0 {
+		// Nothing is being told where to find this node.
+		return nil
+	}
+	addr := c.advertiseRaftAddr()
+	if addr == "" {
+		return fmt.Errorf("easyraft: WithJoinAddr needs a Raft address to advertise; " +
+			"set WithRaftAddr")
+	}
+	if !advertisableHost(addr) {
+		return fmt.Errorf("easyraft: cannot join a cluster while advertising %q: it names no "+
+			"host, so the nodes this one joins have no address to dial it back on. Give "+
+			"WithRaftAddr a reachable host:port (127.0.0.1:7002 for a local cluster), or "+
+			"keep the bind address and set WithAdvertiseRaftAddr to what peers should use",
+			addr)
+	}
+	return nil
+}
+
+// advertiseRaftAddr is what peers are told to dial to reach this node's Raft
+// port: the explicit advertise address when one was given, otherwise the bind
+// address.
+func (c *config) advertiseRaftAddr() string {
+	if c.AdvertiseRaftAddr != "" {
+		return c.AdvertiseRaftAddr
+	}
+	return c.RaftAddr
+}
+
+// resolvedRaftAddr is advertiseRaftAddr with an ephemeral port filled in.
+//
+// Binding port 0 is how a test, or anything that cannot reserve a port in
+// advance, gets one; the real port is only known once the listener exists.
+// Telling a peer to dial port 0 would be useless, so the bound port is
+// substituted. An explicit advertise address is never rewritten: the operator
+// said what they meant.
+func (s *Store) resolvedRaftAddr() string {
+	return resolvePort(s.cfg.AdvertiseRaftAddr, s.cfg.RaftAddr, func() (string, bool) {
+		a, ok := s.transport.(interface{ Addr() string })
+		if !ok || a == nil {
+			return "", false
+		}
+		return a.Addr(), true
+	})
+}
+
+// resolvedHTTPAddr is advertiseHTTPAddr with an ephemeral port filled in.
+func (s *Store) resolvedHTTPAddr() string {
+	return resolvePort(s.cfg.AdvertiseHTTPAddr, s.cfg.HTTPAddr, func() (string, bool) {
+		if s.httpListener == nil {
+			return "", false
+		}
+		return s.httpListener.Addr().String(), true
+	})
+}
+
+// resolvePort returns explicit when it is set, and otherwise bind with a zero
+// port replaced by the one the listener actually got.
+func resolvePort(explicit, bind string, bound func() (string, bool)) string {
+	if explicit != "" {
+		return explicit
+	}
+	host, port, err := net.SplitHostPort(bind)
+	if err != nil || port != "0" {
+		return bind
+	}
+	addr, ok := bound()
+	if !ok {
+		return bind
+	}
+	_, boundPort, berr := net.SplitHostPort(addr)
+	if berr != nil || boundPort == "0" {
+		return bind
+	}
+	return net.JoinHostPort(host, boundPort)
+}
+
 func (s *Store) logger() *slog.Logger {
 	if s.cfg.Logger != nil {
 		return s.cfg.Logger
@@ -753,7 +842,7 @@ func (s *Store) advertiseMetadata() {
 			return
 		}
 
-		b, _ := json.Marshal(s.cfg.HTTPAddr)
+		b, _ := json.Marshal(s.resolvedHTTPAddr())
 		cmd := &command{
 			Collection: metadataCollection,
 			Key:        string(s.cfg.ID),
@@ -770,7 +859,7 @@ func (s *Store) advertiseMetadata() {
 		}
 
 		if err == nil {
-			s.logger().Info("easyraft: advertised HTTP address", "addr", s.cfg.HTTPAddr)
+			s.logger().Info("easyraft: advertised HTTP address", "addr", s.resolvedHTTPAddr())
 			return
 		}
 
@@ -1000,7 +1089,7 @@ func (s *Store) flushGaps() {
 // bootstrapped before starting the joining node.
 func (s *Store) joinCluster(ctx context.Context) error {
 	voter := !s.cfg.JoinAsLearner
-	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.cfg.RaftAddr, Voter: &voter}
+	req := joinRequest{ID: s.cfg.ID, RaftAddr: s.resolvedRaftAddr(), Voter: &voter}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("easyraft: marshal join request: %w", err)

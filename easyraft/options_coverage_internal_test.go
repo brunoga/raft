@@ -27,6 +27,8 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 	opts := []Option{
 		WithID("n1"),
 		WithRaftAddr("127.0.0.1:7001"),
+		WithAdvertiseRaftAddr("node1.internal:7001"),
+		WithAdvertiseHTTPAddr("node1.internal:8001"),
 		WithHTTPAddr("127.0.0.1:8001"),
 		WithDataDir("/tmp/easyraft-options-coverage"),
 		WithPeers(map[raft.NodeID]string{"n1": "127.0.0.1:7001"}),
