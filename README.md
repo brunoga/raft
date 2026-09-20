@@ -1379,24 +1379,67 @@ not a majority by itself cannot elect a leader either. Nodes that are to rejoin
 may be listed alongside it as non-voters, and are promoted with `PromoteMember`
 once they have caught up.
 
-This is not a consensus operation and it is not safe the way the rest of the
-package is. Two things can go wrong, and both are inherent:
+This is not a consensus operation, and it cannot be made safe the way the rest
+of the package is. Two things go wrong, and they are not the same kind of
+problem.
 
-- Entries the recovered node holds but that were never committed **become**
-  committed, because the recovered cluster's history is whatever that node had.
-  A client told its write failed may find that it succeeded.
-- Entries committed by the lost majority that never reached this node are
-  **gone**, because nothing that remains has them. A client told its write
-  succeeded may find that it did not.
+**The first is not fixable by anything.** Entries the lost majority committed
+that never reached this node are gone — nothing that remains has them, so a
+client told its write succeeded may find that it did not. Raft's guarantee is
+that a committed entry is on a majority; losing a majority *is* losing the
+guarantee. The answer is not recovery but not needing it: more voters,
+`MinCommitZones` to spread them across failure domains, backups off the
+cluster.
 
-So it is an operator action for a cluster that is already dead, not a way round
+**The second is bounded, and the API bounds it.** The log splits at the highest
+index the node can prove was committed — `RecoveryInfo.KnownCommittedIndex`.
+Below it, everything is certain. Above it, each entry either committed on the
+majority that died or was still in flight, and nothing that survives can say
+which. `RecoveryInfo.UncommittedBand()` names that range, and recovery has only
+two ways to decide about it:
+
+| | keeps | costs |
+|---|---|---|
+| default | the whole log | entries that were never committed become committed — a write reported as failed took effect |
+| `DiscardUncommitted()` | only the proven prefix | entries that *had* committed but were not yet applied are thrown away — a write reported as succeeded did not |
+
+Neither is safe; which is the lesser harm depends on the application, not on
+Raft. What the package does is make the band small and make it visible:
+
+```go
+info, _ := raft.InspectStorage(ctx, store)
+if from, to, ok := info.UncommittedBand(); ok {
+    log.Printf("entries %d..%d are in doubt", from, to)  // look at them
+}
+
+// A state machine with its own durable state proves more than the snapshot
+// does, which shrinks the band to what the apply loop had not reached.
+applied, _ := sm.AppliedIndex(ctx)
+report, err := raft.RecoverCluster(ctx, store, "n1",
+    []raft.PeerConfig{{ID: "n1", Voter: true}},
+    raft.WithKnownCommitted(applied))
+log.Printf("recovery promoted entries %d..%d", report.PromotedFrom, report.PromotedTo)
+```
+
+Keep that report. A cluster that comes back after a recovery looks like any
+other cluster, and six months later it is the only way to explain a write that
+vanished or one that reappeared.
+
+`RecoverCluster` refuses `DiscardUncommitted()` when nothing at all is proven —
+no snapshot and no `WithKnownCommitted` — rather than throwing away an entire
+log on the strength of an option.
+
+It is an operator action for a cluster that is already dead, not a way round
 one that is merely slow or partitioned. The procedure:
 
 1. Stop every surviving node.
 2. Run `InspectStorage` on each survivor and pick the most recent with
    `RecoveryInfo.MoreRecentThan` — the §5.4.1 up-to-date rule, higher last term
    first and longer log to break the tie. That node's history is the one kept.
-3. Run `RecoverCluster` on it.
+   Check `UncommittedBand()` and look at what is in it: this is the last moment
+   those entries can be told apart from the rest.
+3. Run `RecoverCluster` on it, with `WithKnownCommitted` if the state machine
+   keeps its own durable state. Keep the report.
 4. **Erase the storage of every other survivor.** Their logs are now divergent
    history, and a node that restarts holding entries the recovered node does not
    have can disrupt the elections of the cluster it is no longer part of.
@@ -1405,7 +1448,9 @@ one that is merely slow or partitioned. The procedure:
 6. Add the wiped nodes back with `AddMember`. They receive a snapshot and catch
    up the ordinary way.
 
-`InspectStorage` is read-only and safe to run on any stopped node. Its
+`InspectStorage` is read-only and safe to run on any stopped node, and
+`filestore` refuses to open a directory another store holds, so running it
+against a node that is still up fails rather than racing its writes. Its
 `Members` field is the membership that node would restart with — the one in its
 snapshot, advanced by every configuration entry in its log, committed or not,
 since §4.1 says a node uses the latest configuration it has rather than the

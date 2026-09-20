@@ -216,9 +216,14 @@ func TestRecoverCluster_RestoresAvailabilityAfterQuorumLoss(t *testing.T) {
 		t.Fatalf("InspectStorage reported %d members (complete=%v), want the 3 the cluster had: %v",
 			len(info.Members), info.MembersComplete, info.Members)
 	}
-	if err := raft.RecoverCluster(ctx, survivorStore, survivor,
-		[]raft.PeerConfig{{ID: survivor, Voter: true}}); err != nil {
+	report, err := raft.RecoverCluster(ctx, survivorStore, survivor,
+		[]raft.PeerConfig{{ID: survivor, Voter: true}})
+	if err != nil {
 		t.Fatalf("RecoverCluster: %v", err)
+	}
+	if report.DiscardedFrom != 0 || report.DiscardedTo != 0 {
+		t.Errorf("report discarded [%d,%d]; the default keeps the whole log",
+			report.DiscardedFrom, report.DiscardedTo)
 	}
 
 	recoveredNet := memtransport.NewNetwork()
@@ -482,7 +487,7 @@ func TestRecoverCluster_RejectsUnusableMembership(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := memstore.New()
-			if err := raft.RecoverCluster(ctx, store, tc.self, tc.members); err == nil {
+			if _, err := raft.RecoverCluster(ctx, store, tc.self, tc.members); err == nil {
 				t.Fatal("RecoverCluster accepted a membership that cannot form a cluster")
 			}
 			// Nothing may have been written: a refused recovery must leave the
@@ -518,7 +523,7 @@ func TestRecoverCluster_AllowsLearners(t *testing.T) {
 		{ID: "n2", Voter: false},
 		{ID: "n3", Voter: false},
 	}
-	if err := raft.RecoverCluster(ctx, store, "n1", members); err != nil {
+	if _, err := raft.RecoverCluster(ctx, store, "n1", members); err != nil {
 		t.Fatalf("RecoverCluster: %v", err)
 	}
 	info, err := raft.InspectStorage(ctx, store)
@@ -558,7 +563,7 @@ func TestRecoverCluster_WritesAboveEveryTermItHasSeen(t *testing.T) {
 		t.Fatalf("AppendLogEntries: %v", err)
 	}
 
-	if err := raft.RecoverCluster(ctx, store, "n1", []raft.PeerConfig{{ID: "n1", Voter: true}}); err != nil {
+	if _, err := raft.RecoverCluster(ctx, store, "n1", []raft.PeerConfig{{ID: "n1", Voter: true}}); err != nil {
 		t.Fatalf("RecoverCluster: %v", err)
 	}
 

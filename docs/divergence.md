@@ -210,16 +210,37 @@ commit it.
 `RecoverCluster` rewrites a stopped node's durable state from outside the
 protocol, appending a configuration entry in a term above any the node has seen
 so that the restarted node adopts a membership it can form a quorum in. It is
-deliberately outside the safety argument: it can promote entries that were
-never committed, and it discards whatever the lost majority had that this node
-does not. Both are inherent to recovering a cluster whose majority is gone, and
-both are stated in the API documentation and in the README.
+deliberately outside the safety argument, and it is worth being precise about
+which parts of that are unavoidable.
 
-The safeguards are that it refuses a membership the recovered node could not
-elect itself in, that it never rewrites or discards entries the node already
-has, and that the term it writes in is above the log's own last term as well as
-the hard state's, so it cannot create the one thing a crashed write would: an
-entry from a term the node does not believe it reached.
+Losing entries the dead majority committed and this node never received is
+unavoidable by anything: a committed entry is guaranteed to be on a majority,
+so losing a majority can lose it outright, and no algorithm recovers what no
+surviving disk holds.
+
+Everything above the highest index the node can prove was committed is a
+second, bounded problem. Each such entry either committed on the majority that
+died or was in flight when it did, and nothing that survives distinguishes
+them. Recovery either keeps that band, promoting entries that may never have
+committed, or discards it, throwing away entries that may have. Both are
+wrong in a different direction, so the choice is the operator's:
+`DiscardUncommitted` selects the second.
+
+What the implementation does about it is bound the band and report it.
+`RecoveryInfo.KnownCommittedIndex` is the snapshot's last included index, since
+a snapshot is taken at an applied index and applying follows committing;
+`WithKnownCommitted` raises that floor with a durable state machine's applied
+index, which is usually within a few entries of the true commit point;
+`UncommittedBand` names the range before anything is written, and
+`RecoveryReport` records which indices were promoted or discarded afterwards.
+
+The other safeguards are that it refuses a membership the recovered node could
+not elect itself in, that it refuses to discard a log nothing is proven about,
+that the term it writes in is above the log's own last term as well as the hard
+state's -- so it cannot create the one thing a crashed write would, an entry
+from a term the node does not believe it reached -- and that `filestore` holds
+an exclusive lock on its directory, so recovery run against a node that is
+still up fails at the open rather than racing its writes.
 
 ---
 
@@ -240,6 +261,7 @@ Stated here rather than discovered later.
   there is no member that votes without storing entries (dissertation §11.7.2).
 - **Lease reads assume bounded clock drift.** `ReadIndex` does not; prefer it
   unless you have measured your clocks.
-- **Recovering from permanent quorum loss is not a safe operation.** It cannot
-  be; see the divergence above. It is an operator action with data-loss
-  consequences, not something the cluster does for itself.
+- **Recovering from permanent quorum loss is not a safe operation, and cannot
+  be made one.** Half of it is information-theoretic: what no surviving disk
+  holds is gone. The other half is a choice between two wrong answers, bounded
+  and reported but not eliminated. See the divergence above.

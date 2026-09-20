@@ -21,20 +21,46 @@ import (
 // The cluster comes back as that membership, and the lost nodes are re-added as
 // new members afterwards.
 //
-// This is not a consensus operation, and it is not safe in the sense the rest
-// of this package is. Two things can go wrong, and both are inherent rather
-// than defects in this implementation:
+// This is not a consensus operation, and it cannot be made safe in the sense
+// the rest of this package is. Two things go wrong, and they are not the same
+// kind of problem.
 //
-//   - Entries this node holds but that were never committed become committed,
-//     because the recovered cluster's history is whatever this node had. A
-//     client that was told its write failed may find that it succeeded.
-//   - Entries committed by the lost majority that never reached this node are
-//     gone, because nothing that remains has them. A client that was told its
-//     write succeeded may find that it did not.
+// The first is not fixable by anything. Entries the lost majority committed
+// that never reached this node are gone, because nothing that remains has
+// them: a client told its write succeeded may find that it did not. Raft's
+// guarantee is that a committed entry is on a majority, so losing a majority
+// is losing the guarantee, and no algorithm run afterwards recovers what no
+// surviving disk holds. The answer to it is not recovery but not needing it:
+// more voters, Config.MinCommitZones to spread them across failure domains,
+// and backups taken off the cluster.
+//
+// The second is bounded, and this package bounds it. The node's log splits at
+// the highest index it can prove was committed -- RecoveryInfo.KnownCommittedIndex.
+// Below that, everything is certain. Above it, up to the end of the log, each
+// entry either committed on the majority that died or was still in flight, and
+// nothing that survives can say which. That band is what recovery has to
+// decide about, and there are only two ways to decide:
+//
+//   - Keep it, and entries that were never committed become committed: a
+//     client told its write failed may find that it succeeded. This is the
+//     default, because it is what an operator trying to get their data back
+//     almost always wants.
+//   - Discard it, and entries that had committed but that this node had not
+//     yet applied are thrown away on top of whatever the first problem already
+//     cost. DiscardUncommitted does this, for a system where a write reported
+//     as failed must stay failed.
+//
+// Neither is safe; which is the lesser harm depends on the application rather
+// than on Raft. What can be done, and is, is to make the band small and to
+// make it visible: WithKnownCommitted narrows it to the entries the state
+// machine had not yet applied, InspectStorage reports it before anything is
+// written, and RecoveryReport records exactly which indices were promoted or
+// discarded after the fact.
 //
 // Recovery is therefore an operator action for a cluster that is already dead,
 // not a tool for one that is merely slow or partitioned. Do not run it against
-// storage a node is still using, and do not run it to sidestep an unavailable
+// storage a node is still using -- filestore locks its directory so that this
+// fails rather than corrupts -- and do not run it to sidestep an unavailable
 // but intact cluster: if the lost nodes come back afterwards holding a history
 // this one does not have, there is no longer a single agreed history.
 //
@@ -43,8 +69,13 @@ import (
 //  1. Stop every surviving node.
 //  2. Call InspectStorage on each survivor's storage and pick the most recent,
 //     with RecoveryInfo.MoreRecentThan. That is the one whose history is kept.
+//     RecoveryInfo.UncommittedBand says which of its entries are in doubt;
+//     look at them before going on, because this is the last moment at which
+//     they can be told apart from the rest.
 //  3. Call RecoverCluster on that node's storage, naming a membership it is a
-//     voting majority of. Naming only itself is the usual choice.
+//     voting majority of. Naming only itself is the usual choice. Pass
+//     WithKnownCommitted if the state machine keeps its own durable state, and
+//     keep the returned report.
 //  4. Erase the storage of every other survivor. Their logs are now divergent
 //     history: a node that restarts holding entries the recovered node does
 //     not have can disrupt the elections of the cluster it is no longer part
@@ -77,6 +108,20 @@ type RecoveryInfo struct {
 	// are 0 when it has none.
 	SnapshotIndex Index
 	SnapshotTerm  Term
+
+	// KnownCommittedIndex is the highest index this node's storage proves was
+	// committed. Entries above it, up to LastIndex, are the ones recovery has
+	// to guess about: each was either committed by the majority that is gone,
+	// or was still in flight when it died, and nothing left behind can say
+	// which.
+	//
+	// It is the snapshot's last included index, because a snapshot is taken at
+	// an applied index and applying follows committing. That is a floor, often
+	// a distant one: a node that snapshots every 8192 entries leaves a band
+	// that wide. A state machine holding its own durable state knows better --
+	// its AppliedIndex is also proof -- and RecoverCluster takes that as
+	// WithKnownCommitted.
+	KnownCommittedIndex Index
 
 	// Members is the membership the node would restart with: the one recorded
 	// in its snapshot, advanced by every configuration entry in its log,
@@ -161,7 +206,27 @@ func InspectStorage(ctx context.Context, store Storage) (RecoveryInfo, error) {
 		info.Members = ms.members
 	}
 	info.MembersComplete = complete
+	// Storage on its own proves exactly one thing about commitment: whatever
+	// went into a snapshot was applied, and nothing is applied before it
+	// commits.
+	info.KnownCommittedIndex = info.SnapshotIndex
 	return info, nil
+}
+
+// UncommittedBand returns the range of indices recovery cannot classify: every
+// entry above what the node can prove committed, up to the end of its log.
+// ok is false when there is none, which is the case for a node whose log ends
+// at a snapshot boundary.
+//
+// Recovering this node either promotes that range to committed history or
+// discards it. Which of those is the lesser harm depends on what the
+// application does with a write it was told had failed, so the choice is the
+// operator's; see RecoverCluster and DiscardUncommitted.
+func (r *RecoveryInfo) UncommittedBand() (from, to Index, ok bool) {
+	if r.LastIndex <= r.KnownCommittedIndex {
+		return 0, 0, false
+	}
+	return r.KnownCommittedIndex + 1, r.LastIndex, true
 }
 
 // snapshotMembership reads the node's snapshot, filling in the snapshot fields
@@ -293,6 +358,93 @@ func removePeer(peers []PeerConfig, id NodeID) []PeerConfig {
 	return out
 }
 
+// RecoverOption adjusts what RecoverCluster does with the part of the log it
+// cannot prove was committed.
+type RecoverOption func(*recoverOptions)
+
+type recoverOptions struct {
+	knownCommitted     Index
+	discardUncommitted bool
+}
+
+// WithKnownCommitted raises the index recovery treats as proven committed.
+//
+// Storage alone proves only what went into a snapshot, which can be thousands
+// of entries behind. A state machine that keeps its own durable state knows
+// more: everything at or below its AppliedIndex has been applied, and nothing
+// is applied before it commits. Pass that index here and the band recovery has
+// to guess about shrinks to the handful of entries the apply loop had not
+// reached.
+//
+// It must be a number the caller can actually prove, not an estimate. Claiming
+// more than was committed makes DiscardUncommitted keep entries it should have
+// discarded, and makes the report say entries were committed when they were
+// not. Indices at or below what storage already proves are ignored rather than
+// lowering the floor.
+func WithKnownCommitted(index Index) RecoverOption {
+	return func(o *recoverOptions) { o.knownCommitted = index }
+}
+
+// DiscardUncommitted truncates the log to the last index proven committed
+// instead of keeping it whole.
+//
+// It picks the other side of the trade recovery cannot avoid. By default the
+// node's whole log becomes the recovered cluster's history, which means an
+// entry that was still in flight when the majority died is now committed: a
+// client told its write failed finds that it succeeded. With this option
+// nothing uncommitted is ever promoted -- and entries that had committed, but
+// that this node had not yet applied or snapshotted, are thrown away instead:
+// a client told its write succeeded finds that it did not.
+//
+// Neither is safe. Which is the lesser harm is a property of the application,
+// not of Raft: a system that compensates for failed writes is damaged by the
+// first, and one that acknowledges durably is damaged by the second. Use
+// WithKnownCommitted to make the band small before choosing either.
+//
+// Recovery refuses to discard when nothing at all is proven -- no snapshot and
+// no WithKnownCommitted -- since that would throw the entire log away on the
+// strength of an option.
+func DiscardUncommitted() RecoverOption {
+	return func(o *recoverOptions) { o.discardUncommitted = true }
+}
+
+// RecoveryReport records what a recovery did, so that the one operation in this
+// package that can lose or invent committed data leaves an account of which it
+// did and to what.
+//
+// Log it. A cluster that comes back after a recovery looks like any other
+// cluster, and six months later the only way to explain a write that vanished
+// or one that reappeared is a record made at the time.
+type RecoveryReport struct {
+	// Term is the term the recovery entry was written in, and Index is where
+	// it went. Together they identify the entry in the recovered log.
+	Term  Term
+	Index Index
+
+	// KnownCommittedIndex is the floor recovery worked from: the highest index
+	// it could prove was committed, from the snapshot and from
+	// WithKnownCommitted.
+	KnownCommittedIndex Index
+
+	// PromotedFrom and PromotedTo bound the entries that were not proven
+	// committed and are now part of the recovered cluster's history. Both are
+	// zero when there were none, or when DiscardUncommitted was used.
+	//
+	// These are the writes that may have been reported to a client as failed.
+	PromotedFrom, PromotedTo Index
+
+	// DiscardedFrom and DiscardedTo bound the entries DiscardUncommitted threw
+	// away. Both are zero unless it was used.
+	//
+	// These are the writes that may have been reported to a client as
+	// succeeded.
+	DiscardedFrom, DiscardedTo Index
+
+	// MembersBefore is the membership the node would have restarted with, and
+	// MembersAfter the one it will restart with now.
+	MembersBefore, MembersAfter []PeerConfig
+}
+
 // RecoverCluster rewrites the durable state of a stopped node so that, when it
 // restarts, it belongs to members rather than to whatever membership its log
 // records. self is that node's own ID and must appear in members as a voter.
@@ -311,24 +463,75 @@ func removePeer(peers []PeerConfig, id NodeID) []PeerConfig {
 // snapshot, and either way they are promoted to voters afterwards with
 // Node.PromoteMember.
 //
-// Nothing about the node's log or state machine changes. Everything it had
-// committed it still has; the recovery entry is appended at the end, in a term
+// By default nothing about the node's log or state machine changes: everything
+// it had, it keeps, and the recovery entry is appended at the end in a term
 // higher than any the node has seen, so that it is the last word on the
-// cluster's membership however the log ended.
+// cluster's membership however the log ended. The cost is that entries the
+// node held but that were never committed become committed. DiscardUncommitted
+// takes the other side of that trade, and WithKnownCommitted shrinks how much
+// either one is deciding about.
+//
+// The returned report says what it did, including exactly which indices were
+// promoted or discarded. Log it: it is the only record of the one operation
+// here that can lose or invent committed data.
 //
 // The node must be stopped and this must be the only open handle on its
 // storage. A Storage that can tell refuses to help you break that: filestore
 // takes an exclusive lock on its directory, so recovery run against a node
 // that is still up fails at the open rather than racing its writes. A Storage
 // that cannot tell offers no such protection.
-func RecoverCluster(ctx context.Context, store Storage, self NodeID, members []PeerConfig) error {
+func RecoverCluster(ctx context.Context, store Storage, self NodeID, members []PeerConfig, opts ...RecoverOption) (RecoveryReport, error) {
+	var o recoverOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	if err := validateRecoveryMembers(self, members); err != nil {
-		return err
+		return RecoveryReport{}, err
 	}
 
 	info, err := InspectStorage(ctx, store)
 	if err != nil {
-		return err
+		return RecoveryReport{}, err
+	}
+
+	// Evidence from outside storage can only raise the floor. A caller who
+	// passes something lower than the snapshot has told us nothing new.
+	floor := max(info.KnownCommittedIndex, o.knownCommitted)
+	if floor > info.LastIndex {
+		// A state machine cannot have applied what the log does not hold. This
+		// is a caller mistake or a mismatched pair of directories, and going
+		// ahead would truncate nothing while reporting a floor that is not in
+		// the log.
+		return RecoveryReport{}, fmt.Errorf(
+			"raft.RecoverCluster: WithKnownCommitted(%d) is past the last index in the log (%d); "+
+				"the state machine and the log do not belong to the same node",
+			o.knownCommitted, info.LastIndex)
+	}
+
+	report := RecoveryReport{
+		KnownCommittedIndex: floor,
+		MembersBefore:       info.Members,
+		MembersAfter:        members,
+	}
+
+	// Where the recovery entry goes, and what happens to whatever is above the
+	// floor, is the whole of the choice this function offers.
+	tail := info.LastIndex
+	if o.discardUncommitted {
+		if floor == 0 && info.LastIndex > 0 {
+			return RecoveryReport{}, fmt.Errorf(
+				"raft.RecoverCluster: DiscardUncommitted would discard the entire log (%d entries): "+
+					"this node has no snapshot, so nothing in it is proven committed. Supply "+
+					"WithKnownCommitted if you can prove more, or recover without the option",
+				info.LastIndex)
+		}
+		if info.LastIndex > floor {
+			report.DiscardedFrom, report.DiscardedTo = floor+1, info.LastIndex
+		}
+		tail = floor
+	} else if info.LastIndex > floor {
+		report.PromotedFrom, report.PromotedTo = floor+1, info.LastIndex
 	}
 
 	// A term above everything the node has seen, so that the recovery entry
@@ -338,24 +541,35 @@ func RecoverCluster(ctx context.Context, store Storage, self NodeID, members []P
 	// as the hard state's: storage that disagrees with itself is exactly the
 	// kind of state recovery exists to clean up.
 	term := max(info.Term, info.LastTerm) + 1
+	report.Term, report.Index = term, tail+1
 
 	// Hard state first. A crash between the two writes must not leave a log
 	// holding an entry from a term the node does not believe it reached; the
 	// other order -- a term with no entry to go with it -- costs nothing but a
 	// repeat of the recovery.
 	if err := store.SaveHardState(ctx, HardState{CurrentTerm: term}); err != nil {
-		return fmt.Errorf("raft.RecoverCluster: save hard state: %w", err)
+		return RecoveryReport{}, fmt.Errorf("raft.RecoverCluster: save hard state: %w", err)
+	}
+
+	// Then the truncation, if one was asked for. Before the append rather than
+	// after, so that a crash in between leaves a log that is short rather than
+	// one that has had its tail removed from under the entry that was supposed
+	// to end it.
+	if o.discardUncommitted && info.LastIndex > floor {
+		if err := store.TruncateSuffix(ctx, floor+1); err != nil {
+			return RecoveryReport{}, fmt.Errorf("raft.RecoverCluster: discard uncommitted suffix: %w", err)
+		}
 	}
 
 	entry := LogEntry{
-		Index:   info.LastIndex + 1,
+		Index:   tail + 1,
 		Term:    term,
 		Command: encodeFinaliseConfigEntry(members),
 	}
 	if err := store.AppendLogEntries(ctx, []LogEntry{entry}); err != nil {
-		return fmt.Errorf("raft.RecoverCluster: append membership entry: %w", err)
+		return RecoveryReport{}, fmt.Errorf("raft.RecoverCluster: append membership entry: %w", err)
 	}
-	return nil
+	return report, nil
 }
 
 // validateRecoveryMembers rejects a membership that cannot produce a working
