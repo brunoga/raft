@@ -324,3 +324,74 @@ func (busySM) Apply(_ context.Context, _ raft.LogEntry) ([]byte, error) {
 	time.Sleep(2 * time.Millisecond)
 	return nil, nil
 }
+
+// TestEvents_AnUnreachablePeerDoesNotFloodTheEventLoop pins the cost of
+// noticing that a peer is down.
+//
+// An unreachable peer is retried every heartbeat interval, for as long as the
+// outage lasts. A design that told the event loop about each failure would put
+// one message per peer per interval into its queue precisely when a
+// partitioned cluster can least afford the traffic, competing with the
+// snapshot the leader is trying to send to somebody else. Only the change is
+// reported, in either direction, so an outage costs two messages rather than
+// thousands.
+//
+// What this checks is the consequence: a leader with a peer it cannot reach
+// keeps answering, promptly, however long the outage runs.
+func TestEvents_AnUnreachablePeerDoesNotFloodTheEventLoop(t *testing.T) {
+	cfg := safeBaseConfig(t, "n1")
+	cfg.Peers = []raft.PeerConfig{{ID: "gone"}} // a learner, so n1 leads alone
+	cfg.Transport = &unreachableTransport{}
+
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	node.Start()
+	t.Cleanup(node.Stop)
+
+	events, stopEvents := node.Events()
+	defer stopEvents()
+
+	stop := tickWhile(node)
+	defer stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for node.State() != raft.Leader {
+		if time.Now().After(deadline) {
+			t.Fatal("the node never became leader")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	awaitEvent(t, events, raft.EventPeerUnresponsive, 10*time.Second)
+
+	// Now drive many heartbeat intervals past the outage and keep proposing.
+	// Each proposal has to cross the event loop and come back, so a loop
+	// clogged with failure reports shows up here as a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for i := range 200 {
+		propCtx, propCancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err := node.Propose(propCtx, []byte("x"))
+		propCancel()
+		if err != nil {
+			t.Fatalf("proposal %d was not answered while one peer was unreachable: %v", i, err)
+		}
+	}
+
+	// And the outage was reported once, not once per heartbeat.
+	extra := 0
+	for drained := true; drained; {
+		select {
+		case ev := <-events:
+			if ev.Type == raft.EventPeerUnresponsive {
+				extra++
+			}
+		default:
+			drained = false
+		}
+	}
+	if extra > 0 {
+		t.Errorf("the same outage was reported %d more times; it is one event, not one per heartbeat", extra)
+	}
+}

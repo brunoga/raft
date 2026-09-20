@@ -201,10 +201,12 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 		n.handleVoteResult(req)
 	case *appendResult:
 		n.handleAppendResult(req)
-	case *peerRPCFailed:
-		n.notePeerUnreachable(req.peer)
-	case *peerRPCSucceeded:
-		n.notePeerResponded(req.peer)
+	case *peerReachability:
+		if req.reachable {
+			n.markPeerUp(req.peer)
+		} else {
+			n.markPeerDown(req.peer)
+		}
 	case *installSnapshotResult:
 		n.handleInstallSnapshotResult(req)
 	case *snapInstallResult:

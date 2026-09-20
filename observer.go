@@ -336,14 +336,19 @@ type peerHealth struct {
 	down bool
 }
 
-// peerRPCFailed tells the event loop that a heartbeat to peer got no answer.
-// Sent by a heartbeat pump, which is the only traffic an idle leader has.
-type peerRPCFailed struct{ peer NodeID }
-
-// peerRPCSucceeded tells the event loop that a heartbeat to peer got through
-// after one had not. Sent only on that transition, so a healthy peer costs
-// nothing.
-type peerRPCSucceeded struct{ peer NodeID }
+// peerReachability tells the event loop that a heartbeat pump's view of
+// whether it can reach its peer has changed.
+//
+// Only the change is sent, in either direction. A peer that is simply up costs
+// no messages, and -- which is what matters -- neither does a peer that is
+// simply down: an unreachable peer is retried every heartbeat interval, so a
+// message per failure would put one message per peer per interval into the
+// event loop's queue for as long as the outage lasted, which on a partitioned
+// cluster is the moment it can least afford the traffic.
+type peerReachability struct {
+	peer      NodeID
+	reachable bool
+}
 
 // notePeerUnreachable records an AppendEntries RPC to peer that never got an
 // answer, and reports the peer unresponsive once enough of them have failed in
@@ -354,13 +359,37 @@ func (n *Node) notePeerUnreachable(peer NodeID) {
 	}
 	h := n.peerHealth[peer]
 	h.failures++
-	report := h.failures >= peerUnresponsiveFailures && !h.down
-	if report {
-		h.down = true
-	}
 	n.peerHealth[peer] = h
-	if report {
-		n.emit(&Event{Type: EventPeerUnresponsive, Peer: peer})
+	if h.failures >= peerUnresponsiveFailures {
+		n.markPeerDown(peer)
+	}
+}
+
+// markPeerDown records that peer cannot be reached and reports it once.
+// Event-loop only.
+func (n *Node) markPeerDown(peer NodeID) {
+	if n.peerHealth == nil {
+		n.peerHealth = make(map[NodeID]peerHealth)
+	}
+	h := n.peerHealth[peer]
+	if h.down {
+		return
+	}
+	h.down = true
+	n.peerHealth[peer] = h
+	n.emit(&Event{Type: EventPeerUnresponsive, Peer: peer})
+}
+
+// markPeerUp records that peer can be reached again and reports it if it had
+// been reported unreachable. Event-loop only.
+func (n *Node) markPeerUp(peer NodeID) {
+	h, ok := n.peerHealth[peer]
+	if !ok {
+		return
+	}
+	delete(n.peerHealth, peer)
+	if h.down {
+		n.emit(&Event{Type: EventPeerResponsive, Peer: peer})
 	}
 }
 
@@ -369,14 +398,7 @@ func (n *Node) notePeerUnreachable(peer NodeID) {
 // rejection counts: what is being tracked is whether the peer is reachable,
 // not whether it agreed. Event-loop only.
 func (n *Node) notePeerResponded(peer NodeID) {
-	h, ok := n.peerHealth[peer]
-	if !ok {
-		return // never failed; nothing to reset and nothing to report
-	}
-	delete(n.peerHealth, peer)
-	if h.down {
-		n.emit(&Event{Type: EventPeerResponsive, Peer: peer})
-	}
+	n.markPeerUp(peer)
 }
 
 // resetPeerHealth forgets what was known about every peer's reachability.

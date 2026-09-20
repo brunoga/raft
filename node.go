@@ -1840,10 +1840,11 @@ func (n *Node) stopHBPumpFor(id NodeID) {
 // It reads from ch, sends the AppendEntries RPC, and posts the result to rpcCh.
 // The goroutine exits when stop is closed or n.stopCtx is cancelled.
 func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-chan struct{}) {
-	// failed is this pump's own view of whether the last heartbeat got
-	// through, kept here so that a peer which is simply up costs no messages
-	// at all: only a change of view is reported to the event loop.
-	failed := false
+	// fails counts heartbeats to this peer that got no answer, in a row. It
+	// lives here rather than on the event loop so that neither a peer which is
+	// up nor one which is down costs a message per heartbeat: only crossing
+	// the threshold, and recovering from it, is reported.
+	fails := 0
 	for {
 		var req *AppendEntriesRequest
 		select {
@@ -1862,28 +1863,38 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 			// A missed heartbeat is not itself news -- the next tick sends
 			// another -- but a peer that misses them all is the fact that
 			// decides whether the next failure costs the cluster its quorum,
-			// and heartbeats are the only traffic an idle leader sends. So
-			// the failure is reported, and the recovery after it.
-			failed = true
-			select {
-			case n.rpcCh <- rpcEnvelope{req: &peerRPCFailed{peer: peer}}:
-			case <-stop:
-				return
-			case <-n.stopCtx.Done():
-				return
+			// and heartbeats are the only traffic an idle leader sends.
+			//
+			// Only the change is reported, which is the whole of why this
+			// counts here rather than sending every failure to the event loop
+			// to be counted there: an unreachable peer is retried every
+			// heartbeat interval, so a message per failure would put one
+			// message per peer per interval into the event loop's queue for as
+			// long as the outage lasted. That is the moment a partitioned
+			// cluster can least afford the extra traffic, and it is competing
+			// with the snapshot the leader is trying to send.
+			fails++
+			if fails == peerUnresponsiveFailures {
+				select {
+				case n.rpcCh <- rpcEnvelope{req: &peerReachability{peer: peer}}:
+				case <-stop:
+					return
+				case <-n.stopCtx.Done():
+					return
+				}
 			}
 			continue
 		}
-		if failed {
-			failed = false
+		if fails >= peerUnresponsiveFailures {
 			select {
-			case n.rpcCh <- rpcEnvelope{req: &peerRPCSucceeded{peer: peer}}:
+			case n.rpcCh <- rpcEnvelope{req: &peerReachability{peer: peer, reachable: true}}:
 			case <-stop:
 				return
 			case <-n.stopCtx.Done():
 				return
 			}
 		}
+		fails = 0
 		select {
 		case n.rpcCh <- rpcEnvelope{req: &appendResult{
 			peer:          peer,
