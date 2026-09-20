@@ -212,3 +212,27 @@ type ProposalMetrics interface {
 	// leader.
 	ProposalCompleted(id NodeID, latency time.Duration, ok bool)
 }
+
+// ApplyMetrics is an optional interface that a Config.Metrics implementation
+// may also satisfy. When it does, the node reports how much of its time the
+// apply loop spends applying rather than waiting for work.
+//
+// It is the number that says where a slow write is slow. Proposal latency
+// covers consensus and the state machine together, so a rise in it does not
+// say which of the two to fix. A saturation close to 1 says the apply loop
+// never gets to wait: the state machine is the constraint, and faster
+// consensus buys nothing. A low saturation alongside slow proposals says the
+// opposite, and points at the disk or at replication instead.
+//
+// It is a separate interface so that adding it does not break existing Metrics
+// implementations. Implementations must not block; they are called from the
+// apply goroutine, which is the goroutine the measurement is about.
+type ApplyMetrics interface {
+	// ApplySaturation is called with the fraction of the last window, in the
+	// range [0,1], that the apply goroutine spent working rather than waiting
+	// for committed entries. It is called a few times per window, each time
+	// with the ratio over the whole of the recent window rather than since the
+	// process started, so that a node that was busy an hour ago does not look
+	// busy now.
+	ApplySaturation(id NodeID, saturation float64)
+}

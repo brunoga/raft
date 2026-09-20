@@ -227,6 +227,11 @@ func (n *Node) handleInstallSnapshot(req *InstallSnapshotRequest, respCh chan rp
 			defer n.snapshotInstallWg.Done()
 			n.runSnapshotInstall(installCtx, meta, installCh)
 		}()
+		n.emit(&Event{
+			Type:   EventSnapshotStarted,
+			Origin: SnapshotReceived,
+			Index:  meta.LastIncludedIndex,
+		})
 	}
 
 	// Verify the expected byte offset to detect out-of-order delivery.
@@ -367,6 +372,12 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	if r.err != nil {
 		n.answerSnapInstallAck(r.meta.LastIncludedIndex, r.err)
 		n.logger.Error("snapshot install failed", "err", r.err)
+		n.emit(&Event{
+			Type:   EventSnapshotFailed,
+			Origin: SnapshotReceived,
+			Index:  r.meta.LastIncludedIndex,
+			Err:    r.err,
+		})
 		// Clear the stale pendingSnap reference so that any chunks arriving
 		// before the leader retries from Offset=0 are rejected immediately
 		// rather than being buffered into a channel whose consumer has exited.
@@ -379,6 +390,11 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	// The snapshot is on disk from here on, whatever this node then does with
 	// it, so the leader can be told.
 	n.answerSnapInstallAck(r.meta.LastIncludedIndex, nil)
+	n.emit(&Event{
+		Type:   EventSnapshotCompleted,
+		Origin: SnapshotReceived,
+		Index:  r.meta.LastIncludedIndex,
+	})
 
 	// Skip stale results: a newer snapshot may have already been applied.
 	if r.meta.LastIncludedIndex <= n.lastApplied {
@@ -487,6 +503,8 @@ func (n *Node) maybeSnapshot() {
 	// forward this table through snapshotResult to handleSnapshotResult.
 	tableSnapshot := n.clientTable.records()
 
+	n.emit(&Event{Type: EventSnapshotStarted, Origin: SnapshotLocal, Index: snapAt})
+
 	// Signal applyLoop to take the snapshot. The channel is size-1 and
 	// snapshotting prevents re-entry, so this send never blocks.
 	n.snapshotTriggerCh <- snapshotTrigger{
@@ -512,6 +530,12 @@ func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 
 	if sr.err != nil {
 		n.logger.Error("snapshot goroutine failed", "err", sr.err)
+		n.emit(&Event{
+			Type:   EventSnapshotFailed,
+			Origin: SnapshotLocal,
+			Index:  sr.meta.LastIncludedIndex,
+			Err:    sr.err,
+		})
 		return
 	}
 
@@ -536,6 +560,11 @@ func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 	if n.cfg.Metrics != nil {
 		n.cfg.Metrics.SnapshotTaken(n.cfg.ID, sr.meta.LastIncludedIndex, int(sr.sizeBytes))
 	}
+	n.emit(&Event{
+		Type:   EventSnapshotCompleted,
+		Origin: SnapshotLocal,
+		Index:  sr.meta.LastIncludedIndex,
+	})
 }
 
 // sendSnapshotToPeer loads the latest snapshot and sends it to peer via

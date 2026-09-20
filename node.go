@@ -387,6 +387,16 @@ type Node struct {
 	// leadershipDirty is set when a transition changes state or leader, and
 	// cleared when the event loop announces the result at the end of its turn.
 	leadershipDirty bool
+	// observers holds the subscriptions created by Events. They share
+	// watchersMu with the watchers above because they are published the same
+	// way, by a non-blocking send from the event loop, so one lock covers both
+	// and is never held for longer than that send takes. See observer.go.
+	observers    map[uint64]*observer
+	nextObserver uint64
+	// peerHealth remembers, per peer, whether this leader's AppendEntries RPCs
+	// are reaching it, so that an observer is told once when a follower stops
+	// answering and once when it starts again. Event-loop only.
+	peerHealth map[NodeID]peerHealth
 	// fatalErr holds the first durable-write failure this node hit, if any.
 	// Setting it stops the node; it is read by FatalError and reported in
 	// place of ErrStopped by every operation afterwards.
@@ -408,6 +418,9 @@ func (n *Node) fail(err error, op string) {
 	}
 	n.logger.Error("fatal: durable write failed; stopping this node",
 		"op", op, "err", err)
+	// Told before Stop begins, so that the event reaches the subscriptions
+	// while they are still open. It is the last thing this node reports.
+	n.emit(&Event{Type: EventNodeFailed, Err: wrapped})
 	if n.cfg.OnFatal != nil {
 		go n.cfg.OnFatal(wrapped)
 	}
@@ -561,6 +574,11 @@ func (n *Node) announceLeadership() {
 		return
 	}
 	n.leadership.Store(change)
+	n.emitLocked(&Event{
+		Type:     EventLeadershipChanged,
+		IsLeader: change.IsLeader,
+		Leader:   change.Leader,
+	})
 
 	for _, ch := range n.watchers {
 		// Coalescing send: replace an undelivered status rather than block the
@@ -774,6 +792,7 @@ func (n *Node) Stop() {
 		n.snapshotInstallWg.Wait()
 		n.snapshotWriteWg.Wait()
 		n.closeWatchers()
+		n.closeObservers()
 		n.cfg.Transport.Unregister(n.cfg.ID)
 		n.logger.Info("stopped")
 	})
@@ -1814,6 +1833,10 @@ func (n *Node) stopHBPumpFor(id NodeID) {
 // It reads from ch, sends the AppendEntries RPC, and posts the result to rpcCh.
 // The goroutine exits when stop is closed or n.stopCtx is cancelled.
 func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-chan struct{}) {
+	// failed is this pump's own view of whether the last heartbeat got
+	// through, kept here so that a peer which is simply up costs no messages
+	// at all: only a change of view is reported to the event loop.
+	failed := false
 	for {
 		var req *AppendEntriesRequest
 		select {
@@ -1829,7 +1852,30 @@ func (n *Node) runHBPump(peer NodeID, ch <-chan *AppendEntriesRequest, stop <-ch
 		finish(err)
 		cancel()
 		if err != nil || resp == nil {
-			continue // missed heartbeat; next tick will send another
+			// A missed heartbeat is not itself news -- the next tick sends
+			// another -- but a peer that misses them all is the fact that
+			// decides whether the next failure costs the cluster its quorum,
+			// and heartbeats are the only traffic an idle leader sends. So
+			// the failure is reported, and the recovery after it.
+			failed = true
+			select {
+			case n.rpcCh <- rpcEnvelope{req: &peerRPCFailed{peer: peer}}:
+			case <-stop:
+				return
+			case <-n.stopCtx.Done():
+				return
+			}
+			continue
+		}
+		if failed {
+			failed = false
+			select {
+			case n.rpcCh <- rpcEnvelope{req: &peerRPCSucceeded{peer: peer}}:
+			case <-stop:
+				return
+			case <-n.stopCtx.Done():
+				return
+			}
 		}
 		select {
 		case n.rpcCh <- rpcEnvelope{req: &appendResult{
@@ -1911,6 +1957,12 @@ func (n *Node) applyLoop() {
 	localLastApplied := n.applyBaseIndex
 	ctx := n.stopCtx
 
+	// sat measures how much of this loop's time goes on work rather than on
+	// waiting for it. It is nil, and every call on it a no-op, unless
+	// Config.Metrics implements ApplyMetrics. See apply_saturation.go.
+	sat := n.applySaturationTracker()
+	defer sat.stop()
+
 	// localClientTable is the apply goroutine's own copy of the dedup table.
 	// It is used to enforce exactly-once semantics for ProposeOnce entries: if
 	// a (clientID, seqNum) pair has already been applied, SM.Apply is skipped
@@ -1961,16 +2013,29 @@ func (n *Node) applyLoop() {
 		// goroutine reads (log entries via Storage) is immutable after being written.
 		select {
 		case si := <-n.restoreSnapshotCh:
+			sat.working()
 			localClientTable = n.applyRestore(ctx, si, &localLastApplied, localClientTable)
 			continue
 		default:
 		}
 
+		// Everything below the priority select is time spent waiting for work;
+		// everything a case does with the work is time spent on it.
+		sat.waiting()
+
 		select {
 		case si := <-n.restoreSnapshotCh:
+			sat.working()
 			localClientTable = n.applyRestore(ctx, si, &localLastApplied, localClientTable)
 
+		case <-sat.samples():
+			// Nothing to apply, but the measurement still has to move: a gauge
+			// left at the last busy reading would report a loop that stopped
+			// working as one that never stops.
+			sat.sample()
+
 		case trig := <-n.snapshotTriggerCh:
+			sat.working()
 			// A state machine that can hand over a point-in-time capture
 			// cheaply lets the serialisation move off this goroutine, so
 			// entries keep applying while the snapshot is written. Otherwise
@@ -2010,6 +2075,7 @@ func (n *Node) applyLoop() {
 			}
 
 		case commitIdx := <-n.commitNotifyCh:
+			sat.working()
 			lo := localLastApplied + 1
 			if lo > commitIdx {
 				continue
