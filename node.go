@@ -632,6 +632,19 @@ func New(cfg *Config) (*Node, error) {
 		return nil, fmt.Errorf("raft.New: load hard state: %w", err)
 	}
 
+	// Copy the peer list. Node holds Config by value, so without this the node
+	// and the caller would share one backing array, and the node rewrites its
+	// own list in place from the event-loop goroutine as configuration changes
+	// commit.
+	//
+	// Nothing observable depends on this today: rebuildMembership below
+	// replaces the slice with a freshly built one before the node ever runs,
+	// so the caller's array is already let go of. That is an accident of how
+	// membership recovery happens to work rather than a property anyone
+	// stated, and it is one refactor away from not being true. Copying says it
+	// outright and costs one allocation per node.
+	peers := append([]PeerConfig(nil), cfg.Peers...)
+
 	n := &Node{
 		cfg:         *cfg,
 		logger:      logger,
@@ -665,6 +678,7 @@ func New(cfg *Config) (*Node, error) {
 		clientTable:       newClientLRU(cfg.MaxClientTableSize),
 		rng:               rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
+	n.cfg.Peers = peers
 	n.stopCtx, n.stopCancel = stopCtx, stopCancel
 	n.handler = &nodeHandler{n: n}
 
@@ -990,6 +1004,17 @@ func (n *Node) ReadIndex(ctx context.Context) (Index, error) {
 func (n *Node) ReadIndexLease(ctx context.Context) (Index, error) {
 	if err := n.checkRunning(); err != nil {
 		return 0, err
+	}
+
+	// A lease read is only as good as the promise that a leader which has lost
+	// contact with its cluster stops being one. That promise is check-quorum,
+	// and without it a leader partitioned away from everybody keeps its lease,
+	// keeps believing it leads, and answers reads from a state machine the
+	// rest of the cluster has moved on from -- silently, for as long as the
+	// partition lasts. Refusing here rather than serving the read makes the
+	// unsafe combination impossible to hold by accident.
+	if !n.cfg.CheckQuorum {
+		return 0, ErrLeaseReadUnavailable
 	}
 
 	if n.State() != Leader {
@@ -1629,7 +1654,13 @@ const defaultMaxUnstableLogBytes = 64 << 20
 // unstableLimit returns the byte limit on log entries held in memory awaiting
 // a write.
 func (n *Node) unstableLimit() int {
-	if n.cfg.MaxUnstableLogBytes > 0 {
+	if n.cfg.MaxUnstableLogBytes != 0 {
+		// Negative says no limit, and is the only way to say it: zero selects
+		// the default, because a node with no bound answers a slow disk by
+		// running out of memory.
+		if n.cfg.MaxUnstableLogBytes < 0 {
+			return 0
+		}
 		return n.cfg.MaxUnstableLogBytes
 	}
 	return defaultMaxUnstableLogBytes
