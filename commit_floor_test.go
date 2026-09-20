@@ -37,9 +37,13 @@ func TestCommitFloor_NarrowsTheBandARecoveryGuessesAbout(t *testing.T) {
 	cfg.Transport = net.NewTransport("n1")
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 0 // never compact: the snapshot must prove nothing
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	// This test drives ticks itself, once a millisecond, against timeouts that
+	// were converted to tick counts at a 10ms tick. Left at 20-40ms the
+	// election window is 2-4ms of wall clock, and this is the one test here
+	// that also does real disk I/O: on a loaded machine it starts elections
+	// faster than the fsyncs behind them complete, and never settles on a
+	// leader. Squeezing the window further fails it every time.
+	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)
 	if err != nil {
