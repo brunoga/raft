@@ -20,7 +20,7 @@ import (
 // newTestStore builds a Store with all internal structures initialised but no
 // Raft node, so the state-machine, HTTP and policy code can be exercised
 // without forming a cluster.
-func newTestStore(t *testing.T, cfg *Config) *Store {
+func newTestStore(t *testing.T, cfg *config) *Store {
 	t.Helper()
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -146,7 +146,7 @@ func TestReadIndexWithFallback_NeverSurfacesExpiredLease(t *testing.T) {
 // TestCollectionRead_FallsBackFromExpiredLease checks the same invariant
 // through the public Read and List entry points.
 func TestCollectionRead_FallsBackFromExpiredLease(t *testing.T) {
-	s := newTestStore(t, &Config{ID: "n1", LeaseReads: true})
+	s := newTestStore(t, &config{ID: "n1", LeaseReads: true})
 	reader := &fakeReadIndexer{leaseErr: raft.ErrLeaseExpired}
 	s.reader = reader
 	s.node = nil
@@ -251,7 +251,7 @@ func TestLeaderURL_OnlyUsesAdvertisedAddresses(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := Config{ID: "n1"}
+			cfg := config{ID: "n1"}
 			if tt.httpTLS {
 				cfg.HTTPTLS = testTLSConfig()
 			}
@@ -324,7 +324,7 @@ func TestDiscoveredPeerConfig_LearnerByDefault(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var cfg Config
+			var cfg config
 			for _, o := range tt.options {
 				o(&cfg)
 			}
@@ -355,7 +355,7 @@ func (r *recordingPeerAdder) AddPeer(_ raft.NodeID, addr string) {
 // configured peer's address is authoritative: discovery cannot repoint it, so
 // an announcement cannot redirect that member's Raft traffic.
 func TestApplyDiscoveredAddr_StaticPeersAreNotRepointed(t *testing.T) {
-	s := newTestStore(t, &Config{
+	s := newTestStore(t, &config{
 		ID:    "n1",
 		Peers: map[raft.NodeID]string{"n2": "10.0.0.2:7001"},
 	})
@@ -379,7 +379,7 @@ func TestApplyDiscoveredAddr_StaticPeersAreNotRepointed(t *testing.T) {
 // transaction leaves the store exactly as it found it, now that rollback
 // replays a journal of touched keys rather than restoring whole collections.
 func TestApplyBatch_RollbackRestoresOnlyMutatedKeys(t *testing.T) {
-	s := newTestStore(t, &Config{ID: "n1"})
+	s := newTestStore(t, &config{ID: "n1"})
 	s.collections["a"] = map[string]json.RawMessage{
 		"keep":      json.RawMessage(`1`),
 		"overwrite": json.RawMessage(`2`),
@@ -423,7 +423,7 @@ func TestApplyBatch_RollbackRestoresOnlyMutatedKeys(t *testing.T) {
 // encoder against the streaming decoder, and that identical state produces
 // identical bytes so replicas do not differ gratuitously.
 func TestSnapshotRestore_RoundTripsAndIsDeterministic(t *testing.T) {
-	src := newTestStore(t, &Config{ID: "n1"})
+	src := newTestStore(t, &config{ID: "n1"})
 	src.collections = map[string]map[string]json.RawMessage{
 		"users": {
 			"alice":   json.RawMessage(`{"name":"Alice","tags":["a","b"]}`),
@@ -445,7 +445,7 @@ func TestSnapshotRestore_RoundTripsAndIsDeterministic(t *testing.T) {
 		t.Errorf("two snapshots of identical state differ:\n%s\n%s", first.String(), second.String())
 	}
 
-	dst := newTestStore(t, &Config{ID: "n2"})
+	dst := newTestStore(t, &config{ID: "n2"})
 	if err := dst.Restore(context.Background(), raft.SnapshotMeta{}, bytes.NewReader(first.Bytes())); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -473,7 +473,7 @@ func TestRestore_AcceptsEmptyAndNullSnapshots(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := newTestStore(t, &Config{ID: "n1"})
+			s := newTestStore(t, &config{ID: "n1"})
 			s.collections["stale"] = map[string]json.RawMessage{"k": json.RawMessage(`1`)}
 
 			if err := s.Restore(context.Background(), raft.SnapshotMeta{}, bytes.NewReader([]byte(tt.body))); err != nil {
@@ -492,7 +492,7 @@ func TestRestore_AcceptsEmptyAndNullSnapshots(t *testing.T) {
 // metadata namespace cannot be read or written through the HTTP API. A client
 // that could write it would choose where every follower redirects its traffic.
 func TestReservedCollectionsAreUnreachableOverHTTP(t *testing.T) {
-	s := newTestStore(t, &Config{ID: "n1"})
+	s := newTestStore(t, &config{ID: "n1"})
 	s.collections[metadataCollection] = map[string]json.RawMessage{
 		"n1": json.RawMessage(`"10.0.0.1:8001"`),
 	}

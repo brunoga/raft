@@ -28,7 +28,7 @@ type Manager struct {
 	mu     sync.RWMutex
 	stores map[uint64]*Store
 	mgr    *raft.Manager
-	cfg    Config
+	cfg    config
 
 	transport  *grpctransport.GRPCTransport
 	httpServer *http.Server
@@ -44,7 +44,7 @@ type managedGroup struct {
 
 // NewManager creates a new EasyRaft manager.
 func NewManager(opts ...Option) (*Manager, error) {
-	var c Config
+	var c config
 	for _, o := range opts {
 		o(&c)
 	}
@@ -75,7 +75,7 @@ func (m *Manager) logger() *slog.Logger {
 // newStoreShell builds a Store with every internal structure initialised but
 // no Raft node yet. Both [NewStore] and [Manager.AddStore] go through it so
 // the two construction paths cannot drift apart.
-func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg *Config) *Store {
+func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg *config) *Store {
 	return &Store{
 		collections:     make(map[string]map[string]json.RawMessage),
 		mutations:       make(map[string]map[string]mutationFunc),
@@ -482,7 +482,7 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 	}
 	s.mu.Unlock()
 
-	// Raft Config
+	// Raft config
 	rCfg := raft.DefaultConfig()
 	rCfg.ID = s.cfg.ID
 	rCfg.GroupID = groupID

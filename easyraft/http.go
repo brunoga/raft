@@ -108,7 +108,7 @@ func authorized(auth func(*http.Request) error, logger *slog.Logger, h http.Hand
 // is being served without an authorization hook. The API can add and remove
 // cluster members, so an unauthenticated listener is a cluster-control plane
 // open to anyone who can reach it.
-func warnIfHTTPUnauthenticated(cfg *Config, logger *slog.Logger) {
+func warnIfHTTPUnauthenticated(cfg *config, logger *slog.Logger) {
 	if cfg.HTTPAuth != nil || cfg.AcknowledgeInsecureHTTP {
 		return
 	}
