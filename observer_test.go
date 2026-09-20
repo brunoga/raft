@@ -174,32 +174,26 @@ func TestEvents_ASlowConsumerLosesEventsAndIsToldSo(t *testing.T) {
 		}
 	}
 
-	// Catch up, then cause one more event. The count of what was missed rides
-	// on the next event that gets through, which is what lets a consumer tell
-	// a complete history from a partial one.
-	for drained := true; drained; {
-		select {
-		case <-events:
-		default:
-			drained = false
-		}
-	}
-	if err := node.AddServer(ctx, raft.PeerConfig{ID: "after-the-flood", Voter: false}); err != nil {
-		t.Fatalf("AddServer after draining: %v", err)
-	}
-
-	giveUp := time.After(5 * time.Second)
-	for {
+	// The count of what was missed rides on the next event that gets through,
+	// which is what lets a consumer tell a complete history from a partial
+	// one. So read to make room and keep causing events until one carries it,
+	// rather than assuming which event that will be.
+	giveUp := time.Now().Add(10 * time.Second)
+	for round := 0; time.Now().Before(giveUp); round++ {
 		select {
 		case ev := <-events:
-			if ev.Dropped == 0 {
-				continue
+			if ev.Dropped > 0 {
+				return // told, as it must be
 			}
-			return // told, as it must be
-		case <-giveUp:
-			t.Fatal("a subscription that overran was never told it had missed anything")
+			continue
+		default:
+		}
+		id := raft.NodeID("after-the-flood-" + string(rune('a'+round%26)))
+		if err := node.AddServer(ctx, raft.PeerConfig{ID: id, Voter: false}); err != nil {
+			t.Fatalf("AddServer after the flood: %v", err)
 		}
 	}
+	t.Fatal("a subscription that overran was never told it had missed anything")
 }
 
 // TestEvents_StopIsSafeTwiceAndTheStreamClosesOnShutdown pins the lifecycle.

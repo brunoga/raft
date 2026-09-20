@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -173,6 +174,45 @@ type Config struct {
 	//
 	// Default: 64 MiB.
 	MaxUnstableLogBytes int
+
+	// Zones records which failure domain each node sits in: a rack, an
+	// availability zone, a datacentre, whatever fails as one unit. It is used
+	// with MinCommitZones and ignored without it.
+	//
+	// It is deliberately local to this node and never replicated. Placement is
+	// a fact about infrastructure rather than about consensus, it changes when
+	// machines move rather than when the cluster agrees on something, and
+	// keeping it out of the log means it costs nothing on the wire and can be
+	// corrected by a restart rather than a configuration change. Every node
+	// that might lead should be given the same map; a node that is not leading
+	// does not read it.
+	//
+	// A node absent from the map is in no known zone, and does not count
+	// towards the spread MinCommitZones requires. That is the conservative
+	// reading: a node nobody placed cannot be evidence that a write survived
+	// the loss of a zone.
+	//
+	// Default: nil.
+	Zones map[NodeID]ZoneID
+
+	// MinCommitZones is how many distinct zones an entry must reach before it
+	// counts as committed, in addition to reaching a majority.
+	//
+	// A majority says nothing about where the replicas are. Three replicas in
+	// one availability zone are a quorum, and the loss of that zone loses
+	// every acknowledged write with it. Requiring two zones means an
+	// acknowledged write is on hardware in two failure domains before anyone
+	// is told it succeeded.
+	//
+	// The cost is liveness, and it is the point rather than a side effect: if
+	// the second zone is unreachable, nothing commits. A cluster that would
+	// rather keep taking writes into one zone should leave this unset.
+	//
+	// Validate refuses a configuration whose initial voters do not span this
+	// many zones, since it could never commit anything.
+	//
+	// Default: 0, which together with 1 means a plain majority.
+	MinCommitZones int
 
 	// SnapshotThreshold is the number of log entries after which the leader
 	// automatically requests a snapshot from the state machine:
@@ -503,6 +543,31 @@ func (c *Config) Validate() error {
 	if c.TickInterval > 0 && c.TickInterval > c.HeartbeatInterval {
 		return errors.New("raft: TickInterval must be ≤ HeartbeatInterval")
 	}
+	if c.MinCommitZones < 0 {
+		return errors.New("raft: MinCommitZones must not be negative")
+	}
+	if c.MinCommitZones > 1 {
+		zones := make(map[ZoneID]struct{})
+		if c.Voter {
+			if z, ok := c.Zones[c.ID]; ok {
+				zones[z] = struct{}{}
+			}
+		}
+		for _, p := range c.Peers {
+			if !p.Voter {
+				continue
+			}
+			if z, ok := c.Zones[p.ID]; ok {
+				zones[z] = struct{}{}
+			}
+		}
+		if len(zones) < c.MinCommitZones {
+			return fmt.Errorf("raft: MinCommitZones is %d but the voters in Config.Peers span "+
+				"%d known zones, so nothing could ever commit (a node missing from Config.Zones "+
+				"is in no known zone)", c.MinCommitZones, len(zones))
+		}
+	}
+
 	// A configuration that names peers but gives none of them, nor itself, a
 	// vote describes a cluster that can never elect a leader and so can never
 	// commit anything. It is easy to arrive at by accident, because the zero

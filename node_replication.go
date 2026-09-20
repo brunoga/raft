@@ -494,6 +494,42 @@ func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, sel
 	return count > total/2
 }
 
+// spansEnoughZones reports whether the replicas that hold idx sit in at least
+// Config.MinCommitZones distinct failure domains.
+//
+// A majority says nothing about where the replicas are. Three replicas in one
+// availability zone are a quorum, and losing that zone loses every write they
+// acknowledged. This is the check that turns "a majority has it" into "a
+// majority has it, and not all in the same place".
+//
+// Placement is read from this leader's own configuration and never from the
+// log, which is what makes it free: nothing about it is replicated, agreed, or
+// carried on the wire, and it degrades to a plain majority when unset.
+func (n *Node) spansEnoughZones(idx Index, members []PeerConfig, includeSelf, selfVoter bool) bool {
+	required := n.cfg.MinCommitZones
+	if required <= 1 {
+		return true
+	}
+
+	seen := make(map[ZoneID]struct{}, required)
+	add := func(id NodeID) {
+		// A node in no known zone is not evidence that the write survived the
+		// loss of a zone, so it contributes nothing.
+		if z, ok := n.cfg.Zones[id]; ok {
+			seen[z] = struct{}{}
+		}
+	}
+	if includeSelf && selfVoter && idx <= n.log.stableIndex() {
+		add(n.cfg.ID)
+	}
+	for _, p := range members {
+		if p.Voter && n.matchIndex[p.ID] >= idx {
+			add(p.ID)
+		}
+	}
+	return len(seen) >= required
+}
+
 // replicatedOnMajority reports whether idx has been replicated on a majority
 // of the group described by members plus self when includeSelf is true.
 //
@@ -534,7 +570,10 @@ func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf
 	if includeSelf && selfVoter {
 		total++
 	}
-	return count > total/2
+	if count <= total/2 {
+		return false
+	}
+	return n.spansEnoughZones(idx, members, includeSelf, selfVoter)
 }
 
 // maybeAdvanceCommit checks whether a new index can be committed (replicated
