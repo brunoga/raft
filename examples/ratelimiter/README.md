@@ -60,17 +60,17 @@ Open three terminals and run:
 
 **Terminal 1:**
 ```bash
-go run main.go -id n1 -raft :7001 -http :8001 -data data/n1 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003
+go run main.go -id n1 -raft 127.0.0.1:7001 -http 127.0.0.1:8001 -data data/n1 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003
 ```
 
 **Terminal 2:**
 ```bash
-go run main.go -id n2 -raft :7002 -http :8002 -data data/n2 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003
+go run main.go -id n2 -raft 127.0.0.1:7002 -http 127.0.0.1:8002 -data data/n2 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003
 ```
 
 **Terminal 3:**
 ```bash
-go run main.go -id n3 -raft :7003 -http :8003 -data data/n3 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003
+go run main.go -id n3 -raft 127.0.0.1:7003 -http 127.0.0.1:8003 -data data/n3 -peers n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003
 ```
 
 ### Option B: Join (add nodes one at a time)
@@ -79,17 +79,17 @@ Start the first node as a single-node cluster, then join subsequent nodes to it 
 
 **Terminal 1** (bootstrap the cluster):
 ```bash
-go run main.go -id n1 -raft :7001 -http :8001 -data data/n1 -peers n1=127.0.0.1:7001
+go run main.go -id n1 -raft 127.0.0.1:7001 -http 127.0.0.1:8001 -data data/n1 -peers n1=127.0.0.1:7001
 ```
 
 **Terminal 2** (join the existing cluster):
 ```bash
-go run main.go -id n2 -raft :7002 -http :8002 -data data/n2 -join 127.0.0.1:8001
+go run main.go -id n2 -raft 127.0.0.1:7002 -http 127.0.0.1:8002 -data data/n2 -join 127.0.0.1:8001
 ```
 
 **Terminal 3** (join again):
 ```bash
-go run main.go -id n3 -raft :7003 -http :8003 -data data/n3 -join 127.0.0.1:8001
+go run main.go -id n3 -raft 127.0.0.1:7003 -http 127.0.0.1:8003 -data data/n3 -join 127.0.0.1:8001
 ```
 
 You can pass multiple comma-separated seed addresses to `-join` for redundancy (the node tries each in order until one accepts).

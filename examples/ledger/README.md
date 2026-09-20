@@ -101,20 +101,20 @@ Alternatively, start the nodes manually in separate terminals:
 **Terminal 1 — bootstrap node**
 
 ```bash
-./ledger --id n1 --raft-addr :7001 --http-addr :8001 --data-dir /tmp/lgr/n1
+./ledger --id n1 --raft-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 --data-dir /tmp/lgr/n1
 ```
 
 **Terminal 2 — join**
 
 ```bash
-./ledger --id n2 --raft-addr :7002 --http-addr :8002 --data-dir /tmp/lgr/n2 \
+./ledger --id n2 --raft-addr 127.0.0.1:7002 --http-addr 127.0.0.1:8002 --data-dir /tmp/lgr/n2 \
          --join localhost:8001
 ```
 
 **Terminal 3 — join**
 
 ```bash
-./ledger --id n3 --raft-addr :7003 --http-addr :8003 --data-dir /tmp/lgr/n3 \
+./ledger --id n3 --raft-addr 127.0.0.1:7003 --http-addr 127.0.0.1:8003 --data-dir /tmp/lgr/n3 \
          --join localhost:8001
 ```
 

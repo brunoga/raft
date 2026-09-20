@@ -68,14 +68,14 @@ wait_and_show_status() {
 }
 
 echo "==> Starting n1 (bootstrap)..."
-"$BINARY" --id n1 --raft-addr :7001 --http-addr :8001 --data-dir "$DATA_ROOT/n1" \
+"$BINARY" --id n1 --raft-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 --data-dir "$DATA_ROOT/n1" \
     >"$DATA_ROOT/n1.log" 2>&1 &
 PIDS+=($!)
 
 sleep 0.5
 
 echo "==> Starting n2 (joining n1)..."
-"$BINARY" --id n2 --raft-addr :7002 --http-addr :8002 --data-dir "$DATA_ROOT/n2" \
+"$BINARY" --id n2 --raft-addr 127.0.0.1:7002 --http-addr 127.0.0.1:8002 --data-dir "$DATA_ROOT/n2" \
     --join localhost:8001 \
     >"$DATA_ROOT/n2.log" 2>&1 &
 PIDS+=($!)
@@ -83,7 +83,7 @@ PIDS+=($!)
 sleep 0.5
 
 echo "==> Starting n3 (joining n1)..."
-"$BINARY" --id n3 --raft-addr :7003 --http-addr :8003 --data-dir "$DATA_ROOT/n3" \
+"$BINARY" --id n3 --raft-addr 127.0.0.1:7003 --http-addr 127.0.0.1:8003 --data-dir "$DATA_ROOT/n3" \
     --join localhost:8001 \
     >"$DATA_ROOT/n3.log" 2>&1 &
 PIDS+=($!)
