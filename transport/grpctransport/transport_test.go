@@ -142,7 +142,7 @@ func newGRPCCluster(t *testing.T, n int) *grpcCluster {
 	transports := make([]*grpctransport.GRPCTransport, n)
 	addrs := make([]string, n)
 	for i := range n {
-		tr, err := grpctransport.Listen(":0")
+		tr, err := grpctransport.Listen(":0", grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen node %s: %v", ids[i], err)
 		}
@@ -405,7 +405,7 @@ func TestGRPC_TLS_RejectsMissingClientCert(t *testing.T) {
 	defer func() { _ = tlsServer.Close() }()
 
 	// Insecure (plaintext) client transport.
-	plainClient, err := grpctransport.Listen("127.0.0.1:0")
+	plainClient, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen plain client: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestGRPC_TLS(t *testing.T) {
 	transports := make([]*grpctransport.GRPCTransport, 3)
 	addrs := make([]string, 3)
 	for i := range 3 {
-		tr, err := grpctransport.Listen("127.0.0.1:0", opt)
+		tr, err := grpctransport.Listen("127.0.0.1:0", opt, grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen node %s: %v", ids[i], err)
 		}
@@ -538,7 +538,7 @@ func TestGRPC_GroupIDStamped(t *testing.T) {
 	transports := make([]*grpctransport.GRPCTransport, 3)
 	addrs := make([]string, 3)
 	for i := range 3 {
-		tr, err := grpctransport.Listen(":0")
+		tr, err := grpctransport.Listen(":0", grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
@@ -678,7 +678,7 @@ func (h *signalHandler) HandleReadIndex(_ context.Context, _ *raft.ReadIndexRequ
 // TestGRPC_SetGroupLookup verifies that SetGroupLookup routes inbound RPCs to
 // the correct handler based on the GroupID carried in the request proto.
 func TestGRPC_SetGroupLookup(t *testing.T) {
-	srv, err := grpctransport.Listen("127.0.0.1:0")
+	srv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
@@ -693,7 +693,7 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 		return h, ok
 	})
 
-	cli, err := grpctransport.Listen("127.0.0.1:0")
+	cli, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}
@@ -736,7 +736,7 @@ func TestGRPC_SetGroupLookup(t *testing.T) {
 // GroupID==0 is rejected with InvalidArgument when SetGroupLookup is
 // installed, rather than silently falling through to NodeID-header routing.
 func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -744,7 +744,7 @@ func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
 
 	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -780,7 +780,7 @@ func TestGRPC_GroupIDZeroRejectedInMultiRaftMode(t *testing.T) {
 func TestGRPC_HeartbeatBatching(t *testing.T) {
 	const numGroups = 10 // large enough that O(G×P) vs O(P) is unambiguous
 
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
@@ -796,7 +796,7 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 		return h, ok
 	})
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -858,7 +858,7 @@ func TestGRPC_HeartbeatBatching(t *testing.T) {
 //   - Entries counter reflects the total individual heartbeats dispatched.
 //   - Errors counter increments for unknown groups, not for successful ones.
 func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -874,7 +874,7 @@ func TestGRPC_HeartbeatObservabilityCounters(t *testing.T) {
 		return h, ok
 	})
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen sender: %v", err)
 	}
@@ -916,7 +916,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 
 	// Use a deliberately large window to confirm the option is wired through
 	// without panicking or altering correctness.
-	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond))
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -931,7 +931,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 		return h, ok
 	})
 
-	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond))
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithHeartbeatWindow(10*time.Millisecond), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -975,7 +975,7 @@ func TestGRPC_HeartbeatWindowOption(t *testing.T) {
 func TestGRPC_HeartbeatRPCTimeoutOption(t *testing.T) {
 	// Sender configured with a 50ms RPC timeout.
 	send, err := grpctransport.Listen("127.0.0.1:0",
-		grpctransport.WithHeartbeatRPCTimeout(50*time.Millisecond))
+		grpctransport.WithHeartbeatRPCTimeout(50*time.Millisecond), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -1011,7 +1011,7 @@ func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
 	const numGroups = 4
 	const chanSize = 8 // small but larger than numGroups
 
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
@@ -1027,7 +1027,7 @@ func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
 	})
 
 	send, err := grpctransport.Listen("127.0.0.1:0",
-		grpctransport.WithHeartbeatChannelSize(chanSize))
+		grpctransport.WithHeartbeatChannelSize(chanSize), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -1066,7 +1066,7 @@ func TestGRPC_HeartbeatChannelSizeOption(t *testing.T) {
 // removed node return an error (address no longer registered), and that a
 // subsequent AddPeer + RPC works again.
 func TestGRPC_RemovePeer(t *testing.T) {
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
@@ -1075,7 +1075,7 @@ func TestGRPC_RemovePeer(t *testing.T) {
 	h := &signalHandler{called: make(chan struct{}, 1)}
 	recv.Register("recv", h)
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -1118,7 +1118,7 @@ func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
 	// Use more groups than GOMAXPROCS to force the semaphore to throttle.
 	numGroups := runtime.GOMAXPROCS(0)*4 + 1
 
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1133,7 +1133,7 @@ func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
 		return h, ok
 	})
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1173,13 +1173,13 @@ func TestGRPC_BatchHeartbeatsBoundedDispatch(t *testing.T) {
 // until all peerBatcher goroutines have exited. Before this fix, stop() only
 // cancelled the context, leaving goroutines running after Close() returned.
 func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = recv.Close() }()
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1229,14 +1229,14 @@ func TestGRPC_HeartbeatBatcherStopWaits(t *testing.T) {
 // heartbeatBatcher must prevent peerBatcherFor from creating new goroutines
 // after stop() has been called.
 func TestGRPC_HeartbeatBatcherStoppedFlag(t *testing.T) {
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = recv.Close() }()
 	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1266,14 +1266,14 @@ func TestGRPC_HeartbeatBatcherStoppedFlag(t *testing.T) {
 // this fix, peerBatcher goroutines accumulated indefinitely as peers joined
 // and left the cluster.
 func TestGRPC_RemovePeer_StopsBatcher(t *testing.T) {
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = recv.Close() }()
 	recv.SetGroupLookup(func(uint64) (raft.Handler, bool) { return nil, false })
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1331,7 +1331,7 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 	managers := make([]*raft.Manager, numPhysical)
 
 	for p := range numPhysical {
-		tr, err := grpctransport.Listen("127.0.0.1:0")
+		tr, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen physical %d: %v", p, err)
 		}
@@ -1528,7 +1528,7 @@ func TestGRPC_MultiRaft_ManagerWiring(t *testing.T) {
 // counters and clears them, so that each call reports the interval since the
 // last one rather than a running total.
 func TestGRPC_ResetHeartbeatStats(t *testing.T) {
-	t1, err := grpctransport.Listen(":0")
+	t1, err := grpctransport.Listen(":0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -1560,6 +1560,7 @@ func TestGRPC_ResetHeartbeatStats(t *testing.T) {
 	// and saturate it to produce a non-zero blocked count, then reset and verify.
 	t2, err := grpctransport.Listen(":0",
 		grpctransport.WithHeartbeatChannelSize(1),
+		grpctransport.WithInsecure(),
 	)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)

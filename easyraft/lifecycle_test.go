@@ -47,6 +47,7 @@ func TestStore_StartReportsAFailedJoinToItsCaller(t *testing.T) {
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithJoinAddr(refusedAddr(t)),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +85,7 @@ func TestManager_StartReportsAGroupThatCouldNotJoin(t *testing.T) {
 		easyraft.WithID("n1"),
 		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +124,7 @@ func TestStore_StartSucceedsForAHealthyNode(t *testing.T) {
 		easyraft.WithRaftAddr(freePort(t)),
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +164,8 @@ func TestStore_StartSucceedsWhenItsSeedAnswers(t *testing.T) {
 		easyraft.WithDataDir(filepath.Join(tmpDir, "seed")),
 		easyraft.WithPeers(map[raft.NodeID]string{"seed": seedRaft}),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -182,6 +187,7 @@ func TestStore_StartSucceedsWhenItsSeedAnswers(t *testing.T) {
 		easyraft.WithDataDir(filepath.Join(tmpDir, "joiner")),
 		easyraft.WithJoinAddr(seedHTTP),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -207,6 +213,7 @@ func TestStore_StopReportsAFailedDeparture(t *testing.T) {
 		easyraft.WithPeers(map[raft.NodeID]string{"n2": refusedAddr(t)}),
 		easyraft.WithLeaveOnStop(),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +255,7 @@ func TestStore_CreatesAMissingDataDirectory(t *testing.T) {
 		easyraft.WithRaftAddr(freePort(t)),
 		easyraft.WithDataDir(dataDir),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)

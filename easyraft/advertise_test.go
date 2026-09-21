@@ -34,6 +34,7 @@ func TestJoin_RefusesAnAddressPeersCannotDial(t *testing.T) {
 				easyraft.WithRaftAddr(tc.addr),
 				easyraft.WithDataDir(t.TempDir()),
 				easyraft.WithJoinAddr("127.0.0.1:8001"),
+				easyraft.WithInsecureTransportAcknowledged(),
 			)
 			if err == nil {
 				t.Fatalf("NewStore accepted %q as an address to advertise while joining", tc.addr)
@@ -54,6 +55,7 @@ func TestJoin_AcceptsARoutableAddress(t *testing.T) {
 		easyraft.WithRaftAddr("127.0.0.1:0"),
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithJoinAddr("127.0.0.1:8001"),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatalf("NewStore rejected a routable bind address: %v", err)
@@ -71,6 +73,7 @@ func TestJoin_AdvertiseOverridesAnUnroutableBind(t *testing.T) {
 		easyraft.WithAdvertiseRaftAddr("node2.internal:7002"),
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithJoinAddr("127.0.0.1:8001"),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatalf("NewStore rejected a wildcard bind with an explicit advertise address: %v", err)
@@ -87,6 +90,7 @@ func TestNoJoin_DoesNotRequireARoutableAddress(t *testing.T) {
 		easyraft.WithID("n1"),
 		easyraft.WithRaftAddr(":0"),
 		easyraft.WithDataDir(t.TempDir()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatalf("NewStore rejected a port-only bind address with no join configured: %v", err)

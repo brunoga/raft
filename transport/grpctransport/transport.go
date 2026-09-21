@@ -6,7 +6,7 @@
 //
 // Usage:
 //
-//	t, err := grpctransport.Listen(":50051")
+//	t, err := grpctransport.Listen(":50051", grpctransport.WithTLSConfig(tlsCfg))
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -26,12 +26,13 @@
 //
 // # Security
 //
-// The default configuration is plaintext and unauthenticated. A Raft peer is
-// by definition fully trusted: an AppendEntries carrying a high term makes
-// every node step down, and a TimeoutNow makes a node start an election. A
-// transport listening without TLS therefore lets ANY host that can reach the
-// port take over the cluster. Never expose a default-configured transport to
-// an untrusted network.
+// Listen refuses to start without transport security. A Raft peer is by
+// definition fully trusted: an AppendEntries carrying a high term makes every
+// node step down, and a TimeoutNow makes a node start an election. A transport
+// listening without TLS therefore lets ANY host that can reach the port take
+// over the cluster, so running that way has to be asked for: WithInsecure
+// says so, and is for networks that are trusted for reasons outside this
+// package. Never pass it for a port an untrusted network can reach.
 //
 // For a secure deployment combine two options:
 //
@@ -49,7 +50,7 @@
 // CA can impersonate any other node. Installing an authorizer also enables
 // strict request validation (see WithStrictRequestValidation).
 //
-// A transport created without TLS logs a warning once at Listen time.
+// A transport created with WithInsecure logs a warning once at Listen time.
 //
 // # The wire format is not part of this package's API
 //
@@ -108,6 +109,16 @@ var (
 	// ErrUnauthorizedPeer is returned to a caller whose request was rejected by
 	// the peer authorizer installed with WithPeerAuthorizer.
 	ErrUnauthorizedPeer = errors.New("grpctransport: peer is not authorized for the claimed node ID")
+
+	// ErrNoTransportSecurity is returned by Listen when no TLS configuration
+	// was given and plaintext was not explicitly asked for. A Raft peer is
+	// fully trusted, so a transport anyone can connect to is a cluster anyone
+	// can take over; the choice to run that way has to be made on purpose.
+	// Pass WithTLSConfig, or WithInsecure to listen in plaintext on a network
+	// that is trusted for other reasons, or WithCustomCredentials when the
+	// credentials are supplied through WithServerOptions and WithDialOptions.
+	ErrNoTransportSecurity = errors.New("grpctransport: no TLS configured; pass WithTLSConfig, " +
+		"or WithInsecure to listen in plaintext on a trusted network")
 )
 
 // GRPCTransport implements raft.Transport using gRPC.
@@ -276,6 +287,8 @@ type options struct {
 	serverOpts          []grpc.ServerOption
 	dialOpts            []grpc.DialOption
 	tlsCfg              *tls.Config
+	insecure            bool
+	customCredentials   bool
 	heartbeatWindow     time.Duration
 	heartbeatRPCTimeout time.Duration
 	heartbeatChanSize   int
@@ -411,6 +424,32 @@ func WithStrictRequestValidation() Option {
 	return func(o *options) { o.strictValidation = true }
 }
 
+// WithInsecure lets Listen run without TLS. It is the explicit choice to
+// listen in plaintext, and it has to be explicit because a Raft peer is fully
+// trusted: an AppendEntries carrying a high term makes every node step down,
+// so a transport anyone can connect to is a cluster anyone can take over.
+//
+// Use it on a network that is trusted for reasons outside this package -- a
+// loopback bind, a private link, a service mesh that terminates TLS in front
+// of the process -- and never on one that is not. A transport created with it
+// logs a warning once per process.
+func WithInsecure() Option {
+	return func(o *options) { o.insecure = true }
+}
+
+// WithCustomCredentials tells Listen that transport credentials are supplied
+// through WithServerOptions and WithDialOptions, so it should add none of its
+// own and not refuse for the lack of a WithTLSConfig. It is for deployments
+// whose server and client configurations differ, or that use a credential
+// type other than TLS.
+//
+// It is a statement, not a check: Listen cannot see inside a grpc option, so
+// a caller that passes this and no credentials gets a plaintext transport
+// without the warning WithInsecure would log.
+func WithCustomCredentials() Option {
+	return func(o *options) { o.customCredentials = true }
+}
+
 // WithTLSConfig enables TLS on both the gRPC server and all outbound client
 // connections. For mutual TLS, include client certificates in the config passed
 // to servers and server certificates in the config passed to clients; the same
@@ -433,9 +472,12 @@ func WithTLSConfig(cfg *tls.Config) Option {
 // resort — WithServerOptions / WithDialOptions, which are appended last and so
 // win over every default.
 //
-// Unless WithTLSConfig is supplied the transport is plaintext and
-// unauthenticated; see the package documentation for why that is unsafe on an
-// untrusted network. Listen logs a warning once in that case.
+// Listen refuses to run without transport security unless told to. Pass
+// WithTLSConfig for TLS, WithInsecure to listen in plaintext on a trusted
+// network, or WithCustomCredentials when the credentials come through
+// WithServerOptions and WithDialOptions; with none of the three it returns
+// ErrNoTransportSecurity. See the package documentation for why plaintext is
+// unsafe on an untrusted network.
 func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	o := &options{}
 	for _, fn := range opts {
@@ -444,21 +486,27 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 
 	logger := slog.Default().With("component", "grpctransport")
 
-	// Choose transport credentials based on whether TLS was configured.
-	// WithTLSConfig takes precedence; without it the transport is plaintext.
+	// Choose transport credentials. WithTLSConfig takes precedence; without
+	// it the caller must have said, one way or the other, that no TLS is what
+	// they want.
 	var serverCreds grpc.ServerOption
 	var dialCreds grpc.DialOption
-	if o.tlsCfg != nil {
+	switch {
+	case o.tlsCfg != nil:
 		creds := credentials.NewTLS(o.tlsCfg)
 		serverCreds = grpc.Creds(creds)
 		dialCreds = grpc.WithTransportCredentials(creds)
-	} else {
+	case o.customCredentials:
+		// The caller's grpc options carry the credentials; add nothing.
+	case o.insecure:
 		dialCreds = grpc.WithTransportCredentials(insecure.NewCredentials())
 		warnInsecureOnce.Do(func() {
 			logger.Warn("listening without TLS: any host that can reach this port " +
 				"can join the cluster, force every node to step down, or trigger an " +
 				"election; use WithTLSConfig and WithPeerAuthorizer in production")
 		})
+	default:
+		return nil, ErrNoTransportSecurity
 	}
 
 	maxMsgSize := o.maxMessageSize
@@ -507,7 +555,6 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	}
 
 	defaultDialOpts := []grpc.DialOption{
-		dialCreds,
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxMsgSize),
 			grpc.MaxCallSendMsgSize(maxMsgSize),
@@ -529,6 +576,9 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 			Timeout:             5 * time.Second, // close if no pong within 5 s
 			PermitWithoutStream: true,            // ping even when no RPCs are outstanding
 		}),
+	}
+	if dialCreds != nil {
+		defaultDialOpts = append([]grpc.DialOption{dialCreds}, defaultDialOpts...)
 	}
 	defaultDialOpts = append(defaultDialOpts, o.dialOpts...)
 

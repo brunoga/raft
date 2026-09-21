@@ -85,7 +85,7 @@ func run() error {
 	}
 	defer func() { _ = store.Close() }()
 
-	tr, err := grpctransport.Listen(*raftAddr)
+	tr, err := grpctransport.Listen(*raftAddr, grpctransport.WithInsecure())
 	if err != nil {
 		return fmt.Errorf("listen raft: %w", err)
 	}

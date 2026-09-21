@@ -66,6 +66,11 @@ type config struct {
 	// and mitigated elsewhere (a loopback bind, a service mesh, a firewall).
 	AcknowledgeInsecureHTTP bool
 
+	// AcknowledgeInsecureTransport lets the Raft transport run without TLS.
+	// Without it, or TLS, NewStore and NewManager refuse to start. Set via
+	// [WithInsecureTransportAcknowledged].
+	AcknowledgeInsecureTransport bool
+
 	// HTTPTLS, when set, makes the built-in HTTP server serve HTTPS and makes
 	// leader redirects use the https scheme. Set via [WithHTTPTLS]. It is
 	// independent of TLS, which covers only the gRPC Raft transport.
@@ -236,11 +241,25 @@ func WithHTTPTLS(tlsCfg *tls.Config) Option {
 	return func(c *config) { c.HTTPTLS = tlsCfg }
 }
 
-// WithInsecureHTTPAcknowledged suppresses the startup warning about serving the
-// HTTP API without an authorization hook. Use it only when the exposure is
-// mitigated elsewhere — a loopback-only bind, a service mesh, a network policy.
+// WithInsecureHTTPAcknowledged lets the HTTP API be served without an
+// authorization hook. Without it, or [WithHTTPAuth], a store or manager that
+// serves the API refuses to start: the API adds and removes cluster members,
+// and an unauthenticated listener is a control plane open to anyone who can
+// reach it. Use it only when the exposure is mitigated elsewhere -- a loopback
+// bind, a service mesh, a network policy. The node logs a warning at startup.
 func WithInsecureHTTPAcknowledged() Option {
 	return func(c *config) { c.AcknowledgeInsecureHTTP = true }
+}
+
+// WithInsecureTransportAcknowledged lets the Raft transport run in plaintext.
+// Without it, or [WithTLS], NewStore and NewManager refuse to start: a Raft
+// peer is fully trusted, so a transport anyone can connect to is a cluster
+// anyone can take over. Use it on a network that is trusted for reasons
+// outside this package -- a loopback bind for a local cluster, a private
+// link, a mesh that terminates TLS in front of the process -- and never on
+// one that is not. The transport logs a warning once per process.
+func WithInsecureTransportAcknowledged() Option {
+	return func(c *config) { c.AcknowledgeInsecureTransport = true }
 }
 
 // WithLeaseReads lets linearizable reads be served from the leader's

@@ -287,6 +287,10 @@ func run() error {
 			return tlsErr
 		}
 		trOpts = append(trOpts, opt)
+	} else {
+		// No certificates were given, so this is a plaintext transport: fine
+		// for a local demo, and something the transport insists be asked for.
+		trOpts = append(trOpts, grpctransport.WithInsecure())
 	}
 
 	// Set up gRPC transport.

@@ -357,6 +357,9 @@ func run() error {
 	opts := []easyraft.Option{
 		easyraft.WithID(raft.NodeID(*id)),
 		easyraft.WithRaftAddr(*raftAddr),
+		// A local demo cluster: plaintext transport and open HTTP API, on purpose.
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 		easyraft.WithHTTPAddr(*httpAddr),
 		easyraft.WithHTTPMux(mux),
 		easyraft.WithDataDir(*dataDir),

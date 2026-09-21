@@ -296,6 +296,9 @@ func NewStore(opts ...Option) (*Store, error) {
 	if err := validateAdvertised(&c); err != nil {
 		return nil, err
 	}
+	if err := validateSecurity(&c, true); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
@@ -371,6 +374,39 @@ func validateAdvertised(c *config) error {
 			addr)
 	}
 	return nil
+}
+
+// validateSecurity refuses a configuration that would serve an open Raft port
+// or an open HTTP API without having been told to. A Raft peer is fully
+// trusted and the HTTP API reshapes the cluster, so either left open by
+// omission is a cluster anyone can take; each has an option that says the
+// exposure is understood, and the absence of both is treated as the mistake
+// it almost always is.
+//
+// servesHTTP says whether this configuration will serve the HTTP API at all;
+// a Manager's stores share the manager's listener and are checked there.
+func validateSecurity(c *config, servesHTTP bool) error {
+	if c.TLS == nil && !c.AcknowledgeInsecureTransport {
+		return fmt.Errorf("easyraft: the Raft transport has no TLS configuration; pass WithTLS, " +
+			"or WithInsecureTransportAcknowledged to run in plaintext on a trusted network")
+	}
+	if servesHTTP && (c.HTTPAddr != "" || c.HTTPMux != nil) &&
+		c.HTTPAuth == nil && !c.AcknowledgeInsecureHTTP {
+		return fmt.Errorf("easyraft: the HTTP API has no authorization hook; pass WithHTTPAuth or " +
+			"WithBearerTokenAuth, or WithInsecureHTTPAcknowledged if the listener is only " +
+			"reachable inside a trusted boundary")
+	}
+	return nil
+}
+
+// transportOptions builds the grpctransport options a configuration calls for.
+// validateSecurity has already established that one of the two branches
+// applies.
+func transportOptions(c *config) []grpctransport.Option {
+	if c.TLS != nil {
+		return []grpctransport.Option{grpctransport.WithTLSConfig(c.TLS)}
+	}
+	return []grpctransport.Option{grpctransport.WithInsecure()}
 }
 
 // advertiseRaftAddr is what peers are told to dial to reach this node's Raft
@@ -592,12 +628,7 @@ func (s *Store) initRaft() error {
 		return fmt.Errorf("easyraft: WithRaftAddr is required")
 	}
 
-	var trOpts []grpctransport.Option
-	if s.cfg.TLS != nil {
-		trOpts = append(trOpts, grpctransport.WithTLSConfig(s.cfg.TLS))
-	}
-
-	tr, err := grpctransport.Listen(s.cfg.RaftAddr, trOpts...)
+	tr, err := grpctransport.Listen(s.cfg.RaftAddr, transportOptions(&s.cfg)...)
 	if err != nil {
 		return fmt.Errorf("listen grpc: %w", err)
 	}

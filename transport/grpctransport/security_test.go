@@ -231,14 +231,14 @@ func TestPeerAuthorizer_AppliesToBatchedHeartbeats(t *testing.T) {
 // accepting everything when TLS is accidentally left off.
 func TestMTLSPeerAuthorizer_RejectsPlaintextPeer(t *testing.T) {
 	srv, err := grpctransport.Listen("127.0.0.1:0",
-		grpctransport.WithPeerAuthorizer(grpctransport.MTLSPeerAuthorizer(nil)))
+		grpctransport.WithPeerAuthorizer(grpctransport.MTLSPeerAuthorizer(nil)), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
 	defer func() { _ = srv.Close() }()
 	srv.Register("srv", newRecordingHandler())
 
-	cli, err := grpctransport.Listen("127.0.0.1:0")
+	cli, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}
@@ -363,14 +363,14 @@ func TestPeerAuthorizer_HookReceivesClaimedNodeID(t *testing.T) {
 	}
 
 	srv, err := grpctransport.Listen("127.0.0.1:0",
-		grpctransport.WithPeerAuthorizer(authorizer))
+		grpctransport.WithPeerAuthorizer(authorizer), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
 	defer func() { _ = srv.Close() }()
 	srv.Register("srv", newRecordingHandler())
 
-	cli, err := grpctransport.Listen("127.0.0.1:0")
+	cli, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}

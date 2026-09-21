@@ -82,6 +82,7 @@ func TestHTTPAuth_GuardsEveryRoute(t *testing.T) {
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithLogger(quietLogger()),
 		easyraft.WithBearerTokenAuth(token),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -270,6 +271,8 @@ func TestNewStore_ReportsHTTPBindFailure(t *testing.T) {
 				easyraft.WithHTTPAddr(tt.httpAddr),
 				easyraft.WithDataDir(t.TempDir()),
 				easyraft.WithLogger(quietLogger()),
+				easyraft.WithInsecureTransportAcknowledged(),
+				easyraft.WithInsecureHTTPAcknowledged(),
 			)
 			if err == nil {
 				_ = s.Stop()
@@ -295,6 +298,7 @@ func TestManager_SharedPrometheusRegistryAcrossGroups(t *testing.T) {
 		easyraft.WithRaftAddr(freePort(t)),
 		easyraft.WithLogger(quietLogger()),
 		easyraft.WithPrometheus(reg),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +360,7 @@ func TestManager_StaticPeersAreReportedWithTheirRaftAddress(t *testing.T) {
 		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithLogger(quietLogger()),
 		easyraft.WithInsecureHTTPAcknowledged(),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -431,6 +436,7 @@ func TestManager_StartDoesNotHoldTheLockAcrossJoins(t *testing.T) {
 		easyraft.WithID("n1"),
 		easyraft.WithRaftAddr(freePort(t)),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -476,6 +482,7 @@ func TestStore_ExactlyOnceViaSessionIsRetrySafe(t *testing.T) {
 		easyraft.WithRaftAddr(freePort(t)),
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -550,6 +557,8 @@ func TestStore_StopBeforeStartReleasesResources(t *testing.T) {
 		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)

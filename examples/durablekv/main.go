@@ -96,7 +96,7 @@ func run() error {
 	}
 	slog.Info("durablekv: state machine opened", "applied_index", applied, "keys", len(sm.all()))
 
-	tr, err := grpctransport.Listen(*raftAddr)
+	tr, err := grpctransport.Listen(*raftAddr, grpctransport.WithInsecure())
 	if err != nil {
 		return fmt.Errorf("listen raft: %w", err)
 	}
