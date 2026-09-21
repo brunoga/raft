@@ -51,9 +51,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/brunoga/raft"
@@ -194,7 +197,18 @@ func (s *server) handleWatch(w http.ResponseWriter, r *http.Request) {
 	s.watcher.ServeSSE(w, r, r.PathValue("key"), snap)
 }
 
+// main keeps nothing but the exit code. Everything else is in run, because a
+// process that calls os.Exit past a defer skips it -- which is the same fault
+// this file was fixed for, one level up: shutdown work that is written down
+// but never performed.
 func main() {
+	if err := run(); err != nil {
+		slog.Error("configsvc: exiting", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	id := flag.String("id", "", "Raft node ID (required)")
 	raftAddr := flag.String("raft-addr", ":7001", "Raft gRPC listen address")
 	httpAddr := flag.String("http-addr", ":8001", "HTTP listen address")
@@ -204,7 +218,7 @@ func main() {
 
 	if *id == "" || *dataDir == "" {
 		fmt.Fprintln(os.Stderr, "usage: configsvc --id <id> --data-dir <dir> [--raft-addr :7001] [--http-addr :8001] [--join host:port,...]")
-		os.Exit(1)
+		return errors.New("--id and --data-dir are required")
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -248,18 +262,23 @@ func main() {
 	mux.HandleFunc("GET /watch/{key}", srv.handleWatch)
 	mux.HandleFunc("GET /watch", srv.handleWatch)
 
+	// Every request context descends from this one, so cancelling it is what
+	// ends the /watch streams at shutdown.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+
 	httpSrv := &http.Server{
-		Addr:    *httpAddr,
-		Handler: mux,
+		Addr:        *httpAddr,
+		Handler:     mux,
+		BaseContext: func(net.Listener) context.Context { return baseCtx },
 	}
 
 	// Start registers the easyraft routes on mux. It fails if this node was
 	// told to join a cluster and could not: better to exit than to serve an
 	// endpoint that is not part of any cluster.
 	if err := store.Start(); err != nil {
-		logger.Error("configsvc: cannot start", "err", err)
 		_ = store.Stop()
-		os.Exit(1)
+		return fmt.Errorf("cannot start: %w", err)
 	}
 	defer func() {
 		if err := store.Stop(); err != nil {
@@ -269,7 +288,39 @@ func main() {
 
 	logger.Info("configsvc started", "id", *id, "raft", *raftAddr, "http", *httpAddr)
 
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("HTTP server error", "err", err)
+	// ^C has to reach the deferred Stop above, and by default it does not: with
+	// no handler installed the signal terminates the process outright and every
+	// deferred call is skipped, so the Raft node is never stopped and the store
+	// is never closed. Nothing about that is fatal -- the log is there precisely
+	// so a node can come back from being killed -- but an example is a thing
+	// people copy, and this one was modelling the wrong shutdown.
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serveErr:
+		return fmt.Errorf("http server: %w", err)
+	case <-sigCtx.Done():
+		logger.Info("configsvc: shutting down")
 	}
+
+	// Before Shutdown, not after. Shutdown waits for in-flight requests rather
+	// than cancelling them, and /watch is an event stream with no natural end,
+	// so one attached watcher would otherwise hold the process until the
+	// timeout below expired.
+	cancelBase()
+
+	shutCtx, cancelShut := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShut()
+	if err := httpSrv.Shutdown(shutCtx); err != nil {
+		return fmt.Errorf("http shutdown: %w", err)
+	}
+	return nil
 }
