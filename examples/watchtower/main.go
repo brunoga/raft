@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -132,7 +133,6 @@ func run() error {
 	// too -- and the cost of consuming slowly is lost events, not a stalled
 	// cluster.
 	events, stopEvents := node.Events()
-	defer stopEvents()
 
 	obs := newObserver(slog.Default().With("node", *id))
 	var wg sync.WaitGroup
@@ -141,7 +141,24 @@ func run() error {
 		defer wg.Done()
 		obs.run(events)
 	}()
-	defer wg.Wait()
+	// One defer rather than two, because the order is the whole point and
+	// separate defers get it backwards. The observer returns when the event
+	// channel closes, and only stopEvents closes it; deferred calls run
+	// last-registered-first, so `defer stopEvents()` followed by
+	// `defer wg.Wait()` waits for a goroutine before doing the thing that
+	// lets it finish, and the process never exits.
+	defer func() {
+		stopEvents()
+		wg.Wait()
+	}()
+
+	// Every request context descends from this one, which is what lets
+	// shutdown reach inside a handler that is still running. /events is a
+	// stream with no natural end, and Shutdown does not cancel requests -- it
+	// waits for them -- so without this a single attached viewer holds the
+	// process open until the shutdown timeout expires.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
 
 	srv := &http.Server{
 		Addr:              *httpAddr,
@@ -150,6 +167,7 @@ func run() error {
 		ReadTimeout:       10 * time.Second,
 		// No write timeout: /events is a stream that stays open.
 		IdleTimeout: 120 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return baseCtx },
 	}
 
 	errCh := make(chan error, 1)
@@ -169,6 +187,10 @@ func run() error {
 	case <-sig:
 		slog.Info("watchtower: shutting down")
 	}
+
+	// Before Shutdown, not after: this is what ends the open /events streams,
+	// and Shutdown is what waits for them to end.
+	cancelBase()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
