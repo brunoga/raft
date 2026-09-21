@@ -1228,7 +1228,7 @@ See [`easyraft/`](easyraft/) for the full API reference, option guide, and usage
 
 ## Reference implementation
 
-Six fully-worked services are provided, each targeting a different deployment pattern — from a single-group service using the core `raft` package directly, through a state machine that keeps its own state on disk, to a multi-raft sharded store with automatic leader balancing — plus `raftctl`, an offline operator tool for a cluster that has lost its quorum.
+Seven fully-worked services are provided, each targeting a different deployment pattern — from a single-group service using the core `raft` package directly, through a state machine that keeps its own state on disk, to a multi-raft sharded store with automatic leader balancing — plus `raftctl`, an offline operator tool for a cluster that has lost its quorum.
 
 See [`examples/`](examples/) for the full index with build instructions and quick-start commands for each example.
 
