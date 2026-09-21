@@ -4,6 +4,18 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## Unreleased
+
+### Added
+
+- The proposal queue is configurable. `Config.ProposalQueueSize` sets how
+  many proposals may wait for the event loop at once (the previous fixed
+  1,024 is now the default), and `Config.ProposalOverflow` decides what
+  `Propose` and `ProposeOnce` do when it is full: wait, as before, or return
+  the new `ErrProposalQueueFull` at once so that a caller can shed load
+  rather than hold a goroutine on it. `Node.ProposalQueueDepth` reports the
+  occupancy, which is the number to alert on before either happens.
+
 ## v1.1.0
 
 ### Added

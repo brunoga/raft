@@ -92,6 +92,16 @@ var (
 	// progress, with nothing in the API having reported a problem.
 	ErrProposalTooLarge = errors.New("raft: proposal is too large to replicate")
 
+	// ErrProposalQueueFull is returned by Propose and ProposeOnce when the
+	// proposal queue is full and Config.ProposalOverflow is
+	// ProposalOverflowReject.
+	//
+	// It means the event loop is behind, not that anything is wrong with the
+	// request. Nothing was appended; retry after a pause, or against another
+	// node. A caller that would rather wait than see this should leave
+	// ProposalOverflow at its default.
+	ErrProposalQueueFull = errors.New("raft: proposal queue is full")
+
 	// ErrLeaseExpired is returned by ReadIndexLease when the leader does not
 	// currently hold a valid clock-based read lease. The caller should fall back
 	// to ReadIndex (which performs a heartbeat round-trip) or retry after the

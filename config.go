@@ -25,6 +25,35 @@ type PeerConfig struct {
 	Voter bool
 }
 
+// ProposalOverflowPolicy says what a node does with a proposal that arrives
+// while its proposal queue is full. See Config.ProposalOverflow.
+type ProposalOverflowPolicy uint8
+
+const (
+	// ProposalOverflowWait blocks Propose and ProposeOnce until there is room,
+	// the caller's context is done, or the node stops.
+	ProposalOverflowWait ProposalOverflowPolicy = iota
+	// ProposalOverflowReject makes Propose and ProposeOnce return
+	// ErrProposalQueueFull at once instead of waiting.
+	ProposalOverflowReject
+)
+
+// String returns the policy's name.
+func (p ProposalOverflowPolicy) String() string {
+	switch p {
+	case ProposalOverflowWait:
+		return "Wait"
+	case ProposalOverflowReject:
+		return "Reject"
+	default:
+		return "Unknown"
+	}
+}
+
+// DefaultProposalQueueSize is the proposal queue capacity used when
+// Config.ProposalQueueSize is zero.
+const DefaultProposalQueueSize = 1024
+
 // Config holds all tunables for a Raft node. Start with DefaultConfig() and
 // override only what you need.
 //
@@ -174,6 +203,37 @@ type Config struct {
 	//
 	// Default: 64 MiB.
 	MaxUnstableLogBytes int
+
+	// ProposalQueueSize is how many proposals may wait for the event loop at
+	// once. Propose and ProposeOnce hand their command to the event loop
+	// through this queue, and what happens when it is full is decided by
+	// ProposalOverflow.
+	//
+	// It is the other half of admission control. MaxUnstableLogBytes bounds
+	// what a leader accepts when its disk is behind; this bounds what waits
+	// when the event loop itself is behind, for any reason -- a slow state
+	// machine, a long snapshot, heavy replication. The queue is also the batch:
+	// the event loop drains it in one go, so a larger queue means fewer, larger
+	// storage writes under load, at the cost of a longer wait for the
+	// proposals at the back.
+	//
+	// Zero selects the default. Negative is refused by Validate.
+	//
+	// Default: 1024.
+	ProposalQueueSize int
+
+	// ProposalOverflow says what Propose and ProposeOnce do when the proposal
+	// queue is full: wait for space, or refuse with ErrProposalQueueFull.
+	//
+	// Waiting is the right default for a caller that would only retry anyway,
+	// and it is bounded by the caller's context. Refusing is for a caller that
+	// would rather shed the request than hold a goroutine on it -- a request
+	// handler with its own deadline, or a service that must stay responsive
+	// under overload -- and it makes the queue's fullness visible as an error
+	// rather than as latency.
+	//
+	// Default: ProposalOverflowWait.
+	ProposalOverflow ProposalOverflowPolicy
 
 	// Zones records which failure domain each node sits in: a rack, an
 	// availability zone, a datacentre, whatever fails as one unit. It is used
@@ -485,7 +545,8 @@ func DefaultConfig() Config {
 		CheckQuorum:         true,
 		MaxClientTableSize:  100_000,
 		MaxUnstableLogBytes: 64 << 20, // 64 MiB
-		SnapshotChunkSize:   1 << 20,  // 1 MiB
+		ProposalQueueSize:   DefaultProposalQueueSize,
+		SnapshotChunkSize:   1 << 20, // 1 MiB
 		TickInterval:        10 * time.Millisecond,
 	}
 }
@@ -534,6 +595,12 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxClientTableSize < 0 {
 		return errors.New("raft: MaxClientTableSize must not be negative (use 0 for unlimited)")
+	}
+	if c.ProposalQueueSize < 0 {
+		return errors.New("raft: ProposalQueueSize must not be negative (use 0 for the default)")
+	}
+	if c.ProposalOverflow > ProposalOverflowReject {
+		return fmt.Errorf("raft: ProposalOverflow %d is not a known policy", c.ProposalOverflow)
 	}
 	if c.SnapshotChunkSize < 0 {
 		return errors.New("raft: SnapshotChunkSize must not be negative (use 0 to send whole snapshots)")
