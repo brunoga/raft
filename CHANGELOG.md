@@ -4,7 +4,7 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
-## Unreleased
+## v1.1.0
 
 ### Added
 
@@ -33,6 +33,39 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   reports above all arrive after the guarantee has lapsed; this one arrives
   before. While it stays below `MaxClientTableSize` no client is ever
   forgotten, so it is the value worth alerting on.
+
+### Fixed
+
+- `watchtower` could not be stopped with ^C. It printed its shutdown line and
+  stayed there; pressing ^C again did nothing, and the only way out was
+  `kill -9`. Two deferred calls waited on each other — the observer goroutine
+  returns when the event channel closes, and the only thing that closes it was
+  deferred *before* the wait, so it ran after. A second fault the first one was
+  hiding: an attached `/events` viewer held shutdown for the whole ten-second
+  timeout, because `http.Server.Shutdown` waits for in-flight requests rather
+  than cancelling them.
+
+- `configsvc` and `ledger` installed no signal handler at all, so ^C terminated
+  them through the default disposition and every deferred call was skipped —
+  including the `store.Stop()` that stops the Raft node and closes the log.
+  Their shutdown path had never once run. Both now shut down gracefully, and
+  `main` is the usual two lines over a `run() error` so that nothing calls
+  `os.Exit` past a defer.
+
+  The other four services — `durablekv`, `idprovider`, `ratelimiter` and
+  `shardkv` — were checked the same way and were already correct.
+
+- `examples/internal/shutdowncheck` runs a service end to end and requires a
+  prompt, clean exit on a signal, with the line its cleanup logs. None of these
+  faults are reachable from a normal test: they live in `main`, and from
+  outside, a process killed by the default handler and one that shut down
+  cleanly both simply stop.
+
+- `TestRecover_BringsBackACluster` in `examples/raftctl` raced its own ticks
+  against an election and could fail with `node is not the leader`. Ticks come
+  from the loop waiting on each proposal, so a slow snapshot could outlast a
+  follower's timeout while that loop generated a full election window. It now
+  re-finds the leader and retries, as a client would.
 
 ## v1.0.1
 
