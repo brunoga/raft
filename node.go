@@ -187,6 +187,12 @@ type Node struct {
 	jointSelfVoterOld bool
 
 	// --- Membership provenance ----------------------------------------------
+	// membershipWitness is what the membership in effect says about this
+	// node: whether it is a witness. It is compared with Config.Witness,
+	// which is what the node actually is, at startup and whenever a change
+	// is applied. Event-loop only.
+	membershipWitness bool
+
 	// baseMembership is the membership recorded in the snapshot this node
 	// started from, or the bootstrap membership from Config when there is no
 	// snapshot. It is the base that config entries in the log are replayed on
@@ -699,6 +705,12 @@ func New(cfg *Config) (*Node, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if cfg.Witness && cfg.StateMachine == nil {
+		// A witness applies nothing; give it something that agrees.
+		c := *cfg
+		c.StateMachine = witnessStateMachine{}
+		cfg = &c
+	}
 
 	logger := cfg.Logger
 	if logger == nil {
@@ -849,13 +861,20 @@ func New(cfg *Config) (*Node, error) {
 		n.adoptCommitQuorum(rl.snapMembership.commitQuorum, "snapshot")
 	} else {
 		n.baseMembership = membershipState{
-			members: withSelf(cfg.Peers, cfg.ID, true, cfg.Voter),
+			members: withSelf(cfg.Peers, cfg.ID, true, cfg.Voter, cfg.Witness),
 		}
 	}
 	rl.snapMembership = membershipState{}
 	if err := n.rebuildMembership(context.Background()); err != nil {
 		stopCancel()
 		return nil, fmt.Errorf("raft.New: recover membership: %w", err)
+	}
+	// What the cluster believes this node is has to match what it is; see
+	// Config.Witness.
+	if n.membershipWitness != n.cfg.Witness {
+		stopCancel()
+		return nil, fmt.Errorf("raft.New: %w: the recovered membership says %s is witness=%v "+
+			"but Config.Witness is %v", ErrWitnessMismatch, cfg.ID, n.membershipWitness, cfg.Witness)
 	}
 
 	// Initialise atomic mirrors so external readers never see a nil value.
@@ -1092,6 +1111,7 @@ func (n *Node) Status() GroupStatus {
 		Term:        n.Term(),
 		LastApplied: n.LastApplied(),
 		Voter:       voter,
+		Witness:     n.cfg.Witness,
 	}
 }
 
@@ -1109,7 +1129,7 @@ func (n *Node) Members() []PeerConfig {
 		peers = v.([]PeerConfig)
 	}
 	out := make([]PeerConfig, 0, len(peers)+1)
-	out = append(out, PeerConfig{ID: n.cfg.ID, Voter: n.atomicVoter.Load()})
+	out = append(out, PeerConfig{ID: n.cfg.ID, Voter: n.atomicVoter.Load(), Witness: n.cfg.Witness})
 	out = append(out, peers...)
 	return out
 }
@@ -2571,4 +2591,41 @@ func (n *Node) adoptClientTableCap(capacity int, source string) {
 // put and the wholesale replacement a snapshot restore does.
 func (n *Node) syncClientTableSize() {
 	n.clientTableSize.Store(int64(n.clientTable.len()))
+}
+
+// witnessStateMachine is what a witness applies to: nothing. Its snapshots
+// are empty and it drains whatever a restore hands it, so that a witness
+// takes part in log compaction and snapshot installs without holding state.
+type witnessStateMachine struct{}
+
+func (witnessStateMachine) Apply(context.Context, LogEntry) ([]byte, error) { return nil, nil }
+func (witnessStateMachine) Snapshot(context.Context, io.Writer) error       { return nil }
+func (witnessStateMachine) Restore(_ context.Context, _ SnapshotMeta, r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
+}
+
+// stripForWitness returns entries with every command a witness does not need
+// removed. Config entries are kept: a witness tracks membership and the
+// group's policies like any member, and they are small. Everything else is
+// reduced to its index and term. The result is a fresh slice; entries is not
+// modified, since it may alias the log.
+func stripForWitness(entries []LogEntry) []LogEntry {
+	out := make([]LogEntry, len(entries))
+	for i, e := range entries {
+		out[i] = LogEntry{Index: e.Index, Term: e.Term}
+		if isConfigEntry(e.Command) {
+			out[i].Command = e.Command
+		}
+	}
+	return out
+}
+
+// isWitnessPeer reports whether the membership marks peer as a witness.
+// Event-loop only.
+func (n *Node) isWitnessPeer(peer NodeID) bool {
+	if i := indexOfPeer(n.cfg.Peers, peer); i >= 0 {
+		return n.cfg.Peers[i].Witness
+	}
+	return false
 }

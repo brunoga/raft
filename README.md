@@ -1351,6 +1351,50 @@ the old and new sizes for every decision, so no vote is ever counted under a
 pair of quorums that do not intersect. The count follows the membership: if
 voters are later removed below it, it is treated as "all of them".
 
+## Witnesses
+
+A witness is a voter that keeps the index and term of every log entry and
+never the entries themselves, and applies nothing (dissertation §11.7.2). It
+votes and counts towards every quorum like any voter, so two full replicas
+and a witness survive the loss of any one member at a third of the storage
+and none of the state machine a third full replica would cost — a small
+machine in a third location whose job is to break ties.
+
+```go
+// On the witness: no state machine, only the log's shape.
+cfg := raft.DefaultConfig()
+cfg.ID = "w"
+cfg.Witness = true
+cfg.Peers = []raft.PeerConfig{{ID: "a", Voter: true}, {ID: "b", Voter: true}}
+
+// On the full replicas: the witness is a voting peer marked as one.
+cfg.Peers = []raft.PeerConfig{{ID: "b", Voter: true}, {ID: "w", Voter: true, Witness: true}}
+
+// Or add one to a running group.
+err := leader.AddWitness(ctx, "w")
+```
+
+The leader sends a witness each entry's index and term and none of its
+contents, and sends it a snapshot that is a few hundred bytes of membership
+and policy. A witness cannot become leader, cannot be the target of a
+leadership transfer, and cannot be the source of a state transfer, so a
+group must keep at least one full voter.
+
+**The leader prefers full replicas.** A witness's acknowledgement counts
+towards a commit quorum only while some full voter that lacks the entry has
+stopped answering. In a healthy group every committed entry is therefore on
+every full replica, and a witness stands in for a full replica that is down
+rather than for one that is merely slow. The alternative — counting the
+witness whenever it answers first — commits entries that live on one full
+replica, and if that replica then fails no survivor can supply them and no
+full replica behind them can be elected.
+
+The membership and the node must agree. `New` refuses a node whose recovered
+membership disagrees with `Config.Witness`, and a full node that applies a
+membership entry calling it a witness stops with `ErrWitnessMismatch` rather
+than apply stripped entries. Upgrade every node before adding a witness: a
+node on a version without witnesses reads the role as a non-voter.
+
 ## State machines that keep their own state
 
 A state machine that is itself a database already holds, on its own disk, the

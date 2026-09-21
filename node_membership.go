@@ -46,13 +46,13 @@ func (n *Node) currentMembership() membershipState {
 	if n.jointOld != nil {
 		return membershipState{
 			joint:        true,
-			old:          withSelf(n.jointOld, n.cfg.ID, true, n.jointSelfVoterOld),
-			new:          withSelf(n.jointNew, n.cfg.ID, n.jointIncludeSelf, n.jointSelfVoter),
+			old:          withSelf(n.jointOld, n.cfg.ID, true, n.jointSelfVoterOld, n.cfg.Witness),
+			new:          withSelf(n.jointNew, n.cfg.ID, n.jointIncludeSelf, n.jointSelfVoter, n.cfg.Witness),
 			commitQuorum: n.commitQuorumApplied,
 		}
 	}
 	return membershipState{
-		members:      withSelf(n.cfg.Peers, n.cfg.ID, true, n.cfg.Voter),
+		members:      withSelf(n.cfg.Peers, n.cfg.ID, true, n.cfg.Voter, n.cfg.Witness),
 		commitQuorum: n.commitQuorumApplied,
 	}
 }
@@ -63,6 +63,9 @@ func (n *Node) restoreMembership(ms *membershipState) {
 	n.commitQuorumLatest = ms.commitQuorum
 	if !ms.joint {
 		peers, present, voter := splitSelf(ms.members, n.cfg.ID)
+		if _, witness := selfWitnessIn(ms.members, n.cfg.ID); present {
+			n.membershipWitness = witness
+		}
 		n.cfg.Peers = peers
 		n.cfg.Voter = present && voter
 		n.jointOld, n.jointNew = nil, nil
@@ -73,6 +76,9 @@ func (n *Node) restoreMembership(ms *membershipState) {
 
 	oldPeers, _, oldVoter := splitSelf(ms.old, n.cfg.ID)
 	newPeers, inNew, newVoter := splitSelf(ms.new, n.cfg.ID)
+	if present, witness := selfWitnessIn(ms.old, n.cfg.ID); present {
+		n.membershipWitness = witness
+	}
 	n.jointOld = oldPeers
 	n.jointNew = newPeers
 	n.jointSelfVoterOld = oldVoter
@@ -87,10 +93,10 @@ func (n *Node) restoreMembership(ms *membershipState) {
 
 // withSelf returns peers plus the local node when present is true. The result
 // is a fresh slice; peers is never aliased.
-func withSelf(peers []PeerConfig, self NodeID, present, voter bool) []PeerConfig {
+func withSelf(peers []PeerConfig, self NodeID, present, voter, witness bool) []PeerConfig {
 	out := make([]PeerConfig, 0, len(peers)+1)
 	if present {
-		out = append(out, PeerConfig{ID: self, Voter: voter})
+		out = append(out, PeerConfig{ID: self, Voter: voter, Witness: witness})
 	}
 	return append(out, peers...)
 }
@@ -107,6 +113,16 @@ func splitSelf(members []PeerConfig, self NodeID) (peers []PeerConfig, present, 
 		peers = append(peers, m)
 	}
 	return peers, present, voter
+}
+
+// selfWitnessIn reports whether members lists self, and as a witness.
+func selfWitnessIn(members []PeerConfig, self NodeID) (present, witness bool) {
+	for _, m := range members {
+		if m.ID == self {
+			return true, m.Witness
+		}
+	}
+	return false, false
 }
 
 // rebuildMembership recomputes the membership in effect from the snapshot base
@@ -186,6 +202,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 			// This node's own promotion or demotion. The peer list is
 			// unchanged, but the mirror still has to be refreshed: the role in
 			// it is what every reader outside the event loop sees.
+			n.membershipWitness = peer.Witness
 			n.cfg.Voter = peer.Voter
 			n.storeMembership()
 			return
@@ -259,7 +276,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 		// as a full membership that may or may not include self.
 		n.restoreMembership(&membershipState{
 			joint: true,
-			old:   withSelf(old, n.cfg.ID, true, n.cfg.Voter),
+			old:   withSelf(old, n.cfg.ID, true, n.cfg.Voter, n.cfg.Witness),
 			new:   new_,
 		})
 		if n.state == Leader {
@@ -315,6 +332,9 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 	before := n.membershipRoles()
 	n.adoptConfigEntry(configCmd, index)
 	after := n.membershipRoles()
+	if n.membershipWitness != n.cfg.Witness {
+		n.witnessMismatch(n.membershipWitness)
+	}
 	// Deferred, and after is amended rather than re-read, because a node that
 	// removes itself keeps its own ID in cfg -- it goes on running as a
 	// follower -- so the fact that it is no longer a member is recorded by the
@@ -526,7 +546,7 @@ func indexOfPeer(peers []PeerConfig, id NodeID) int {
 // the cluster; false means self is removed and will step down when the
 // finalise entry commits.
 func (n *Node) appendFinaliseEntry(newPeers []PeerConfig, includeSelf, selfVoter bool) {
-	allNew := withSelf(newPeers, n.cfg.ID, includeSelf, selfVoter)
+	allNew := withSelf(newPeers, n.cfg.ID, includeSelf, selfVoter, n.cfg.Witness)
 
 	idx := n.log.lastLogIndex() + 1
 	entry := LogEntry{
@@ -569,6 +589,42 @@ func peerUnion(a, b []PeerConfig, self NodeID) []PeerConfig {
 	return result
 }
 
+// witnessMismatch handles a membership entry that describes this node as a
+// witness when it is not, or the reverse. Event-loop only.
+//
+// A full node the cluster calls a witness is the dangerous direction: from
+// here on the leader sends it entries with their commands stripped, and it
+// would apply nothing where its peers applied commands. It stops instead, and
+// FatalError says why. The other direction only costs the cluster a replica
+// it thought was full; that is logged.
+func (n *Node) witnessMismatch(membershipSaysWitness bool) {
+	if membershipSaysWitness && !n.cfg.Witness {
+		n.fail(fmt.Errorf("%w: the cluster's membership marks %s as a witness, but it was "+
+			"built without Config.Witness; a full node fed stripped entries would diverge",
+			ErrWitnessMismatch, n.cfg.ID), "membership")
+		return
+	}
+	n.logger.Error("the cluster's membership marks this node as a full voter, but it is a "+
+		"witness and stores no entries; add it again with PeerConfig.Witness",
+		"node", n.cfg.ID)
+}
+
+// AddWitness adds a witness to the cluster as a voter. It blocks until the
+// change is committed and applied, or until ctx is cancelled, and returns
+// ErrNotLeader on any node but the leader.
+//
+// A witness is added in one step where AddVoter stages a full node through
+// learner first, because a witness has almost nothing to catch up on: the
+// index and term of each entry, which the leader sends it without the
+// entries' contents. It counts towards every quorum from the moment the
+// change commits. The node itself must have been built with Config.Witness.
+func (n *Node) AddWitness(ctx context.Context, id NodeID) error {
+	if id == "" {
+		return errors.New("raft: AddWitness: empty node ID")
+	}
+	return n.AddServer(ctx, PeerConfig{ID: id, Voter: true, Witness: true})
+}
+
 // ---- Replication progress and promotion -------------------------------------
 
 // PeerProgress is the leader's view of how far one peer has kept up.
@@ -577,6 +633,10 @@ type PeerProgress struct {
 	ID NodeID `json:"id"`
 	// Voter reports whether the peer votes and counts towards quorums.
 	Voter bool `json:"voter"`
+	// Witness reports whether the peer is a witness: it votes but holds no
+	// entries, so its MatchIndex describes what it knows the shape of, not
+	// what it could serve.
+	Witness bool `json:"witness"`
 	// MatchIndex is the highest log index the leader knows this peer has
 	// stored. Zero means the leader has not yet confirmed anything with it.
 	MatchIndex Index `json:"match_index"`
@@ -613,6 +673,7 @@ func (n *Node) replicationProgress() []PeerProgress {
 		out = append(out, PeerProgress{
 			ID:              p.ID,
 			Voter:           p.Voter,
+			Witness:         p.Witness,
 			MatchIndex:      n.matchIndex[p.ID],
 			NextIndex:       n.nextIndex[p.ID],
 			LeaderLastIndex: last,

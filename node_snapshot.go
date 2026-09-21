@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -452,6 +453,9 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 		if err := n.rebuildMembership(n.stopCtx); err != nil {
 			n.logger.Error("snapshot install: rebuild membership", "err", err)
 		}
+		if n.membershipWitness != n.cfg.Witness {
+			n.witnessMismatch(n.membershipWitness)
+		}
 	}
 
 	// Preemptively advance lastApplied to the snapshot boundary. This
@@ -616,6 +620,16 @@ func (n *Node) sendSnapshotToPeer(peer NodeID) {
 		n.logger.Error("sendSnapshotToPeer: LoadSnapshot", "peer", peer, "err", err)
 		return
 	}
+	if n.isWitnessPeer(peer) {
+		// A witness needs the snapshot's position, membership and policies,
+		// and none of the state machine or the client table. Send it a
+		// snapshot that says so, which is a few hundred bytes.
+		r, err = witnessSnapshot(r)
+		if err != nil {
+			n.logger.Error("sendSnapshotToPeer: witness snapshot", "peer", peer, "err", err)
+			return
+		}
+	}
 	n.snapshotInflight[peer] = true
 
 	chunkSize := n.snapshotChunkSize()
@@ -720,4 +734,21 @@ func (n *Node) handleInstallSnapshotResult(r *installSnapshotResult) {
 	if n.nextIndex[r.peer] <= n.log.lastLogIndex() {
 		n.replicateToPeer(r.peer)
 	}
+}
+
+// witnessSnapshot reads the framing of a full snapshot from r, closes r, and
+// returns a snapshot carrying only what a witness needs: the membership and
+// the group's policies, with no client table and no state machine data.
+func witnessSnapshot(r io.ReadCloser) (io.ReadCloser, error) {
+	defer func() { _ = r.Close() }()
+	frame, _, err := readSnapshotFrame(r)
+	if err != nil {
+		return nil, err
+	}
+	frame.table = nil
+	var buf bytes.Buffer
+	if err := writeSnapshotFrame(&buf, &frame, func(io.Writer) error { return nil }); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(&buf), nil
 }

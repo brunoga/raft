@@ -613,8 +613,17 @@ func (rl *raftLog) truncateSuffix(ctx context.Context, fromIndex Index) error {
 // the one it is about to send; when the answer is no, the peer has fallen
 // behind what the log still holds and needs a snapshot instead.
 func (rl *raftLog) canDescribe(index Index) bool {
-	if index == 0 || index == rl.snapMeta.LastIncludedIndex {
+	if index == rl.snapMeta.LastIncludedIndex {
 		return true
+	}
+	if index == 0 {
+		// The empty position before the first entry describes a log that
+		// starts at 1, which is only so while entry 1 is still here or no
+		// entry has ever been compacted away. A peer that needs everything
+		// from index 1 on a log that has compacted anything needs a
+		// snapshot, and saying yes here sent it a read of entries that were
+		// gone, again and again, in place of one.
+		return rl.first == 1 || (rl.first == 0 && rl.snapMeta.LastIncludedIndex == 0)
 	}
 	return rl.first != 0 && index >= rl.first && index <= rl.last
 }

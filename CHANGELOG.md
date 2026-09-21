@@ -111,6 +111,32 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   before setting a policy; a node on the previous version counts by a
   majority regardless.
 
+## Unreleased
+
+### Added
+
+- Witnesses (dissertation §11.7.2). `Config.Witness` builds a node that
+  keeps the index and term of every entry and never the entries themselves,
+  needs no state machine, and applies nothing; `PeerConfig.Witness` marks
+  it in the membership and `Node.AddWitness` adds one to a running group. It
+  votes and counts towards every quorum, so two full replicas and a witness
+  survive the loss of any one member. The leader sends it entries stripped
+  to their shape and a snapshot of a few hundred bytes. A witness cannot
+  lead, be transferred leadership, or be the source of a state transfer.
+
+  The leader prefers full replicas: a witness's acknowledgement counts
+  towards a commit quorum only while a full voter that lacks the entry has
+  stopped answering, so in a healthy group every committed entry is on every
+  full replica and the witness stands in for a replica that is down, not for
+  one that is slow. `New` refuses a node whose recovered membership disagrees
+  with `Config.Witness`; a full node that applies a membership entry calling
+  it a witness stops with the new `ErrWitnessMismatch`. `GroupStatus` and
+  `PeerProgress` report `Witness`, and the leader balancer never targets one.
+
+  On the wire the witness role is a second bit in the peer role byte; a node
+  on the previous version reads it as a non-voter, so upgrade every node
+  before adding a witness.
+
 ## v1.1.0
 
 ### Added

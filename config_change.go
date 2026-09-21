@@ -42,11 +42,7 @@ func encodeConfigEntry(op byte, peer PeerConfig) []byte {
 	b := make([]byte, 6+len(peer.ID))
 	copy(b[:4], configMagic[:])
 	b[4] = op
-	if peer.Voter {
-		b[5] = 1
-	} else {
-		b[5] = 0
-	}
+	b[5] = peerFlags(peer)
 	copy(b[6:], peer.ID)
 	return b
 }
@@ -57,8 +53,35 @@ func decodeConfigEntry(cmd []byte) (op byte, peer PeerConfig, ok bool) {
 	if !isConfigEntry(cmd) || len(cmd) < 6 {
 		return 0, PeerConfig{}, false
 	}
-	voter := cmd[5] == 1
-	return cmd[4], PeerConfig{ID: NodeID(cmd[6:]), Voter: voter}, true
+	peer = PeerConfig{ID: NodeID(cmd[6:])}
+	peer.Voter, peer.Witness = peerRoles(cmd[5])
+	return cmd[4], peer, true
+}
+
+// Peer role flags, packed into the byte that used to hold only the voter
+// bit. A reader from before witnesses existed compares the byte to 1, so a
+// witness (3) reads there as a non-voter; that is one of the reasons every
+// node must be upgraded before a witness is added.
+const (
+	peerFlagVoter   byte = 1 << 0
+	peerFlagWitness byte = 1 << 1
+)
+
+// peerFlags packs a peer's roles into one byte.
+func peerFlags(p PeerConfig) byte {
+	var b byte
+	if p.Voter {
+		b |= peerFlagVoter
+	}
+	if p.Witness {
+		b |= peerFlagWitness
+	}
+	return b
+}
+
+// peerRoles unpacks peerFlags.
+func peerRoles(b byte) (voter, witness bool) {
+	return b&peerFlagVoter != 0, b&peerFlagWitness != 0
 }
 
 // ---- Joint consensus encoding ----------------------------------------------
@@ -257,11 +280,7 @@ func appendPeerList(b []byte, list []PeerConfig) []byte {
 	b = binary.BigEndian.AppendUint32(b, uint32(len(list)))
 	for _, p := range list {
 		b = binary.BigEndian.AppendUint16(b, uint16(len(p.ID)))
-		if p.Voter {
-			b = append(b, 1)
-		} else {
-			b = append(b, 0)
-		}
+		b = append(b, peerFlags(p))
 		b = append(b, p.ID...)
 	}
 	return b
@@ -282,12 +301,12 @@ func decodePeerList(buf []byte) (peers []PeerConfig, rest []byte, ok bool) {
 		}
 		idLen := int(binary.BigEndian.Uint16(buf))
 		buf = buf[2:]
-		voter := buf[0] == 1
+		voter, witness := peerRoles(buf[0])
 		buf = buf[1:]
 		if len(buf) < idLen {
 			return nil, nil, false
 		}
-		peers = append(peers, PeerConfig{ID: NodeID(buf[:idLen]), Voter: voter})
+		peers = append(peers, PeerConfig{ID: NodeID(buf[:idLen]), Voter: voter, Witness: witness})
 		buf = buf[idLen:]
 	}
 	return peers, buf, true

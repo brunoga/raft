@@ -38,6 +38,9 @@ type GroupStatus struct {
 	// non-voter cannot become leader, so leadership planning must not target
 	// one.
 	Voter bool `json:"voter"`
+	// Witness reports whether this replica is a witness: it votes but holds
+	// no entries, so it can no more be a leader than a non-voter can.
+	Witness bool `json:"witness"`
 }
 
 // Manager multiplexes multiple independent Raft groups on a single physical
