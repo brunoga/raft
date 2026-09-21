@@ -25,6 +25,36 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      # A tracked file that .gitignore names is a build artifact somebody
+      # force-added, and the module zip carries it to everyone who depends on
+      # this package. v1.0.0 shipped a 21MB example binary that way: the source
+      # is 2.5MB and the published zip was 12MB. Nothing about the build fails
+      # when that happens, so check for it explicitly.
+      - name: No build artifacts in the tree
+        run: |
+          tracked_but_ignored=$(git ls-files -c -i --exclude-standard)
+          if [ -n "$tracked_but_ignored" ]; then
+            echo "These files are tracked but .gitignore says they should not be:"
+            echo "$tracked_but_ignored"
+            echo
+            echo "They ship inside the module zip. Remove with: git rm --cached <file>"
+            exit 1
+          fi
+
+          # The check above only sees artifacts .gitignore already names, so a
+          # new example whose binary nobody listed would still slip through.
+          # This one needs no list: the largest source file here is under 100KB
+          # and nothing this package ships has any business being a megabyte.
+          oversized=$(git ls-files | while read -r f; do
+            size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+            if [ "$size" -gt 1048576 ]; then echo "$size $f"; fi
+          done)
+          if [ -n "$oversized" ]; then
+            echo "Tracked files over 1MB (size in bytes):"
+            echo "$oversized"
+            exit 1
+          fi
+
       - name: Run tests with race detector
         run: go test -v -race ./...
 

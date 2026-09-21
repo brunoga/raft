@@ -4,6 +4,21 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## v1.0.1
+
+### Fixed
+
+- The published `v1.0.0` module zip contained a 21MB example binary that had
+  been committed by mistake. The package's own source is about 2.5MB; the zip
+  was 12MB compressed and 24MB unpacked, so anyone depending on `v1.0.0` was
+  downloading and caching roughly ten times what the module is. The binary is
+  gone from the tree, and CI now fails on any tracked file that `.gitignore`
+  names or that exceeds 1MB.
+
+  `v1.0.0` cannot be repaired in place — the module proxy and checksum database
+  have it pinned — so `v1.0.1` is the same code, correctly packaged. No source
+  change, no API change; upgrading is a `go get` and nothing else.
+
 ## v1.0.0
 
 First stable release. The API of every package listed in
