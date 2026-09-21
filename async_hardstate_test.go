@@ -443,8 +443,17 @@ func TestAsyncHardState_AForwardedReadCarriesOnlyADurableTerm(t *testing.T) {
 	}()
 	store.awaitHeld(t)
 
-	if got := node.Term(); got != 7 {
-		t.Fatalf("Term() = %d, want 7: the term takes effect immediately", got)
+	// The write reaching the gate does not mean the term is visible yet.
+	// saveTerm queues the write before it publishes the term, so the writer
+	// goroutine can already be blocked at the gate while the event loop has
+	// not yet stored the new term in the mirror Term() reads. That ordering is
+	// the conservative one -- the write is on its way before anything
+	// announces the term -- so waiting is what the test has to do about it.
+	// Asserting the instant awaitHeld returns fails about one run in three
+	// hundred on a loaded machine.
+	if !awaitTerm(node, 7, 5*time.Second) {
+		t.Fatalf("Term() = %d, want 7: the term takes effect once the event loop "+
+			"has processed the request", node.Term())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -475,4 +484,17 @@ func (t *readIndexSpyTransport) ReadIndex(_ context.Context, _ raft.NodeID, req 
 	default:
 	}
 	return &raft.ReadIndexResponse{Index: 0}, nil
+}
+
+// awaitTerm waits for the node to report term, which happens a moment after
+// the hard-state write carrying it is queued. See the note at the call site.
+func awaitTerm(node *raft.Node, term raft.Term, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for node.Term() != term {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }

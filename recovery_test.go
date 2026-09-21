@@ -73,9 +73,7 @@ func recoveryNode(t *testing.T, net *memtransport.Network, store raft.Storage, s
 	cfg.StateMachine = sm
 	cfg.Transport = net.NewTransport(id)
 	cfg.TickInterval = 0
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -384,9 +382,7 @@ func TestInspectStorage_ReportsMembershipFromSnapshot(t *testing.T) {
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 2
 	cfg.TrailingLogs = 0
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 
 	node, newErr := raft.New(&cfg)
 	if newErr != nil {

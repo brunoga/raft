@@ -78,9 +78,7 @@ func twoNodeWithRecorder(t *testing.T, tune func(*raft.Config)) (*raft.Node, *si
 		cfg.Transport = tr
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 0
-		cfg.ElectionTimeoutMin = 20 * time.Millisecond
-		cfg.ElectionTimeoutMax = 40 * time.Millisecond
-		cfg.HeartbeatInterval = 10 * time.Millisecond
+		tuneForManualTicks(&cfg)
 		if tune != nil {
 			tune(&cfg)
 		}

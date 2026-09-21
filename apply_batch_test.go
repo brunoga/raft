@@ -95,22 +95,75 @@ func leaderWithSM(t *testing.T, sm raft.StateMachine) *raft.Node {
 }
 
 // TestApplyBatch_EntriesArriveTogether is the point of the interface.
+//
+// The batch has to be arranged rather than hoped for. Firing proposals from
+// many goroutines and expecting them to commit together works on an idle
+// machine and stops working on a busy one: if the scheduler runs them one at a
+// time, each commits alone, the apply loop is handed one entry at a time, and
+// the test fails for want of CPU rather than for want of batching. Under a
+// loaded machine that is not a rare flake -- it failed every run.
+//
+// Holding the log writes makes it deterministic. Nothing commits while the
+// disk is held, so the proposals pile up in the unstable log; releasing makes
+// them durable together, the commit index jumps over all of them at once, and
+// the apply loop is handed the run that the interface exists for.
 func TestApplyBatch_EntriesArriveTogether(t *testing.T) {
 	sm := &batchSM{}
-	node := leaderWithSM(t, sm)
+	store := newGateStore()
 
-	// Propose concurrently so that several entries commit together and the
-	// apply loop is handed more than one at a time.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	cfg := safeBaseConfig(t, "n1")
+	cfg.Storage = store
+	cfg.StateMachine = sm
+	tuneForManualTicks(&cfg)
+
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	node.Start()
+	t.Cleanup(node.Stop)
+
+	stopTicking := tickWhile(node)
+	t.Cleanup(stopTicking)
+	deadline := time.Now().Add(10 * time.Second)
+	for node.State() != raft.Leader {
+		if time.Now().After(deadline) {
+			t.Fatal("the node never became leader")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	release := store.hold(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	const proposals = 64
 	var wg sync.WaitGroup
-	for i := range 64 {
+	submitted := make(chan struct{}, proposals)
+	for i := range proposals {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			submitted <- struct{}{}
 			_, _ = node.Propose(ctx, fmt.Appendf(nil, "cmd%02d", i))
 		}(i)
 	}
+
+	// Every goroutine has reached its Propose call, and at least one proposal
+	// has already been appended and had its write taken up by the writer,
+	// which is now blocked. Nothing can drain while the disk is held, so the
+	// rest queue behind it rather than racing ahead.
+	for range proposals {
+		select {
+		case <-submitted:
+		case <-time.After(10 * time.Second):
+			t.Fatal("not every proposal was submitted")
+		}
+	}
+	store.awaitHeld(t)
+
+	release()
 	wg.Wait()
 
 	biggest := 0
@@ -120,9 +173,10 @@ func TestApplyBatch_EntriesArriveTogether(t *testing.T) {
 		}
 	}
 	if biggest < 2 {
-		t.Errorf("the largest batch the state machine saw held %d entries; "+
-			"64 concurrent proposals should have grouped at least some of them", biggest)
+		t.Errorf("the largest batch the state machine saw held %d entries; %d entries "+
+			"committed at once should have been handed over together", biggest, proposals)
 	}
+	t.Logf("largest batch: %d of %d entries", biggest, proposals)
 }
 
 // TestApplyBatch_ResultsGoBackToTheRightProposer is the property that a batch

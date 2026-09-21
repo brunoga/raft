@@ -57,9 +57,7 @@ func leaderWithLimit(t *testing.T, limit int, tune func(*raft.Config)) *raft.Nod
 	cfg.StateMachine = sizeSM2{}
 	cfg.Transport = &limitedTransport{Transport: net.NewTransport("n1"), limit: limit}
 	cfg.TickInterval = 0
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 	if tune != nil {
 		tune(&cfg)
 	}
