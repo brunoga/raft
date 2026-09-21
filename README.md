@@ -294,7 +294,7 @@ for {
 - The dedup table is replicated through the log and persisted inside every snapshot, so exactly-once survives leader failover and restart.
 - Only a *successful* apply is recorded. A command the state machine rejected is not cached, so a retry runs it again and sees the same error rather than a spurious success.
 - `MaxClientTableSize` (default 100 000) bounds the table. **A client that retries after its entry has been evicted has its request executed a second time** — size the table to outlive the retry window of your slowest client, and use stable `clientID` values.
-- Eviction order is a function of the log alone, so every replica evicts the same entry at the same point. This holds only if `MaxClientTableSize` is identical on every node in the group; a node with a smaller table forgets requests its peers still remember, and the replicas diverge.
+- The bound is replicated. The leader writes it into the log ahead of the first `ProposeOnce` entry and snapshots carry it, so every replica evicts the same entry at the same point whatever its own `Config` says. `Node.MaxClientTableSize()` reports the value in effect; `Node.SetMaxClientTableSize(ctx, n)` changes it for the whole group.
 - The bound is on entry count, not bytes: each entry also retains the result the state machine returned.
 - `ErrObsoleteSeqNum` means the submitted `seqNum` is strictly less than the one already recorded for that client. Never retry with a lower `seqNum`.
 
@@ -530,7 +530,7 @@ cfg.Transport = tr                          // required
 | `SnapshotChunkSize` | `1 MiB` | Maximum bytes per InstallSnapshot chunk. Leave room for framing: a chunk sized at exactly the transport's message limit does not fit. `0` sends snapshots as a single RPC. |
 | `RPCTimeout` | `0` | Per-RPC deadline. `0` falls back to `ElectionTimeoutMin`. Snapshot RPCs use `4×RPCTimeout`. |
 | `CheckQuorum` | `true` | Leader steps down if it doesn't hear from a quorum within one election timeout. |
-| `MaxClientTableSize` | `100000` | Maximum entries in the ProposeOnce dedup table. `0` disables eviction. **Must be identical on every node in a group.** |
+| `MaxClientTableSize` | `100000` | Maximum entries in the ProposeOnce dedup table; `0` disables eviction. The value a group is created with: it is replicated through the log, so a node whose `Config` differs from the group's uses the group's and logs a warning. Change it at run time with `Node.SetMaxClientTableSize`. |
 | `OnFatal` | `nil` | Called once, from its own goroutine, if the node stops because a durable write failed. |
 | `Logger` | `slog.Default()` | Structured logger. Set to a `slog.LevelWarn` logger to silence routine traffic. |
 | `Metrics` | `nil` | Observability hook (see [Metrics and tracing](#observability--metrics-and-tracing)). |
@@ -1181,10 +1181,12 @@ a table of `MaxClientTableSize` entries. A client that retries after its entry
 has been evicted has its request executed a second time. Size the table to
 outlive the retry window of the slowest client.
 
-Eviction order is a function of the log alone, so every replica evicts the same
-entry at the same point — but only if `MaxClientTableSize` is identical across
-the group. A node with a smaller table forgets requests its peers still
-remember, and the replicas diverge.
+Eviction order is a function of the log alone, and so is the bound: the leader
+writes it into the log ahead of the first `ProposeOnce` entry, and snapshots
+carry it, so every replica evicts the same entry at the same point whatever
+its own `Config.MaxClientTableSize` says. Resize a running group with
+`Node.SetMaxClientTableSize`; a smaller bound forgets the oldest clients
+everywhere at once, and a larger one recovers nothing already forgotten.
 
 ### Nothing listens open by accident, but plaintext is still a choice
 

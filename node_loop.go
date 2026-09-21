@@ -261,7 +261,34 @@ func (n *Node) handleProposals(props []proposeMsg) {
 	limit := n.unstableLimit()
 	backlog := n.log.unstableSize()
 
-	entries := make([]LogEntry, 0, len(props))
+	entries := make([]LogEntry, 0, len(props)+1)
+
+	// The group's bound on the exactly-once table has to be agreed before
+	// the first entry that table records, or each replica would apply that
+	// entry under its own configuration and evict differently from there on.
+	// So a leader whose group has no agreed bound yet puts one in the log
+	// ahead of the first ProposeOnce entry, from its own configuration; every
+	// replica adopts it at apply time, before the entry that needs it.
+	if !n.clientTableCapReplicated && n.capEntryPending == 0 {
+		for _, prop := range props {
+			if !isDedupCmd(prop.cmd) {
+				continue
+			}
+			idx := n.log.lastLogIndex() + 1
+			entries = append(entries, LogEntry{
+				Index:   idx,
+				Term:    n.currentTerm,
+				Command: encodeClientTableCapEntry(n.cfg.MaxClientTableSize),
+			})
+			n.capEntryPending = idx
+			// The log now knows of a bound. The table itself is unchanged:
+			// the value is this node's own, and it takes effect in apply
+			// order like every other cap entry.
+			n.clientTableCapReplicated = true
+			break
+		}
+	}
+
 	for _, prop := range props {
 		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
 			p := promise[[]byte]{ch: prop.respCh}
@@ -341,6 +368,9 @@ func (n *Node) handleProposals(props []proposeMsg) {
 				}
 				if n.pendingConfigIndex == idx {
 					n.pendingConfigIndex = 0
+				}
+				if n.capEntryPending == idx {
+					n.capEntryPending = 0
 				}
 			}
 		})

@@ -379,9 +379,13 @@ type Config struct {
 	// entries were written, which is the order of the log, so every replica
 	// evicts the same entry at the same point.
 	//
-	// MUST be the same on every node in a group. A node with a smaller table
-	// forgets requests its peers still remember, so a client retry is
-	// re-executed there and skipped elsewhere, and the replicas diverge.
+	// The bound is replicated, so that every replica keeps the same table. A
+	// leader whose group has not agreed one yet writes this value into the
+	// log ahead of the first ProposeOnce entry, and from then on every node
+	// uses the agreed value whatever its own Config says, with a warning when
+	// the two differ. Snapshots carry it. So this is the value a group is
+	// created with; Node.MaxClientTableSize reports the value in effect, and
+	// Node.SetMaxClientTableSize changes it for the whole group.
 	//
 	// Eviction is a real limit on the exactly-once guarantee: a client that
 	// retries a request after its entry has been evicted has that request

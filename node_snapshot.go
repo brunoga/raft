@@ -29,8 +29,12 @@ type snapInstallResult struct {
 	// hasMembership is false for a snapshot written before the membership
 	// section existed; the receiver then keeps the membership it already has.
 	hasMembership bool
-	smR           io.ReadCloser // positioned past framing header, at SM data; nil on error
-	err           error
+	// clientTableCap is the client table bound the snapshot was taken under,
+	// when hasClientTableCap; otherwise the receiver keeps its own.
+	clientTableCap    int
+	hasClientTableCap bool
+	smR               io.ReadCloser // positioned past framing header, at SM data; nil on error
+	err               error
 }
 
 // chunkReader implements io.Reader by draining a channel of byte slices.
@@ -91,6 +95,11 @@ type snapshotTrigger struct {
 	// snapshot replaces the log prefix that carried the config entries, so it
 	// has to carry the membership they established.
 	membership membershipState
+	// clientTableCap is the client table bound in effect at
+	// meta.LastIncludedIndex, established the same way, and
+	// hasClientTableCap whether the group has agreed one at all.
+	clientTableCap    int
+	hasClientTableCap bool
 }
 
 // snapshotResult is delivered from applyLoop to the event loop once the
@@ -100,6 +109,10 @@ type snapshotResult struct {
 	// membership is the membership written into the snapshot; it becomes the
 	// new base once the log prefix it covers is truncated away.
 	membership membershipState
+	// clientTableCap and hasClientTableCap are the bound written into the
+	// snapshot, which becomes the new base the same way.
+	clientTableCap    int
+	hasClientTableCap bool
 	// sizeBytes is how much the snapshot came to on the wire, and duration how
 	// long it took to produce. Both are only observable while it is being
 	// written, so they are carried back rather than recomputed.
@@ -115,6 +128,11 @@ type snapshotInstall struct {
 	meta        SnapshotMeta
 	r           io.ReadCloser
 	clientTable []clientRecord
+	// clientTableCap is the bound to keep the restored table under, and
+	// hasClientTableCap whether the snapshot said; without it the apply
+	// goroutine keeps the bound it has.
+	clientTableCap    int
+	hasClientTableCap bool
 }
 
 // installSnapshotResult is delivered from sendSnapshotToPeer's background
@@ -344,7 +362,7 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 		return
 	}
 
-	table, ms, hasMS, _, parseErr := readWrappedSnapshot(r)
+	frame, _, parseErr := readSnapshotFrame(r)
 	if parseErr != nil {
 		_ = r.Close()
 		sendResult(&snapInstallResult{meta: meta, err: fmt.Errorf("snapshot install: unwrap: %w", parseErr)})
@@ -354,11 +372,13 @@ func (n *Node) runSnapshotInstall(ctx context.Context, meta SnapshotMeta, chunkC
 	// loop forwards it to the apply goroutine for StateMachine.Restore; the
 	// apply goroutine closes r when done.
 	sendResult(&snapInstallResult{
-		meta:          meta,
-		table:         table,
-		membership:    ms,
-		hasMembership: hasMS,
-		smR:           r,
+		meta:              meta,
+		table:             frame.table,
+		membership:        frame.membership,
+		hasMembership:     frame.hasMembership,
+		clientTableCap:    frame.clientTableCap,
+		hasClientTableCap: frame.hasClientTableCap,
+		smR:               r,
 	})
 }
 
@@ -402,6 +422,12 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 		return
 	}
 
+	// The bound comes before the table: a table loaded under the wrong bound
+	// would be trimmed to it.
+	if r.hasClientTableCap {
+		n.adoptClientTableCap(r.clientTableCap, "snapshot")
+		n.baseClientTableCap, n.hasBaseClientTableCap = r.clientTableCap, true
+	}
 	n.clientTable.loadFrom(r.table)
 	n.syncClientTableSize()
 
@@ -438,9 +464,11 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 
 	// Signal applyLoop to restore the state machine.
 	install := snapshotInstall{
-		meta:        r.meta,
-		r:           r.smR,
-		clientTable: r.table,
+		meta:              r.meta,
+		r:                 r.smR,
+		clientTable:       r.table,
+		clientTableCap:    r.clientTableCap,
+		hasClientTableCap: r.hasClientTableCap,
 	}
 	select {
 	case n.restoreSnapshotCh <- install:
@@ -509,9 +537,11 @@ func (n *Node) maybeSnapshot() {
 	// Signal applyLoop to take the snapshot. The channel is size-1 and
 	// snapshotting prevents re-entry, so this send never blocks.
 	n.snapshotTriggerCh <- snapshotTrigger{
-		meta:        meta,
-		clientTable: tableSnapshot,
-		membership:  n.currentMembership(),
+		meta:              meta,
+		clientTable:       tableSnapshot,
+		membership:        n.currentMembership(),
+		clientTableCap:    n.clientTableCap,
+		hasClientTableCap: n.clientTableCapAgreed,
 	}
 }
 
@@ -554,6 +584,7 @@ func (n *Node) handleSnapshotResult(sr *snapshotResult) {
 	n.log.truncatePrefix(keepFrom)
 	n.log.snapMeta = sr.meta
 	n.baseMembership = sr.membership
+	n.baseClientTableCap, n.hasBaseClientTableCap = sr.clientTableCap, sr.hasClientTableCap
 	n.atomicSnapshotIndex.Store(uint64(sr.meta.LastIncludedIndex))
 	n.logger.Info("snapshot saved",
 		"index", sr.meta.LastIncludedIndex, "term", sr.meta.LastIncludedTerm,
