@@ -403,6 +403,7 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	}
 
 	n.clientTable.loadFrom(r.table)
+	n.syncClientTableSize()
 
 	// The snapshot replaces every log entry up to its last-included index,
 	// including any config entries in that range, so the membership it carries

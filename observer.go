@@ -78,6 +78,22 @@ const (
 	// so this is the event that should page somebody: nothing else about it
 	// will recover on its own.
 	EventNodeFailed
+	// EventClientForgotten reports that a client was dropped from the
+	// exactly-once table to make room for another, and names it in Client.
+	//
+	// It is the moment a guarantee stops holding. The table behind ProposeOnce
+	// is bounded by Config.MaxClientTableSize, and once a client is out of it
+	// the node cannot tell that client's retry from a first attempt: the retry
+	// is executed a second time, the log stays consistent, every replica
+	// agrees, and nothing anywhere records that it happened. This event is the
+	// only notice there is, and it arrives at the eviction rather than at the
+	// duplicate, which may be minutes later on a client nobody is watching.
+	//
+	// Every node emits it, because every node evicts the same entry at the
+	// same point -- that is what keeps replicas agreeing about what they have
+	// already seen. A consumer counting incidents should count them per
+	// cluster, not per node.
+	EventClientForgotten
 )
 
 // String returns the event type's name, as it appears in logs and dashboards.
@@ -105,6 +121,8 @@ func (t EventType) String() string {
 		return "SnapshotFailed"
 	case EventNodeFailed:
 		return "NodeFailed"
+	case EventClientForgotten:
+		return "ClientForgotten"
 	default:
 		return "Unknown"
 	}
@@ -172,6 +190,11 @@ type Event struct {
 	// Origin says whether the snapshot is this node's own or one a leader sent
 	// it. Set by the snapshot events.
 	Origin SnapshotOrigin
+	// Client is the client dropped from the exactly-once table. Set by
+	// EventClientForgotten. It is a client's ID as passed to ProposeOnce,
+	// which is a different namespace from Peer: clients are not cluster
+	// members and the two may collide without meaning anything.
+	Client NodeID
 	// Err is the failure being reported. Set by EventSnapshotFailed and
 	// EventNodeFailed, and nil everywhere else.
 	Err error

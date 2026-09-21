@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // run is the single goroutine that exclusively owns all mutable Node state.
 // Every other goroutine communicates with it only through channels.
@@ -373,7 +376,11 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 	if isDedupCmd(ar.cmd) && ar.err == nil {
 		if clientID, seqNum, _, err := decodeDedupCmd(ar.cmd); err == nil {
 			if cached, ok := n.clientTable.get(clientID); !ok || seqNum >= cached.seqNum {
-				n.clientTable.put(clientID, clientEntry{seqNum: seqNum, result: ar.val})
+				if forgotten, evicted := n.clientTable.put(clientID,
+					clientEntry{seqNum: seqNum, result: ar.val}); evicted {
+					n.reportClientForgotten(forgotten)
+				}
+				n.syncClientTableSize()
 			}
 		}
 	}
@@ -456,4 +463,43 @@ func (n *Node) drainPendingReads(err error) {
 	n.waitingReads = n.waitingReads[:0]
 
 	n.readBatchAcks = nil
+}
+
+// reportClientForgotten announces that a client was dropped from the
+// exactly-once table. Called from the event loop.
+//
+// This is not a warning about pressure. The table is the only record of which
+// requests have already been carried out, so a client that is no longer in it
+// will have its next retry executed a second time -- and that duplicate is
+// undetectable after the fact: it applies cleanly, the log stays consistent,
+// and every replica agrees, because every replica evicted the same entry. The
+// eviction is the last moment anything can be said about it, so it is said
+// three ways: to Metrics, to Events, and to the log for the many deployments
+// that wire up neither.
+//
+// Only the event loop reports. The apply loop keeps its own copy of the table
+// and evicts in lockstep with this one, by construction -- both are driven by
+// the same entries in the same order -- so reporting there as well would
+// double every count.
+func (n *Node) reportClientForgotten(clientID NodeID) {
+	n.clientsForgotten++
+
+	if cm, ok := n.cfg.Metrics.(ClientTableMetrics); ok {
+		cm.ClientForgotten(n.cfg.ID, clientID)
+	}
+	n.emit(&Event{Type: EventClientForgotten, Client: clientID})
+
+	// The first one is always logged: it is the transition from a cluster that
+	// keeps its exactly-once promise to one that does not, and an operator who
+	// sees nothing else should see that. After it, a table one entry too small
+	// evicts on every single proposal, so the rest are summarised.
+	now := n.now()
+	if n.clientsForgotten > 1 && now.Sub(n.lastForgetLog) < time.Minute {
+		return
+	}
+	n.lastForgetLog = now
+	n.logger.Warn("client dropped from the exactly-once table; a retry from it will run twice",
+		"client", clientID,
+		"maxClientTableSize", n.cfg.MaxClientTableSize,
+		"forgottenTotal", n.clientsForgotten)
 }

@@ -47,6 +47,13 @@ func (n *Node) applyPending(
 			// Recorded here rather than before the call, so that a command the
 			// state machine rejected is not remembered as having succeeded and
 			// answered from the table on the retry.
+			//
+			// The eviction this may cause is deliberately not reported
+			// here. This table and the event loop's evict in lockstep --
+			// both are driven by the same entries in the same order, which
+			// is what makes every replica agree about what it has already
+			// seen -- so the event loop reports for both and counting here
+			// too would double it. See Node.reportClientForgotten.
 			clients.put(notes[i].clientID, clientEntry{
 				seqNum: notes[i].seqNum,
 				result: out.Value,

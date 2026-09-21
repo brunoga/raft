@@ -362,6 +362,18 @@ type Node struct {
 	// least-recently-used client when the table exceeds MaxClientTableSize.
 	clientTable *clientLRU
 
+	// clientTableSize mirrors clientTable.len() for ClientTableSize, which is
+	// called from outside the event loop.
+	clientTableSize atomic.Int64
+
+	// clientsForgotten counts evictions since the node started, and
+	// lastForgetLog is when one was last written to the log. Both are
+	// event-loop-owned. The eviction is worth a warning because it is the
+	// point at which exactly-once stops holding, and worth rate-limiting
+	// because a table that is one entry too small evicts on every proposal.
+	clientsForgotten uint64
+	lastForgetLog    time.Time
+
 	// --- Heartbeat write-pumps (leader only; one per peer) ------------------
 	// hbPumps maps each peer to a size-1 channel used by broadcastHeartbeat
 	// to enqueue outbound heartbeat AppendEntries RPCs. A persistent pump
@@ -743,6 +755,7 @@ func New(cfg *Config) (*Node, error) {
 	// snapshot point does not want it: restoring would put it back.
 	if rl.snapMeta.LastIncludedIndex > 0 && durableApplied < rl.snapMeta.LastIncludedIndex {
 		n.clientTable.loadFrom(rl.snapClientTable)
+		n.syncClientTableSize()
 		// We don't load the SM data here; applyLoop will call LoadSnapshot.
 		n.initialSnap = &snapshotInstall{
 			meta:        rl.snapMeta,
@@ -777,6 +790,7 @@ func New(cfg *Config) (*Node, error) {
 		// not: without it a client whose command was applied before the
 		// restart gets it applied a second time on retry.
 		n.clientTable.loadFrom(rl.snapClientTable)
+		n.syncClientTableSize()
 		rl.snapClientTable = nil
 	}
 
@@ -2333,4 +2347,33 @@ func (n *Node) applyLoop() {
 			return
 		}
 	}
+}
+
+// ClientTableSize returns how many clients the exactly-once table currently
+// holds. Safe for concurrent use; reads an atomic mirror the event loop keeps
+// in sync.
+//
+// It is the measurement to watch before anything goes wrong, as opposed to the
+// eviction reports, which arrive after. The table is bounded by
+// Config.MaxClientTableSize, and while it is below that bound every ProposeOnce
+// retry is answered from it and the exactly-once guarantee holds absolutely.
+// Once it reaches the bound, admitting a client means forgetting one, and a
+// forgotten client's retry runs a second time. So the useful alert is on this
+// value approaching MaxClientTableSize, with the eviction count as the
+// confirmation that the deadline was missed.
+//
+// The value is the same on every node in a healthy cluster: the table is
+// replicated state, built from the same entries in the same order everywhere.
+// A node whose count has drifted from its peers' has a different
+// MaxClientTableSize from them, which is a misconfiguration that will
+// eventually diverge their state machines.
+func (n *Node) ClientTableSize() int {
+	return int(n.clientTableSize.Load())
+}
+
+// syncClientTableSize refreshes the mirror ClientTableSize reads. Called from
+// the event loop after anything that changes the table's occupancy, which is a
+// put and the wholesale replacement a snapshot restore does.
+func (n *Node) syncClientTableSize() {
+	n.clientTableSize.Store(int64(n.clientTable.len()))
 }

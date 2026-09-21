@@ -61,7 +61,8 @@ type Metrics struct {
 	storageLatency *prometheus.HistogramVec // durable write duration, by op and outcome
 	storageWrites  *prometheus.CounterVec   // durable writes, by op and outcome
 
-	applySaturation *prometheus.GaugeVec // fraction of the apply loop spent working
+	applySaturation  *prometheus.GaugeVec   // fraction of the apply loop spent working
+	clientsForgotten *prometheus.CounterVec // clients dropped from the exactly-once table
 
 	// tracked holds the nodes whose live indices are read at scrape time.
 	// Gauges like the apply lag have no natural event to hang off: they are a
@@ -76,6 +77,13 @@ type NodeSource interface {
 	ID() raft.NodeID
 	CommitIndex() raft.Index
 	LastApplied() raft.Index
+}
+
+// clientTableSource is the optional part of NodeSource. *raft.Node satisfies
+// it; it is separate so that adding the series does not break a caller that
+// passes its own NodeSource implementation to Track.
+type clientTableSource interface {
+	ClientTableSize() int
 }
 
 // Track reports n's progress on every scrape: its commit index, its applied
@@ -126,6 +134,15 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(commitIndexDesc, prometheus.GaugeValue, float64(commit), m.group, node)
 		ch <- prometheus.MustNewConstMetric(lastAppliedDesc, prometheus.GaugeValue, float64(applied), m.group, node)
 		ch <- prometheus.MustNewConstMetric(applyLagDesc, prometheus.GaugeValue, float64(lag), m.group, node)
+
+		// The exactly-once table's occupancy, which is the signal that
+		// arrives while there is still something to do about it:
+		// raft_clients_forgotten_total says the guarantee has already
+		// lapsed, this says how close the next one is.
+		if cts, ok := n.(clientTableSource); ok {
+			ch <- prometheus.MustNewConstMetric(clientTableSizeDesc, prometheus.GaugeValue,
+				float64(cts.ClientTableSize()), m.group, node)
+		}
 	}
 }
 
@@ -136,6 +153,10 @@ var (
 		"Highest log index applied to the state machine, read at scrape time.", commonLabels, nil)
 	applyLagDesc = prometheus.NewDesc("raft_apply_lag",
 		"Entries committed but not yet applied to the state machine.", commonLabels, nil)
+	clientTableSizeDesc = prometheus.NewDesc("raft_client_table_size",
+		"Clients currently held in the exactly-once table, read at scrape time. "+
+			"Below MaxClientTableSize nothing is ever forgotten; at it, every new "+
+			"client costs an old one.", commonLabels, nil)
 )
 
 // New returns a Metrics instance whose series carry an empty "group" label.
@@ -267,6 +288,20 @@ func newMetricVecs(reg prometheus.Registerer, group string) *Metrics {
 				"than waiting for committed entries, in [0,1].",
 		}, commonLabels)),
 
+		// Not a performance metric. Each increment is one client for which the
+		// exactly-once guarantee stopped holding: its next retry will be
+		// executed a second time, and nothing downstream can detect that the
+		// command applies cleanly, the log stays consistent and every replica
+		// agrees. A cluster meeting its promise leaves this at zero forever,
+		// so the alert is on any increase at all rather than on a rate.
+		clientsForgotten: registerOrGet(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "raft",
+			Name:      "clients_forgotten_total",
+			Help: "Clients dropped from the exactly-once table because it reached " +
+				"MaxClientTableSize. Each one is a client whose retry will now be " +
+				"executed twice.",
+		}, commonLabels)),
+
 		// A durable write that has become slow is the usual explanation for a
 		// rise in proposal latency that nothing in the Raft state accounts
 		// for, so the buckets start far below a healthy fsync and run well
@@ -351,6 +386,17 @@ func (m *Metrics) StorageWrite(id raft.NodeID, op string, d time.Duration, err e
 // ApplySaturation implements raft.ApplyMetrics.
 func (m *Metrics) ApplySaturation(id raft.NodeID, saturation float64) {
 	m.applySaturation.WithLabelValues(m.group, string(id)).Set(saturation)
+}
+
+// ClientForgotten implements raft.ClientTableMetrics.
+//
+// The forgotten client is not a label. A table that is one entry too small
+// evicts on every proposal, so labelling by client would mint a new series per
+// eviction and turn a correctness problem into a cardinality one. Which client
+// it was is in the log line and in EventClientForgotten; what belongs here is
+// that it happened.
+func (m *Metrics) ClientForgotten(id, _ raft.NodeID) {
+	m.clientsForgotten.WithLabelValues(m.group, string(id)).Inc()
 }
 
 // ProposalCompleted implements raft.ProposalMetrics.
