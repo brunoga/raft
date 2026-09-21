@@ -253,8 +253,8 @@ type ApplyMetrics interface {
 //
 // So an eviction is not a pressure signal to watch a trend in. It is the point
 // at which a guarantee stopped holding, and the correct response is to raise
-// MaxClientTableSize (on every node -- see its documentation) or to shorten
-// how long clients may retry for. A cluster meeting its exactly-once promise
+// the bound with Node.SetMaxClientTableSize or to shorten how long clients may
+// retry for. A cluster meeting its exactly-once promise
 // reports zero here, forever.
 //
 // Implementations must not block; they are called from the event-loop

@@ -80,6 +80,23 @@ func (c *clientLRU) put(id NodeID, ce clientEntry) (evicted NodeID, didEvict boo
 	return "", false
 }
 
+// setCap changes the bound and evicts from the tail until the table fits it.
+// The evicted clients are returned oldest first, so a caller can report each
+// one the way put's eviction is reported. A cap of 0 lifts the bound. O(k) in
+// the number evicted.
+func (c *clientLRU) setCap(capacity int) (evicted []NodeID) {
+	c.cap = capacity
+	for c.cap > 0 && c.l.Len() > c.cap {
+		item := c.l.Remove(c.l.Back()).(*lruItem)
+		delete(c.m, item.id)
+		evicted = append(evicted, item.id)
+	}
+	return evicted
+}
+
+// capacity returns the bound, 0 meaning none.
+func (c *clientLRU) capacity() int { return c.cap }
+
 // clientRecord is one table entry in eviction order. The table is carried
 // between goroutines and into snapshots as a slice rather than a map because
 // the order is part of the state: rebuilt in a different order, two replicas
@@ -188,32 +205,60 @@ type clientEntry struct {
 //
 // Wire format:
 //
-//	[8-byte snapFrameMagicV2][4-byte tableLen][4-byte membershipLen]
-//	[table bytes][membership bytes][smData bytes]
+//	[8-byte snapFrameMagicV3][4-byte tableLen][4-byte membershipLen][4-byte limitsLen]
+//	[table bytes][membership bytes][limits bytes][smData bytes]
 //
 // Table format:
 //
 //	[4-byte N] repeated N times: [2-byte idLen][id][8-byte seqNum][4-byte resLen][res]
 //
-// snapFrameMagicV1 is the original layout, which had no membership section. It
-// is still read so that a node can start on a snapshot written by an older
-// build; such a snapshot yields no membership and the node falls back to the
-// peer list supplied in its Config.
+// Limits format, when limitsLen > 0:
+//
+//	[8-byte client table cap]
+//
+// snapFrameMagicV1 is the original layout, which had no membership section,
+// and snapFrameMagicV2 added it; V3 adds the limits section. Both older
+// layouts are still read so that a node can start on a snapshot written by an
+// older build. A V1 snapshot yields no membership and the node falls back to
+// the peer list supplied in its Config; a V1 or V2 snapshot yields no table
+// cap and the node keeps the one it has.
 const (
 	snapFrameMagicV1 uint64 = 0xCAFEDEAD_BEEFD00D
 	snapFrameMagicV2 uint64 = 0xCAFEDEAD_BEEFD00E
+	snapFrameMagicV3 uint64 = 0xCAFEDEAD_BEEFD00F
 )
 
-// writeWrappedSnapshot writes the client dedup table and the cluster
-// membership, followed by the state-machine data (via smSnapshot), to w.
-func writeWrappedSnapshot(w io.Writer, table []clientRecord, ms *membershipState, smSnapshot func(io.Writer) error) error {
-	tableBytes := encodeClientTable(table)
-	membershipBytes := encodeMembership(ms)
+// snapshotFrame is everything a snapshot carries besides the state machine's
+// own data: what the log prefix it replaces had established.
+type snapshotFrame struct {
+	table      []clientRecord
+	membership membershipState
+	// hasMembership is false for a snapshot written before the membership
+	// section existed; the reader then keeps the membership it already has
+	// rather than treating the zero value as an empty cluster.
+	hasMembership bool
+	// clientTableCap is the bound the client table was kept under at the
+	// snapshot's index, and hasClientTableCap whether the snapshot recorded
+	// one. 0 with hasClientTableCap true means unlimited.
+	clientTableCap    int
+	hasClientTableCap bool
+}
 
-	var hdr [16]byte
-	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagicV2)
+// writeSnapshotFrame writes frame, followed by the state-machine data (via
+// smSnapshot), to w.
+func writeSnapshotFrame(w io.Writer, frame *snapshotFrame, smSnapshot func(io.Writer) error) error {
+	tableBytes := encodeClientTable(frame.table)
+	membershipBytes := encodeMembership(&frame.membership)
+	var limitsBytes []byte
+	if frame.hasClientTableCap {
+		limitsBytes = binary.LittleEndian.AppendUint64(nil, uint64(frame.clientTableCap))
+	}
+
+	var hdr [20]byte
+	binary.LittleEndian.PutUint64(hdr[:8], snapFrameMagicV3)
 	binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(tableBytes)))
-	binary.LittleEndian.PutUint32(hdr[12:], uint32(len(membershipBytes)))
+	binary.LittleEndian.PutUint32(hdr[12:16], uint32(len(membershipBytes)))
+	binary.LittleEndian.PutUint32(hdr[16:], uint32(len(limitsBytes)))
 
 	if _, err := w.Write(hdr[:]); err != nil {
 		return fmt.Errorf("write snap header: %w", err)
@@ -224,69 +269,107 @@ func writeWrappedSnapshot(w io.Writer, table []clientRecord, ms *membershipState
 	if _, err := w.Write(membershipBytes); err != nil {
 		return fmt.Errorf("write snap membership: %w", err)
 	}
+	if _, err := w.Write(limitsBytes); err != nil {
+		return fmt.Errorf("write snap limits: %w", err)
+	}
 	if err := smSnapshot(w); err != nil {
 		return fmt.Errorf("write snap sm data: %w", err)
 	}
 	return nil
 }
 
-// readWrappedSnapshot reads the client table and membership from r and returns
-// them along with a reader positioned at the state-machine data.
-//
-// hasMembership is false for a snapshot written before the membership section
-// existed; the caller must then keep whatever membership it already has rather
-// than treating the zero value as an empty cluster.
-func readWrappedSnapshot(r io.Reader) (table []clientRecord, ms membershipState, hasMembership bool, smDataReader io.Reader, err error) {
-	var hdr [16]byte
+// writeWrappedSnapshot writes the client dedup table and the cluster
+// membership, followed by the state-machine data (via smSnapshot), to w. It
+// records no client table cap; see writeSnapshotFrame.
+func writeWrappedSnapshot(w io.Writer, table []clientRecord, ms *membershipState, smSnapshot func(io.Writer) error) error {
+	return writeSnapshotFrame(w, &snapshotFrame{table: table, membership: *ms}, smSnapshot)
+}
 
-	// The two layouts share a leading magic and table length; only V2 has the
-	// membership length, so read the common prefix first.
+// readSnapshotFrame reads the framing from r and returns it along with a
+// reader positioned at the state-machine data.
+func readSnapshotFrame(r io.Reader) (frame snapshotFrame, smDataReader io.Reader, err error) {
+	var hdr [20]byte
+
+	// The layouts share a leading magic and table length; V2 adds the
+	// membership length and V3 the limits length, so read the common prefix
+	// first.
 	if _, readErr := io.ReadFull(r, hdr[:12]); readErr != nil {
 		if readErr == io.EOF {
-			return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: empty file")
+			return snapshotFrame{}, nil, fmt.Errorf("read snap header: empty file")
 		}
-		return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: %w", readErr)
+		return snapshotFrame{}, nil, fmt.Errorf("read snap header: %w", readErr)
 	}
 
 	magic := binary.LittleEndian.Uint64(hdr[:8])
-	if magic != snapFrameMagicV1 && magic != snapFrameMagicV2 {
+	if magic != snapFrameMagicV1 && magic != snapFrameMagicV2 && magic != snapFrameMagicV3 {
 		// A snapshot from a different producer entirely: treat the whole
 		// reader as state-machine data, putting back the bytes consumed.
-		return nil, membershipState{}, false,
-			io.MultiReader(bytes.NewReader(hdr[:12]), r), nil
+		return snapshotFrame{}, io.MultiReader(bytes.NewReader(hdr[:12]), r), nil
 	}
 
-	membershipLen := 0
-	if magic == snapFrameMagicV2 {
-		if _, readErr := io.ReadFull(r, hdr[12:]); readErr != nil {
-			return nil, membershipState{}, false, nil, fmt.Errorf("read snap header: %w", readErr)
+	membershipLen, limitsLen := 0, 0
+	if magic == snapFrameMagicV2 || magic == snapFrameMagicV3 {
+		if _, readErr := io.ReadFull(r, hdr[12:16]); readErr != nil {
+			return snapshotFrame{}, nil, fmt.Errorf("read snap header: %w", readErr)
 		}
-		membershipLen = int(binary.LittleEndian.Uint32(hdr[12:]))
+		membershipLen = int(binary.LittleEndian.Uint32(hdr[12:16]))
+	}
+	if magic == snapFrameMagicV3 {
+		if _, readErr := io.ReadFull(r, hdr[16:]); readErr != nil {
+			return snapshotFrame{}, nil, fmt.Errorf("read snap header: %w", readErr)
+		}
+		limitsLen = int(binary.LittleEndian.Uint32(hdr[16:]))
 	}
 
 	tableLen := int(binary.LittleEndian.Uint32(hdr[8:12]))
 	tableBytes := make([]byte, tableLen)
 	if _, readErr := io.ReadFull(r, tableBytes); readErr != nil {
-		return nil, membershipState{}, false, nil, fmt.Errorf("read snap table: %w", readErr)
+		return snapshotFrame{}, nil, fmt.Errorf("read snap table: %w", readErr)
 	}
-	table, err = decodeClientTable(tableBytes)
+	frame.table, err = decodeClientTable(tableBytes)
 	if err != nil {
-		return nil, membershipState{}, false, nil, fmt.Errorf("decode snap table: %w", err)
+		return snapshotFrame{}, nil, fmt.Errorf("decode snap table: %w", err)
 	}
 
 	if membershipLen > 0 {
 		membershipBytes := make([]byte, membershipLen)
 		if _, readErr := io.ReadFull(r, membershipBytes); readErr != nil {
-			return nil, membershipState{}, false, nil, fmt.Errorf("read snap membership: %w", readErr)
+			return snapshotFrame{}, nil, fmt.Errorf("read snap membership: %w", readErr)
 		}
 		decoded, ok := decodeMembership(membershipBytes)
 		if !ok {
-			return nil, membershipState{}, false, nil, fmt.Errorf("decode snap membership: malformed")
+			return snapshotFrame{}, nil, fmt.Errorf("decode snap membership: malformed")
 		}
-		ms, hasMembership = decoded, true
+		frame.membership, frame.hasMembership = decoded, true
 	}
 
-	return table, ms, hasMembership, r, nil
+	if limitsLen > 0 {
+		limitsBytes := make([]byte, limitsLen)
+		if _, readErr := io.ReadFull(r, limitsBytes); readErr != nil {
+			return snapshotFrame{}, nil, fmt.Errorf("read snap limits: %w", readErr)
+		}
+		if len(limitsBytes) < 8 {
+			return snapshotFrame{}, nil, fmt.Errorf("decode snap limits: malformed")
+		}
+		v := binary.LittleEndian.Uint64(limitsBytes)
+		if v > uint64(int(^uint(0)>>1)) {
+			return snapshotFrame{}, nil, fmt.Errorf("decode snap limits: client table cap out of range")
+		}
+		frame.clientTableCap, frame.hasClientTableCap = int(v), true
+	}
+
+	return frame, r, nil
+}
+
+// readWrappedSnapshot reads the client table and membership from r and returns
+// them along with a reader positioned at the state-machine data. It is
+// readSnapshotFrame for a caller that does not need the limits section.
+func readWrappedSnapshot(r io.Reader) (table []clientRecord, ms membershipState, hasMembership bool, smDataReader io.Reader, err error) {
+	frame, smDataReader, err := readSnapshotFrame(r)
+	if err != nil {
+		return nil, membershipState{}, false, nil, err
+	}
+	return frame.table, frame.membership, frame.hasMembership, smDataReader, nil
 }
 
 func encodeClientTable(table []clientRecord) []byte {

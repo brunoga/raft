@@ -9,6 +9,12 @@ const (
 	configOpRemove   byte = 0x02
 	configOpJoint    byte = 0x03 // joint-consensus: C_old ∪ C_new
 	configOpFinalise byte = 0x04 // finalise: commit C_new only
+	// configOpClientTableCap sets the size of the exactly-once client table
+	// for the whole group. It is a config entry rather than a user command
+	// because, like membership, it is state every replica must agree on: a
+	// replica with a different bound evicts different clients and diverges.
+	// It changes no membership.
+	configOpClientTableCap byte = 0x05
 )
 
 // configMagic is a 4-byte sentinel that marks a log entry as a Raft
@@ -229,4 +235,34 @@ func decodePeerList(buf []byte) (peers []PeerConfig, rest []byte, ok bool) {
 		buf = buf[idLen:]
 	}
 	return peers, buf, true
+}
+
+// ---- Client table cap encoding ----------------------------------------------
+//
+// Wire format for configOpClientTableCap (opcode 0x05):
+//
+//	[4 magic][0x05][8-byte cap, big endian]
+//
+// A cap of 0 means unlimited, as it does in Config.MaxClientTableSize.
+
+// encodeClientTableCapEntry encodes a config entry that sets the client table
+// cap for the group.
+func encodeClientTableCapEntry(capacity int) []byte {
+	b := make([]byte, 5, 13)
+	copy(b[:4], configMagic[:])
+	b[4] = configOpClientTableCap
+	return binary.BigEndian.AppendUint64(b, uint64(capacity))
+}
+
+// decodeClientTableCapEntry parses a client table cap entry. ok is false if
+// cmd is not one.
+func decodeClientTableCapEntry(cmd []byte) (capacity int, ok bool) {
+	if !isConfigEntry(cmd) || cmd[4] != configOpClientTableCap || len(cmd) < 13 {
+		return 0, false
+	}
+	v := binary.BigEndian.Uint64(cmd[5:13])
+	if v > uint64(int(^uint(0)>>1)) {
+		return 0, false
+	}
+	return int(v), true
 }
