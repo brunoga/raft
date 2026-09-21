@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -157,23 +158,61 @@ func startCluster(t *testing.T, snapshot bool) (dirs []string, ids []raft.NodeID
 	}
 
 	// Commit a few entries so the survivors have history worth keeping.
+	//
+	// The leader can change underneath this, and the test is the reason. Ticks
+	// here are driven by the loop below rather than by a clock, so while a
+	// proposal is in flight the loop is generating election ticks as fast as
+	// it can -- a few hundred of them, which is a whole election timeout, in
+	// the time one fsync takes on a loaded machine. SnapshotThreshold is 2, so
+	// every one of these proposals also makes the leader write a snapshot; if
+	// that disk work outlasts a follower's timeout, the follower calls an
+	// election, the leader steps down, and the proposal comes back
+	// ErrNotLeader.
+	//
+	// None of that is a bug in what this test is about, which is recovering a
+	// cluster from its storage. So it does what a client does: find the leader
+	// again and retry.
 	ctx := context.Background()
 	for i := range 3 {
-		done := make(chan error, 1)
-		go func() {
-			_, err := nodes[leader].Propose(ctx, fmt.Appendf(nil, "cmd%d", i))
-			done <- err
-		}()
-	wait:
+		cmd := fmt.Appendf(nil, "cmd%d", i)
+		deadline := time.Now().Add(30 * time.Second)
 		for {
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatalf("propose: %v", err)
+			done := make(chan error, 1)
+			go func() {
+				_, err := nodes[leader].Propose(ctx, cmd)
+				done <- err
+			}()
+			var err error
+		wait:
+			for {
+				select {
+				case err = <-done:
+					break wait
+				default:
+					tick()
 				}
-				break wait
-			default:
+			}
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, raft.ErrNotLeader) {
+				t.Fatalf("propose %q: %v", cmd, err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("propose %q: no stable leader within 30s", cmd)
+			}
+			// Leadership moved. Wait for whoever holds it now.
+			leader = -1
+			for time.Now().Before(deadline) && leader < 0 {
+				for j, n := range nodes {
+					if n.State() == raft.Leader {
+						leader = j
+					}
+				}
 				tick()
+			}
+			if leader < 0 {
+				t.Fatalf("propose %q: no leader re-elected within 30s", cmd)
 			}
 		}
 	}
