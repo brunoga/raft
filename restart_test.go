@@ -33,23 +33,6 @@ import (
 // heartbeat, and a node that is never ticked never sends one. That makes such a
 // test a race between the RPC and its own deadline, which is fine on a fast
 // machine and flaky on a busy one.
-// tuneForManualTicks widens the timeouts for a test that drives ticks itself.
-//
-// Timeouts are converted to tick counts at construction, against a 10ms tick
-// when TickInterval is left at zero. A test that then ticks every millisecond
-// is running the cluster ten times faster than it was configured for, which
-// turns the default 150-300ms election timeout into 15-30ms of wall clock.
-// A heartbeat round-trip under -race on a loaded machine does not reliably fit
-// in that, so check-quorum steps a perfectly healthy leader down.
-//
-// These values leave a 100-200ms election window at a one-millisecond tick,
-// which is the headroom the defaults were meant to have.
-func tuneForManualTicks(cfg *raft.Config) {
-	cfg.HeartbeatInterval = 100 * time.Millisecond
-	cfg.ElectionTimeoutMin = 1000 * time.Millisecond
-	cfg.ElectionTimeoutMax = 2000 * time.Millisecond
-}
-
 func tickWhile(nodes ...*raft.Node) (stop func()) {
 	done := make(chan struct{})
 	finished := make(chan struct{})

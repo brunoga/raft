@@ -89,9 +89,7 @@ func snapshotNode(t *testing.T, sm raft.StateMachine) *raft.Node {
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 4
 	cfg.TrailingLogs = 2
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)
 	if err != nil {

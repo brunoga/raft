@@ -40,9 +40,7 @@ func restartableNode(t *testing.T, store raft.Storage, net *memtransport.Network
 	cfg.Transport = net.NewTransport(id)
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = snapshotThreshold
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)
 	if err != nil {

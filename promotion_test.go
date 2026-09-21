@@ -46,9 +46,7 @@ func newPromotionCluster(t *testing.T) *promotionCluster {
 		cfg.Transport = net.NewTransport(id)
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 0
-		cfg.ElectionTimeoutMin = 20 * time.Millisecond
-		cfg.ElectionTimeoutMax = 40 * time.Millisecond
-		cfg.HeartbeatInterval = 10 * time.Millisecond
+		tuneForManualTicks(&cfg)
 		node, err := raft.New(&cfg)
 		if err != nil {
 			t.Fatalf("raft.New(%s): %v", id, err)

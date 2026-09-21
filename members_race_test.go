@@ -35,9 +35,7 @@ func TestMembers_ConcurrentWithConfigChange(t *testing.T) {
 	cfg.StateMachine = nullSM{}
 	cfg.Transport = net.NewTransport("n1")
 	cfg.TickInterval = 0
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)
 	if err != nil {

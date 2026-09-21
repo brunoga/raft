@@ -241,9 +241,7 @@ func TestTrailingLogs_LogIsStillCompacted(t *testing.T) {
 	c := newTrailingCluster(t, 1, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 8
 		cfg.TrailingLogs = 4
-		cfg.ElectionTimeoutMin = 20 * time.Millisecond
-		cfg.ElectionTimeoutMax = 40 * time.Millisecond
-		cfg.HeartbeatInterval = 10 * time.Millisecond
+		tuneForManualTicks(cfg)
 	})
 
 	if !c.tickUntil(3*time.Second, func() bool { return c.leaderIndex() >= 0 }) {

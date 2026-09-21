@@ -94,9 +94,7 @@ func snapshotPayload(t *testing.T) []byte {
 	cfg.Transport = memtransport.NewNetwork().NewTransport("src")
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 1
-	cfg.ElectionTimeoutMin = 20 * time.Millisecond
-	cfg.ElectionTimeoutMax = 40 * time.Millisecond
-	cfg.HeartbeatInterval = 10 * time.Millisecond
+	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)
 	if err != nil {
