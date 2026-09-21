@@ -71,6 +71,25 @@ entries. **A client that retries after its entry has been evicted has its
 command executed a second time.** This is a real limit, not a theoretical one:
 size the table to outlive the retry window of your slowest client.
 
+The bound cannot be removed. A client picks its own identifier, so a client the
+node has forgotten and a client it has never seen are the same observation, and
+telling them apart would mean remembering every identifier ever used — which is
+not a bound at all, just a slower failure. What the bound costs is therefore
+fixed; what is avoidable is finding out about it from the duplicate. Eviction
+is reported three ways, at the moment it happens:
+
+- `ClientTableMetrics.ClientForgotten`, for a `Config.Metrics` that implements it.
+- `EventClientForgotten`, on the stream from `Node.Events`.
+- A warning on `Config.Logger`, for deployments that wire neither. The first is
+  always logged; the rest are summarised once a minute, because a table one
+  entry too small evicts on every proposal.
+
+Those all arrive after the guarantee has lapsed for that client.
+`Node.ClientTableSize` arrives before: it is the table's occupancy, and while it
+stays below `MaxClientTableSize` no client is ever forgotten and exactly-once
+holds absolutely. Alert on it approaching the bound; treat a non-zero eviction
+count as the deadline already missed.
+
 ---
 
 ## Divergences

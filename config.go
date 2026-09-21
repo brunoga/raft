@@ -297,6 +297,14 @@ type Config struct {
 	// executed a second time. Size the table so that it comfortably outlives
 	// the retry window of the slowest client.
 	//
+	// Whether it does is measurable rather than a matter of hope.
+	// Node.ClientTableSize is the current occupancy, and while it stays below
+	// this bound nothing is ever evicted and exactly-once holds absolutely;
+	// that is the value to alert on. Once the bound is reached each eviction
+	// is reported through ClientTableMetrics, as EventClientForgotten, and as
+	// a warning on Logger -- but those say the guarantee has already lapsed
+	// for the named client, so they are a confirmation rather than a warning.
+	//
 	// The bound is on entry count, not bytes; each entry also retains the
 	// result the state machine returned, so a state machine with large results
 	// needs a smaller table. In long-running clusters with many ephemeral

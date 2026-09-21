@@ -55,11 +55,17 @@ func (c *clientLRU) get(id NodeID) (clientEntry, bool) {
 func (c *clientLRU) len() int { return c.l.Len() }
 
 // put inserts or updates id and evicts the LRU entry if over cap. O(1).
-func (c *clientLRU) put(id NodeID, ce clientEntry) {
+//
+// It returns the client that was dropped to make room, if any. That return is
+// the only moment at which the exactly-once guarantee is lost for a client:
+// from here on the table cannot tell that client's retry from a first attempt,
+// and will run its command again. Nothing downstream can detect it afterwards,
+// so a caller that has any way to report it should.
+func (c *clientLRU) put(id NodeID, ce clientEntry) (evicted NodeID, didEvict bool) {
 	if e, ok := c.m[id]; ok {
 		e.Value.(*lruItem).ce = ce
 		c.l.MoveToFront(e)
-		return
+		return "", false
 	}
 	elem := c.l.PushFront(&lruItem{id: id, ce: ce})
 	c.m[id] = elem
@@ -68,8 +74,10 @@ func (c *clientLRU) put(id NodeID, ce clientEntry) {
 		if back != nil {
 			item := c.l.Remove(back).(*lruItem)
 			delete(c.m, item.id)
+			return item.id, true
 		}
 	}
+	return "", false
 }
 
 // clientRecord is one table entry in eviction order. The table is carried

@@ -4,6 +4,36 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## Unreleased
+
+### Added
+
+- Eviction from the exactly-once client table is now reported. It is the moment
+  the `ProposeOnce` guarantee stops holding for a client — from there its next
+  retry runs a second time — and until now it happened in complete silence:
+  the command applies cleanly, the log stays consistent, every replica agrees,
+  and the only evidence is whatever the duplicate did.
+
+  - `ClientTableMetrics`, a new optional interface a `Config.Metrics` may also
+    satisfy, with `ClientForgotten(id, clientID NodeID)`.
+  - `EventClientForgotten`, on the stream from `Node.Events`, naming the client
+    in the new `Event.Client` field.
+  - A warning on `Config.Logger` for deployments that wire neither. The first
+    eviction is always logged; the rest are summarised once a minute, because a
+    table one entry too small evicts on every proposal.
+
+- `prommetrics` exports both as `raft_clients_forgotten_total` (a counter that
+  stays at zero in a cluster meeting its promise, so the alert is on any
+  increase at all) and `raft_client_table_size` (read at scrape time from a
+  tracked node). The forgotten client is deliberately not a label: a table one
+  entry too small evicts on every proposal, which would mint a series per
+  eviction.
+
+- `Node.ClientTableSize` reports the table's current occupancy. The eviction
+  reports above all arrive after the guarantee has lapsed; this one arrives
+  before. While it stays below `MaxClientTableSize` no client is ever
+  forgotten, so it is the value worth alerting on.
+
 ## v1.0.1
 
 ### Fixed

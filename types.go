@@ -238,3 +238,29 @@ type ApplyMetrics interface {
 	// busy now.
 	ApplySaturation(id NodeID, saturation float64)
 }
+
+// ClientTableMetrics is an optional interface that a Config.Metrics
+// implementation may also satisfy. When it does, the node reports each time a
+// client is dropped from the exactly-once table.
+//
+// This is the one measurement here that is not about performance. The table
+// behind ProposeOnce is bounded by Config.MaxClientTableSize, and a client
+// whose entry has been dropped is a client whose next retry will be executed a
+// second time -- the table no longer has any way to tell that retry from a
+// first attempt. Nothing downstream can detect it: the command applies
+// cleanly, the log is consistent, every replica agrees, and the only evidence
+// is whatever the duplicate did.
+//
+// So an eviction is not a pressure signal to watch a trend in. It is the point
+// at which a guarantee stopped holding, and the correct response is to raise
+// MaxClientTableSize (on every node -- see its documentation) or to shorten
+// how long clients may retry for. A cluster meeting its exactly-once promise
+// reports zero here, forever.
+//
+// Implementations must not block; they are called from the event-loop
+// goroutine.
+type ClientTableMetrics interface {
+	// ClientForgotten is called once for each client dropped from the table.
+	// id is the local node, clientID the client whose result was discarded.
+	ClientForgotten(id, clientID NodeID)
+}
