@@ -36,6 +36,7 @@ func (n *Node) applyFollowerTransition(leaderID NodeID) {
 	n.transferElapsed = 0
 	n.pendingConfigIndex = 0
 	n.capEntryPending = 0
+	n.quorumEntryPending = 0
 	n.termStartIndex = 0
 	n.leaderNopCommitted = false
 	// Reject all in-flight client proposals. If an uncommitted entry is later

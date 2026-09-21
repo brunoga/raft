@@ -24,6 +24,31 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   new-version leader is elected with `ProposeOnce` traffic, as a node on the
   previous version ignores the opcode and keeps its own bound.
 
+## Unreleased
+
+### Added
+
+- Flexible quorums. `Node.SetCommitQuorum(ctx, q)` sets how many voters an
+  entry must reach to commit, for the whole group; the election quorum
+  becomes `voters − q + 1`, never below a majority, so the two always
+  intersect and Leader Completeness holds unchanged (Howard, Malkhi and
+  Spiegelman, *Flexible Paxos*). A commit quorum below a majority makes
+  writes cheaper than elections; one above a majority, up to every replica,
+  means no acknowledged write is ever on fewer than that many disks. The
+  majority floor on elections is Raft's own requirement: two election
+  quorums must intersect each other for a term to have one leader. The policy is
+  group state, agreed through the log and carried in snapshots;
+  `Config.CommitQuorum` is only what a group is created with, and no node
+  ever counts by its own `Config`. A change is safe on a running group: a
+  node holding the new policy in its log requires the stricter of old and
+  new for every decision until the entry is applied. `Node.CommitQuorum`
+  reports the value in effect.
+
+  On the wire this is a new config-entry opcode and a trailing field in the
+  snapshot membership section that older readers ignore. Upgrade every node
+  before setting a policy; a node on the previous version counts by a
+  majority regardless.
+
 ## v1.1.0
 
 ### Added

@@ -147,6 +147,10 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 	// PrevLogIndex + len(Entries) is exactly the range the leader has vouched
 	// for: the prefix matched the PrevLog check above, and the entries are the
 	// leader's own.
+	// Whatever these entries say about how the group counts is in effect
+	// from the moment they are in the log. See noteAppendedConfig.
+	n.noteAppendedConfig(req.Entries)
+
 	lastCovered := req.PrevLogIndex + Index(len(req.Entries))
 	if newCommit := min(req.LeaderCommit, lastCovered); newCommit > n.commitIndex {
 		n.setCommitIndex(newCommit)
@@ -448,10 +452,10 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		n.readBatchAcks[r.peer] = true
 		var confirmed bool
 		if n.jointOld == nil {
-			confirmed = hasMajorityAck(n.readBatchAcks, n.cfg.Peers, true, n.cfg.Voter)
+			confirmed = n.hasQuorumAck(commitQuorum, n.readBatchAcks, n.cfg.Peers, true, n.cfg.Voter)
 		} else {
-			confirmed = hasMajorityAck(n.readBatchAcks, n.jointOld, true, n.jointSelfVoterOld) &&
-				hasMajorityAck(n.readBatchAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
+			confirmed = n.hasQuorumAck(commitQuorum, n.readBatchAcks, n.jointOld, true, n.jointSelfVoterOld) &&
+				n.hasQuorumAck(commitQuorum, n.readBatchAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 		}
 		if confirmed {
 			n.confirmReadBatch()
@@ -466,13 +470,13 @@ func (n *Node) handleAppendResult(r *appendResult) {
 	}
 }
 
-// hasMajorityAck reports whether acks (a set of peer IDs that responded
-// positively) together with self (when includeSelf is true) form a strict
-// majority of the group described by members.
+// hasQuorumAck reports whether acks (a set of peer IDs that responded
+// positively) together with self (when includeSelf is true) form a quorum of
+// the given kind of the group described by members.
 //
-// This is used for both election vote counting and read-barrier / check-quorum
-// tracking; the same quorum formula applies to all three.
-func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, selfVoter bool) bool {
+// This is used for election vote counting and for read-barrier and
+// check-quorum tracking. Event-loop only.
+func (n *Node) hasQuorumAck(kind quorumKind, acks map[NodeID]bool, members []PeerConfig, includeSelf, selfVoter bool) bool {
 	count := 0
 	if includeSelf && selfVoter {
 		count = 1
@@ -491,7 +495,7 @@ func hasMajorityAck(acks map[NodeID]bool, members []PeerConfig, includeSelf, sel
 	if includeSelf && selfVoter {
 		total++
 	}
-	return count > total/2
+	return count >= n.quorumNeeded(kind, total)
 }
 
 // spansEnoughZones reports whether the replicas that hold idx sit in at least
@@ -530,8 +534,10 @@ func (n *Node) spansEnoughZones(idx Index, members []PeerConfig, includeSelf, se
 	return len(seen) >= required
 }
 
-// replicatedOnMajority reports whether idx has been replicated on a majority
-// of the group described by members plus self when includeSelf is true.
+// replicatedOnMajority reports whether idx has been replicated on a commit
+// quorum of the group described by members plus self when includeSelf is
+// true. The name is historical: the quorum is a majority unless the group has
+// set another with SetCommitQuorum.
 //
 // members is a peer list for one config group (e.g. jointOld or jointNew) and
 // never includes the local node. includeSelf must be false when the leader is
@@ -570,7 +576,7 @@ func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf
 	if includeSelf && selfVoter {
 		total++
 	}
-	if count <= total/2 {
+	if count < n.quorumNeeded(commitQuorum, total) {
 		return false
 	}
 	return n.spansEnoughZones(idx, members, includeSelf, selfVoter)

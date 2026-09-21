@@ -395,6 +395,20 @@ type Node struct {
 	// applyStartCap is the bound the apply goroutine's own table starts
 	// under: the snapshot's when there was one, else Config. Set in New.
 	applyStartCap int
+	// commitQuorumApplied is the commit quorum policy in effect, from the
+	// latest applied quorum entry or the snapshot; commitQuorumLatest the
+	// policy from the latest quorum entry in the log, applied or not. Every
+	// decision uses the stricter of the two; see quorum.go. 0 is a majority.
+	// commitQuorumAgreed says whether the group has agreed one at all, as
+	// distinct from 0 meaning majority, so that a snapshot can carry it.
+	// Event-loop only; atomicCommitQuorum mirrors commitQuorumApplied.
+	commitQuorumApplied int
+	commitQuorumLatest  int
+	commitQuorumAgreed  bool
+	atomicCommitQuorum  atomic.Int64
+	// quorumEntryPending is the index of a commit quorum entry this leader
+	// has appended from its Config and not yet seen commit, or 0.
+	quorumEntryPending Index
 	// capEntryPending is the index of a client table cap entry this leader
 	// has appended and not yet seen commit, or 0. It stops a burst of
 	// ProposeOnce batches from each appending one.
@@ -818,6 +832,7 @@ func New(cfg *Config) (*Node, error) {
 	// the wrong quorum rules.
 	if rl.hasSnapMembership {
 		n.baseMembership = rl.snapMembership
+		n.adoptCommitQuorum(rl.snapMembership.commitQuorum, "snapshot")
 	} else {
 		n.baseMembership = membershipState{
 			members: withSelf(cfg.Peers, cfg.ID, true, cfg.Voter),
@@ -842,6 +857,7 @@ func New(cfg *Config) (*Node, error) {
 	}
 
 	n.atomicClientTableCap.Store(int64(n.clientTableCap))
+	n.atomicCommitQuorum.Store(int64(n.commitQuorumApplied))
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
 	n.leadership.Store(LeadershipChange{Term: n.currentTerm})

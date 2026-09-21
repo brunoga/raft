@@ -437,6 +437,9 @@ func (n *Node) handleSnapInstallResult(r *snapInstallResult) {
 	// of it below.
 	if r.hasMembership {
 		n.baseMembership = r.membership
+		// The quorum in effect at the snapshot's index is the one it
+		// recorded, and everything the snapshot covers has been applied.
+		n.adoptCommitQuorum(r.membership.commitQuorum, "snapshot")
 	}
 
 	if err := n.log.installSnapshot(n.stopCtx, r.meta); err != nil {
