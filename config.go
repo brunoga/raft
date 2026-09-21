@@ -305,6 +305,24 @@ type Config struct {
 	// Default: 0, which together with 1 means a plain majority.
 	MinCommitZones int
 
+	// CommitQuorum is how many voters an entry must reach to commit, 0
+	// meaning a simple majority. The election quorum follows from it, as
+	// voters - CommitQuorum + 1 or a majority, whichever is larger, so the
+	// two always intersect and the safety argument holds whatever the split;
+	// see Node.SetCommitQuorum for what the split trades.
+	//
+	// It is group state, like membership, and this field is only what a
+	// group is created with: the first leader writes it into the log when
+	// the group has agreed no policy yet, and every node counts by the
+	// agreed value from then on, never by its own Config. Until then every
+	// node counts by a majority. Change a running group's policy with
+	// Node.SetCommitQuorum; read the one in effect with Node.CommitQuorum.
+	//
+	// Validate refuses a value larger than the number of voters in Config.
+	//
+	// Default: 0 (a majority).
+	CommitQuorum int
+
 	// SnapshotThreshold is the number of log entries after which the leader
 	// automatically requests a snapshot from the state machine:
 	//   trigger when  lastApplied − lastSnapshotIndex >= SnapshotThreshold
@@ -684,6 +702,24 @@ func (c *Config) Validate() error {
 	}
 	if c.MinCommitZones < 0 {
 		return errors.New("raft: MinCommitZones must not be negative")
+	}
+	if c.CommitQuorum < 0 {
+		return errors.New("raft: CommitQuorum must not be negative (0 means a majority)")
+	}
+	if c.CommitQuorum > 0 {
+		voters := 0
+		if c.Voter {
+			voters++
+		}
+		for _, p := range c.Peers {
+			if p.Voter {
+				voters++
+			}
+		}
+		if c.CommitQuorum > voters {
+			return fmt.Errorf("raft: CommitQuorum is %d but Config describes %d voters, "+
+				"so nothing could ever commit", c.CommitQuorum, voters)
+		}
 	}
 	if c.MinCommitZones > 1 {
 		zones := make(map[ZoneID]struct{})

@@ -163,10 +163,10 @@ func (n *Node) tick() {
 				// the legitimate leader for that config group.
 				var hasQuorum bool
 				if n.jointOld == nil {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
+					hasQuorum = n.hasQuorumAck(commitQuorum, n.quorumAcks, n.cfg.Peers, true, n.cfg.Voter)
 				} else {
-					hasQuorum = hasMajorityAck(n.quorumAcks, n.jointOld, true, n.jointSelfVoterOld) &&
-						hasMajorityAck(n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
+					hasQuorum = n.hasQuorumAck(commitQuorum, n.quorumAcks, n.jointOld, true, n.jointSelfVoterOld) &&
+						n.hasQuorumAck(commitQuorum, n.quorumAcks, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 				}
 				if !hasQuorum {
 					n.logger.Warn("check-quorum: no majority of peers responded; stepping down")
@@ -289,6 +289,24 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		}
 	}
 
+	// A group is created on a majority. A Config.CommitQuorum is what this
+	// node proposes for the group when the group has not agreed a policy,
+	// and it takes effect the way every quorum change does, through the log,
+	// rather than locally -- two nodes bootstrapped with different values
+	// must not each count by their own.
+	if n.cfg.CommitQuorum != 0 && !n.commitQuorumAgreed && n.commitQuorumLatest == 0 &&
+		n.quorumEntryPending == 0 && n.pendingConfigIndex == 0 {
+		idx := n.log.lastLogIndex() + 1
+		entries = append(entries, LogEntry{
+			Index:   idx,
+			Term:    n.currentTerm,
+			Command: encodeCommitQuorumEntry(n.cfg.CommitQuorum),
+		})
+		n.quorumEntryPending = idx
+		n.pendingConfigIndex = idx
+		n.commitQuorumLatest = n.cfg.CommitQuorum
+	}
+
 	for _, prop := range props {
 		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
 			p := promise[[]byte]{ch: prop.respCh}
@@ -347,6 +365,7 @@ func (n *Node) handleProposals(props []proposeMsg) {
 	}
 
 	if len(entries) > 0 {
+		n.noteAppendedConfig(entries)
 		// The entries are in the log now and go out to followers now. They are
 		// not counted towards a commit quorum until the write lands, which is
 		// what maybeAdvanceCommit consults the durable point for; so this
@@ -371,6 +390,9 @@ func (n *Node) handleProposals(props []proposeMsg) {
 				}
 				if n.capEntryPending == idx {
 					n.capEntryPending = 0
+				}
+				if n.quorumEntryPending == idx {
+					n.quorumEntryPending = 0
 				}
 			}
 		})
