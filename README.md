@@ -349,18 +349,19 @@ if _, err := node.ReadIndexLease(ctx); err != nil {
 > automatically; reads queued before it commits are held and released as soon
 > as the no-op is applied.
 
-The lease is valid for `ElectionTimeoutMin` from the instant the last barrier
-heartbeat was *sent* (not when ACKs arrived). Inject a `raft.Clock` to make
-lease expiry deterministic in tests:
+The lease is valid for `ElectionTimeoutMin − LeaseSafetyMargin` from the
+instant the last barrier heartbeat was *sent* (not when ACKs arrived). Inject
+a `raft.Clock` to make lease expiry deterministic in tests:
 
 ```go
 cfg.Clock = myClock // implements raft.Clock: Now() time.Time
 ```
 
-> **Warning**: lease reads rely on the system clock not jumping forward by more
-> than `ElectionTimeoutMin` between nodes. They are not safe under large NTP
-> corrections or VM live-migration if clocks are not well-synchronised. When in
-> doubt, use `ReadIndex`.
+> **Warning**: lease reads rely on time passing at the same rate on every
+> node. Elapsed time is measured on the monotonic clock, so NTP corrections
+> do not affect it, and `LeaseSafetyMargin` covers ordinary rate differences
+> and detects a suspended or live-migrated leader — but a rate skew larger
+> than the margin is still stale reads. When in doubt, use `ReadIndex`.
 
 ---
 
@@ -514,6 +515,7 @@ cfg.Transport = tr                          // required
 | Field | Default | Description |
 |-------|---------|-------------|
 | `ElectionTimeoutMin` | `150ms` | Lower bound of the randomised election timeout. Also the read-lease duration. |
+| `LeaseSafetyMargin` | `15ms` | Taken off the read lease to cover clock-rate skew between nodes, and the tolerance for wall-clock time running ahead of monotonic time before a lease is dropped as the mark of a suspended leader. `0` restores the bare `ElectionTimeoutMin` lease. |
 | `ElectionTimeoutMax` | `300ms` | Upper bound. Wider spread reduces split-vote probability. Must be > Min. |
 | `HeartbeatInterval` | `50ms` | How often the leader sends heartbeats. Enforced constraint: `ElectionTimeoutMin ≥ 2×HeartbeatInterval`. Recommended: `HeartbeatInterval ≤ ElectionTimeoutMin / 5`. |
 | `TickInterval` | `10ms` | Wall-clock period per `Tick()`. Zero means manual ticks (recommended for tests). |
@@ -1111,12 +1113,21 @@ See [`examples/shardkv`](examples/shardkv/) for a complete cross-machine wiring.
 
 ## Caveats and known limitations
 
-### Lease reads require well-synchronised clocks
+### Lease reads assume clocks that run at the same rate
 
-`ReadIndexLease` assumes that the system clock does not jump forward by more
-than `ElectionTimeoutMin` relative to peer clocks. Large NTP corrections or VM
-live-migration with unsynchronised clocks can cause stale reads. Use `ReadIndex`
-when strong linearizability is required regardless of clock quality.
+`ReadIndexLease` serves a read without contacting any follower, on the
+argument that no follower can have started an election within
+`ElectionTimeoutMin` of the last heartbeat. Elapsed time is measured on the
+monotonic clock, so NTP stepping the wall clock does not affect it. What can
+still break the argument is a clock *rate* difference between nodes, and a
+leader that was suspended — a paused or live-migrated VM — whose monotonic
+clock stood still while its followers' election timers ran.
+`LeaseSafetyMargin` (default 15 ms) is taken off the lease to cover the
+first, and is the tolerance beyond which wall-clock time running ahead of
+monotonic time is treated as a suspend and the lease dropped, for the
+second. A rate skew larger than the margin cannot be detected and is still
+stale reads. Use `ReadIndex` when strong linearizability is required
+regardless of clock quality.
 
 ### A hung fsync stalls this node's writes, not its clock
 

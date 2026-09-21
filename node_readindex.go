@@ -1,6 +1,9 @@
 package raft
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ---- Linearizable read-only queries ------------------------------------------
 
@@ -74,7 +77,7 @@ func (n *Node) handleReadIndex(msg readIndexMsg) {
 	// round-trip. Cache n.now() once so both branches see the same instant.
 	if msg.useLease {
 		now := n.now()
-		if !n.leaseExpiry.IsZero() && now.Before(n.leaseExpiry) {
+		if n.leaseValid(now) {
 			msg.resolver.resolve(n.commitIndex)
 		} else {
 			msg.resolver.reject(ErrLeaseExpired)
@@ -205,7 +208,8 @@ func (n *Node) confirmReadBatch() {
 		// (should not occur in normal operation).
 		base = n.now()
 	}
-	n.leaseExpiry = base.Add(n.cfg.ElectionTimeoutMin)
+	n.leaseBase = base
+	n.leaseExpiry = base.Add(n.cfg.ElectionTimeoutMin - n.cfg.LeaseSafetyMargin)
 
 	idx := n.readBatchIndex
 	for _, p := range n.pendingReads {
@@ -222,4 +226,46 @@ func (n *Node) confirmReadBatch() {
 		n.waitingReads = n.waitingReads[:0]
 		n.startReadBatch()
 	}
+}
+
+// leaseValid reports whether the read lease is held at now. Event-loop only.
+//
+// Two checks. The lease has an expiry, measured on the monotonic clock when
+// the time source supplies one, which is the clock that election timers run
+// on. And, when Config.LeaseSafetyMargin is set, the wall clock is consulted
+// as well: a monotonic clock that has fallen behind the wall clock by more
+// than the margin since the lease was granted says this process was suspended
+// in between, and a suspended leader's followers have been counting down
+// election timers it knows nothing about.
+func (n *Node) leaseValid(now time.Time) bool {
+	if n.leaseExpiry.IsZero() || !now.Before(n.leaseExpiry) {
+		return false
+	}
+	if margin := n.cfg.LeaseSafetyMargin; margin > 0 {
+		wall := now.Round(0).Sub(n.leaseBase.Round(0))
+		mono := now.Sub(n.leaseBase)
+		if leaseClockJumped(wall, mono, margin) {
+			n.logger.Warn("read lease dropped: wall clock ran ahead of the monotonic clock, "+
+				"which is what a suspend looks like",
+				"wall", wall, "monotonic", mono, "margin", margin)
+			n.leaseExpiry = time.Time{}
+			return false
+		}
+	}
+	return true
+}
+
+// leaseClockJumped reports whether wall-clock time has run ahead of monotonic
+// time by more than margin over the life of a lease. Rounding a time strips
+// its monotonic reading, so wall is the elapsed wall-clock time and mono is
+// the elapsed monotonic time -- or, for a time source that supplies no
+// monotonic reading, the same wall-clock figure, in which case nothing can be
+// detected and nothing is.
+//
+// A wall clock that went backwards is not a problem here: it means the
+// monotonic clock has, if anything, overstated how long the lease has been
+// held, and a lease judged by an overstated age expires early rather than
+// late.
+func leaseClockJumped(wall, mono, margin time.Duration) bool {
+	return wall-mono > margin
 }
