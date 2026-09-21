@@ -1483,6 +1483,10 @@ Every implementation departs from the Raft paper and dissertation somewhere.
 [`docs/divergence.md`](docs/divergence.md) lists every place this one does, the
 reason for each, and the known limitations.
 
+## Changelog
+
+[`CHANGELOG.md`](CHANGELOG.md) lists what each release contains.
+
 ## Compatibility
 
 [`docs/compatibility.md`](docs/compatibility.md) states what a version number
