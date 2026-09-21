@@ -187,42 +187,53 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 // goroutine is spawned, so there are no data races.
 func (n *Node) broadcastHeartbeat() {
 	for _, peer := range n.cfg.Peers {
-		id := peer.ID
-		// Build the request in the event-loop goroutine (safe: n is single-threaded here).
-		prevIdx := n.nextIndex[id] - 1
-		prevTerm, _ := n.log.termAt(prevIdx)
-		req := &AppendEntriesRequest{
-			GroupID:      n.cfg.GroupID,
-			Term:         n.currentTerm,
-			LeaderID:     n.cfg.ID,
-			PrevLogIndex: prevIdx,
-			PrevLogTerm:  prevTerm,
-			LeaderCommit: n.commitIndex,
+		n.heartbeatPeer(peer.ID)
+	}
+	for id := range n.departing {
+		n.heartbeatPeer(id)
+	}
+}
+
+// heartbeatPeer queues one heartbeat to a peer on its pump.
+func (n *Node) heartbeatPeer(id NodeID) {
+	// Build the request in the event-loop goroutine (safe: n is single-threaded here).
+	prevIdx := n.nextIndex[id] - 1
+	prevTerm, _ := n.log.termAt(prevIdx)
+	req := &AppendEntriesRequest{
+		GroupID:      n.cfg.GroupID,
+		Term:         n.currentTerm,
+		LeaderID:     n.cfg.ID,
+		PrevLogIndex: prevIdx,
+		PrevLogTerm:  prevTerm,
+		LeaderCommit: n.commitIndex,
+	}
+	// Enqueue on the pump's size-1 channel. Non-blocking: if the pump is
+	// still sending the previous heartbeat, the new one overwrites it (a
+	// missed heartbeat only delays follower timer resets, not safety).
+	ch := n.hbPumps[id]
+	select {
+	case ch <- req:
+	default:
+		// Pump busy; drain the stale heartbeat and replace it.
+		select {
+		case <-ch:
+		default:
 		}
-		// Enqueue on the pump's size-1 channel. Non-blocking: if the pump is
-		// still sending the previous heartbeat, the new one overwrites it (a
-		// missed heartbeat only delays follower timer resets, not safety).
-		ch := n.hbPumps[id]
 		select {
 		case ch <- req:
 		default:
-			// Pump busy; drain the stale heartbeat and replace it.
-			select {
-			case <-ch:
-			default:
-			}
-			select {
-			case ch <- req:
-			default:
-			}
 		}
 	}
 }
 
-// replicateToFollowers sends AppendEntries with pending entries to all peers.
+// replicateToFollowers sends AppendEntries with pending entries to all peers,
+// including those on their way out of the cluster.
 func (n *Node) replicateToFollowers() {
 	for _, peer := range n.cfg.Peers {
 		n.replicateToPeer(peer.ID)
+	}
+	for id := range n.departing {
+		n.replicateToPeer(id)
 	}
 }
 
@@ -238,6 +249,13 @@ func (n *Node) replicateToPeer(peer NodeID) {
 	// with TrailingLogs set, entries below that boundary are often still
 	// present and a snapshot would be wasted work.
 	if !n.log.canDescribe(nextIdx - 1) {
+		if _, leaving := n.departing[peer]; leaving {
+			// A node on its way out is not owed a state transfer.
+			n.logger.Warn("removed peer is too far behind to be told of its removal; giving up",
+				"id", peer)
+			n.endDeparture(peer)
+			return
+		}
 		n.sendSnapshotToPeer(peer)
 		return
 	}
@@ -370,6 +388,9 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		return
 	}
 	if n.state != Leader {
+		return
+	}
+	if r.success && n.departingPeer(r) {
 		return
 	}
 	if !r.success {

@@ -121,6 +121,11 @@ type Node struct {
 	// prevent sending the same snapshot twice to the same peer.
 	snapshotInflight map[NodeID]bool
 
+	// departing holds the peers this leader has removed from the membership
+	// but is still replicating to, so that each of them learns it was
+	// removed. Leader only; nil otherwise. See beginDeparture.
+	departing map[NodeID]departure
+
 	// --- Log ----------------------------------------------------------------
 	log *raftLog
 
@@ -420,6 +425,10 @@ type Node struct {
 	// are reaching it, so that an observer is told once when a follower stops
 	// answering and once when it starts again. Event-loop only.
 	peerHealth map[NodeID]peerHealth
+	// removedNotified is set once Config.OnRemoved has been invoked, so that
+	// a removal reported by more than one entry -- a finalise entry after a
+	// direct remove, say -- reports once. Event-loop only.
+	removedNotified bool
 	// fatalErr holds the first durable-write failure this node hit, if any.
 	// Setting it stops the node; it is read by FatalError and reported in
 	// place of ErrStopped by every operation afterwards.
@@ -1318,6 +1327,14 @@ func (n *Node) AddServer(ctx context.Context, peer PeerConfig) error {
 // Safety: see AddServer. For removing the current leader, prefer
 // ReconfigureCluster (which uses joint consensus and handles leader self-removal
 // atomically), or transfer leadership first via TransferLeadership.
+//
+// The removed node is told. It stops counting towards any quorum as soon as
+// the leader appends the change, but the leader goes on replicating to it
+// until it has acknowledged the entry and a commit index covering it, so that
+// it steps down and its Config.OnRemoved fires rather than being left to
+// campaign against a cluster that ignores it. That courtesy is bounded: a
+// removed node that cannot be reached, or that is so far behind it would need
+// a snapshot, is given up on.
 func (n *Node) RemoveServer(ctx context.Context, id NodeID) error {
 	_, err := n.Propose(ctx, encodeConfigEntry(configOpRemove, PeerConfig{ID: id}))
 	return err

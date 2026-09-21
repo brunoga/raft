@@ -178,12 +178,20 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 		n.cfg.Peers = append(n.cfg.Peers, peer)
 		n.storeMembership()
 		if n.state == Leader {
-			n.nextIndex[peer.ID] = n.log.lastLogIndex() + 1
-			n.matchIndex[peer.ID] = 0
-			// inflight and snapshotInflight are zero/false by map default.
-			// Start a heartbeat pump so the newly added peer receives ongoing
-			// heartbeats immediately, without waiting for the next proposal.
-			n.startHBPumpFor(peer.ID)
+			if _, leaving := n.departing[peer.ID]; leaving {
+				// Re-added before it had been told it was removed. Its
+				// progress is still being tracked and its pump still runs;
+				// it is simply a member again.
+				delete(n.departing, peer.ID)
+			} else {
+				n.nextIndex[peer.ID] = n.log.lastLogIndex() + 1
+				n.matchIndex[peer.ID] = 0
+				// inflight and snapshotInflight are zero/false by map default.
+				// Start a heartbeat pump so the newly added peer receives
+				// ongoing heartbeats immediately, without waiting for the
+				// next proposal.
+				n.startHBPumpFor(peer.ID)
+			}
 		}
 		n.logger.Info("config change: added peer", "id", peer.ID, "voter", peer.Voter)
 
@@ -205,11 +213,7 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 		}
 		n.storeMembership()
 		if n.state == Leader {
-			n.stopHBPumpFor(id)
-			delete(n.nextIndex, id)
-			delete(n.matchIndex, id)
-			delete(n.inflight, id)
-			delete(n.snapshotInflight, id)
+			n.beginDeparture(id, index)
 			// We may now have quorum with one fewer peer; re-check.
 			n.maybeAdvanceCommit()
 		}
@@ -247,17 +251,14 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 		oldPeers := n.cfg.Peers
 		n.restoreMembership(&membershipState{members: members})
 
-		// Clean up leader tracking for peers that left the cluster.
+		// Peers that left the cluster are told so before their tracking is
+		// dropped.
 		if n.state == Leader {
 			for _, p := range oldPeers {
 				if containsPeer(n.cfg.Peers, p.ID) {
 					continue
 				}
-				n.stopHBPumpFor(p.ID)
-				delete(n.nextIndex, p.ID)
-				delete(n.matchIndex, p.ID)
-				delete(n.inflight, p.ID)
-				delete(n.snapshotInflight, p.ID)
+				n.beginDeparture(p.ID, index)
 			}
 			// Quorum size has changed; re-check whether anything can commit.
 			n.maybeAdvanceCommit()
@@ -301,6 +302,7 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 			delete(after, n.cfg.ID)
 			n.logger.Info("config change: self removed, stepping down")
 			n.becomeFollower(n.currentTerm, "")
+			n.notifyRemoved()
 		}
 
 	case configOpJoint:
@@ -321,7 +323,133 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 			delete(after, n.cfg.ID)
 			n.logger.Info("config change: self removed, stepping down")
 			n.becomeFollower(n.currentTerm, "")
+			n.notifyRemoved()
 		}
+	}
+}
+
+// notifyRemoved invokes Config.OnRemoved, once, after a committed
+// configuration change has removed this node from the cluster. Event-loop
+// only.
+//
+// The callback runs on its own goroutine because the one thing it is most
+// likely to do is call Stop, and Stop waits for the event loop to exit.
+func (n *Node) notifyRemoved() {
+	if n.removedNotified {
+		return
+	}
+	n.removedNotified = true
+	if n.cfg.OnRemoved != nil {
+		go n.cfg.OnRemoved()
+	}
+}
+
+// ---- Departing peers --------------------------------------------------------
+//
+// A peer removed by a configuration change leaves the membership the moment
+// the leader appends the entry, and from then on it counts towards nothing.
+// But a leader that also stopped talking to it at that moment would leave it
+// with no way to find out: the removal entry, and the commit index that makes
+// it binding, both arrive by AppendEntries. Such a node keeps believing it is
+// a voter, times out, and campaigns against a cluster that ignores it, for
+// ever, and its Config.OnRemoved never fires.
+//
+// So a removed peer is kept as a departing one: replicated to and sent
+// heartbeats exactly as before, but never counted, until it has acknowledged
+// an AppendEntries whose commit index covers its removal. That is the message
+// that makes it step down and report the removal. A departure is bounded, so
+// that a peer removed because it is dead does not keep a pump for ever, and
+// abandoned rather than served with a snapshot, which is more than a node on
+// its way out is owed.
+
+// departure is what a leader remembers about a peer it has removed but is
+// still telling about the removal.
+type departure struct {
+	// index is the config entry that removed the peer. The departure ends
+	// once the peer has acknowledged a commit index at or above it.
+	index Index
+	// elapsed counts ticks since the departure began.
+	elapsed int
+}
+
+// departureGraceTicks is how many election timeouts, at the longest, a
+// leader spends telling a removed peer about its removal before giving up on
+// it. The removal has to commit first, which is one round trip to a quorum,
+// and the goodbye is one more to the peer itself; a peer that cannot be
+// reached in this long is not listening.
+const departureGraceTicks = 4
+
+// beginDeparture starts telling peer that the config entry at index removed
+// it. Event-loop only; leader only.
+func (n *Node) beginDeparture(peer NodeID, index Index) {
+	if n.state != Leader {
+		return
+	}
+	if n.departing == nil {
+		n.departing = make(map[NodeID]departure)
+	}
+	n.departing[peer] = departure{index: index}
+	// Push the entry now rather than at the next heartbeat.
+	n.replicateToPeer(peer)
+}
+
+// endDeparture stops tracking a departing peer, whether or not it was told.
+// Event-loop only.
+func (n *Node) endDeparture(peer NodeID) {
+	delete(n.departing, peer)
+	n.stopHBPumpFor(peer)
+	delete(n.nextIndex, peer)
+	delete(n.matchIndex, peer)
+	delete(n.inflight, peer)
+	delete(n.snapshotInflight, peer)
+	delete(n.peerHealth, peer)
+}
+
+// departingPeer handles an AppendEntries result from a peer that is on its way
+// out, and reports whether the result was one. A departing peer's progress is
+// tracked so that it can be caught up to its removal entry, but it counts
+// towards nothing, so none of the leader's other bookkeeping applies to it.
+// Event-loop only.
+func (n *Node) departingPeer(r *appendResult) bool {
+	d, ok := n.departing[r.peer]
+	if !ok {
+		return false
+	}
+	if r.success && r.req.LeaderCommit >= d.index {
+		// It has the entry and knows it committed: it will step down on its
+		// own from here.
+		n.logger.Info("removed peer told of its removal", "id", r.peer)
+		n.endDeparture(r.peer)
+		return true
+	}
+	if r.success && len(r.req.Entries) > 0 {
+		last := r.req.Entries[len(r.req.Entries)-1].Index
+		if last > n.matchIndex[r.peer] {
+			n.matchIndex[r.peer] = last
+			n.nextIndex[r.peer] = last + 1
+		}
+	}
+	// Either it is still behind, or it has the entry but has not yet been
+	// sent a commit index covering it. In both cases the next message is the
+	// same: whatever entries it lacks, with the current commit index.
+	if n.nextIndex[r.peer] <= n.log.lastLogIndex() || n.commitIndex >= d.index {
+		n.replicateToPeer(r.peer)
+	}
+	return true
+}
+
+// tickDepartures ages every departure and gives up on those that have gone on
+// too long. Event-loop only; leader only.
+func (n *Node) tickDepartures() {
+	for peer, d := range n.departing {
+		d.elapsed++
+		if d.elapsed < departureGraceTicks*n.electionMaxTicks {
+			n.departing[peer] = d
+			continue
+		}
+		n.logger.Warn("removed peer could not be told of its removal; giving up",
+			"id", peer)
+		n.endDeparture(peer)
 	}
 }
 
