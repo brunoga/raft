@@ -326,11 +326,6 @@ still up fails at the open rather than racing its writes.
 
 Stated here rather than discovered later.
 
-- **No batched write across groups.** Each group writes and syncs its own log.
-  At high group counts this is the binding constraint; see the scale notes in
-  the README. Sharing one write-ahead log across groups needs a storage
-  abstraction that spans them rather than one per node, which is an
-  architectural change rather than a missing option.
 - **No weighted quorums, deliberately.** A quorum is a count of voters, not a
   sum of weights: a voter cannot count for more than one. Weights would be
   safe -- a weighted majority intersects another weighted majority exactly as
@@ -343,9 +338,9 @@ Stated here rather than discovered later.
   it are. A member that should not vote is a learner, which is weight zero.
   Cheaper writes, or writes that are on every disk before they are
   acknowledged, is `SetCommitQuorum`. A cheap tie-breaker in a third site is
-  a witness, which votes in full and stores nothing. Leadership on the largest machine is
-  `Config.PreferredLeader`; quorum size is about how many failures a group
-  survives, not how fast its members are, and weighting a node up makes the
+  a witness, which votes in full and stores nothing. Leadership on the
+  largest machine is `Config.PreferredLeader`; quorum size is about how many
+  failures a group survives, not how fast its members are, and weighting a node up makes the
   group *depend* on it rather than benefit from it.
 
   What weights would add is a misconfiguration with no good error. Any node

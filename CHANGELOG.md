@@ -46,6 +46,19 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   new-version leader is elected with `ProposeOnce` traffic, as a node on the
   previous version ignores the opcode and keeps its own bound.
 
+- `storage/sharedwal`: one write-ahead log for every Raft group on a host.
+  Every group appends to the same log and one goroutine writes everything
+  waiting and syncs once per batch, so a burst of appends from many groups
+  costs one `fsync` rather than one per group — the multiplier that made
+  `filestore` the binding constraint at high group counts. Records carry
+  their group and a checksum; a torn tail is cut off on open; snapshots live
+  in one file per group; segments are reclaimed once nothing needs them,
+  with the little that keeps an old one alive copied forward. `Storage(id)`
+  returns a value implementing `raft.Storage`, `raft.BatchWriter` and
+  `raft.CommitRecorder`; `Groups` lists the groups a log holds and `Remove`
+  forgets one. The README's multi-Raft scale notes and the divergence doc's
+  limitations are updated accordingly.
+
 ### Fixed
 
 - A node removed by the leader was usually never told. The leader dropped
@@ -112,8 +125,6 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   majority regardless.
 
 ## Unreleased
-
-### Added
 
 - Witnesses (dissertation §11.7.2). `Config.Witness` builds a node that
   keeps the index and term of every entry and never the entries themselves,
