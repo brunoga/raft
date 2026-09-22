@@ -29,6 +29,19 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Fixed
 
+- A single-voter leader answered a linearizable read before committing
+  anything in its own term, which after a restart meant answering from a
+  commit index of zero. The commit index is not persisted -- a restarting
+  node learns it again from its leader, and a single-node cluster's leader
+  is itself -- so it comes back at zero with a log full of entries that
+  certainly did commit, and `ReadIndex` returned that zero. A client that
+  wrote, restarted the node and read back saw an empty state machine. The
+  single-voter fast path now waits for the leader's no-op like every other
+  leader, and resolves without a confirmation round only afterwards, since
+  a node that is the whole cluster has nobody to confirm with. Found
+  through easyraft, where several groups sharing one write-ahead log made
+  the window wide enough to hit.
+
 - `easyraft.WithTLS` authenticated the connection and then trusted whatever
   the peer claimed to be. Every Raft RPC names the node it comes from, and
   nothing was binding that name to the certificate that carried it, so any
