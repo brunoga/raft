@@ -36,6 +36,9 @@ type Manager struct {
 	httpServer *http.Server
 	cancel     context.CancelFunc
 	stopCtx    context.Context
+	// waitBalancer blocks until the leader balance controller has stopped, so
+	// Stop does not return while it is still transferring leadership.
+	waitBalancer func()
 }
 
 // SharedWAL returns the write-ahead log every group on this Manager appends
@@ -134,6 +137,18 @@ func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg *conf
 // Store-level options override Manager-level options.
 // AddStore must be called before [Manager.Start].
 func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
+	// Group zero is not a group here. A Manager routes inbound RPCs by the
+	// group ID they carry, and zero is what an RPC from a single-group node
+	// carries -- so the transport refuses it, and a group numbered zero gets
+	// no votes, no appends and no election. It sits in PreCandidate for ever
+	// with nothing in this node's log to say why, which is the failure worth
+	// spending a line here to make impossible.
+	if groupID == 0 {
+		return nil, fmt.Errorf("easyraft: group 0 is reserved: a Manager routes by group ID " +
+			"and zero means \"no group\", so a group numbered zero would never be reachable. " +
+			"Number groups from 1")
+	}
+
 	// Merge manager-level options with store-specific options.
 	// Store-specific options (like DataDir) take precedence.
 	mergedCfg := m.cfg
@@ -313,6 +328,15 @@ func (m *Manager) Start() error {
 		}
 	}
 
+	// 4. Leader balancing, last: it reaches the other hosts over HTTP and
+	// answers them over this node's, so both ends have to be up first.
+	wait, balanceErr := m.startBalancing()
+	if balanceErr != nil {
+		cleanup()
+		return balanceErr
+	}
+	m.waitBalancer = wait
+
 	return nil
 }
 
@@ -356,6 +380,15 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 func (m *Manager) Stop() error {
 	m.cancel()
+
+	// Before anything is torn down: the controller may have a transfer in
+	// flight, and a transfer is a proposal to a node this is about to stop.
+	// Its context is already cancelled, so this waits for it to notice rather
+	// than for the interval to come round again.
+	if m.waitBalancer != nil {
+		m.waitBalancer()
+		m.waitBalancer = nil
+	}
 
 	m.mu.Lock()
 	httpServer := m.httpServer

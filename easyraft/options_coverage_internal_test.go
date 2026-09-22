@@ -56,6 +56,8 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithLeaseSafetyMargin(15 * time.Millisecond),
 		WithKeyLeaseSweepInterval(250 * time.Millisecond),
 		WithMaxProposalBytes(1 << 20),
+		WithLeaderBalancing(map[raft.HostID]string{"n1": "127.0.0.1:8001"},
+			time.Second, raft.WithGroupCooldown(time.Minute)),
 		WithTransport(memtransport.NewNetwork().NewTransport("n1")),
 		WithProposalQueue(512, raft.ProposalOverflowReject),
 		WithOnRemoved(func() {}),

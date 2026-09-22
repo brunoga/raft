@@ -129,7 +129,9 @@ func TestManager_StopReleasesTheSharedListenerOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
-	for g := range uint64(2) {
+	// Numbered from one: a Manager reserves group zero, since it routes by
+	// group ID and zero is what a single-group node's RPCs carry.
+	for g := uint64(1); g <= 2; g++ {
 		if _, addErr := m.AddStore(g,
 			easyraft.WithDataDir(filepath.Join(dir, "g"+string(rune('0'+g)))),
 			easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),

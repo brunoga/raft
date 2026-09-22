@@ -130,6 +130,12 @@ type config struct {
 	// [WithMaxProposalBytes].
 	MaxProposalBytes int
 
+	// BalanceHosts, BalanceInterval and BalanceOptions configure automatic
+	// leader balancing on a [Manager]. Set via [WithLeaderBalancing].
+	BalanceHosts    map[raft.HostID]string
+	BalanceInterval time.Duration
+	BalanceOptions  []raft.BalanceOption
+
 	// ProposalQueueSize and ProposalOverflow govern how many writes may wait
 	// for the event loop and what happens to the next one. Set via
 	// [WithProposalQueue].
@@ -573,6 +579,52 @@ func WithPreferredLeader(id raft.NodeID) Option {
 // change a running group with [Store.SetMaxClientTableSize].
 func WithMaxClientTableSize(entries int) Option {
 	return func(c *config) { c.MaxClientTableSize = entries }
+}
+
+// WithLeaderBalancing keeps group leadership spread across the hosts given,
+// moving it when it bunches up. It applies to a [Manager] and is ignored by a
+// single-group [Store], which has nothing to balance.
+//
+// hosts maps each host to the HTTP address of the easyraft Manager running on
+// it, and must include this one -- a host's ID is the node ID its Manager was
+// built with, since one Manager is one physical node. This node is asked
+// directly; the others over HTTP, carrying whatever credential
+// [WithBearerTokenAuth] set.
+//
+//	easyraft.WithLeaderBalancing(map[raft.HostID]string{
+//		"n1": "10.0.0.1:8001",
+//		"n2": "10.0.0.2:8001",
+//		"n3": "10.0.0.3:8001",
+//	}, 30*time.Second)
+//
+// # Why this exists
+//
+// Groups elect leaders independently, and nothing coordinates them. Left
+// alone, a host that was up while others restarted ends up leading most of
+// them -- and a leader does the replication, serves the linearizable reads
+// and takes every write, so one host doing all of it is both a bottleneck and
+// the failure that hurts most.
+//
+// # What it costs
+//
+// A transfer is an election, so a balanced cluster is worth more than a
+// perfectly balanced one. Every group is left alone for a cooldown after it
+// moves (five intervals by default), a round where any host fails to report
+// is skipped entirely rather than planned from a partial view, and leadership
+// is only ever moved to a voter that is close enough to the leader to take
+// over. Pass [raft.WithGroupCooldown], [raft.WithStatusTimeout] and
+// [raft.WithTransferTimeout] through opts to tune that.
+//
+// Every host may run this. Two controllers with views that disagree would
+// hand a group back and forth, which is what the cooldown is there to stop.
+func WithLeaderBalancing(hosts map[raft.HostID]string, interval time.Duration,
+	opts ...raft.BalanceOption,
+) Option {
+	return func(c *config) {
+		c.BalanceHosts = hosts
+		c.BalanceInterval = interval
+		c.BalanceOptions = opts
+	}
 }
 
 // WithMaxProposalBytes caps the size of a single command, refusing a larger

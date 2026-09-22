@@ -8,6 +8,27 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **Leader balancing on a `Manager`.** `WithLeaderBalancing(hosts, interval)`
+  keeps group leadership spread across the hosts given, moving it when it
+  bunches up. Groups elect leaders independently and nothing coordinates
+  them, so a host that stayed up while others restarted ends up leading most
+  of them -- and the leader does the replication, serves the linearizable
+  reads and takes every write.
+
+  A host's ID is the node ID its `Manager` was built with, since one
+  `Manager` is one physical node. This node is asked directly; the others
+  over HTTP at `/__balance/status` and `/__balance/transfer`, behind the same
+  authorization hook as every other route and carrying whatever credential
+  `WithBearerTokenAuth` set. A configuration that would silently balance
+  nothing -- this host missing from the list, fewer than two hosts, no HTTP
+  listener, an address that is not one -- fails at `Start` with the reason.
+
+  A transfer is an election, so the point is a balanced cluster rather than a
+  perfectly balanced one: a group is left alone for a cooldown after it
+  moves, a round where any host fails to report is skipped rather than
+  planned from a partial view, and leadership only moves to a voter close
+  enough to the leader to take over. Off unless asked for.
+
 - **Backup and restore.** `Store.Backup` writes a cluster's state to an
   `io.Writer` and reports the revision it describes; `Store.Import` replaces a
   cluster's state with one. Over HTTP they are `GET /__backup` and
@@ -234,6 +255,13 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   every field added to the other.
 
 ### Fixed
+
+- `Manager.AddStore(0)` is now refused rather than accepted. A `Manager`
+  routes every inbound RPC by the group ID it carries, and zero is what a
+  single-group node's RPCs carry, so the transport refuses it: a group
+  numbered zero got no votes, no appends and no election, and sat in
+  `PreCandidate` for ever with nothing in its own log to say why. The error
+  says so and says to number groups from one.
 
 - `Store.Stop` left the Raft listener open. `Node.Stop` unregisters the
   node's handler but does not close the transport -- correctly, since a
