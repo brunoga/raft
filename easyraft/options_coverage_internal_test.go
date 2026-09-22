@@ -11,6 +11,7 @@ import (
 
 	"github.com/brunoga/raft/v2"
 	"github.com/brunoga/raft/v2/discovery"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -54,6 +55,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithMaxClientTableSize(1000),
 		WithLeaseSafetyMargin(15 * time.Millisecond),
 		WithKeyLeaseSweepInterval(250 * time.Millisecond),
+		WithTransport(memtransport.NewNetwork().NewTransport("n1")),
 		WithProposalQueue(512, raft.ProposalOverflowReject),
 		WithOnRemoved(func() {}),
 		WithHTTPTLS(&tls.Config{MinVersion: tls.VersionTLS13}),

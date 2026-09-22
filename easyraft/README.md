@@ -1163,6 +1163,57 @@ And as above: discovered peers join as learners, so no discovery source can chan
 
 ---
 
+## Testing against a real cluster
+
+[`easyraft/easyrafttest`](easyrafttest/) runs real easyraft nodes inside a test process, on an in-memory network a test can cut and heal. Every node is a real `Store` running the real engine — the only thing replaced is the wire between them.
+
+```go
+c := easyrafttest.NewCluster(t, 3)
+users := easyrafttest.AddCollection[User](c, "users")
+ctx := c.Context()
+
+if err := users.Leader().Create(ctx, "alice", User{Name: "Alice"}); err != nil {
+    t.Fatal(err)
+}
+c.WaitApplied()
+
+got, err := users.Node(2).ReadStale("alice")  // a follower has it
+```
+
+`NewCluster` builds the nodes, starts them, waits for a leader, and registers the shutdown with the test. Nothing is cleaned up by hand, and the default Raft timings make an election tens of milliseconds rather than seconds.
+
+Mutations and change handlers must exist on every replica before any entry can reach them, so register them between the two halves of the build:
+
+```go
+c := easyrafttest.New(t, 3)
+counters := easyrafttest.AddCollection[Counter](c, "counters")
+counters.RegisterMutation("increment", increment)
+c.Start()
+```
+
+### Failures a test can cause
+
+| Method | Does |
+|--------|------|
+| `Partition(i)` | cuts node `i` off from every other node, both directions |
+| `Heal(i)` | restores those links |
+| `Drop(i, j)` | discards messages from `i` to `j` only — for the asymmetric failures a whole-node partition cannot express |
+| `Restore(i, j)` | undoes one `Drop` |
+| `StopNode(i)` | stops a node and leaves it stopped |
+| `RestartNode(i)` | brings it back from its own data directory, as a process restart does |
+
+`WaitLeader`, `WaitNoLeader`, `WaitApplied` and `Ready` wait for the cluster to reach a state, failing the test with every node's state if it does not. Every method fails the test rather than returning an error: a harness that hands back errors for its own failures turns each test into error-checking for things the test was not about.
+
+`Options.Store` applies options to every node and `Options.PerNode` to one, so a test can make a witness, a preferred leader, or a node configured wrong on purpose.
+
+After `RestartNode(i)`, call `Rebind(i)` on each `Collections` — the restarted node is a new `Store`, and the old handle points at one that has stopped.
+
+### Using your own transport
+
+`WithTransport` is the seam `easyrafttest` is built on, and it is public for the same reason anything else here is: a transport written for an environment gRPC cannot reach plugs in the same way. A store never closes a transport it was given — something that may outlive the store, or be shared by several, is the caller's to close.
+
+---
+
 ## Observability
 
 ```go
@@ -1214,6 +1265,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithOnRemoved(fn)` | Called when a committed change removes this node |
 | `WithInsecureTransportAcknowledged()` | Run the gRPC transport in plaintext, on purpose; without this or `WithTLS` the node refuses to start |
 | `WithPrometheus(registerer)` | Enable Prometheus metrics |
+| `WithTransport(tr)` | Use `tr` for Raft RPCs instead of listening on `WithRaftAddr`; the store never closes it |
 | `WithRaftTiming(tick, heartbeat, electionMin, electionMax)` | Override Raft timing (easyraft defaults: 100 ms tick/heartbeat, 1–2 s election) |
 
 ---
