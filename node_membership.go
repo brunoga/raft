@@ -112,6 +112,11 @@ func splitSelf(members []PeerConfig, self NodeID) (peers []PeerConfig, present, 
 func (n *Node) rebuildMembership(ctx context.Context) error {
 	n.restoreMembership(&n.baseMembership)
 	n.configIndex = n.log.snapMeta.LastIncludedIndex
+	// Whether the group has agreed a client table bound is rebuilt the same
+	// way: from the snapshot, then from any cap entry in the log. The bound
+	// on the table itself is not touched here -- it follows the apply order,
+	// and the entries replayed below have not been applied.
+	n.clientTableCapReplicated = n.hasBaseClientTableCap
 
 	first, last := n.log.first, n.log.last
 	if first == 0 || last < first {
@@ -150,6 +155,12 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 	n.configIndex = index
 
 	switch op {
+	case configOpClientTableCap:
+		// The log knows of a bound; the table adopts it when the entry is
+		// applied. See applyConfigChange.
+		n.clientTableCapReplicated = true
+		return
+
 	case configOpAdd:
 		if peer.ID == n.cfg.ID {
 			// This node's own promotion or demotion. The peer list is
@@ -292,6 +303,14 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 	defer func() { n.emitMembershipChanges(before, after) }()
 
 	switch op {
+	case configOpClientTableCap:
+		if capacity, ok := decodeClientTableCapEntry(configCmd); ok {
+			n.adoptClientTableCap(capacity, "log")
+		}
+		if n.capEntryPending == index {
+			n.capEntryPending = 0
+		}
+
 	case configOpRemove:
 		// A node removed from the cluster stops being a leader or candidate for
 		// it. Waiting for the commit matters: a removal that never commits must

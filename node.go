@@ -375,6 +375,40 @@ type Node struct {
 	// clientTableSize mirrors clientTable.len() for ClientTableSize, which is
 	// called from outside the event loop.
 	clientTableSize atomic.Int64
+	// clientTableCap is the bound the table is kept under. Like membership,
+	// the bound is state every replica must share: a replica keeping a
+	// different one evicts different clients and diverges. It is established
+	// by a config entry the leader appends before the first ProposeOnce
+	// entry, carried in every snapshot, and changed with
+	// SetMaxClientTableSize.
+	//
+	// It follows the apply order, not the log: a cap entry changes the table
+	// when it is applied, in sequence with the entries around it, because a
+	// bound that shrank and then grew again leaves a different table from
+	// one that was only ever the final value. clientTableCapAgreed says
+	// whether the bound in effect is one the group agreed (applied from the
+	// log or loaded from a snapshot) rather than this node's own
+	// Config.MaxClientTableSize. Event-loop only; atomicClientTableCap
+	// mirrors clientTableCap for readers outside.
+	clientTableCap       int
+	clientTableCapAgreed bool
+	atomicClientTableCap atomic.Int64
+	// clientTableCapReplicated says whether the group has agreed a bound as
+	// far as this node's log knows: a cap entry in the log, applied or not,
+	// or one in the snapshot base. A leader whose log knows of none appends
+	// one before the first ProposeOnce entry. Rebuilt with membership.
+	clientTableCapReplicated bool
+	// baseClientTableCap is the bound recorded in the snapshot this node
+	// started from, when hasBaseClientTableCap.
+	baseClientTableCap    int
+	hasBaseClientTableCap bool
+	// applyStartCap is the bound the apply goroutine's own table starts
+	// under: the snapshot's when there was one, else Config. Set in New.
+	applyStartCap int
+	// capEntryPending is the index of a client table cap entry this leader
+	// has appended and not yet seen commit, or 0. It stops a burst of
+	// ProposeOnce batches from each appending one.
+	capEntryPending Index
 
 	// clientsForgotten counts evictions since the node started, and
 	// lastForgetLog is when one was last written to the log. Both are
@@ -731,6 +765,8 @@ func New(cfg *Config) (*Node, error) {
 		restoreSnapshotCh: make(chan snapshotInstall, 1),
 		pending:           make(map[Index]pendingProposal),
 		clientTable:       newClientLRU(cfg.MaxClientTableSize),
+		clientTableCap:    cfg.MaxClientTableSize,
+		applyStartCap:     cfg.MaxClientTableSize,
 		rng:               rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())),
 	}
 	n.cfg.Peers = peers
@@ -764,6 +800,15 @@ func New(cfg *Config) (*Node, error) {
 		n.applyBaseIndex = durableApplied
 	}
 
+	// The client table bound the snapshot was taken under comes first, so
+	// that the table is loaded under it. A snapshot that recorded none leaves
+	// this node on its Config value until the log or a leader says otherwise.
+	if rl.hasSnapClientTableCap {
+		n.adoptClientTableCap(rl.snapClientTableCap, "snapshot")
+		n.baseClientTableCap, n.hasBaseClientTableCap = rl.snapClientTableCap, true
+		n.applyStartCap = rl.snapClientTableCap
+	}
+
 	// If a snapshot exists, seed initialSnap so applyLoop can restore the
 	// state machine on its first iteration. A state machine already past the
 	// snapshot point does not want it: restoring would put it back.
@@ -772,8 +817,10 @@ func New(cfg *Config) (*Node, error) {
 		n.syncClientTableSize()
 		// We don't load the SM data here; applyLoop will call LoadSnapshot.
 		n.initialSnap = &snapshotInstall{
-			meta:        rl.snapMeta,
-			clientTable: rl.snapClientTable,
+			meta:              rl.snapMeta,
+			clientTable:       rl.snapClientTable,
+			clientTableCap:    rl.snapClientTableCap,
+			hasClientTableCap: rl.hasSnapClientTableCap,
 		}
 		rl.snapClientTable = nil // release reference
 	}
@@ -808,6 +855,7 @@ func New(cfg *Config) (*Node, error) {
 		rl.snapClientTable = nil
 	}
 
+	n.atomicClientTableCap.Store(int64(n.clientTableCap))
 	n.atomicState.Store(uint32(Follower))
 	n.atomicLeader.Store(string(NodeID("")))
 	n.leadership.Store(LeadershipChange{Term: n.currentTerm})
@@ -1686,7 +1734,12 @@ func (n *Node) writeSnapshot(trig *snapshotTrigger, write func(context.Context, 
 	// is worth reporting, and this is the only place that sees it.
 	counter := &countingWriter{w: pw}
 	started := n.now()
-	serr := writeWrappedSnapshot(counter, trig.clientTable, &trig.membership, func(w io.Writer) error {
+	serr := writeSnapshotFrame(counter, &snapshotFrame{
+		table:             trig.clientTable,
+		membership:        trig.membership,
+		clientTableCap:    trig.clientTableCap,
+		hasClientTableCap: trig.hasClientTableCap,
+	}, func(w io.Writer) error {
 		return write(n.stopCtx, w)
 	})
 	_ = pw.Close() // signals EOF to SaveSnapshot
@@ -1697,11 +1750,13 @@ func (n *Node) writeSnapshot(trig *snapshotTrigger, write func(context.Context, 
 	}
 
 	return snapshotResult{
-		meta:       trig.meta,
-		membership: trig.membership,
-		sizeBytes:  counter.n,
-		duration:   n.now().Sub(started),
-		err:        serr,
+		meta:              trig.meta,
+		membership:        trig.membership,
+		clientTableCap:    trig.clientTableCap,
+		hasClientTableCap: trig.hasClientTableCap,
+		sizeBytes:         counter.n,
+		duration:          n.now().Sub(started),
+		err:               serr,
 	}
 }
 
@@ -2151,7 +2206,11 @@ func (n *Node) applyRestore(ctx context.Context, si snapshotInstall, localLastAp
 	case n.applyAdvancedCh <- struct{}{}:
 	default:
 	}
-	newTable := newClientLRU(n.cfg.MaxClientTableSize)
+	capacity := current.capacity()
+	if si.hasClientTableCap {
+		capacity = si.clientTableCap
+	}
+	newTable := newClientLRU(capacity)
 	newTable.loadFrom(si.clientTable)
 	return newTable
 }
@@ -2192,7 +2251,9 @@ func (n *Node) applyLoop() {
 	// sequence of entries, so the two hold the same contents, and so does every
 	// other replica's: whether a retry is deduplicated must not depend on which
 	// replica applies it.
-	localClientTable := newClientLRU(n.cfg.MaxClientTableSize)
+	// It starts under the bound in effect at the snapshot, when there was
+	// one, and follows the log's cap entries from there in apply order.
+	localClientTable := newClientLRU(n.applyStartCap)
 
 	// On restart from a snapshot: restore the state machine once before
 	// processing any committed entries. initialSnap is set once in New()
@@ -2352,6 +2413,11 @@ func (n *Node) applyLoop() {
 					if !flush() {
 						return
 					}
+					if capacity, ok := decodeClientTableCapEntry(entry.Command); ok {
+						// The event loop reports the evictions; this copy
+						// only has to make the same ones.
+						localClientTable.setCap(capacity)
+					}
 					ar = applyResult{index: i, configCmd: entry.Command, cmd: entry.Command}
 				case isDedupCmd(entry.Command):
 					// ProposeOnce command: enforce exactly-once by checking the
@@ -2424,12 +2490,64 @@ func (n *Node) applyLoop() {
 // confirmation that the deadline was missed.
 //
 // The value is the same on every node in a healthy cluster: the table is
-// replicated state, built from the same entries in the same order everywhere.
-// A node whose count has drifted from its peers' has a different
-// MaxClientTableSize from them, which is a misconfiguration that will
-// eventually diverge their state machines.
+// replicated state, built from the same entries in the same order everywhere,
+// under a bound the group agreed on rather than one each node configured.
 func (n *Node) ClientTableSize() int {
 	return int(n.clientTableSize.Load())
+}
+
+// MaxClientTableSize returns the bound the exactly-once table is kept under,
+// 0 meaning none. Safe for concurrent use.
+//
+// It is the group's value, not this node's Config.MaxClientTableSize: the
+// bound is replicated, so that every node evicts the same client at the same
+// point. Until the group has agreed one -- which happens when a leader
+// appends the first ProposeOnce entry -- it is this node's own configuration.
+func (n *Node) MaxClientTableSize() int {
+	return int(n.atomicClientTableCap.Load())
+}
+
+// SetMaxClientTableSize changes the bound of the exactly-once table for the
+// whole group, 0 meaning none. It blocks until the change is committed and
+// applied, or until ctx is cancelled, and returns ErrNotLeader on any node but
+// the leader.
+//
+// This is the way to resize the table once a cluster is running, because
+// Config.MaxClientTableSize is only what a node proposes when the group has no
+// agreed bound yet. A smaller bound evicts the oldest entries everywhere at
+// the same point in the log, each eviction reported as usual; a larger one
+// takes effect from that point on and recovers nothing already forgotten.
+//
+// Like a membership change, only one is in flight at a time:
+// ErrConfigChangeInProgress is returned while another configuration change is
+// pending.
+func (n *Node) SetMaxClientTableSize(ctx context.Context, size int) error {
+	if size < 0 {
+		return errors.New("raft: SetMaxClientTableSize: size must not be negative (0 means unlimited)")
+	}
+	_, err := n.Propose(ctx, encodeClientTableCapEntry(size))
+	return err
+}
+
+// adoptClientTableCap puts a group-agreed bound into effect on the event
+// loop's table, reporting each client it evicts. source says where the bound
+// came from, for the log line written when it differs from this node's own
+// configuration. Event-loop only, or before Start.
+func (n *Node) adoptClientTableCap(capacity int, source string) {
+	if capacity != n.cfg.MaxClientTableSize && (!n.clientTableCapAgreed || capacity != n.clientTableCap) {
+		n.logger.Warn("exactly-once table bound taken from the cluster, not this node's Config",
+			"clusterMaxClientTableSize", capacity,
+			"configMaxClientTableSize", n.cfg.MaxClientTableSize,
+			"source", source)
+	}
+	n.clientTableCap = capacity
+	n.clientTableCapAgreed = true
+	n.clientTableCapReplicated = true
+	n.atomicClientTableCap.Store(int64(capacity))
+	for _, id := range n.clientTable.setCap(capacity) {
+		n.reportClientForgotten(id)
+	}
+	n.syncClientTableSize()
 }
 
 // syncClientTableSize refreshes the mirror ClientTableSize reads. Called from

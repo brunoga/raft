@@ -30,6 +30,22 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   like on resume — drops the lease rather than serving from it. `DefaultConfig`
   sets 15 ms; zero keeps the previous behaviour exactly.
 
+- The exactly-once table's bound is replicated. `Config.MaxClientTableSize`
+  had to be identical on every node of a group, and a node with a different
+  value diverged silently: it evicted different clients, re-ran a retry its
+  peers deduplicated, and nothing anywhere noticed. The bound is now written
+  into the log by the leader ahead of the first `ProposeOnce` entry and
+  carried in every snapshot, so every replica keeps the same table whatever
+  its own `Config` says (a mismatch is logged as a warning and otherwise
+  ignored). `Node.MaxClientTableSize` reports the value in effect;
+  `Node.SetMaxClientTableSize` changes it for the whole group as a
+  configuration change.
+
+  On the wire this is a new config-entry opcode and a new snapshot framing
+  version; both older framings are still read. Upgrade every node before a
+  new-version leader is elected with `ProposeOnce` traffic, as a node on the
+  previous version ignores the opcode and keeps its own bound.
+
 ### Fixed
 
 - A node removed by the leader was usually never told. The leader dropped

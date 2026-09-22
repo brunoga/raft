@@ -42,6 +42,11 @@ type raftLog struct {
 	snapMembership    membershipState
 	hasSnapMembership bool
 
+	// snapClientTableCap is the client table bound recorded in that
+	// snapshot, and hasSnapClientTableCap whether one was recorded.
+	snapClientTableCap    int
+	hasSnapClientTableCap bool
+
 	// cached positions; 0 means "no entries in storage"
 	first    Index
 	last     Index
@@ -115,13 +120,15 @@ func newRaftLog(s Storage, w *storageWriter) (*raftLog, error) {
 		defer func() { _ = r.Close() }()
 		rl.snapMeta = meta
 		// Read the framing header to extract the client dedup table.
-		table, ms, hasMS, _, parseErr := readWrappedSnapshot(r)
+		frame, _, parseErr := readSnapshotFrame(r)
 		if parseErr != nil {
 			return nil, fmt.Errorf("raftLog: read snapshot framing: %w", parseErr)
 		}
-		rl.snapClientTable = table
-		rl.snapMembership = ms
-		rl.hasSnapMembership = hasMS
+		rl.snapClientTable = frame.table
+		rl.snapMembership = frame.membership
+		rl.hasSnapMembership = frame.hasMembership
+		rl.snapClientTableCap = frame.clientTableCap
+		rl.hasSnapClientTableCap = frame.hasClientTableCap
 	} else if loadErr != ErrNoSnapshot {
 		return nil, fmt.Errorf("raftLog: load snapshot: %w", loadErr)
 	}
