@@ -244,6 +244,39 @@ err := configs.Upsert(ctx, "db.host", ConfigEntry{Value: "localhost"})
 
 ---
 
+## Prefix scans and pagination
+
+`List` returns a whole collection in one answer. When a collection is large, or when the keys are namespaced and only one namespace is wanted, `Scan` returns it a page at a time in ascending key order:
+
+```go
+opts := easyraft.ScanOptions{Prefix: "session/", Limit: 100}
+for {
+    page, err := sessions.Scan(ctx, opts)
+    if err != nil {
+        return err
+    }
+    for _, item := range page.Items {
+        // item.Key, item.Value, item.Revision
+    }
+    if page.Next == "" {
+        break
+    }
+    opts.After = page.Next
+}
+```
+
+`ListPrefix(ctx, prefix)` is the one-call form for a result small enough to hold in memory, and `ScanStale` / `ListPrefixStale` read the local replica without a leader round-trip.
+
+**`Next` is the only end-of-scan signal.** A page with fewer items than `Limit` is not one — nothing stops a page from being short. `Next` is empty exactly when a page reached the end of the collection, so a page that fills the limit and leaves nothing behind carries no cursor, and the loop above makes no round-trip that could only come back empty.
+
+**The cursor is a key, not an offset.** An offset shifts under every insert before it, so a page boundary would skip or repeat keys whenever the collection changed between pages. A key does not: whatever happens in between, nothing already returned comes back. A scan is still not a snapshot of the whole collection — a key written before the cursor after its page was read is missed, and one written after it is seen — but each page is linearizable as of its own read.
+
+Deleting the key a cursor names is harmless. The scan resumes strictly after it, whether or not it is still there.
+
+**Cost.** Collections are held in a map, so a page costs one pass over the collection plus a sort of what matched. A prefix pays for the keys it excludes, and paging through a large collection pays that per page. Pagination here bounds the size of each *answer*, not the work behind it — it is for keeping a response and its decoding small, not for making a scan of a huge collection cheap.
+
+---
+
 ## Revisions — compare-and-swap
 
 Every key carries a **revision**: the index of the log entry that last wrote it. Read it with `ReadRev`, and hand it back to a conditional write, which applies only while the key is still at that revision:
@@ -811,6 +844,7 @@ http.ListenAndServe(":8001", mux) // one server, no conflict
 | `DELETE` | `/{collection}/{key}` | Delete item — honours `If-Match` |
 | `GET` | `/{collection}` | List all — linearizable |
 | `GET` | `/{collection}?consistency=stale` | List all — local |
+| `GET` | `/{collection}?prefix=&limit=&after=` | List narrowed and paginated (see below) |
 | `POST` | `/{collection}/{key}/mutate` | Run named mutation — honours `If-Match` |
 | `GET` | `/status` | Cluster status (JSON) |
 | `GET` | `/health` | Liveness probe |
@@ -862,6 +896,26 @@ Any operation may carry an `if_rev` that makes it conditional on the key's curre
   { "op": "upsert", "collection": "work",   "key": "item-1", "value": {"done":true} }
 ]
 ```
+
+### Listing a page
+
+`GET /{collection}` accepts three query parameters, each of which only removes results: `prefix` keeps keys that begin with it, `limit` caps the page, and `after` resumes strictly after that key.
+
+The body is a JSON object of key to value whether or not the request paginates, so a client parses one format either way. The cursor travels in headers beside it:
+
+```
+$ curl -i 'http://host:8001/sessions?prefix=user/&limit=100'
+HTTP/1.1 200 OK
+X-Raft-Revision: 4192
+X-Raft-Next-Cursor: user/0099
+Link: </sessions?limit=100&prefix=user%2F&after=user%2F0099>; rel="next"
+
+{"user/0000": {...}, ...}
+```
+
+Follow the `Link` header rather than assembling the next URL. It is built from the request's own path and query, so it stays correct behind a proxy with no configuration. The absence of both headers means the page reached the end of the collection; see the note above on why a short page does not.
+
+A `limit` that is not a non-negative number is answered with `400` rather than ignored.
 
 ### Conditional requests
 

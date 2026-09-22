@@ -8,6 +8,21 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **Prefix scans and pagination in easyraft.** `Collection.Scan` returns a
+  collection one page at a time in ascending key order, narrowed by a prefix,
+  and `ListPrefix` is the one-call form for a result small enough to hold in
+  memory. Both have `Stale` variants, and both are on the `EasyRaft[T]`
+  wrapper. Over HTTP, `GET /{collection}` takes `prefix`, `limit` and `after`,
+  answers with the same JSON object it always did, and carries the cursor in
+  `X-Raft-Next-Cursor` and a `Link` header with `rel="next"`.
+
+  The cursor is a key rather than an offset. An offset shifts under every
+  insert before it, so a page boundary would skip or repeat keys whenever the
+  collection changed between pages; a key does not, so nothing already
+  returned can come back. A cursor is set only when a key was actually left
+  behind, so a final page that happens to fill the limit ends the scan rather
+  than sending the caller back for a page that could only be empty.
+
 - **Compare-and-swap in easyraft.** Every key now carries a revision -- the
   index of the log entry that last wrote it -- and every write can be made
   conditional on it. `Collection.ReadRev` returns a value with its revision;
@@ -82,6 +97,14 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   - **`Store.Events`**, the stream of what the node does: leadership
     changes, peers arriving and leaving, snapshots, a client dropped from
     the exactly-once table, a durable write that failed.
+
+### Changed
+
+- `NewStore` now builds its `Store` through `newStoreShell`, which it already
+  documented itself as doing while keeping a second copy of the same literal.
+  The two had not drifted, but the previous time two construction paths
+  assembled the same value separately one of them quietly fell behind by
+  every field added to the other.
 
 ### Fixed
 

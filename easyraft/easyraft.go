@@ -138,6 +138,30 @@ func (e *EasyRaft[T]) List(ctx context.Context) (map[string]T, error) {
 	return e.collection.List(ctx)
 }
 
+// Scan returns one page of the collection in ascending key order, narrowed
+// and paginated by opts. See [Collection.Scan] for what a page guarantees
+// across the boundary between two of them.
+func (e *EasyRaft[T]) Scan(ctx context.Context, opts ScanOptions) (Page[T], error) {
+	return e.collection.Scan(ctx, opts)
+}
+
+// ScanStale returns one page from local state without a leader round-trip.
+func (e *EasyRaft[T]) ScanStale(opts ScanOptions) (Page[T], error) {
+	return e.collection.ScanStale(opts)
+}
+
+// ListPrefix returns every item whose key begins with prefix, with
+// linearizable consistency.
+func (e *EasyRaft[T]) ListPrefix(ctx context.Context, prefix string) (map[string]T, error) {
+	return e.collection.ListPrefix(ctx, prefix)
+}
+
+// ListPrefixStale returns every item whose key begins with prefix, from local
+// state.
+func (e *EasyRaft[T]) ListPrefixStale(prefix string) (map[string]T, error) {
+	return e.collection.ListPrefixStale(prefix)
+}
+
 // ReadRev returns an item and the revision at which it was last written,
 // with linearizable consistency. Pass the revision to [EasyRaft.UpdateIf] to
 // make the write conditional on nothing having changed in between.
