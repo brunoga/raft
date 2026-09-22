@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
 )
 
 // With a 100-byte segment threshold and the 7-byte commands makeEntries

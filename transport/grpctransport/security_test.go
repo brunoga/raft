@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
 // nodeCA issues certificates that name a node, so a test can hand each side of

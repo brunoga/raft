@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // waitCommitQuorum ticks until every node reports q as the commit quorum in

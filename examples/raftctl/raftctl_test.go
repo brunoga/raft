@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
-	"github.com/brunoga/raft/transport/memtransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // countSM records every command it applies, so a recovered node can be asked

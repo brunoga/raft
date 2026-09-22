@@ -4,13 +4,20 @@ What a version number here promises, and what it does not.
 
 ## Versioning
 
-[Semantic versioning](https://semver.org/). Within a `v1` line, code that
-compiles and works against `v1.x` continues to compile and work against every
-later `v1.y`.
+[Semantic versioning](https://semver.org/). Within a `v2` line, code that
+compiles and works against `v2.x` continues to compile and work against every
+later `v2.y`.
 
 Breaking that requires a major version, which in Go means a new import path
-(`github.com/brunoga/raft/v2`). Both can be imported at once, so a migration
+(`github.com/brunoga/raft/v3`). Both can be imported at once, so a migration
 does not have to happen everywhere in one commit.
+
+`v2` is where that rule was first used. `v1` promised that a transport
+listening in plaintext and an HTTP API serving without authorization would
+keep working, and `v2` withdraws that promise deliberately: those listeners
+now refuse to start unless the exposure is asked for by name. See the
+migration notes in the [changelog](../CHANGELOG.md). `v1` is still importable
+as `github.com/brunoga/raft` and still gets fixes that do not break it.
 
 ## What is covered
 
@@ -18,7 +25,7 @@ Everything exported from these packages:
 
 | package | |
 |---|---|
-| `github.com/brunoga/raft` | the engine |
+| `github.com/brunoga/raft/v2` | the engine |
 | `.../easyraft` | the batteries-included layer |
 | `.../storage/filestore`, `.../storage/memstore` | storage backends |
 | `.../transport/grpctransport`, `.../transport/memtransport` | transports |

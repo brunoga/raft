@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
 )
 
 // bigEntries builds entries with a payload large enough that a segment rewrite

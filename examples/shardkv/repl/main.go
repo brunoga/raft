@@ -26,8 +26,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/brunoga/raft/examples/internal/exampleutil"
-	"github.com/brunoga/raft/examples/shardkv/client"
+	"github.com/brunoga/raft/v2/examples/internal/exampleutil"
+	"github.com/brunoga/raft/v2/examples/shardkv/client"
 )
 
 func main() {

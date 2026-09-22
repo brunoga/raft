@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package raft;
 
-option go_package = "github.com/brunoga/raft/transport/grpctransport/internal/raftpb";
+option go_package = "github.com/brunoga/raft/v2/transport/grpctransport/internal/raftpb";
 
 // Wire compatibility
 //

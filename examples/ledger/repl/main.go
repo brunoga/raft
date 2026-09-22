@@ -30,8 +30,8 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/brunoga/raft/examples/internal/exampleutil"
-	"github.com/brunoga/raft/examples/ledger/client"
+	"github.com/brunoga/raft/v2/examples/internal/exampleutil"
+	"github.com/brunoga/raft/v2/examples/ledger/client"
 )
 
 func main() {

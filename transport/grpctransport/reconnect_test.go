@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
 // freePort reserves and releases a local TCP port so the same address can be

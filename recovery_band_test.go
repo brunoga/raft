@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // seedRecoveryLog writes a hard state and a run of entries straight into a store, the

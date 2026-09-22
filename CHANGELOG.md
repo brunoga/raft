@@ -4,7 +4,24 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
-## Unreleased
+## v2.0.0
+
+The import path is now `github.com/brunoga/raft/v2`, because this release
+withdraws a promise `v1` made: a transport or an HTTP API that was open by
+default now refuses to start unless the exposure is asked for by name. That
+is a deliberate break and Go says a break means a new major version, so the
+import path carries the `/v2` suffix. Everything else here is additive.
+
+Upgrading is two steps: add `/v2` to the import paths, and give each listener
+the security decision it now insists on -- `WithTLSConfig` or `WithInsecure`
+for the Raft transport, an authorizer or the matching acknowledgement for the
+HTTP endpoints. A deployment that was relying on the old defaults behaves
+exactly as before once the acknowledgement options are passed.
+
+Several changes below also alter what goes on the wire or into a snapshot, in
+each case by adding something older nodes ignore. The individual entries say
+what that means for a rolling upgrade; the short version is to upgrade every
+node before using the feature that needs it.
 
 ### Added
 
@@ -59,17 +76,48 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   forgets one. The README's multi-Raft scale notes and the divergence doc's
   limitations are updated accordingly.
 
-### Fixed
+- Flexible quorums. `Node.SetCommitQuorum(ctx, q)` sets how many voters an
+  entry must reach to commit, for the whole group; the election quorum
+  becomes `voters − q + 1`, never below a majority, so the two always
+  intersect and Leader Completeness holds unchanged (Howard, Malkhi and
+  Spiegelman, *Flexible Paxos*). A commit quorum below a majority makes
+  writes cheaper than elections; one above a majority, up to every replica,
+  means no acknowledged write is ever on fewer than that many disks. The
+  majority floor on elections is Raft's own requirement: two election
+  quorums must intersect each other for a term to have one leader. The policy is
+  group state, agreed through the log and carried in snapshots;
+  `Config.CommitQuorum` is only what a group is created with, and no node
+  ever counts by its own `Config`. A change is safe on a running group: a
+  node holding the new policy in its log requires the stricter of old and
+  new for every decision until the entry is applied. `Node.CommitQuorum`
+  reports the value in effect.
 
-- A node removed by the leader was usually never told. The leader dropped
-  its heartbeat pump and progress tracking the moment it appended the
-  removal entry, so unless the entry happened to reach the node first, it
-  never saw the change commit: it went on believing it was a voter, timed
-  out, and campaigned against a cluster that ignored it, for ever. The leader
-  now keeps replicating to a removed peer — without counting it towards
-  anything — until it has acknowledged a commit index covering its removal,
-  bounded by a few election timeouts so that a peer removed because it is
-  dead does not keep a pump for ever.
+  On the wire this is a new config-entry opcode and a trailing field in the
+  snapshot membership section that older readers ignore. Upgrade every node
+  before setting a policy; a node on the previous version counts by a
+  majority regardless.
+
+- Witnesses (dissertation §11.7.2). `Config.Witness` builds a node that
+  keeps the index and term of every entry and never the entries themselves,
+  needs no state machine, and applies nothing; `PeerConfig.Witness` marks
+  it in the membership and `Node.AddWitness` adds one to a running group. It
+  votes and counts towards every quorum, so two full replicas and a witness
+  survive the loss of any one member. The leader sends it entries stripped
+  to their shape and a snapshot of a few hundred bytes. A witness cannot
+  lead, be transferred leadership, or be the source of a state transfer.
+
+  The leader prefers full replicas: a witness's acknowledgement counts
+  towards a commit quorum only while a full voter that lacks the entry has
+  stopped answering, so in a healthy group every committed entry is on every
+  full replica and the witness stands in for a replica that is down, not for
+  one that is slow. `New` refuses a node whose recovered membership disagrees
+  with `Config.Witness`; a full node that applies a membership entry calling
+  it a witness stops with the new `ErrWitnessMismatch`. `GroupStatus` and
+  `PeerProgress` report `Witness`, and the leader balancer never targets one.
+
+  On the wire the witness role is a second bit in the peer role byte; a node
+  on the previous version reads it as a non-voter, so upgrade every node
+  before adding a witness.
 
 ### Changed
 
@@ -99,54 +147,22 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   breaks a working configuration on purpose, which is why it is called out
   here rather than folded into an "Added" entry.
 
-## Unreleased
+### Fixed
 
-### Added
+- A node removed by the leader was usually never told. The leader dropped
+  its heartbeat pump and progress tracking the moment it appended the
+  removal entry, so unless the entry happened to reach the node first, it
+  never saw the change commit: it went on believing it was a voter, timed
+  out, and campaigned against a cluster that ignored it, for ever. The leader
+  now keeps replicating to a removed peer — without counting it towards
+  anything — until it has acknowledged a commit index covering its removal,
+  bounded by a few election timeouts so that a peer removed because it is
+  dead does not keep a pump for ever.
 
-- Flexible quorums. `Node.SetCommitQuorum(ctx, q)` sets how many voters an
-  entry must reach to commit, for the whole group; the election quorum
-  becomes `voters − q + 1`, never below a majority, so the two always
-  intersect and Leader Completeness holds unchanged (Howard, Malkhi and
-  Spiegelman, *Flexible Paxos*). A commit quorum below a majority makes
-  writes cheaper than elections; one above a majority, up to every replica,
-  means no acknowledged write is ever on fewer than that many disks. The
-  majority floor on elections is Raft's own requirement: two election
-  quorums must intersect each other for a term to have one leader. The policy is
-  group state, agreed through the log and carried in snapshots;
-  `Config.CommitQuorum` is only what a group is created with, and no node
-  ever counts by its own `Config`. A change is safe on a running group: a
-  node holding the new policy in its log requires the stricter of old and
-  new for every decision until the entry is applied. `Node.CommitQuorum`
-  reports the value in effect.
-
-  On the wire this is a new config-entry opcode and a trailing field in the
-  snapshot membership section that older readers ignore. Upgrade every node
-  before setting a policy; a node on the previous version counts by a
-  majority regardless.
-
-## Unreleased
-
-- Witnesses (dissertation §11.7.2). `Config.Witness` builds a node that
-  keeps the index and term of every entry and never the entries themselves,
-  needs no state machine, and applies nothing; `PeerConfig.Witness` marks
-  it in the membership and `Node.AddWitness` adds one to a running group. It
-  votes and counts towards every quorum, so two full replicas and a witness
-  survive the loss of any one member. The leader sends it entries stripped
-  to their shape and a snapshot of a few hundred bytes. A witness cannot
-  lead, be transferred leadership, or be the source of a state transfer.
-
-  The leader prefers full replicas: a witness's acknowledgement counts
-  towards a commit quorum only while a full voter that lacks the entry has
-  stopped answering, so in a healthy group every committed entry is on every
-  full replica and the witness stands in for a replica that is down, not for
-  one that is slow. `New` refuses a node whose recovered membership disagrees
-  with `Config.Witness`; a full node that applies a membership entry calling
-  it a witness stops with the new `ErrWitnessMismatch`. `GroupStatus` and
-  `PeerProgress` report `Witness`, and the leader balancer never targets one.
-
-  On the wire the witness role is a second bit in the peer role byte; a node
-  on the previous version reads it as a non-voter, so upgrade every node
-  before adding a witness.
+- A proposal's outcome is now reported to `ProposalMetrics` before the call
+  that made it returns, rather than just after. A caller that scraped its
+  metrics the moment `Propose` returned could miss the very proposal it had
+  just made.
 
 ## v1.1.0
 

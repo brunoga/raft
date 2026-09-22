@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // TestParseSegSeq covers the segment-name parser. Names are matched by parsing

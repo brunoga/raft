@@ -36,9 +36,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
-	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
 type peerList []string

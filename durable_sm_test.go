@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // A state machine that is itself a database already has, on its own disk, the

@@ -6,7 +6,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ErrDiskFailure is the error a [FaultStore] returns from every mutating call

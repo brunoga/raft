@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // DefaultSegmentSize is the size at which the active segment is closed and a

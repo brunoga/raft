@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ---- Chaos / fault-injection tests -----------------------------------------

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
 // batchingPair returns a (sender, receiver) pair in multi-Raft mode: the

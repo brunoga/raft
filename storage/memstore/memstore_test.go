@@ -7,8 +7,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 func makeEntries(from, to raft.Index, term raft.Term) []raft.LogEntry {

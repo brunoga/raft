@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/brunoga/raft/examples/ratelimiter/client"
+	"github.com/brunoga/raft/v2/examples/ratelimiter/client"
 )
 
 func Example() {

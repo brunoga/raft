@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // GroupStore is one group's view of the shared log. It implements

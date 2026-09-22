@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // These tests are about the one shape that arrives at storage twice when it

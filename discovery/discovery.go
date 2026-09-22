@@ -38,7 +38,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // PeerInfo identifies a single Raft peer.

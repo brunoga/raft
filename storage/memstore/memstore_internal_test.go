@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 func bigEntries(from, to raft.Index) []raft.LogEntry {

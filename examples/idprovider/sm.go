@@ -8,7 +8,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ErrDomainNotFound is returned by Apply when the target domain does not exist.

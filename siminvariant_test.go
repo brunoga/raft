@@ -35,8 +35,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/internal/simnet"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/internal/simnet"
 )
 
 // entryID is the identity of a log entry: its term and a hash of its command.

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/memstore"
-	"github.com/brunoga/raft/transport/memtransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/memstore"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // These tests are about configurations that are accepted, start cleanly, and

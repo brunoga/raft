@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // stubProvider is a NodeProvider driven entirely by the test.

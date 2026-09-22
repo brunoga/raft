@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
 )
 
 func snapPath(dir string) string    { return filepath.Join(dir, "snap") }

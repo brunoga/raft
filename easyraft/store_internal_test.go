@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // newTestStore builds a Store with all internal structures initialised but no

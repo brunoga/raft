@@ -46,7 +46,7 @@ Additional patterns:
 A high-level Go client is available in the [`client`](./client) package. It handles node discovery (retrying other nodes if one is down), automatic redirects to the leader, and provides a type-safe API for CRUD operations and SSE watches.
 
 ```go
-import "github.com/brunoga/raft/examples/configsvc/client"
+import "github.com/brunoga/raft/v2/examples/configsvc/client"
 
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
 

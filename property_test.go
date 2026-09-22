@@ -17,8 +17,8 @@ import (
 	"testing/quick"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // makeLeaderNode returns a started single-node cluster that has elected

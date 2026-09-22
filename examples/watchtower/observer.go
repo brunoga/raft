@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ---- Turning events into something an operator can act on ------------------

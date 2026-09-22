@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
-	"github.com/brunoga/raft/storage/memstore"
-	"github.com/brunoga/raft/transport/memtransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
+	"github.com/brunoga/raft/v2/storage/memstore"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // tickWhile drives the given nodes in the background until the returned stop

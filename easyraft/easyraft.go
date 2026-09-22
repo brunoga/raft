@@ -3,7 +3,7 @@ package easyraft
 import (
 	"context"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // EasyRaft is a convenience wrapper that binds a [Store] to a single [Collection]

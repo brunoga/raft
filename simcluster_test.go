@@ -32,9 +32,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/internal/simnet"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/internal/simnet"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // simSeed returns the seed for this run: the value of RAFT_SIM_SEED when set,

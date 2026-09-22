@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // TestTracer_ContextReachesTheTransport is the point of giving Tracer a

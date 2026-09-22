@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/brunoga/raft/examples/configsvc/client"
+	"github.com/brunoga/raft/v2/examples/configsvc/client"
 )
 
 func Example() {

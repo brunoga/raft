@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // nodeByID returns the cluster node with the given ID.

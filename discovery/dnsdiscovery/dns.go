@@ -30,8 +30,8 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/discovery"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/discovery"
 )
 
 // Resolver is the DNS lookup interface used by this package.

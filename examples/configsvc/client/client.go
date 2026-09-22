@@ -18,7 +18,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/brunoga/raft/examples/internal/exampleutil"
+	"github.com/brunoga/raft/v2/examples/internal/exampleutil"
 )
 
 // Sentinel errors returned by the client.

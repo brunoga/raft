@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/brunoga/raft/examples/shardkv/client"
+	"github.com/brunoga/raft/v2/examples/shardkv/client"
 )
 
 func Example() {

@@ -54,8 +54,11 @@ func TestREADME_CompleteProgramsCompile(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0o600); err != nil {
 				t.Fatalf("write main.go: %v", err)
 			}
-			goMod := "module readmecheck\n\ngo 1.26\n\nrequire github.com/brunoga/raft v0.0.0\n\n" +
-				"replace github.com/brunoga/raft => " + root + "\n"
+			// A major-version suffix in the path constrains the version that
+			// may be required against it: v0.0.0 is what a replaced module is
+			// usually pinned at, and /v2 refuses it.
+			goMod := "module readmecheck\n\ngo 1.26\n\nrequire github.com/brunoga/raft/v2 v2.0.0\n\n" +
+				"replace github.com/brunoga/raft/v2 => " + root + "\n"
 			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o600); err != nil {
 				t.Fatalf("write go.mod: %v", err)
 			}

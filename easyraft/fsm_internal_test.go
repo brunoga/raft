@@ -3,7 +3,7 @@ package easyraft
 import (
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // storeFSM is what the Raft layer is given, and it has to satisfy the

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // A state machine backed by storage almost always has a way to group work:

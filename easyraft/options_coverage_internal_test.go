@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/discovery"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/discovery"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

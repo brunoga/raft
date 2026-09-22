@@ -17,7 +17,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // MemStore is a strictly in-memory implementation of raft.Storage.

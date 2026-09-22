@@ -28,8 +28,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/brunoga/raft/examples/internal/exampleutil"
-	"github.com/brunoga/raft/examples/ratelimiter/client"
+	"github.com/brunoga/raft/v2/examples/internal/exampleutil"
+	"github.com/brunoga/raft/v2/examples/ratelimiter/client"
 )
 
 func main() {

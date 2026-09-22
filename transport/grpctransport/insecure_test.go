@@ -7,8 +7,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
 // TestListen_RefusesPlaintextByDefault pins that a transport with no TLS

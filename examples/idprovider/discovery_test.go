@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/discovery"
-	"github.com/brunoga/raft/discovery/dnsdiscovery"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/discovery"
+	"github.com/brunoga/raft/v2/discovery/dnsdiscovery"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // ---- helpers ---------------------------------------------------------------

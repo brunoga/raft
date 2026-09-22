@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // Errors reported to the Raft node when the simulator decides an RPC does not

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // A majority says nothing about where the replicas are. Three replicas in one

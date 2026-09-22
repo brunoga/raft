@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // TestApplySnapshotSettings_NeverLeavesThePairInconsistent checks the

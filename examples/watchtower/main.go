@@ -38,10 +38,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/metrics/prommetrics"
-	"github.com/brunoga/raft/storage/filestore"
-	"github.com/brunoga/raft/transport/grpctransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/metrics/prommetrics"
+	"github.com/brunoga/raft/v2/storage/filestore"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
 type peerList []string

@@ -303,7 +303,7 @@ curl -s http://localhost:8001/status | jq
 A high-level Go client is available in the [`client`](./client) package. It handles key hashing (FNV-32a), node discovery, and automatic leader redirection for each shard.
 
 ```go
-import "github.com/brunoga/raft/examples/shardkv/client"
+import "github.com/brunoga/raft/v2/examples/shardkv/client"
 
 // Initialize client with physical node addresses and shard count.
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"}, 4)
