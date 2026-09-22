@@ -627,6 +627,38 @@ one. This is also what makes `RecoverCluster`'s precondition — the node stoppe
 and no other handle open — something the store enforces rather than something
 the documentation asks for.
 
+### `storage/sharedwal` — one log for every group on a host (multi-Raft)
+
+```go
+import "github.com/brunoga/raft/storage/sharedwal"
+
+wal, err := sharedwal.Open("/var/lib/myapp/raft")
+defer wal.Close()
+
+for _, groupID := range groupIDs {
+    cfg := raft.DefaultConfig()
+    cfg.Storage = wal.Storage(groupID)   // raft.Storage, BatchWriter, CommitRecorder
+    // ...
+}
+```
+
+Every group on the host appends to the same write-ahead log, and one goroutine
+writes everything that is waiting and syncs once per batch. A burst of appends
+from a hundred groups costs one `fsync` rather than a hundred, which is what
+makes a write-heavy host with many groups possible on ordinary storage; see
+[Scale boundaries](#scale-boundaries). Records carry their group, every record
+has a checksum, and a torn tail from a crash is cut off on the next open.
+
+Snapshot data lives outside the log in one file per group. Segments are
+deleted once nothing in them is still needed, and the little that keeps an
+old one alive — a group's latest hard state, or a handful of live entries —
+is copied forward so that a quiet group cannot pin old segments for ever.
+
+`Groups()` lists the groups the log holds, which is how a host finds them
+again after a restart; `Remove(groupID)` forgets a decommissioned group. The
+directory is locked like `filestore`'s, and the value `Storage` returns has a
+no-op `Close`: the log is shared, and closing it is `wal.Close`'s job.
+
 ---
 
 ## Transport backends
@@ -971,8 +1003,7 @@ go mgr.RunTicker(ctx, 10*time.Millisecond)
 
 ### Storage partitioning convention
 
-Each group must have its own storage directory to avoid log and snapshot
-collisions:
+Groups must not share a `filestore` directory. Either give each group its own:
 
 ```
 /var/lib/myapp/raft/
@@ -984,6 +1015,15 @@ collisions:
 
 ```go
 store, err := filestore.Open(fmt.Sprintf("/var/lib/myapp/raft/groups/%d", groupID))
+```
+
+or, for many groups on one host, keep them all in one shared log, which is
+what [`storage/sharedwal`](#storagesharedwal--one-log-for-every-group-on-a-host-multi-raft)
+is for:
+
+```go
+wal, err := sharedwal.Open("/var/lib/myapp/raft")
+store := wal.Storage(groupID)
 ```
 
 ### Heartbeat batching
@@ -1043,7 +1083,7 @@ and its README for a fuller discussion of the trade-offs.
 
 **Practical group counts**: at 10–200 groups per node the implementation runs comfortably within both goroutine and I/O budgets on typical SSD hardware. Beyond ~500 actively-writing groups, disk throughput becomes the binding constraint rather than CPU or goroutines.
 
-**fsync amplification (filestore)**: `filestore` issues an `fsync` after every mutating operation on each group's storage. Under write load, G simultaneously-active groups can issue G fsyncs within a single tick window. On a fast NVMe device (≈200 µs per fsync), 500 concurrent fsyncs consume roughly 100 ms of disk time.
+**fsync amplification (filestore)**: `filestore` issues an `fsync` after every mutating operation on each group's storage. Under write load, G simultaneously-active groups can issue G fsyncs within a single tick window. On a fast NVMe device (≈200 µs per fsync), 500 concurrent fsyncs consume roughly 100 ms of disk time. `sharedwal` removes the multiplier: every group on the host appends to one log and a batch of appends costs one `fsync`, whatever the number of groups in it.
 
 What that costs has changed. Every mutating storage call — log entries, truncations, and the term and vote — is carried out by each group's own storage-writer goroutine rather than on its event loop, so a group waiting on its own storage still counts election ticks, still reads its inbound queue, still answers pre-votes, and still replicates the entries it has accepted.
 
@@ -1056,7 +1096,7 @@ A node whose storage falls far enough behind refuses new entries with `ErrWriteB
 Disk throughput is still the binding constraint on write rate, and these remain the ways to spend less of it:
 
 - **Stagger write load**: spread groups so that only a fraction are actively receiving proposals at any instant. Read-heavy or idle groups do not amplify fsyncs.
-- **Use a shared-WAL storage backend**: `Storage` has twelve methods — `SaveHardState`, `LoadHardState`, `AppendLogEntries`, `GetLogEntry`, `GetLogEntries`, `FirstIndex`, `LastIndex`, `TruncateSuffix`, `TruncatePrefix`, `SaveSnapshot`, `LoadSnapshot` and `Close` — and only the four mutating ones need to reach the disk. A production system at very high group counts should replace `filestore` with an implementation that batches writes from multiple groups into a single shared write-ahead log and issues one `fsync` per batch. `filestore` is the reference implementation for correctness and single-group deployments, not for a 1,000-group write-heavy cluster.
+- **Use `storage/sharedwal`**: one write-ahead log for every group on the host, one `fsync` per batch of appends from any number of groups. `filestore` is the reference implementation for correctness and single-group deployments; `sharedwal` is for the 1,000-group write-heavy host.
 - **Use `memstore` for recoverable groups**: groups whose data can be rebuilt from an external source of truth (e.g. a sharded RDBMS) can use `memstore` without durability concerns.
 
 **No inter-group flow control**: all groups share the same gRPC connection(s) to each peer. A group under heavy replication load (large log entries, frequent snapshot installs) can consume a disproportionate share of the shared TCP bandwidth and delay heartbeats from other groups, triggering unnecessary elections. HTTP/2 multiplexing prevents TCP head-of-line blocking, but the library does not implement application-level priority scheduling or bandwidth allocation between groups.
@@ -1238,9 +1278,9 @@ throughout the two-phase transition.
 `TickInterval` is read once in `New()` and converted to tick counts. Changing it
 after `Start()` has no effect.
 
-### fsync amplification with many groups
+### fsync amplification with many groups on `filestore`
 
-When using `filestore` with many simultaneously-active groups, each group issues its own `fsync` on every log append. G concurrent writers produce up to G fsyncs per replication round. On NVMe storage this is usually acceptable up to ~100–200 concurrent writers; on network-attached or spinning storage the accumulated latency spikes will cause election timeouts well below that threshold. For write-heavy deployments above ~200 groups, use a shared-WAL `Storage` implementation that amortises fsyncs across groups. See [Scale boundaries](#scale-boundaries) in the Multi-Raft section.
+When using `filestore` with many simultaneously-active groups, each group issues its own `fsync` on every log append. G concurrent writers produce up to G fsyncs per replication round. On NVMe storage this is usually acceptable up to ~100–200 concurrent writers; on network-attached or spinning storage the accumulated latency spikes will cause election timeouts well below that threshold. Above that, use `storage/sharedwal`, which keeps every group on a host in one log and syncs once per batch. See [Scale boundaries](#scale-boundaries) in the Multi-Raft section.
 
 ### Backpressure has two limits: the write backlog and the proposal queue
 

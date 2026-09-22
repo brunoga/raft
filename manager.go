@@ -50,14 +50,17 @@ type GroupStatus struct {
 //
 // # Storage partitioning convention
 //
-// Every group must have its own isolated storage to avoid log and snapshot
-// collisions. The recommended layout when using filestore is:
+// Groups must not share a filestore directory, since a FileStore keeps one
+// log and one snapshot. Either give each group its own:
 //
 //	<data-dir>/groups/<groupID>/
 //
-// Pass that path to filestore.Open when constructing each Node's Config.
-// The Manager itself does not enforce this convention; it is the caller's
-// responsibility to provide correctly partitioned storage.
+// passing that path to filestore.Open when constructing each Node's Config,
+// or keep every group on the host in one log with storage/sharedwal, whose
+// Storage(groupID) hands out a partitioned view of it and whose single fsync
+// per batch is what a host with many writing groups needs. The Manager itself
+// does not enforce either; it is the caller's responsibility to provide
+// correctly partitioned storage.
 //
 // # Typical usage
 //
