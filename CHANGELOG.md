@@ -4,7 +4,23 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
-## Unreleased
+## v2.1.0
+
+Everything here is additive. A `v2.0.0` deployment upgrades by changing the
+version and nothing else: no import path change, no option that has to be
+passed, no behaviour that was relied on and is now different.
+
+The theme is the batteries `easyraft` was missing. A store could replicate a
+value but not compare-and-swap it, not expire it, not page through it, not
+back it up, and not be talked to from a process that was not part of the
+cluster. It can now do all five. The engine underneath is unchanged except
+for one new accessor.
+
+Three of the fixes below were found by building those features rather than
+by a bug report, which is the most useful thing to say about them: a leaked
+Raft listener, a client that could not outlast a leader election, and a
+group ID that produced a Raft group nothing could ever reach.
+
 
 ### Added
 
