@@ -1116,26 +1116,30 @@ than `ElectionTimeoutMin` relative to peer clocks. Large NTP corrections or VM
 live-migration with unsynchronised clocks can cause stale reads. Use `ReadIndex`
 when strong linearizability is required regardless of clock quality.
 
-### Storage methods check context but cannot interrupt in-progress syscalls
+### A hung fsync stalls this node's writes, not its clock
 
-The filestore checks `ctx.Err()` at the start of every method and between
-write and sync steps. However, once a `file.Sync()` (fsync) syscall has been
-issued, it cannot be interrupted at the OS level. On NFS or network-attached
-block storage, a hung fsync will block the event loop until the OS returns.
-Use local SSDs in production for predictable latency.
+Storage writes run on their own goroutine, so the event loop keeps counting
+election ticks, answering heartbeats and voting while a write is in progress.
+What a slow or hung `fsync` does hold up is everything that depends on that
+write having landed: this node's acknowledgements, the entries it can count
+towards a commit, and — on a leader — the proposals queued behind it, which
+`MaxUnstableLogBytes` bounds. Once an `fsync` syscall has been issued it
+cannot be interrupted, so on NFS or network-attached block storage a hung
+disk holds those writes until the OS returns. Use local SSDs in production
+for predictable latency.
 
 ### Single-node clusters and `CheckQuorum`
 
 In a single-node cluster `Peers` is empty, so `CheckQuorum` is a no-op
 (the leader is always its own quorum). No special configuration is needed.
 
-### `Config.Peers` is a bootstrap value, and is mutated in-place
+### `Config.Peers` is a bootstrap value
 
 Membership is agreed through the log, so it is cluster state rather than
 configuration. On restart it is recovered from the snapshot and the log;
-`Config.Peers` applies only when there is neither. The event loop updates
-`cfg.Peers` as membership changes are applied, so do not read or write it after
-calling `Start()` — use `Members()`.
+`Config.Peers` applies only when there is neither. `New` copies the `Config`
+and the slice, so the caller's values are never written to — but they are also
+never updated. Read the membership the node actually has with `Members()`.
 
 ### A node that cannot write to storage stops
 
