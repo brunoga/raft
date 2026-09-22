@@ -56,20 +56,30 @@ func (n *Node) handleReadIndex(msg readIndexMsg) {
 		return
 	}
 
-	// Single-node cluster: we are the only member, so we are trivially the
-	// leader and there is no previous leader that could have committed entries
-	// we have not yet accounted for; resolve immediately.
-	if n.isSingleVoter() {
-		msg.resolver.resolve(n.commitIndex)
-		return
-	}
-
 	// Raft §8: a leader must not serve reads until it has committed at least
 	// one entry in its own term (the no-op). Until then, commitIndex may not
 	// reflect all entries committed by the previous leader. Queue the request;
 	// it will be dispatched by maybeAdvanceCommit when the nop commits.
+	//
+	// A single voter is not exempt, though it reads as though it should be:
+	// it is the whole cluster, so what could it be behind? Itself, in an
+	// earlier term. The commit index is not persisted -- a restarting node
+	// learns it again from its leader, and a single-node cluster's leader is
+	// itself -- so it starts at zero with a log full of entries that
+	// certainly did commit. Answering from it before the no-op lands reports
+	// a state machine that is empty, to a caller who wrote to it before the
+	// restart. That is the linearizability violation this check exists to
+	// prevent, and the one node case is where it is easiest to hit.
 	if !n.leaderNopCommitted {
 		n.pendingReads = append(n.pendingReads, msg.resolver)
+		return
+	}
+
+	// With the no-op committed, a single voter's commit index accounts for
+	// everything: there is nobody to confirm leadership with, because there
+	// is nobody who could have taken it.
+	if n.isSingleVoter() {
+		msg.resolver.resolve(n.commitIndex)
 		return
 	}
 
@@ -110,6 +120,13 @@ func (n *Node) startReadBatch() {
 	n.readBatchGen++
 	n.readBatchAcks = make(map[NodeID]bool)
 	n.readBatchIndex = n.commitIndex
+	// A single voter has nobody to ask. Waiting for acknowledgements that
+	// cannot arrive would hold every read queued behind the no-op for ever,
+	// which is what queueing them in the first place would otherwise cost.
+	if n.isSingleVoter() {
+		n.confirmReadBatch()
+		return
+	}
 	n.broadcastReadBarrier()
 }
 
