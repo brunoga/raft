@@ -682,6 +682,22 @@ if err != nil {
 
 When no `WithLogger` is set, easyraft logs through `slog.Default()` rather than staying silent, so serve-time failures are still reported.
 
+### Shutting down on a deadline
+
+`Stop` finishes what it started: storage writes the node already accepted are carried out rather than abandoned, which is what makes an orderly restart keep the tail of its log instead of fetching it back from a peer, and a departure under `WithLeaveOnStop` is waited for. A disk that has hung rather than failed, or a leader that cannot be reached to accept the departure, holds it there.
+
+A process that has to come down on a deadline uses `Shutdown` instead:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := store.Shutdown(ctx); err != nil {
+    log.Printf("shutdown did not finish in time: %v", err)
+}
+```
+
+Giving up does not cancel the shutdown — it carries on in the background, so the store is then neither running nor finished and its data directory must not be reopened by another process. `Manager.Shutdown` is the same for a manager.
+
 ### What `Start` and `Stop` report
 
 `Store.Start`, `EasyRaft.Start`, `Manager.Start`, and their `Stop` counterparts all return an `error`. Handle it — a node that did not join the cluster it was pointed at is the difference between "my process started" and "my process is part of the cluster", and an application needs to tell those apart to fail its own startup, retry, or report unreadiness to an orchestrator.

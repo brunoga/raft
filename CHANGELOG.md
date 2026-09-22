@@ -23,6 +23,11 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   - **`WithMaxClientTableSize`**, with `Store.MaxClientTableSize` and
     `Store.SetMaxClientTableSize` for the bound the group has agreed.
   - **`WithLeaseSafetyMargin`**, `WithProposalQueue` and `WithOnRemoved`.
+  - **`Store.Shutdown(ctx)` and `Manager.Shutdown(ctx)`**, which stop like
+    `Stop` but give up waiting when the context is done. `Stop` finishes
+    what it started -- accepted storage writes, and a departure under
+    `WithLeaveOnStop` -- and a hung disk or an unreachable leader holds it
+    there, which a process coming down on a deadline cannot afford.
   - **`WithSharedWAL`** puts every group on a `Manager` onto one
     write-ahead log rather than one per group, so a burst of appends across
     groups costs one `fsync` instead of one each.

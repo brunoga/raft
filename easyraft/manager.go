@@ -316,6 +316,33 @@ func (m *Manager) Start() error {
 // Stopping the Raft nodes and closing each group's storage go through the
 // stores themselves, so a group that was already shut down individually is not
 // torn down twice.
+// Shutdown stops the manager like [Manager.Stop], but gives up waiting when ctx is
+// done and returns ctx.Err().
+//
+// It exists because [Manager.Stop] finishes what it has started: storage writes the
+// node already accepted are carried out rather than abandoned, which is what
+// makes an orderly restart keep the tail of its log instead of fetching it
+// back from a peer, and a departure under [WithLeaveOnStop] is waited for.
+// A disk that has hung rather than failed, or a leader that cannot be reached
+// to accept the departure, holds [Manager.Stop] there. A process that has to come
+// down on a deadline needs a way to say so.
+//
+// Giving up does not cancel the shutdown. It carries on in the background, so
+// the manager is then neither running nor finished, and its data directory
+// must not be reopened by another process. Prefer [Manager.Stop] where there is no
+// deadline to meet.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() { done <- m.Stop() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		m.logger().Warn("easyraft: shutdown deadline passed; the manager is still stopping")
+		return ctx.Err()
+	}
+}
+
 func (m *Manager) Stop() error {
 	m.cancel()
 
