@@ -23,6 +23,11 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   - **`WithMaxClientTableSize`**, with `Store.MaxClientTableSize` and
     `Store.SetMaxClientTableSize` for the bound the group has agreed.
   - **`WithLeaseSafetyMargin`**, `WithProposalQueue` and `WithOnRemoved`.
+  - **`WithSharedWAL`** puts every group on a `Manager` onto one
+    write-ahead log rather than one per group, so a burst of appends across
+    groups costs one `fsync` instead of one each.
+    `Manager.SharedWAL()` exposes the log itself, whose `Groups` is how a
+    host finds its groups again after a restart.
   - **`Store.Events`**, the stream of what the node does: leadership
     changes, peers arriving and leaving, snapshots, a client dropped from
     the exactly-once table, a durable write that failed.
@@ -41,6 +46,11 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   a node that is the whole cluster has nobody to confirm with. Found
   through easyraft, where several groups sharing one write-ahead log made
   the window wide enough to hit.
+
+- Every setting easyraft added to a `Store`'s Raft configuration was missing
+  from the `Manager`'s, which assembled its own copy. The two now go through
+  one function, so a knob cannot exist for one kind of deployment and
+  silently do nothing for the other.
 
 - `easyraft.WithTLS` authenticated the connection and then trusted whatever
   the peer claimed to be. Every Raft RPC names the node it comes from, and

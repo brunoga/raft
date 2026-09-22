@@ -77,6 +77,11 @@ type config struct {
 	// [WithWitness].
 	Witness bool
 
+	// SharedWAL makes every group on a Manager share one write-ahead log at
+	// the Manager's DataDir. Set via [WithSharedWAL]; ignored by a plain
+	// Store, which has only one group to write for.
+	SharedWAL bool
+
 	// Witnesses names the peers from [WithPeers] that are witnesses, so that
 	// this node's view of the bootstrap membership matches theirs. Set via
 	// [WithWitnessPeers].
@@ -428,6 +433,26 @@ func WithJoinAsLearner() Option {
 // attempt is abandoned after 5 seconds.
 func WithLeaveOnStop() Option {
 	return func(c *config) { c.LeaveOnStop = true }
+}
+
+// WithSharedWAL makes every group on a [Manager] append to one write-ahead
+// log instead of one per group. It is a Manager-level option and the log
+// lives at the Manager's [WithDataDir]; a plain [Store] ignores it, having
+// only one group to write for.
+//
+// With a log per group, G groups appending at once issue G fsyncs, and fsync
+// is the expensive part: it is what makes disk throughput rather than CPU the
+// limit on how many writing groups a host can carry. One log, synced once per
+// batch, gives every group in that batch the same durability for one fsync.
+//
+// It also means a Manager can find its groups again. `Manager.SharedWAL().Groups()`
+// lists what the log holds, which is what a host that runs a changing set of
+// groups needs after a restart, and `Remove` forgets a group that has been
+// decommissioned so its space can be reclaimed.
+//
+// With it, per-group [WithDataDir] is neither needed nor used.
+func WithSharedWAL() Option {
+	return func(c *config) { c.SharedWAL = true }
 }
 
 // WithWitness makes this node a witness: a voter that keeps the index and

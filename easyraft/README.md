@@ -392,6 +392,34 @@ defer func() {
 
 ---
 
+### One log for every group
+
+With a data directory per group, G groups appending at once issue G fsyncs, and fsync is the expensive part — it is what makes disk throughput rather than CPU the limit on how many writing groups a host can carry. `WithSharedWAL` puts every group on one write-ahead log, synced once per batch:
+
+```go
+mgr, _ := easyraft.NewManager(
+    easyraft.WithID("n1"),
+    easyraft.WithRaftAddr("10.0.0.1:7001"),
+    easyraft.WithDataDir("/var/lib/raft"),   // the log lives here
+    easyraft.WithSharedWAL(),
+)
+
+// No per-group WithDataDir: each group is a partition of the one log.
+s1, _ := mgr.AddStore(1)
+s2, _ := mgr.AddStore(2)
+```
+
+`Manager.SharedWAL()` is the handle for what only the log knows:
+
+```go
+wal := mgr.SharedWAL()
+wal.Groups()        // which groups the log holds — how a host finds them after a restart
+wal.Remove(7)       // forget a decommissioned group so its space can be reclaimed
+wal.Reclaim()       // run that reclamation now rather than after the next compaction
+```
+
+Removing a store from the Manager deliberately does **not** remove its log: a group taken off a host is usually coming back.
+
 ## Joining a running cluster
 
 `WithJoinAddr` lets a new node join an existing cluster by contacting a seed node over HTTP, instead of configuring every node with the full peer list up-front. The seed calls `AddServer` on behalf of the joiner and returns the current peer list so the new node can bootstrap its transport.

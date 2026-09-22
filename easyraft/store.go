@@ -664,6 +664,48 @@ func (s *Store) Txn(ctx context.Context, fn func(tx *Txn) error) (TxnResults, er
 	return results, nil
 }
 
+// raftConfig turns this store's configuration into the engine's, which is
+// the one place that mapping happens.
+//
+// Both ways of building a store go through it -- one node with its own
+// transport, and one group of many sharing a manager's -- and when they each
+// did it themselves the manager's copy quietly fell behind by every field
+// added to the other. A setting that exists and does nothing is worse than
+// one that does not exist.
+func (s *Store) raftConfig(peers []raft.PeerConfig, tr raft.Transport, st raft.Storage) raft.Config {
+	cfg := raft.DefaultConfig()
+	cfg.ID = s.cfg.ID
+	cfg.Peers = peers
+	cfg.Transport = tr
+	cfg.Storage = st
+	// A witness applies nothing, so it is given no state machine: the engine
+	// installs one that discards what it is handed, and this store's
+	// collections stay empty by construction rather than by accident. Reads
+	// against them report ErrWitness rather than an empty answer.
+	if !s.cfg.Witness {
+		cfg.StateMachine = storeFSM{s: s}
+	}
+	cfg.Witness = s.cfg.Witness
+	cfg.CommitQuorum = s.cfg.CommitQuorum
+	cfg.Zones = s.cfg.Zones
+	cfg.MinCommitZones = s.cfg.MinCommitZones
+	cfg.PreferredLeader = s.cfg.PreferredLeader
+	cfg.LeaseSafetyMargin = s.cfg.LeaseSafetyMargin
+	cfg.ProposalQueueSize = s.cfg.ProposalQueueSize
+	cfg.ProposalOverflow = s.cfg.ProposalOverflow
+	cfg.OnRemoved = s.cfg.OnRemoved
+	if s.cfg.MaxClientTableSize > 0 {
+		cfg.MaxClientTableSize = s.cfg.MaxClientTableSize
+	}
+	cfg.Logger = s.cfg.Logger
+	cfg.TickInterval = s.raftTickInterval()
+	cfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
+	cfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
+	cfg.HeartbeatInterval = s.raftHeartbeatInterval()
+	applySnapshotSettings(&cfg, s.cfg.SnapCount)
+	return cfg
+}
+
 func (s *Store) initRaft() error {
 	// 1. Storage
 	// filestore.Open creates the directory itself, and makes the creation
@@ -698,36 +740,7 @@ func (s *Store) initRaft() error {
 	}
 
 	// 3. Raft config
-	rCfg := raft.DefaultConfig()
-	rCfg.ID = s.cfg.ID
-	rCfg.Peers = peerConfigs
-	rCfg.Transport = tr
-	rCfg.Storage = st
-	// A witness applies nothing, so it is given no state machine: the engine
-	// installs one that discards what it is handed, and this store's
-	// collections stay empty by construction rather than by accident. Reads
-	// against them report ErrWitness rather than an empty answer.
-	if !s.cfg.Witness {
-		rCfg.StateMachine = storeFSM{s: s}
-	}
-	rCfg.Witness = s.cfg.Witness
-	rCfg.CommitQuorum = s.cfg.CommitQuorum
-	rCfg.Zones = s.cfg.Zones
-	rCfg.MinCommitZones = s.cfg.MinCommitZones
-	rCfg.PreferredLeader = s.cfg.PreferredLeader
-	rCfg.LeaseSafetyMargin = s.cfg.LeaseSafetyMargin
-	rCfg.ProposalQueueSize = s.cfg.ProposalQueueSize
-	rCfg.ProposalOverflow = s.cfg.ProposalOverflow
-	rCfg.OnRemoved = s.cfg.OnRemoved
-	if s.cfg.MaxClientTableSize > 0 {
-		rCfg.MaxClientTableSize = s.cfg.MaxClientTableSize
-	}
-	rCfg.Logger = s.cfg.Logger
-	rCfg.TickInterval = s.raftTickInterval()
-	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
-	rCfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
-	rCfg.HeartbeatInterval = s.raftHeartbeatInterval()
-	applySnapshotSettings(&rCfg, s.cfg.SnapCount)
+	rCfg := s.raftConfig(peerConfigs, tr, st)
 
 	// 4. Metrics — must be set before raft.New so the node is constructed with metrics wired in.
 	if s.cfg.PromRegisterer != nil {
