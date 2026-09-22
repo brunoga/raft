@@ -6,6 +6,27 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ## Unreleased
 
+### Added
+
+- easyraft can reach the batteries v2 added to the engine. Every one of them
+  was unreachable through the high-level layer, which is the layer most
+  services use.
+
+  - **Witnesses.** `WithWitness` builds one, `WithWitnessPeers` tells the
+    full replicas which member it is, and `Store.AddWitness` brings one into
+    a running cluster. A witness holds no data, so reads against it return
+    the new `ErrWitness` rather than the empty answer its collections would
+    otherwise give.
+  - **Quorum and placement.** `WithCommitQuorum`, `WithZones`,
+    `WithPreferredLeader`, and `Store.CommitQuorum` /
+    `Store.SetCommitQuorum` for the policy a running group has agreed.
+  - **`WithMaxClientTableSize`**, with `Store.MaxClientTableSize` and
+    `Store.SetMaxClientTableSize` for the bound the group has agreed.
+  - **`WithLeaseSafetyMargin`**, `WithProposalQueue` and `WithOnRemoved`.
+  - **`Store.Events`**, the stream of what the node does: leadership
+    changes, peers arriving and leaving, snapshots, a client dropped from
+    the exactly-once table, a durable write that failed.
+
 ### Fixed
 
 - `easyraft.WithTLS` authenticated the connection and then trusted whatever

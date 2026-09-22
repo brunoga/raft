@@ -495,6 +495,82 @@ err := er.TransferLeadership(ctx, "n2")
 
 ---
 
+## Witnesses
+
+A witness votes and counts towards every quorum, keeps the shape of the log, and holds none of the data. Two full replicas and a witness survive the loss of any one member, at a third of the storage and none of the state machine a third full replica would cost — a small machine in a third location whose job is to break ties.
+
+```go
+// On the witness itself.
+w, _ := easyraft.NewStore(
+    easyraft.WithID("w1"),
+    easyraft.WithRaftAddr("10.0.2.9:7001"),
+    easyraft.WithDataDir("/var/lib/w1"),
+    easyraft.WithPeers(peers),
+    easyraft.WithWitnessPeers("w1"),
+    easyraft.WithWitness(),
+    // ...
+)
+
+// On every full replica, so that their view of the membership matches.
+easyraft.WithWitnessPeers("w1")
+
+// Or add one to a running cluster, from the leader.
+err := store.AddWitness(ctx, "w1", "10.0.2.9:7001")
+```
+
+A witness holds no data, so every read against it returns `ErrWitness` rather than the empty answer its collections would otherwise give — reporting "not found" for a key the cluster holds would be worse than refusing. It never becomes leader, so writes against it are refused with the leader to redirect to, exactly as on any follower. Membership, status, health, joining and discovery all work as usual.
+
+## Quorum, placement and timing
+
+The knobs that decide how many replicas a write must reach, and where those replicas must be:
+
+```go
+// Writes must reach every voter before they are acknowledged; elections are
+// unchanged. Group state, so this is only what the group is created with —
+// change a running one with store.SetCommitQuorum(ctx, n).
+easyraft.WithCommitQuorum(3)
+
+// An acknowledged write must be in two failure domains, not just on a
+// majority of machines that might all be in one.
+easyraft.WithZones(map[raft.NodeID]raft.ZoneID{
+    "n1": "eu-west-1a", "n2": "eu-west-1a", "n3": "eu-west-1b",
+}, 2)
+
+// Keep leadership beside the clients that write to it.
+easyraft.WithPreferredLeader("n1")
+
+// Bound what a lease read assumes about clocks (see WithLeaseReads).
+easyraft.WithLeaseSafetyMargin(15 * time.Millisecond)
+
+// Shed writes rather than queue them without limit when the event loop is
+// behind; the default waits.
+easyraft.WithProposalQueue(1024, raft.ProposalOverflowReject)
+
+// Size the exactly-once table behind Session. Group state, like the commit
+// quorum: store.SetMaxClientTableSize(ctx, n) changes a running group.
+easyraft.WithMaxClientTableSize(100_000)
+```
+
+## Reacting to what the node does
+
+```go
+// Called once, from its own goroutine, when a committed change removes this
+// node. It is not stopped for you — that decision is yours, and this is
+// where it goes.
+easyraft.WithOnRemoved(func() { _ = store.Stop() })
+
+// Everything the node does: leadership changes, peers arriving and leaving,
+// snapshots, a client dropped from the exactly-once table, a durable write
+// that failed. Bounded and lossy; Event.Dropped says how many were missed.
+events, stop := store.Events()
+defer stop()
+for ev := range events {
+    log.Printf("%s: %+v", ev.Type, ev)
+}
+```
+
+Subscribe before `Start` if you need the first leadership change: the stream carries what happens after a subscription, not what happened before it.
+
 ## Discovery
 
 When `WithDiscovery` is configured, EasyRaft polls the discovery source periodically and:
@@ -861,6 +937,16 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithSnapCount(n)` | Log entries between automatic snapshots (default 1000) |
 | `WithLogger(logger)` | Custom `*slog.Logger` |
 | `WithTLS(tlsConfig)` | TLS for the gRPC transport (not the HTTP API — see `WithHTTPTLS`) |
+| `WithPeerAuthorizer(fn)` | Bind the node ID a Raft RPC claims to the certificate that carried it |
+| `WithWitness()` | This node votes and holds no data |
+| `WithWitnessPeers(ids...)` | Which peers from `WithPeers` are witnesses |
+| `WithCommitQuorum(n)` | Voters a write must reach to commit; `0` is a majority |
+| `WithZones(zones, n)` | Failure domains, and how many a write must reach |
+| `WithPreferredLeader(id)` | Node that should hold leadership when possible |
+| `WithMaxClientTableSize(n)` | Bound on the exactly-once table behind `Session` |
+| `WithLeaseSafetyMargin(d)` | What a lease read may assume about clocks |
+| `WithProposalQueue(size, policy)` | Writes that may wait, and what happens to the next one |
+| `WithOnRemoved(fn)` | Called when a committed change removes this node |
 | `WithInsecureTransportAcknowledged()` | Run the gRPC transport in plaintext, on purpose; without this or `WithTLS` the node refuses to start |
 | `WithPrometheus(registerer)` | Enable Prometheus metrics |
 | `WithRaftTiming(tick, heartbeat, electionMin, electionMax)` | Override Raft timing (easyraft defaults: 100 ms tick/heartbeat, 1–2 s election) |
