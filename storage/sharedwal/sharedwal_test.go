@@ -221,7 +221,7 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 	}
 	// A newer one replaces it and the old file goes.
 	meta2 := raft.SnapshotMeta{LastIncludedIndex: 80, LastIncludedTerm: 3}
-	if err := s.SaveSnapshot(ctx, meta2, bytes.NewReader([]byte("v2"))); err != nil {
+	if err = s.SaveSnapshot(ctx, meta2, bytes.NewReader([]byte("v2"))); err != nil {
 		t.Fatal(err)
 	}
 	got, rc, err = s.LoadSnapshot(ctx)
@@ -243,7 +243,7 @@ func TestSnapshot_RoundTrip(t *testing.T) {
 	}
 	// An empty snapshot is a valid one.
 	meta3 := raft.SnapshotMeta{LastIncludedIndex: 90, LastIncludedTerm: 3}
-	if err := s.SaveSnapshot(ctx, meta3, bytes.NewReader(nil)); err != nil {
+	if err = s.SaveSnapshot(ctx, meta3, bytes.NewReader(nil)); err != nil {
 		t.Fatal(err)
 	}
 	_, rc, err = s.LoadSnapshot(ctx)
@@ -283,10 +283,7 @@ func TestSnapshot_CorruptionIsDetected(t *testing.T) {
 
 func TestRestart_RecoversEveryGroup(t *testing.T) {
 	dir := t.TempDir()
-	w, err := sharedwal.Open(dir, sharedwal.WithSegmentSize(4096))
-	if err != nil {
-		t.Fatal(err)
-	}
+	w := mustOpen(t, dir, sharedwal.WithSegmentSize(4096))
 	a, b := w.Storage(1), w.Storage(2)
 	if err := a.SaveState(ctx, &raft.HardState{CurrentTerm: 4, VotedFor: "x"}, entries(1, 50, 1)); err != nil {
 		t.Fatal(err)

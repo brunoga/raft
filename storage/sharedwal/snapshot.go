@@ -53,7 +53,7 @@ func writeSnapshotFile(dir string, group uint64, meta raft.SnapshotMeta, r io.Re
 	copy(hdr[:4], snapMagic[:])
 	binary.LittleEndian.PutUint64(hdr[4:12], uint64(meta.LastIncludedIndex))
 	binary.LittleEndian.PutUint64(hdr[12:20], uint64(meta.LastIncludedTerm))
-	if _, err := f.Write(hdr[:]); err != nil {
+	if _, err = f.Write(hdr[:]); err != nil {
 		return fail(fmt.Errorf("sharedwal: write snapshot header: %w", err))
 	}
 	h := crc32.New(crcTable)

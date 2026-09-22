@@ -49,11 +49,6 @@ func appendRecord(buf []byte, group uint64, kind byte, body []byte) []byte {
 	return buf
 }
 
-// recordSize returns the on-disk size of a record with a body of bodyLen.
-func recordSize(bodyLen int) int64 {
-	return int64(recordHeaderSize + bodyLen)
-}
-
 // parsedRecord is one record read back from a segment.
 type parsedRecord struct {
 	group uint64
