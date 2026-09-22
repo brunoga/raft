@@ -72,6 +72,50 @@ type config struct {
 	// [WithInsecureTransportAcknowledged].
 	AcknowledgeInsecureTransport bool
 
+	// Witness makes this node a witness: it votes and counts towards every
+	// quorum, keeps the shape of the log, and holds none of the data. Set via
+	// [WithWitness].
+	Witness bool
+
+	// Witnesses names the peers from [WithPeers] that are witnesses, so that
+	// this node's view of the bootstrap membership matches theirs. Set via
+	// [WithWitnessPeers].
+	Witnesses map[raft.NodeID]bool
+
+	// CommitQuorum is how many voters an entry must reach to commit, 0
+	// meaning a majority. It is only what a group is created with; see
+	// [WithCommitQuorum].
+	CommitQuorum int
+
+	// MinCommitZones is how many distinct zones an entry must reach before it
+	// counts as committed, and Zones says which zone each node is in. Set via
+	// [WithZones].
+	Zones          map[raft.NodeID]raft.ZoneID
+	MinCommitZones int
+
+	// PreferredLeader is the node that should hold leadership whenever
+	// possible. Set via [WithPreferredLeader].
+	PreferredLeader raft.NodeID
+
+	// MaxClientTableSize bounds the exactly-once table behind [Session]. Set
+	// via [WithMaxClientTableSize].
+	MaxClientTableSize int
+
+	// LeaseSafetyMargin shortens the read lease and bounds what it assumes
+	// about clocks. Set via [WithLeaseSafetyMargin].
+	LeaseSafetyMargin time.Duration
+
+	// ProposalQueueSize and ProposalOverflow govern how many writes may wait
+	// for the event loop and what happens to the next one. Set via
+	// [WithProposalQueue].
+	ProposalQueueSize int
+	ProposalOverflow  raft.ProposalOverflowPolicy
+
+	// OnRemoved is called once, from its own goroutine, when a committed
+	// configuration change removes this node from the cluster. Set via
+	// [WithOnRemoved].
+	OnRemoved func()
+
 	// PeerAuthorizer decides whether the node a Raft RPC claims to come from
 	// is the node that sent it. Set via [WithPeerAuthorizer]; left nil, a
 	// configuration whose TLS requires and verifies client certificates gets
@@ -384,6 +428,148 @@ func WithJoinAsLearner() Option {
 // attempt is abandoned after 5 seconds.
 func WithLeaveOnStop() Option {
 	return func(c *config) { c.LeaveOnStop = true }
+}
+
+// WithWitness makes this node a witness: a voter that keeps the index and
+// term of every log entry, never the entries themselves, and applies nothing
+// (Raft dissertation §11.7.2).
+//
+// It votes and counts towards every quorum like any voter, so two full
+// replicas and a witness survive the loss of any one member at a third of the
+// storage and none of the state machine a third full replica would cost -- a
+// small machine in a third location whose job is to break ties.
+//
+// A witness holds no data, so reads against it return [ErrWitness] rather
+// than the empty answer its collections would otherwise give. It cannot
+// become leader, so writes against it are refused with the leader's address
+// to redirect to, exactly as on any follower. Everything else -- membership,
+// status, health, joining, discovery -- works as usual.
+//
+// Every other node's view of this one must agree: the peer entry that names
+// it, whether from [WithPeers] at bootstrap or from [Store.AddWitness], has
+// to say witness too. A node whose recovered membership disagrees refuses to
+// start.
+func WithWitness() Option {
+	return func(c *config) { c.Witness = true }
+}
+
+// WithWitnessPeers names the peers from [WithPeers] that are witnesses.
+//
+// Membership is agreed state, and every node's view of it has to match: a
+// peer this node thinks is a full replica but which was built with
+// [WithWitness] would be counted on to hold entries it discards. A node whose
+// recovered membership disagrees with what it is refuses to start, so the
+// mismatch surfaces at the first restart rather than at the first failure.
+//
+// Only needed at bootstrap. A witness added to a running cluster through
+// [Store.AddWitness] is recorded in the log, and nodes that join later learn
+// it from there.
+func WithWitnessPeers(ids ...raft.NodeID) Option {
+	return func(c *config) {
+		if c.Witnesses == nil {
+			c.Witnesses = make(map[raft.NodeID]bool, len(ids))
+		}
+		for _, id := range ids {
+			c.Witnesses[id] = true
+		}
+	}
+}
+
+// WithCommitQuorum sets how many voters an entry must reach to commit, 0
+// meaning a simple majority. The election quorum follows from it, as
+// voters - quorum + 1 or a majority, whichever is larger.
+//
+// This is only what a group is *created* with. The policy is group state,
+// agreed through the log like membership, so the first leader writes this
+// value into the log and from then on every node counts by the agreed value
+// whatever its own configuration says. Change a running group with
+// [Store.SetCommitQuorum].
+func WithCommitQuorum(quorum int) Option {
+	return func(c *config) { c.CommitQuorum = quorum }
+}
+
+// WithZones records which failure domain each node sits in and how many of
+// them an entry must reach before it counts as committed.
+//
+// A majority says nothing about where the replicas are: three replicas in one
+// availability zone are a quorum, and losing that zone loses every write they
+// acknowledged. Requiring two zones means an acknowledged write is on
+// hardware in two failure domains before anyone is told it succeeded. The
+// cost is liveness, and it is the point: if the second zone is unreachable,
+// nothing commits.
+//
+// A node absent from the map is in no known zone and does not count towards
+// the spread. The map is local to this node and never replicated; give the
+// same one to every node that might lead.
+func WithZones(zones map[raft.NodeID]raft.ZoneID, minCommitZones int) Option {
+	return func(c *config) {
+		c.Zones = zones
+		c.MinCommitZones = minCommitZones
+	}
+}
+
+// WithPreferredLeader names the node that should hold leadership whenever
+// possible. A node that wins an election without being the preferred one
+// hands leadership over as soon as it is safe to.
+//
+// Useful for heterogeneous hardware, or for keeping the leader beside the
+// clients that write to it.
+func WithPreferredLeader(id raft.NodeID) Option {
+	return func(c *config) { c.PreferredLeader = id }
+}
+
+// WithMaxClientTableSize bounds the exactly-once table that [Session] and the
+// Once methods rely on, in entries. A client that retries after its entry has
+// been evicted has its request executed a second time, so size it to outlive
+// the retry window of the slowest client.
+//
+// The bound is group state, agreed through the log and carried in snapshots,
+// so this is what a group is created with rather than what each node uses;
+// change a running group with [Store.SetMaxClientTableSize].
+func WithMaxClientTableSize(entries int) Option {
+	return func(c *config) { c.MaxClientTableSize = entries }
+}
+
+// WithLeaseSafetyMargin shortens the read lease behind [WithLeaseReads] and
+// sets how far the wall clock and the monotonic clock may disagree before the
+// lease is treated as expired.
+//
+// A lease read is served without contacting any follower, on the argument
+// that none of them can have elected another leader yet. The margin is taken
+// off the lease to cover clock rates that differ between machines, and is the
+// tolerance beyond which wall-clock time running ahead of monotonic time --
+// which is what a paused or live-migrated virtual machine looks like on
+// resume -- drops the lease rather than serving from it.
+//
+// Zero keeps the whole election timeout as the lease and skips the divergence
+// check. The default is a tenth of the election timeout.
+func WithLeaseSafetyMargin(d time.Duration) Option {
+	return func(c *config) { c.LeaseSafetyMargin = d }
+}
+
+// WithProposalQueue sets how many writes may wait for the Raft event loop at
+// once, and what happens to the next one when that many already are.
+//
+// [raft.ProposalOverflowWait], the default, blocks until there is room or the
+// caller's context is done. [raft.ProposalOverflowReject] returns
+// [raft.ErrProposalQueueFull] at once, for a service that would rather shed a
+// request than hold a goroutine on it. A size of 0 keeps the default.
+func WithProposalQueue(size int, overflow raft.ProposalOverflowPolicy) Option {
+	return func(c *config) {
+		c.ProposalQueueSize = size
+		c.ProposalOverflow = overflow
+	}
+}
+
+// WithOnRemoved registers a callback invoked once, from its own goroutine,
+// when a committed configuration change removes this node from the cluster.
+//
+// A removed node is not stopped: it goes on running as a non-voting follower
+// that nobody replicates to, so that whatever owns it can decide what to do
+// -- shut it down, wipe its data directory, keep it for inspection. This is
+// where that decision goes, and it may call [Store.Stop].
+func WithOnRemoved(fn func()) Option {
+	return func(c *config) { c.OnRemoved = fn }
 }
 
 // WithPeerAuthorizer decides whether the node a Raft RPC claims to come from

@@ -108,6 +108,12 @@ var (
 	// collection.
 	ErrKeyExists = errors.New("easyraft: key already exists")
 
+	// ErrWitness is returned by every read against a store built with
+	// [WithWitness]. A witness votes and holds no data, so its collections
+	// are empty by construction; answering a read from them would report
+	// "not found" for a key the cluster holds.
+	ErrWitness = errors.New("easyraft: this node is a witness and holds no data")
+
 	// ErrNotLeader is an alias for [raft.ErrNotLeader]. It is returned by any
 	// write or linearizable-read operation when this node is not the current
 	// Raft leader. The HTTP layer translates this into a 307 redirect (if the
@@ -684,7 +690,9 @@ func (s *Store) initRaft() error {
 	for id, addr := range s.cfg.Peers {
 		if id != s.cfg.ID {
 			tr.AddPeer(id, addr)
-			peerConfigs = append(peerConfigs, raft.PeerConfig{ID: id, Voter: true})
+			peerConfigs = append(peerConfigs, raft.PeerConfig{
+				ID: id, Voter: true, Witness: s.cfg.Witnesses[id],
+			})
 			s.raftPeers[id] = raftPeerInfo{addr: addr, voter: true}
 		}
 	}
@@ -695,7 +703,25 @@ func (s *Store) initRaft() error {
 	rCfg.Peers = peerConfigs
 	rCfg.Transport = tr
 	rCfg.Storage = st
-	rCfg.StateMachine = storeFSM{s: s}
+	// A witness applies nothing, so it is given no state machine: the engine
+	// installs one that discards what it is handed, and this store's
+	// collections stay empty by construction rather than by accident. Reads
+	// against them report ErrWitness rather than an empty answer.
+	if !s.cfg.Witness {
+		rCfg.StateMachine = storeFSM{s: s}
+	}
+	rCfg.Witness = s.cfg.Witness
+	rCfg.CommitQuorum = s.cfg.CommitQuorum
+	rCfg.Zones = s.cfg.Zones
+	rCfg.MinCommitZones = s.cfg.MinCommitZones
+	rCfg.PreferredLeader = s.cfg.PreferredLeader
+	rCfg.LeaseSafetyMargin = s.cfg.LeaseSafetyMargin
+	rCfg.ProposalQueueSize = s.cfg.ProposalQueueSize
+	rCfg.ProposalOverflow = s.cfg.ProposalOverflow
+	rCfg.OnRemoved = s.cfg.OnRemoved
+	if s.cfg.MaxClientTableSize > 0 {
+		rCfg.MaxClientTableSize = s.cfg.MaxClientTableSize
+	}
 	rCfg.Logger = s.cfg.Logger
 	rCfg.TickInterval = s.raftTickInterval()
 	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
@@ -1644,6 +1670,9 @@ func (c *Collection[T]) MutateOnce(ctx context.Context, clientID raft.NodeID, se
 // Returns [ErrNotLeader] if this node cannot reach the leader.
 func (c *Collection[T]) Read(ctx context.Context, key string) (T, error) {
 	var empty T
+	if c.store.cfg.Witness {
+		return empty, ErrWitness
+	}
 	if c.store.node == nil {
 		return empty, fmt.Errorf("easyraft: node not started")
 	}
@@ -1660,6 +1689,9 @@ func (c *Collection[T]) Read(ctx context.Context, key string) (T, error) {
 // Returns [ErrKeyNotFound] if the key does not exist locally.
 func (c *Collection[T]) ReadStale(key string) (T, error) {
 	var val T
+	if c.store.cfg.Witness {
+		return val, ErrWitness
+	}
 	c.store.mu.RLock()
 	defer c.store.mu.RUnlock()
 
@@ -1682,6 +1714,9 @@ func (c *Collection[T]) ReadStale(key string) (T, error) {
 // without a leader round-trip. The result may be stale by up to one heartbeat.
 // Returns an empty map (not nil) if the collection has no items.
 func (c *Collection[T]) ListStale() (map[string]T, error) {
+	if c.store.cfg.Witness {
+		return nil, ErrWitness
+	}
 	c.store.mu.RLock()
 	defer c.store.mu.RUnlock()
 	return c.listLocked()
@@ -1711,6 +1746,9 @@ func (c *Collection[T]) listLocked() (map[string]T, error) {
 // [WithLeaseReads] is set.
 // Returns an empty map (not nil) if the collection has no items.
 func (c *Collection[T]) List(ctx context.Context) (map[string]T, error) {
+	if c.store.cfg.Witness {
+		return nil, ErrWitness
+	}
 	if c.store.node == nil {
 		return nil, fmt.Errorf("easyraft: node not started")
 	}
@@ -1748,6 +1786,96 @@ func (s *Store) AddServer(ctx context.Context, id raft.NodeID, addr string) erro
 // RemoveServer removes id from the Raft cluster membership. Must be called on
 // the leader. If id is the current leader, it commits the removal and then
 // steps down; the caller is responsible for stopping the removed node.
+// AddWitness brings a witness into the cluster as a voter: it votes and
+// counts towards every quorum, keeps the shape of the log, and holds none of
+// the data. See [WithWitness], which is how the node at addr must have been
+// built.
+//
+// Unlike a full replica, a witness is added in one step rather than staged in
+// as a learner first, because it has almost nothing to catch up on: the index
+// and term of each entry, which the leader sends without the entries
+// themselves.
+func (s *Store) AddWitness(ctx context.Context, id raft.NodeID, addr string) error {
+	if s.node == nil {
+		return errors.New("easyraft: node not started")
+	}
+	if adder, ok := s.transport.(peerAdder); ok {
+		adder.AddPeer(id, addr)
+	}
+	if err := s.node.AddWitness(ctx, id); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.raftPeers[id] = raftPeerInfo{addr: addr, voter: true}
+	s.mu.Unlock()
+	return nil
+}
+
+// CommitQuorum returns how many voters an entry must currently reach to
+// commit, or 0 while the group uses a simple majority. It is the group's
+// agreed value, not this node's [WithCommitQuorum].
+func (s *Store) CommitQuorum() int {
+	if s.node == nil {
+		return 0
+	}
+	return s.node.CommitQuorum()
+}
+
+// SetCommitQuorum sets how many voters an entry must reach to commit, for the
+// whole group, and with it the election quorum. A quorum of 0 restores a
+// simple majority. It must be called on the leader.
+//
+// Writing to every replica means no acknowledged write is ever on fewer than
+// that many disks, at the cost of stalling writes when any one voter is down.
+// A quorum below a majority makes writes need fewer acknowledgements than a
+// leader needs votes. Neither changes what is safe.
+func (s *Store) SetCommitQuorum(ctx context.Context, quorum int) error {
+	if s.node == nil {
+		return errors.New("easyraft: node not started")
+	}
+	return s.node.SetCommitQuorum(ctx, quorum)
+}
+
+// MaxClientTableSize returns the bound the exactly-once table behind
+// [Session] is kept under, 0 meaning none. It is the group's agreed value.
+func (s *Store) MaxClientTableSize() int {
+	if s.node == nil {
+		return 0
+	}
+	return s.node.MaxClientTableSize()
+}
+
+// SetMaxClientTableSize changes that bound for the whole group. It must be
+// called on the leader.
+//
+// A smaller bound forgets the oldest clients everywhere at the same point in
+// the log, and a forgotten client's retry runs a second time. A larger one
+// takes effect from here on and recovers nothing already forgotten.
+func (s *Store) SetMaxClientTableSize(ctx context.Context, size int) error {
+	if s.node == nil {
+		return errors.New("easyraft: node not started")
+	}
+	return s.node.SetMaxClientTableSize(ctx, size)
+}
+
+// Events returns a channel reporting what happens to this node -- leadership
+// changes, peers arriving and leaving, snapshots, a client dropped from the
+// exactly-once table, a durable write that failed -- and a function that ends
+// the subscription.
+//
+// The channel is bounded and lossy: a consumer that falls behind is told how
+// many events it missed in Event.Dropped rather than slowing the node down.
+// The subscription must be released with the returned function, which never
+// blocks and may be called more than once.
+func (s *Store) Events() (events <-chan raft.Event, stop func()) {
+	if s.node == nil {
+		ch := make(chan raft.Event)
+		close(ch)
+		return ch, func() {}
+	}
+	return s.node.Events()
+}
+
 func (s *Store) RemoveServer(ctx context.Context, id raft.NodeID) error {
 	if s.node == nil {
 		return errors.New("easyraft: node not started")
