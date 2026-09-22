@@ -39,10 +39,13 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
     than applied unconditionally, since guessing which one the caller meant
     is the lost update the feature exists to prevent.
   - `Store.Revision()` reports the highest revision this replica has applied.
-  - Revisions travel in snapshots, so a replica restored from one refuses and
-    accepts exactly what the replica that wrote it would. A snapshot written
-    before this change restores as a store whose keys have never been
-    written, so an upgrade needs no migration.
+  - Revisions travel in snapshots under two reserved names beside the
+    collections, spelled like every other internal name in the package so
+    that no collection can collide with them. A replica restored from one
+    refuses and accepts exactly what the replica that wrote it would. A
+    snapshot
+    written before this change has neither name and restores as a store
+    whose keys have never been written, so an upgrade needs no migration.
 
 - easyraft can reach the batteries v2 added to the engine. Every one of them
   was unreachable through the high-level layer, which is the layer most

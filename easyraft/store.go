@@ -2581,14 +2581,16 @@ func (s *Store) snapshot(w io.Writer) error {
 // streamCollections writes collections as a JSON object without materialising
 // an intermediate copy of the data.
 // Revisions travel beside the collections under two reserved names rather
-// than in a wrapper around them. A collection whose name begins with two
+// than in a wrapper around them. They are spelled like every other internal
+// name in this package, which is what keeps them out of the way of a future
+// internal collection as well as of a caller's. A collection whose name begins with two
 // underscores is already refused to callers, so neither can collide with one;
 // and a snapshot written before revisions existed simply has neither key,
 // which decodes as a store that has never recorded one. That is what keeps
 // this readable by a node that is newer than the snapshot it starts on.
 const (
-	snapshotRevisionsKey = "__revisions"
-	snapshotRevisionKey  = "__revision"
+	snapshotRevisionsKey = "__easyraft_revisions__"
+	snapshotRevisionKey  = "__easyraft_revision__"
 )
 
 func streamCollections(w *bufio.Writer, collections map[string]map[string]json.RawMessage,
