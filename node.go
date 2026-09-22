@@ -1830,6 +1830,11 @@ func (n *Node) onDurableAdvanced() {
 }
 
 // reportProposal tells a ProposalMetrics implementation how a proposal ended.
+//
+// Always called before the proposal's own promise is resolved or rejected,
+// because resolving it releases the caller: report afterwards and a caller
+// that scrapes its metrics as soon as Propose returns can miss the very
+// proposal it just made.
 // Event-loop only; a no-op unless Config.Metrics also implements it.
 func (n *Node) reportProposal(submitted time.Time, ok bool) {
 	if submitted.IsZero() || n.cfg.Metrics == nil {
