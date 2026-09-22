@@ -1,6 +1,6 @@
 # Examples
 
-Seven fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. An eighth example, `raftctl`, is an operator tool rather than a service.
+Eight fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. A ninth example, `raftctl`, is an operator tool rather than a service.
 
 ---
 
@@ -52,6 +52,39 @@ go build -o ratelimiter ./ratelimiter
 The addresses a joining node is given have to name a host: it hands them to the
 cluster as the address to dial it back on, and `:7002` is not one. See
 [Addressing](#addressing) below.
+
+---
+
+## `serviceregistry` — EasyRaft with key leases
+
+See [`serviceregistry/`](serviceregistry/) for a service registry where
+instances register themselves under a lease and disappear when they stop
+renewing it. It demonstrates:
+
+- **`Store.GrantLease` + `Collection.UpsertWithLease`**: an entry that outlives
+  nothing. Stop renewing and every replica deletes it at the same point in the
+  log — no heartbeat table, and nothing has to notice that an instance died.
+- **`Store.KeepAliveLoop`**: one goroutine holding a registration for as long
+  as its context lives, retrying an election and giving up on a lost lease.
+- **`Collection.ListPrefix` and `Collection.Scan`**: instances keyed
+  `<service>/<instance>`, so "who is running this service" is one prefix scan,
+  and the whole registry pages by cursor.
+- **[`easyraft/client`](../easyraft/client/)**: the thing that registers is a
+  separate program that talks to the cluster from outside it, finding the
+  leader and following it when it moves. There is no registration endpoint on
+  the registry, because none is needed.
+- **`Collection.OnChange`**: arrivals and departures logged on every replica.
+  A lease expiring produces ordinary delete events, so a watcher sees an
+  instance leave exactly as it sees one arrive.
+
+The two ways an instance leaves are written differently on purpose: a SIGKILL
+runs no code and the entry expires, while a clean stop revokes the lease and
+the entry goes at once.
+
+```bash
+cd serviceregistry && ./cluster.sh     # 3 nodes + 2 registered instances
+curl -s http://localhost:8003/services/api
+```
 
 ---
 

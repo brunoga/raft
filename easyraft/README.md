@@ -1446,6 +1446,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 
 ## Examples
 
+- [`examples/serviceregistry`](../examples/serviceregistry/) — service registry whose entries expire when nothing renews them. Demonstrates key leases, `KeepAliveLoop`, prefix scans and pagination, and the [`client`](client/) package registering from outside the cluster.
 - [`examples/ratelimiter`](../examples/ratelimiter/) — token-bucket rate limiter with time-based refill. Demonstrates the deterministic mutation pattern.
 - [`examples/configsvc`](../examples/configsvc/) — distributed configuration service with SSE watch streams. Demonstrates `Upsert`, `OnChange`, and the replicated-state vs. local-subscriber pattern.
 - [`examples/ledger`](../examples/ledger/) — double-entry ledger with atomic multi-collection transactions. Demonstrates `Store.Txn`, idempotent transfers via `ErrKeyExists`, and mutation-enforced invariants.
