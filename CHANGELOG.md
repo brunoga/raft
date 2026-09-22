@@ -8,6 +8,17 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **`examples/serviceregistry`**, a service registry where instances register
+  themselves under a lease and disappear when they stop renewing it. It is the
+  worked example for key leases, `KeepAliveLoop`, prefix scans and pagination,
+  and the `easyraft/client` package -- the thing that registers is a separate
+  program talking to the cluster from outside it, so the registry has no
+  registration endpoint at all.
+
+  The two ways an instance leaves are written differently on purpose: a
+  SIGKILL runs no code and the entry expires, while a clean stop revokes the
+  lease and the entry goes at once.
+
 - **Leader balancing on a `Manager`.** `WithLeaderBalancing(hosts, interval)`
   keeps group leadership spread across the hosts given, moving it when it
   bunches up. Groups elect leaders independently and nothing coordinates
