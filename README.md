@@ -530,6 +530,7 @@ cfg.Transport = tr                          // required
 | `SnapshotChunkSize` | `1 MiB` | Maximum bytes per InstallSnapshot chunk. Leave room for framing: a chunk sized at exactly the transport's message limit does not fit. `0` sends snapshots as a single RPC. |
 | `RPCTimeout` | `0` | Per-RPC deadline. `0` falls back to `ElectionTimeoutMin`. Snapshot RPCs use `4×RPCTimeout`. |
 | `CheckQuorum` | `true` | Leader steps down if it doesn't hear from a quorum within one election timeout. |
+| `CommitQuorum` | `0` | Voters an entry must reach to commit; `0` is a majority. The election quorum is `voters − CommitQuorum + 1`, never below a majority. Group state: this is only what a group is created with; change it with `Node.SetCommitQuorum`. |
 | `MaxClientTableSize` | `100000` | Maximum entries in the ProposeOnce dedup table; `0` disables eviction. The value a group is created with: it is replicated through the log, so a node whose `Config` differs from the group's uses the group's and logs a warning. Change it at run time with `Node.SetMaxClientTableSize`. |
 | `OnFatal` | `nil` | Called once, from its own goroutine, if the node stops because a durable write failed. |
 | `Logger` | `slog.Default()` | Structured logger. Set to a `slog.LevelWarn` logger to silence routine traffic. |
@@ -1306,6 +1307,49 @@ of a zone.
 
 `Validate` refuses a configuration whose voters do not span the required number
 of zones, since it could never commit anything.
+
+## Flexible quorums
+
+Raft commits on a majority and elects on a majority, and the argument that a
+new leader holds every committed entry uses one fact about those two sets:
+they intersect. Any pair of sizes with that property serves it, so a group
+may trade one against the other (Howard, Malkhi and Spiegelman, *Flexible
+Paxos*). With `N` voters and a commit quorum of `Q`, the election quorum is
+`N − Q + 1` — or a majority, whichever is larger, because Raft additionally
+needs one leader per term and two election quorums below a majority need not
+intersect each other.
+
+```go
+// Five voters. Writes need two acknowledgements; a leader needs four votes.
+err := leader.SetCommitQuorum(ctx, 2)
+
+// Writes need every replica; elections are unchanged. No acknowledged write
+// is ever on fewer than five disks.
+err = leader.SetCommitQuorum(ctx, 5)
+
+// Back to a simple majority.
+err = leader.SetCommitQuorum(ctx, 0)
+```
+
+The policy is group state, like membership: it is agreed through the log and
+carried in snapshots, `Node.CommitQuorum()` reports the value in effect, and
+`Config.CommitQuorum` is only what a group is *created* with — the first
+leader writes it into the log, and no node ever counts by its own `Config`.
+Two nodes bootstrapped with different values therefore cannot disagree about
+how to count.
+
+What the split changes is liveness, which is the point. A commit quorum below
+a majority makes a write need fewer acknowledgements than a leader needs
+votes, for a group whose writes are frequent and whose elections are not. A
+commit quorum above a majority means no acknowledged write is ever on fewer
+than that many disks — but one voter down stalls every write. Choose against
+the failures the deployment expects.
+
+The change is safe to make while the group is running. A node that holds the
+new policy in its log but has not applied it yet requires the *stricter* of
+the old and new sizes for every decision, so no vote is ever counted under a
+pair of quorums that do not intersect. The count follows the membership: if
+voters are later removed below it, it is treated as "all of them".
 
 ## State machines that keep their own state
 

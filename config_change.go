@@ -15,6 +15,11 @@ const (
 	// replica with a different bound evicts different clients and diverges.
 	// It changes no membership.
 	configOpClientTableCap byte = 0x05
+	// configOpCommitQuorum sets how many voters an entry must reach to
+	// commit, for the whole group; the election quorum follows from it. Like
+	// membership it is group state, since a node that counted differently
+	// could elect a leader without the entries another node had committed.
+	configOpCommitQuorum byte = 0x06
 )
 
 // configMagic is a 4-byte sentinel that marks a log entry as a Raft
@@ -107,6 +112,36 @@ func decodeFinaliseConfigEntry(cmd []byte) (members []PeerConfig, ok bool) {
 	return members, ok
 }
 
+// ---- Commit quorum encoding -------------------------------------------------
+//
+// Wire format for configOpCommitQuorum (opcode 0x06):
+//
+//	[4 magic][0x06][8-byte quorum, big endian]
+//
+// A quorum of 0 means a simple majority.
+
+// encodeCommitQuorumEntry encodes a config entry that sets the group's commit
+// quorum.
+func encodeCommitQuorumEntry(quorum int) []byte {
+	b := make([]byte, 5, 13)
+	copy(b[:4], configMagic[:])
+	b[4] = configOpCommitQuorum
+	return binary.BigEndian.AppendUint64(b, uint64(quorum))
+}
+
+// decodeCommitQuorumEntry parses a commit quorum entry. ok is false if cmd is
+// not one.
+func decodeCommitQuorumEntry(cmd []byte) (quorum int, ok bool) {
+	if !isConfigEntry(cmd) || cmd[4] != configOpCommitQuorum || len(cmd) < 13 {
+		return 0, false
+	}
+	v := binary.BigEndian.Uint64(cmd[5:13])
+	if v > uint64(int(^uint(0)>>1)) {
+		return 0, false
+	}
+	return int(v), true
+}
+
 // ---- Membership snapshot encoding ------------------------------------------
 //
 // The membership in effect at a snapshot's last-included index is stored inside
@@ -119,6 +154,11 @@ func decodeFinaliseConfigEntry(cmd []byte) (members []PeerConfig, ok bool) {
 //	[1-byte kind] 0 = simple, 1 = joint
 //	simple: [peer list]                  — every member, including self
 //	joint:  [peer list][peer list]       — C_old then C_new, each including self
+//	then, optionally: [8-byte commit quorum]
+//
+// The commit quorum trails the lists so that a reader from before it existed,
+// which stops after the lists, still reads the membership; it then takes the
+// quorum to be a majority, which is what the absence of the field means.
 const (
 	membershipKindSimple byte = 0
 	membershipKindJoint  byte = 1
@@ -138,16 +178,23 @@ type membershipState struct {
 
 	// old and new are the two configurations when joint is true.
 	old, new []PeerConfig
+
+	// commitQuorum is how many voters an entry must reach to commit, 0
+	// meaning a majority. See quorum.go.
+	commitQuorum int
 }
 
 // encodeMembership serialises a membershipState.
 func encodeMembership(ms *membershipState) []byte {
+	var b []byte
 	if ms.joint {
-		b := []byte{membershipKindJoint}
+		b = []byte{membershipKindJoint}
 		b = appendPeerList(b, ms.old)
-		return appendPeerList(b, ms.new)
+		b = appendPeerList(b, ms.new)
+	} else {
+		b = appendPeerList([]byte{membershipKindSimple}, ms.members)
 	}
-	return appendPeerList([]byte{membershipKindSimple}, ms.members)
+	return binary.BigEndian.AppendUint64(b, uint64(ms.commitQuorum))
 }
 
 // decodeMembership parses a membershipState. ok is false if buf is malformed.
@@ -155,26 +202,35 @@ func decodeMembership(buf []byte) (ms membershipState, ok bool) {
 	if len(buf) < 1 {
 		return membershipState{}, false
 	}
+	var rest []byte
 	switch buf[0] {
 	case membershipKindSimple:
-		members, _, ok := decodePeerList(buf[1:])
+		members, r, ok := decodePeerList(buf[1:])
 		if !ok {
 			return membershipState{}, false
 		}
-		return membershipState{members: members}, true
+		ms, rest = membershipState{members: members}, r
 	case membershipKindJoint:
-		old, rest, ok := decodePeerList(buf[1:])
+		old, r, ok := decodePeerList(buf[1:])
 		if !ok {
 			return membershipState{}, false
 		}
-		new_, _, ok := decodePeerList(rest)
+		new_, r, ok := decodePeerList(r)
 		if !ok {
 			return membershipState{}, false
 		}
-		return membershipState{joint: true, old: old, new: new_}, true
+		ms, rest = membershipState{joint: true, old: old, new: new_}, r
 	default:
 		return membershipState{}, false
 	}
+	if len(rest) >= 8 {
+		v := binary.BigEndian.Uint64(rest)
+		if v > uint64(int(^uint(0)>>1)) {
+			return membershipState{}, false
+		}
+		ms.commitQuorum = int(v)
+	}
+	return ms, true
 }
 
 // encodePeerLists encodes [magic][op] followed by one or more peer lists.

@@ -198,11 +198,11 @@ type voteResult struct {
 func (n *Node) electionWon() bool {
 	if n.jointOld == nil {
 		// Normal single-config: self + voted peers must reach quorum.
-		return hasMajorityAck(n.receivedVoteSet, n.cfg.Peers, true, n.cfg.Voter)
+		return n.hasQuorumAck(electionQuorum, n.receivedVoteSet, n.cfg.Peers, true, n.cfg.Voter)
 	}
-	// Joint consensus: both C_old and C_new must independently have a majority.
-	return hasMajorityAck(n.receivedVoteSet, n.jointOld, true, n.jointSelfVoterOld) &&
-		hasMajorityAck(n.receivedVoteSet, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
+	// Joint consensus: both C_old and C_new must independently have a quorum.
+	return n.hasQuorumAck(electionQuorum, n.receivedVoteSet, n.jointOld, true, n.jointSelfVoterOld) &&
+		n.hasQuorumAck(electionQuorum, n.receivedVoteSet, n.jointNew, n.jointIncludeSelf, n.jointSelfVoter)
 }
 
 func (n *Node) handleVoteResult(r *voteResult) {

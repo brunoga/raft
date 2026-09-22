@@ -45,19 +45,22 @@ func (n *Node) storeMembership() {
 func (n *Node) currentMembership() membershipState {
 	if n.jointOld != nil {
 		return membershipState{
-			joint: true,
-			old:   withSelf(n.jointOld, n.cfg.ID, true, n.jointSelfVoterOld),
-			new:   withSelf(n.jointNew, n.cfg.ID, n.jointIncludeSelf, n.jointSelfVoter),
+			joint:        true,
+			old:          withSelf(n.jointOld, n.cfg.ID, true, n.jointSelfVoterOld),
+			new:          withSelf(n.jointNew, n.cfg.ID, n.jointIncludeSelf, n.jointSelfVoter),
+			commitQuorum: n.commitQuorumApplied,
 		}
 	}
 	return membershipState{
-		members: withSelf(n.cfg.Peers, n.cfg.ID, true, n.cfg.Voter),
+		members:      withSelf(n.cfg.Peers, n.cfg.ID, true, n.cfg.Voter),
+		commitQuorum: n.commitQuorumApplied,
 	}
 }
 
 // restoreMembership installs ms as the membership in effect, replacing whatever
 // was there. Event-loop only.
 func (n *Node) restoreMembership(ms *membershipState) {
+	n.commitQuorumLatest = ms.commitQuorum
 	if !ms.joint {
 		peers, present, voter := splitSelf(ms.members, n.cfg.ID)
 		n.cfg.Peers = peers
@@ -117,6 +120,10 @@ func (n *Node) rebuildMembership(ctx context.Context) error {
 	// on the table itself is not touched here -- it follows the apply order,
 	// and the entries replayed below have not been applied.
 	n.clientTableCapReplicated = n.hasBaseClientTableCap
+	// Likewise the commit quorum the log knows of starts from the snapshot's
+	// and is updated by every quorum entry replayed below; the one in effect
+	// follows the apply order and is not touched here.
+	n.commitQuorumLatest = n.baseMembership.commitQuorum
 
 	first, last := n.log.first, n.log.last
 	if first == 0 || last < first {
@@ -159,6 +166,19 @@ func (n *Node) adoptConfigEntry(configCmd []byte, index Index) {
 		// The log knows of a bound; the table adopts it when the entry is
 		// applied. See applyConfigChange.
 		n.clientTableCapReplicated = true
+		return
+
+	case configOpCommitQuorum:
+		// In the log from here on: every decision now requires the stricter
+		// of this and the policy in effect, until the entry is applied.
+		if quorum, ok := decodeCommitQuorumEntry(configCmd); ok {
+			n.commitQuorumLatest = quorum
+			if n.state == Leader {
+				// A stricter commit quorum can uncommit nothing, but a
+				// looser one that was pending may now be met.
+				n.maybeAdvanceCommit()
+			}
+		}
 		return
 
 	case configOpAdd:
@@ -309,6 +329,17 @@ func (n *Node) applyConfigChange(configCmd []byte, index Index) {
 		}
 		if n.capEntryPending == index {
 			n.capEntryPending = 0
+		}
+
+	case configOpCommitQuorum:
+		if quorum, ok := decodeCommitQuorumEntry(configCmd); ok {
+			n.adoptCommitQuorum(quorum, "log")
+			if n.state == Leader {
+				n.maybeAdvanceCommit()
+			}
+		}
+		if n.quorumEntryPending == index {
+			n.quorumEntryPending = 0
 		}
 
 	case configOpRemove:
