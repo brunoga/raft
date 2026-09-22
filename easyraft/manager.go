@@ -14,6 +14,7 @@ import (
 	"github.com/brunoga/raft/v2"
 	"github.com/brunoga/raft/v2/metrics/prommetrics"
 	"github.com/brunoga/raft/v2/storage/filestore"
+	"github.com/brunoga/raft/v2/storage/sharedwal"
 	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
@@ -31,9 +32,36 @@ type Manager struct {
 	cfg    config
 
 	transport  *grpctransport.GRPCTransport
+	wal        *sharedwal.WAL
 	httpServer *http.Server
 	cancel     context.CancelFunc
 	stopCtx    context.Context
+}
+
+// SharedWAL returns the write-ahead log every group on this Manager appends
+// to, or nil when [WithSharedWAL] was not given.
+//
+// It is the handle for the things only the log knows: Groups lists what it
+// holds, which is how a host that runs a changing set of groups finds them
+// again after a restart; Remove forgets a group that has been decommissioned
+// so its space can be reclaimed; Reclaim runs that reclamation on demand.
+// Removing a store from the Manager deliberately does not remove its log --
+// a group taken off a host is usually coming back.
+func (m *Manager) SharedWAL() *sharedwal.WAL {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.wal
+}
+
+// groupStorage returns the storage a group should use, or nil to let it open
+// its own directory.
+func (m *Manager) groupStorage(groupID uint64) raft.Storage {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.wal == nil {
+		return nil
+	}
+	return m.wal.Storage(groupID)
 }
 
 // managedGroup pairs a group ID with its store for iteration outside the lock.
@@ -107,7 +135,10 @@ func (m *Manager) AddStore(groupID uint64, opts ...Option) (*Store, error) {
 		o(&mergedCfg)
 	}
 
-	if mergedCfg.DataDir == "" {
+	// With a shared log there is nothing for a per-group directory to hold:
+	// the log lives at the Manager's own DataDir and every group is a
+	// partition of it.
+	if mergedCfg.DataDir == "" && !m.cfg.SharedWAL {
 		return nil, fmt.Errorf("easyraft: WithDataDir is required for Store %d", groupID)
 	}
 
@@ -165,7 +196,22 @@ func (m *Manager) Start() error {
 		}
 	})
 
-	// 1. Shared Transport
+	// 1. Shared write-ahead log, when every group is to write to one.
+	if m.cfg.SharedWAL {
+		if m.cfg.DataDir == "" {
+			return fmt.Errorf("easyraft: WithSharedWAL needs WithDataDir on the Manager: " +
+				"the log every group shares has to live somewhere")
+		}
+		wal, walErr := sharedwal.Open(m.cfg.DataDir)
+		if walErr != nil {
+			return fmt.Errorf("open shared wal: %w", walErr)
+		}
+		m.mu.Lock()
+		m.wal = wal
+		m.mu.Unlock()
+	}
+
+	// 2. Shared Transport
 	warnIfPeersUnauthorized(&m.cfg, m.logger())
 	tr, err := grpctransport.Listen(m.cfg.RaftAddr, transportOptions(&m.cfg)...)
 	if err != nil {
@@ -198,13 +244,17 @@ func (m *Manager) Start() error {
 		}
 		_ = tr.Close()
 		m.mu.Lock()
+		if m.wal != nil {
+			_ = m.wal.Close()
+			m.wal = nil
+		}
 		m.transport = nil
 		m.mu.Unlock()
 	}
 
 	// 2. Initialize and Start all Stores
 	for _, g := range groups {
-		if err := g.store.initRaftForManager(g.id, tr); err != nil {
+		if err := g.store.initRaftForManager(g.id, tr, m.groupStorage(g.id)); err != nil {
 			cleanup()
 			return fmt.Errorf("init store %d: %w", g.id, err)
 		}
@@ -272,7 +322,9 @@ func (m *Manager) Stop() error {
 	m.mu.Lock()
 	httpServer := m.httpServer
 	transport := m.transport
+	wal := m.wal
 	m.transport = nil
+	m.wal = nil
 	stores := make([]*Store, 0, len(m.stores))
 	for _, s := range m.stores {
 		stores = append(stores, s)
@@ -304,6 +356,15 @@ func (m *Manager) Stop() error {
 	if transport != nil {
 		if err := transport.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("easyraft: close manager transport: %w", err))
+		}
+	}
+
+	// Last, and only here: the log is shared, so a group closing its own view
+	// of it closes nothing. Every node has stopped by now, so there is no
+	// write left that could arrive after it.
+	if wal != nil {
+		if err := wal.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("easyraft: close shared wal: %w", err))
 		}
 	}
 
@@ -452,15 +513,20 @@ func (m *Manager) TransferGroupLeadership(ctx context.Context, groupID uint64, t
 }
 
 // initRaftForManager is a modified initRaft that uses a shared transport.
-func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
-	// Storage
+func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport, st raft.Storage) error {
+	// Storage. A shared log hands one in; without it each group opens its own
+	// directory.
+	//
 	// filestore.Open creates the directory itself, and makes the creation
 	// durable by fsyncing the parents it had to create. Creating it here first
 	// would leave the store nothing to create, so that durability would be
 	// skipped and the directory's own name would never be fsynced.
-	st, err := filestore.Open(s.cfg.DataDir)
-	if err != nil {
-		return fmt.Errorf("open store: %w", err)
+	if st == nil {
+		fs, err := filestore.Open(s.cfg.DataDir)
+		if err != nil {
+			return fmt.Errorf("open store: %w", err)
+		}
+		st = fs
 	}
 	s.storage = st
 
@@ -477,25 +543,16 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport) error {
 		if hasAdder {
 			adder.AddPeer(id, addr)
 		}
-		peerConfigs = append(peerConfigs, raft.PeerConfig{ID: id, Voter: true})
+		peerConfigs = append(peerConfigs, raft.PeerConfig{
+			ID: id, Voter: true, Witness: s.cfg.Witnesses[id],
+		})
 		s.raftPeers[id] = raftPeerInfo{addr: addr, voter: true}
 	}
 	s.mu.Unlock()
 
 	// Raft config
-	rCfg := raft.DefaultConfig()
-	rCfg.ID = s.cfg.ID
+	rCfg := s.raftConfig(peerConfigs, tr, st)
 	rCfg.GroupID = groupID
-	rCfg.Peers = peerConfigs
-	rCfg.Transport = tr
-	rCfg.Storage = st
-	rCfg.StateMachine = storeFSM{s: s}
-	rCfg.Logger = s.cfg.Logger
-	rCfg.TickInterval = s.raftTickInterval() // Or 0 to use Manager.RunTicker
-	rCfg.ElectionTimeoutMin = s.raftElectionTimeoutMin()
-	rCfg.ElectionTimeoutMax = s.raftElectionTimeoutMax()
-	rCfg.HeartbeatInterval = s.raftHeartbeatInterval()
-	applySnapshotSettings(&rCfg, s.cfg.SnapCount)
 
 	// Every group shares the caller's registry, so the collectors are
 	// registered once and each group's series carry its own "group" label.

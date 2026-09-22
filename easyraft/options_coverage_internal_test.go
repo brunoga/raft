@@ -44,6 +44,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithInsecureHTTPAcknowledged(),
 		WithInsecureTransportAcknowledged(),
 		WithPeerAuthorizer(func(context.Context, string) error { return nil }),
+		WithSharedWAL(),
 		WithWitness(),
 		WithWitnessPeers("w1"),
 		WithCommitQuorum(2),
