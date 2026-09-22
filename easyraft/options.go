@@ -122,6 +122,10 @@ type config struct {
 	// leases. Set via [WithKeyLeaseSweepInterval].
 	KeyLeaseSweepInterval time.Duration
 
+	// Transport replaces the gRPC transport this store would otherwise
+	// build. Set via [WithTransport].
+	Transport raft.Transport
+
 	// ProposalQueueSize and ProposalOverflow govern how many writes may wait
 	// for the event loop and what happens to the next one. Set via
 	// [WithProposalQueue].
@@ -565,6 +569,27 @@ func WithPreferredLeader(id raft.NodeID) Option {
 // change a running group with [Store.SetMaxClientTableSize].
 func WithMaxClientTableSize(entries int) Option {
 	return func(c *config) { c.MaxClientTableSize = entries }
+}
+
+// WithTransport uses tr for Raft RPCs instead of building a gRPC transport
+// and listening on [WithRaftAddr].
+//
+// This is the seam behind the in-process clusters in
+// [github.com/brunoga/raft/v2/easyraft/easyrafttest], and it is what a
+// transport written for an environment gRPC cannot reach plugs into.
+//
+// The store does not close a transport it was given: something that outlives
+// one store, and may be shared by several, is the caller's to close. It also
+// does not enforce the TLS acknowledgement, which is about the listener this
+// store would otherwise have opened -- whatever tr carries over the wire, and
+// whether that is a wire at all, is tr's business.
+//
+// If tr has an AddPeer(raft.NodeID, string) method, peer addresses from
+// [WithPeers] and from joins are registered on it. If it does not, the store
+// assumes tr already knows how to reach every peer, which is how an in-memory
+// network works.
+func WithTransport(tr raft.Transport) Option {
+	return func(c *config) { c.Transport = tr }
 }
 
 // WithKeyLeaseSweepInterval sets how often the leader looks for key leases

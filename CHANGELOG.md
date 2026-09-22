@@ -8,6 +8,27 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **`easyraft/easyrafttest`**, which runs real easyraft clusters inside a
+  test process on an in-memory network a test can cut and heal. Every node is
+  a real `Store` running the real engine; the only thing replaced is the wire
+  between them, so a test of a service built on easyraft tests the service
+  rather than a mock of the library under it.
+
+  `NewCluster(t, 3)` builds the nodes, starts them, waits for a leader and
+  registers the shutdown with the test; `AddCollection[T]` gives the same
+  typed collection on every node, with `Leader()` for writes and `Node(i)`
+  for reads from a follower. `Partition`, `Heal`, `Drop`, `Restore`,
+  `StopNode` and `RestartNode` cause the failures the rest of this library
+  exists to survive, and `WaitLeader`, `WaitNoLeader`, `WaitApplied` and
+  `Ready` wait for the cluster to reach a state rather than leaving each test
+  to poll. Default timings make an election tens of milliseconds.
+
+- **`WithTransport`**, the seam that package is built on. A store uses the
+  transport it is given instead of listening on `WithRaftAddr`, and never
+  closes it: something that may outlive the store, or be shared by several,
+  is the caller's to close. It is also how a transport written for an
+  environment gRPC cannot reach plugs in.
+
 - **Key leases in easyraft.** `Store.GrantLease` creates a lease with a time
   to live; keys written under it with `Collection.CreateWithLease` or
   `UpsertWithLease` are deleted together when it expires or is revoked.

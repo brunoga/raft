@@ -543,7 +543,9 @@ func resolveTLSFiles(c *config) error {
 }
 
 func validateSecurity(c *config, servesHTTP bool) error {
-	if c.TLS == nil && !c.AcknowledgeInsecureTransport {
+	// A transport the caller built is the caller's to secure; this check is
+	// about the listener this store would otherwise have opened itself.
+	if c.Transport == nil && c.TLS == nil && !c.AcknowledgeInsecureTransport {
 		return fmt.Errorf("easyraft: the Raft transport has no TLS configuration; pass WithTLS, " +
 			"or WithInsecureTransportAcknowledged to run in plaintext on a trusted network")
 	}
@@ -903,20 +905,29 @@ func (s *Store) initRaft() error {
 	}
 
 	// 2. Transport
-	if s.cfg.RaftAddr == "" {
-		return fmt.Errorf("easyraft: WithRaftAddr is required")
+	tr := s.cfg.Transport
+	if tr == nil {
+		if s.cfg.RaftAddr == "" {
+			return fmt.Errorf("easyraft: WithRaftAddr is required")
+		}
+		warnIfPeersUnauthorized(&s.cfg, s.logger())
+		listened, listenErr := grpctransport.Listen(s.cfg.RaftAddr, transportOptions(&s.cfg)...)
+		if listenErr != nil {
+			return fmt.Errorf("listen grpc: %w", listenErr)
+		}
+		tr = listened
 	}
 
-	warnIfPeersUnauthorized(&s.cfg, s.logger())
-	tr, err := grpctransport.Listen(s.cfg.RaftAddr, transportOptions(&s.cfg)...)
-	if err != nil {
-		return fmt.Errorf("listen grpc: %w", err)
-	}
+	// A transport that cannot be told peer addresses is one that already
+	// knows how to reach everyone, which is what an in-memory network is.
+	adder, _ := tr.(peerAdder)
 
 	var peerConfigs []raft.PeerConfig
 	for id, addr := range s.cfg.Peers {
 		if id != s.cfg.ID {
-			tr.AddPeer(id, addr)
+			if adder != nil {
+				adder.AddPeer(id, addr)
+			}
 			peerConfigs = append(peerConfigs, raft.PeerConfig{
 				ID: id, Voter: true, Witness: s.cfg.Witnesses[id],
 			})
@@ -939,14 +950,20 @@ func (s *Store) initRaft() error {
 
 	tr.Register(s.cfg.ID, node.Handler())
 	s.transport = tr
-	s.ownsTransport = true
+	// Only a transport this store opened is this store's to close. One given
+	// by WithTransport may outlive the store and be shared by others.
+	s.ownsTransport = s.cfg.Transport == nil
 	s.storage = st
 
 	// 5. Discovery: wire both transport-level connectivity and Raft membership.
 	// We run our own polling loop rather than using DiscoveryAgent so we can
 	// call node.AddServer for each newly seen peer (not just tr.AddPeer).
 	if s.cfg.Discovery != nil {
-		s.startDiscovery(node, tr)
+		if adder == nil {
+			return fmt.Errorf("easyraft: WithDiscovery needs a transport that can be told peer " +
+				"addresses, and the one given by WithTransport cannot")
+		}
+		s.startDiscovery(node, adder)
 	}
 
 	s.node = node
