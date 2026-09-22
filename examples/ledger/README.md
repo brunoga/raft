@@ -18,6 +18,7 @@ Additional patterns:
 - **Idempotent writes via `ErrKeyExists`** — the transfer record is created first inside the Txn. The transfer ID is `client_id:seq`, so a retry with the same (client_id, seq) pair hits `ErrKeyExists` on the Create step before any balance mutations run — no rollback needed, and no double-debit.
 - **`Collection.RegisterMutation`** — the `debit` mutation enforces the "no negative balance" invariant inside the state machine, running on every replica during Apply and log replay.
 - **Deterministic mutations** — the debit amount is encoded in the args before proposing; replicas never read external state inside a mutation.
+- **`Txn.CheckRev`** — a transfer is guarded on the accounting period it was checked against, so one validated while the books were open cannot commit after they closed. See below.
 - **`WithHTTPMux`** — easyraft management routes share the application's mux; one HTTP server handles everything.
 
 ---
@@ -32,6 +33,9 @@ Additional patterns:
 | `POST` | `/transfers` | Transfer funds (see below) |
 | `GET` | `/transfers/{id}` | Get a transfer record |
 | `GET` | `/transfers` | List all transfer records |
+| `GET` | `/period` | The live accounting period; its revision comes back as `ETag` |
+| `POST` | `/period` | Open a period `{"id":"2026-09"}` |
+| `POST` | `/period/close` | Close the books |
 
 ### Transfer request body
 
@@ -208,6 +212,7 @@ fmt.Printf("alice balance: %d\n", alice.Balance)
 | `400 Bad Request` | Malformed JSON or missing required fields |
 | `404 Not Found` | Account does not exist |
 | `409 Conflict` | Account with that ID already exists |
+| `412 Precondition Failed` | The accounting period changed while a transfer was in flight |
 | `422 Unprocessable Entity` | Insufficient funds |
 | `503 Service Unavailable` | This node is not the leader |
 | `500 Internal Server Error` | Storage failure or unexpected error |
@@ -236,6 +241,35 @@ alice.balance -= amount
 bob.balance   += amount
 transfer record created
 ```
+
+### Closing the books, and the race it creates
+
+Transfers are posted into an accounting period. Closing that period is the one operation a ledger must not have transfers racing with: a transfer posted into books somebody has already reconciled is a discrepancy nobody will find.
+
+The handler reads the period and refuses if it is closed. That is necessary and not sufficient — a check is a read, and a read is not a decision that survives. The close can land between that read and the commit, and then a transfer validated against open books is posted into closed ones with nothing having reported an error.
+
+So the transaction carries a guard:
+
+```go
+_, err := s.store.Txn(ctx, func(tx *easyraft.Txn) error {
+    if err := tx.CheckRev("periods", currentPeriodKey, periodRev); err != nil {
+        return err
+    }
+    // ... create the record, debit, credit
+})
+```
+
+`CheckRev` writes nothing. It asserts that a key is at a revision, and fails the whole batch if it is not — evaluated where it has to be, as the entry applies, against every other entry in the log.
+
+**A per-operation condition could not express this.** `Txn.UpdateIf` and friends make a condition on a key the transaction *writes*; this transaction does not write the period, it only depends on it. That is the gap `CheckRev` fills.
+
+Closing the books is itself conditional, with `Collection.UpdateIf` on the same revision, so two operators closing at once do not both succeed and record different closing times for the same period.
+
+### A note on testing this
+
+The guard is the interesting part of the transaction and the hardest to test, because the window it closes cannot be opened through HTTP: a test has to hold a revision, move the period, and only then commit. That is why the transaction lives in a `postTransfer` method rather than a closure inside the handler.
+
+It matters. While this example was being written the guard was removed as an experiment, and every test driving the HTTP surface still passed. `TestPeriod_GuardIsCheckedAtCommit` calls `postTransfer` directly and does fail.
 
 ### Idempotency without MutateOnce
 

@@ -15,6 +15,14 @@
 // the same (client_id, seq), the server returns the previously committed record
 // rather than double-debiting.
 //
+// Guarded batches: a transfer is posted into an accounting period, and the
+// transaction carries [easyraft.Txn.CheckRev] on that period's revision. The
+// handler checks the period is open, but a check is a read and a read is not
+// a decision that survives -- the books can close between it and the commit.
+// The guard is evaluated where it has to be, as the entry applies, and fails
+// the whole batch if the period moved. A per-operation condition could not
+// express it, because the transaction does not write the period.
+//
 // Atomic rollback: [easyraft.Store.Txn] commits all operations in a single
 // Raft log entry. If any operation fails (insufficient funds, unknown account,
 // etc.) the entire batch is rolled back by the state machine, leaving balances
@@ -66,6 +74,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -89,6 +98,22 @@ type Transfer struct {
 	Amount    int64  `json:"amount"`
 	Timestamp int64  `json:"timestamp"` // Unix nanoseconds; set by HTTP handler, not inside Apply
 }
+
+// Period is the accounting period transfers are posted into. There is one
+// live period, under the key "current" in the periods collection.
+//
+// It exists to make a guard necessary. Closing the books is the operation a
+// ledger must not have transfers racing with: a transfer validated while the
+// period was open, and committed after it closed, is posted into a period
+// somebody has already reconciled.
+type Period struct {
+	ID     string `json:"id"`
+	Open   bool   `json:"open"`
+	Closed int64  `json:"closed,omitempty"` // Unix nanoseconds; set by the handler
+}
+
+// currentPeriodKey is the only key in the periods collection.
+const currentPeriodKey = "current"
 
 // debitArgs is passed to the "debit" mutation on the accounts collection.
 type debitArgs struct {
@@ -118,11 +143,13 @@ type server struct {
 	store     *easyraft.Store
 	accounts  *easyraft.Collection[Account]
 	transfers *easyraft.Collection[Transfer]
+	periods   *easyraft.Collection[Period]
 }
 
 func newServer(store *easyraft.Store) *server {
 	accounts := easyraft.AddCollection[Account](store, "accounts")
 	transfers := easyraft.AddCollection[Transfer](store, "transfers")
+	periods := easyraft.AddCollection[Period](store, "periods")
 
 	// debit reduces the balance by amount. Returns an error if the resulting
 	// balance would be negative.
@@ -153,7 +180,80 @@ func newServer(store *easyraft.Store) *server {
 		return &updated, nil, nil
 	})
 
-	return &server{store: store, accounts: accounts, transfers: transfers}
+	return &server{store: store, accounts: accounts, transfers: transfers, periods: periods}
+}
+
+// handleGetPeriod serves GET /period, returning the live accounting period
+// and the revision a transfer would be guarded on.
+func (s *server) handleGetPeriod(w http.ResponseWriter, r *http.Request) {
+	period, rev, err := s.periods.ReadRev(r.Context(), currentPeriodKey)
+	if err != nil {
+		if errors.Is(err, easyraft.ErrKeyNotFound) {
+			http.Error(w, "no accounting period has been opened", http.StatusNotFound)
+			return
+		}
+		s.writeErr(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", strconv.FormatUint(rev, 10))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(period)
+}
+
+// handleOpenPeriod serves POST /period, opening a new accounting period and
+// replacing whatever was there.
+func (s *server) handleOpenPeriod(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+		http.Error(w, `invalid body: need {"id":"2026-09"}`, http.StatusBadRequest)
+		return
+	}
+	if err := s.periods.Upsert(r.Context(), currentPeriodKey,
+		Period{ID: body.ID, Open: true}); err != nil {
+		s.writeErr(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleClosePeriod serves POST /period/close.
+//
+// Closing is what every in-flight transfer is racing with, which is why each
+// one guards on this key's revision: a transfer that read an open period and
+// committed after this ran would be posted into books already reconciled.
+func (s *server) handleClosePeriod(w http.ResponseWriter, r *http.Request) {
+	period, rev, err := s.periods.ReadRev(r.Context(), currentPeriodKey)
+	if err != nil {
+		if errors.Is(err, easyraft.ErrKeyNotFound) {
+			http.Error(w, "no accounting period has been opened", http.StatusNotFound)
+			return
+		}
+		s.writeErr(w, r, err)
+		return
+	}
+	if !period.Open {
+		http.Error(w, "the period is already closed", http.StatusConflict)
+		return
+	}
+
+	period.Open = false
+	// Timestamp fixed before proposing, like every other one here.
+	period.Closed = time.Now().UnixNano()
+	// Conditional, so two operators closing at once do not both succeed and
+	// record different closing times for the same period.
+	if err := s.periods.UpdateIf(r.Context(), currentPeriodKey, period, rev); err != nil {
+		if errors.Is(err, easyraft.ErrRevisionMismatch) {
+			http.Error(w, "the period changed while it was being closed; read it again",
+				http.StatusPreconditionFailed)
+			return
+		}
+		s.writeErr(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(period)
 }
 
 func (s *server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +317,7 @@ type transferRequest struct {
 // handleTransfer handles POST /transfers.
 //
 // The transfer is executed as a single atomic Txn with three operations:
+//  0. Guard on the accounting period's revision (CheckRev — writes nothing)
 //  1. Create the transfer record (idempotency guard — ErrKeyExists = duplicate)
 //  2. Debit the source account
 //  3. Credit the destination account
@@ -239,6 +340,23 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The live accounting period, and the revision the transaction will be
+	// guarded on. Read before the transfer is built, because whether this
+	// transfer may happen at all is decided here.
+	period, periodRev, periodErr := s.periods.ReadRev(r.Context(), currentPeriodKey)
+	if periodErr != nil {
+		if errors.Is(periodErr, easyraft.ErrKeyNotFound) {
+			http.Error(w, "no accounting period has been opened", http.StatusConflict)
+			return
+		}
+		s.writeErr(w, r, periodErr)
+		return
+	}
+	if !period.Open {
+		http.Error(w, "the accounting period is closed", http.StatusConflict)
+		return
+	}
+
 	// Transfer ID derived from client identity — retries land on the same key.
 	transferID := fmt.Sprintf("%s:%d", req.ClientID, req.Seq)
 
@@ -251,21 +369,7 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now().UnixNano(),
 	}
 
-	_, txErr := s.store.Txn(r.Context(), func(tx *easyraft.Txn) error {
-		// Step 1: create the transfer record. This is the idempotency guard:
-		// if the record already exists, ErrKeyExists aborts the batch before
-		// any balance mutations run — nothing to roll back.
-		if err := tx.Create("transfers", transferID, record); err != nil {
-			return err
-		}
-		// Step 2: debit source. Fails if balance < amount; the whole batch
-		// (including the Create above) is rolled back.
-		if err := tx.Mutate("accounts", req.From, "debit", debitArgs{Amount: req.Amount}); err != nil {
-			return err
-		}
-		// Step 3: credit destination.
-		return tx.Mutate("accounts", req.To, "credit", creditArgs{Amount: req.Amount})
-	})
+	txErr := s.postTransfer(r.Context(), record, periodRev)
 
 	if txErr != nil {
 		if errors.Is(txErr, easyraft.ErrKeyExists) {
@@ -278,6 +382,15 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if errors.Is(txErr, easyraft.ErrRevisionMismatch) {
+			// The period changed between the check above and this commit --
+			// closed, or rolled to the next one. Nothing was written. The
+			// client re-reads and decides again; this service will not guess
+			// which period a transfer belonged to.
+			http.Error(w, "the accounting period changed while this transfer was in flight; retry",
+				http.StatusPreconditionFailed)
+			return
+		}
 		if errors.Is(txErr, easyraft.ErrKeyNotFound) {
 			http.Error(w, "account not found", http.StatusNotFound)
 			return
@@ -289,6 +402,49 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(record)
+}
+
+// postTransfer commits one transfer as a single atomic batch, guarded on the
+// accounting period still being at periodRev.
+//
+// Separate from the handler because the guard is the part worth testing and
+// the window it closes cannot be opened through HTTP: a test has to hold a
+// revision, move the period, and only then commit. A handler that built its
+// transaction inline could be given a guard, lose it, and still pass every
+// test driving the HTTP surface -- which is exactly what happened while this
+// example was being written.
+func (s *server) postTransfer(ctx context.Context, record Transfer, periodRev uint64) error {
+	_, err := s.store.Txn(ctx, func(tx *easyraft.Txn) error {
+		// Step 0: the period must still be the one this transfer was checked
+		// against. CheckRev writes nothing; it fails the whole batch if the
+		// key has moved.
+		//
+		// This is the only way to close the race. The handler's check ran
+		// against a value read some time ago, and the close can land between
+		// that read and this commit -- so without the guard a transfer
+		// validated while the books were open is posted after they were
+		// reconciled, with nothing having reported an error. A per-operation
+		// condition cannot express it either, because this transaction does
+		// not write the period: only a guard on a key it leaves alone can.
+		if checkErr := tx.CheckRev("periods", currentPeriodKey, periodRev); checkErr != nil {
+			return checkErr
+		}
+		// Step 1: create the transfer record. This is the idempotency guard:
+		// if the record already exists, ErrKeyExists aborts the batch before
+		// any balance mutations run — nothing to roll back.
+		if createErr := tx.Create("transfers", record.ID, record); createErr != nil {
+			return createErr
+		}
+		// Step 2: debit source. Fails if balance < amount; the whole batch
+		// (including the Create above) is rolled back.
+		if debitErr := tx.Mutate("accounts", record.From, "debit",
+			debitArgs{Amount: record.Amount}); debitErr != nil {
+			return debitErr
+		}
+		// Step 3: credit destination.
+		return tx.Mutate("accounts", record.To, "credit", creditArgs{Amount: record.Amount})
+	})
+	return err
 }
 
 func (s *server) handleGetTransfer(w http.ResponseWriter, r *http.Request) {
@@ -386,6 +542,9 @@ func run() error {
 	mux.HandleFunc("POST /transfers", srv.handleTransfer)
 	mux.HandleFunc("GET /transfers/{id}", srv.handleGetTransfer)
 	mux.HandleFunc("GET /transfers", srv.handleListTransfers)
+	mux.HandleFunc("GET /period", srv.handleGetPeriod)
+	mux.HandleFunc("POST /period", srv.handleOpenPeriod)
+	mux.HandleFunc("POST /period/close", srv.handleClosePeriod)
 
 	// Every request context descends from this one, so cancelling it is what
 	// ends the /watch streams at shutdown.
