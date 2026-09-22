@@ -8,6 +8,13 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **`examples/ledger` gained a guarded transaction.** Transfers are posted
+  into an accounting period, and each transfer's batch carries
+  `Txn.CheckRev` on that period's revision -- so one validated while the
+  books were open cannot commit after they closed. A per-operation condition
+  could not express it: the transaction does not write the period, it only
+  depends on it, which is the gap `CheckRev` fills.
+
 - **`examples/configsvc` gained compare-and-swap.** A `GET` returns the key's
   revision as an `ETag`, `If-Match` makes the next write conditional on it,
   `If-None-Match: *` is create-if-absent, and a failed condition answers

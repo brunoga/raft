@@ -125,6 +125,7 @@ See [`ledger/`](ledger/) for a distributed double-entry ledger built on `easyraf
 - **`Store.Txn`**: commits a debit, a credit, and a transfer record across two collections in a single Raft log entry. Any failure rolls back the entire batch — no partial state.
 - **Idempotent transfers**: the transfer record is created first inside the Txn, keyed by `client_id:seq`. A retry hits `ErrKeyExists` before any balance mutations run.
 - **`Collection.RegisterMutation`**: the `debit` mutation enforces the "no negative balance" invariant inside `Apply` on every replica.
+- **`Txn.CheckRev`**: each transfer is guarded on the accounting period it was checked against, so one validated while the books were open cannot commit after they closed. A per-operation condition could not express it — the transaction does not write the period, it only depends on it.
 - **`WithHTTPMux`**: easyraft management routes share the application's mux.
 
 ```bash

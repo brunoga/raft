@@ -1,5 +1,19 @@
-# Binaries
+# Binaries.
+#
+# `go build ./examples/ledger/` from the repository root leaves the binary
+# here, named after the package directory, not in the example's own folder --
+# which is how a 22MB `ledger` nearly landed in a commit. Every example is
+# listed, so building any of them from the root is safe.
+/configsvc
+/durablekv
 /idprovider
+/ledger
+/raftctl
+/ratelimiter
+/serviceregistry
+/shardkv
+/tenants
+/watchtower
 # Example binaries, built in place by each cluster.sh.
 /examples/*/configsvc
 /examples/*/durablekv
