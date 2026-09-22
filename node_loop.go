@@ -228,19 +228,25 @@ func (n *Node) handleRPCEnvelope(env rpcEnvelope) {
 
 // handlePropose is called when a client sends a command to the leader.
 func (n *Node) handleProposals(props []proposeMsg) {
+	// Every outcome below is reported before the caller is answered, never
+	// after. Answering unblocks the caller, and a caller that reads its
+	// metrics the moment Propose returns would otherwise be racing this
+	// goroutine for its own proposal's outcome -- which it loses often
+	// enough to matter. Reporting costs a call into an implementation that
+	// is required not to block, so doing it first costs the caller nothing.
 	if n.state != Leader {
 		for _, prop := range props {
 			p := promise[[]byte]{ch: prop.respCh}
-			p.reject(&NotLeaderError{Leader: n.leaderID})
 			n.reportProposal(prop.submitted, false)
+			p.reject(&NotLeaderError{Leader: n.leaderID})
 		}
 		return
 	}
 	if n.transferTarget != "" {
 		for _, prop := range props {
 			p := promise[[]byte]{ch: prop.respCh}
-			p.reject(ErrLeadershipTransferInProgress)
 			n.reportProposal(prop.submitted, false)
+			p.reject(ErrLeadershipTransferInProgress)
 		}
 		return
 	}
@@ -256,8 +262,8 @@ func (n *Node) handleProposals(props []proposeMsg) {
 	for _, prop := range props {
 		if isConfigEntry(prop.cmd) && n.pendingConfigIndex != 0 {
 			p := promise[[]byte]{ch: prop.respCh}
-			p.reject(ErrConfigChangeInProgress)
 			n.reportProposal(prop.submitted, false)
+			p.reject(ErrConfigChangeInProgress)
 			continue
 		}
 
@@ -268,15 +274,15 @@ func (n *Node) handleProposals(props []proposeMsg) {
 				if cached, ok := n.clientTable.get(clientID); ok {
 					if seqNum < cached.seqNum {
 						p := promise[[]byte]{ch: prop.respCh}
-						p.reject(ErrObsoleteSeqNum)
 						n.reportProposal(prop.submitted, false)
+						p.reject(ErrObsoleteSeqNum)
 						continue
 					}
 					if seqNum == cached.seqNum {
 						// Exact duplicate — return the cached result without re-appending.
 						p := promise[[]byte]{ch: prop.respCh}
-						p.resolve(cached.result)
 						n.reportProposal(prop.submitted, true)
+						p.resolve(cached.result)
 						continue
 					}
 					// seqNum > cached.seqNum — new request; fall through to normal propose.
@@ -292,8 +298,8 @@ func (n *Node) handleProposals(props []proposeMsg) {
 		// with no error to explain it.
 		if limit > 0 && backlog > 0 && backlog+len(prop.cmd) > limit {
 			p := promise[[]byte]{ch: prop.respCh}
-			p.reject(ErrWriteBacklogFull)
 			n.reportProposal(prop.submitted, false)
+			p.reject(ErrWriteBacklogFull)
 			continue
 		}
 
@@ -326,8 +332,8 @@ func (n *Node) handleProposals(props []proposeMsg) {
 			// entries it believes it appended may or may not be there.
 			for _, idx := range indices {
 				if p, ok := n.pending[idx]; ok {
-					p.promise.reject(fmt.Errorf("propose: append: %w", err))
 					n.reportProposal(p.submitted, false)
+					p.promise.reject(fmt.Errorf("propose: append: %w", err))
 					delete(n.pending, idx)
 				}
 				if n.pendingConfigIndex == idx {
@@ -387,12 +393,12 @@ func (n *Node) handleApplyResult(ar *applyResult) {
 
 	p, ok := n.pending[ar.index]
 	if ok {
+		n.reportProposal(p.submitted, ar.err == nil)
 		if ar.err != nil {
 			p.promise.reject(ar.err)
 		} else {
 			p.promise.resolve(ar.val)
 		}
-		n.reportProposal(p.submitted, ar.err == nil)
 		delete(n.pending, ar.index)
 	}
 	n.maybeSnapshot()
@@ -440,8 +446,8 @@ func (n *Node) notifyApply() {
 // drainPending rejects all in-flight proposals with the given error.
 func (n *Node) drainPending(err error) {
 	for idx, p := range n.pending {
-		p.promise.reject(err)
 		n.reportProposal(p.submitted, false)
+		p.promise.reject(err)
 		delete(n.pending, idx)
 	}
 	n.drainPendingReads(err)

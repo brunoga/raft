@@ -19,6 +19,26 @@
 //
 // Both reproduce on every run once you have the assembled binary, and neither
 // is visible without it.
+//
+// # What the bound has to clear
+//
+// The check is a wall-clock one, so it has to sit above everything slow that
+// is not a fault. There is one such thing, and it is not obvious:
+// http.Server.Shutdown will not finish while any connection sits in
+// http.StateNew -- accepted, but with no request read from it yet -- and it
+// waits a full five seconds before treating such a connection as idle and
+// closing it (net/http's own comment cites Go issue 22682). So a single
+// connection that was opened and never used costs a shutdown five seconds,
+// whatever the service does.
+//
+// A client is enough to produce one by accident. http.Transport answers a
+// request by racing the idle pool against a fresh dial, and when the pool
+// wins, the dial that lost is parked in the pool having sent nothing --
+// which is exactly a StateNew connection on the server. That is what made
+// this check fail intermittently: the checker's own client was leaving one
+// behind. The client below therefore keeps no idle connections and drops
+// what it has before signalling, and the bound still allows for five
+// seconds in case something else opens one.
 package shutdowncheck
 
 import (
@@ -34,15 +54,32 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
 // promptly is how long a shutdown may take before it is treated as having
-// waited for something. It is generous -- the work itself is milliseconds --
-// but well under the ten-second server shutdown timeout these examples set,
-// which is the duration the bug it catches produces.
-const promptly = 5 * time.Second
+// waited for something. Three numbers decide it: the work itself is
+// milliseconds, a connection that was opened and never used costs
+// http.Server.Shutdown five seconds (see above), and the fault this looks
+// for -- waiting out the shutdown timeout instead of cancelling -- costs the
+// ten seconds these examples give it. Eight seconds is the room between the
+// worst case that is not a fault and the best case that is.
+const promptly = 8 * time.Second
+
+// newClient returns an HTTP client that leaves no connection behind on the
+// service, and the transport to drop what it holds before signalling.
+//
+// Keep-alives are off because an idle connection in the pool is what gives
+// http.Transport something to race a dial against, and the dial that loses
+// that race is the unused connection that costs Shutdown five seconds. Each
+// run gets its own, so one subtest cannot leave a connection pooled for the
+// next.
+func newClient() (*http.Client, *http.Transport) {
+	tr := &http.Transport{DisableKeepAlives: true}
+	return &http.Client{Transport: tr}, tr
+}
 
 // Options describes the command under test.
 type Options struct {
@@ -113,13 +150,19 @@ func runOnce(t *testing.T, bin string, opts Options, attach bool) {
 	defer func() { _ = cmd.Process.Kill() }()
 
 	logs := drain(out)
-	awaitServing(t, httpAddr, opts.ReadyPath, logs)
+	client, transport := newClient()
+	awaitServing(t, client, httpAddr, opts.ReadyPath, logs)
 
 	if attach {
-		resp, cancel := openStream(t, httpAddr, opts.StreamPath)
+		resp, cancel := openStream(t, client, httpAddr, opts.StreamPath)
 		defer cancel()
 		defer func() { _ = resp.Body.Close() }()
 	}
+
+	// Anything still pooled here is a connection the service would have to
+	// wait out; the one being measured is the attached stream, which is in
+	// use and so is not touched by this.
+	transport.CloseIdleConnections()
 
 	if sigErr := cmd.Process.Signal(os.Interrupt); sigErr != nil {
 		t.Fatalf("signal: %v", sigErr)
@@ -128,30 +171,46 @@ func runOnce(t *testing.T, bin string, opts Options, attach bool) {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	// Well past any shutdown timeout an example sets, so that a failure here
-	// means stuck rather than slow.
-	started := time.Now()
-	select {
-	case waitErr := <-done:
-		if waitErr != nil {
-			t.Errorf("exited with %v, want a clean exit; output:\n%s", waitErr, logs())
-		}
-	case <-time.After(25 * time.Second):
-		t.Fatalf("still running 25s after an interrupt; output:\n%s", logs())
-	}
-
 	// Exiting is not enough. A service that waits for an open stream exits
 	// only when its shutdown timeout expires, which these examples set to ten
 	// seconds -- and some of them treat that as a warning rather than an
 	// error, so the process still exits zero and nothing looks wrong. Stopping
 	// a node and closing its log takes milliseconds, so anything in the
 	// seconds means something was waited on that should have been cancelled.
-	if elapsed := time.Since(started); elapsed > promptly {
-		t.Errorf("took %s to exit, want under %s: a shutdown that slow is one waiting out "+
-			"a timeout rather than finishing. http.Server.Shutdown waits for in-flight "+
+	//
+	// A process that misses the bound is asked for its stacks before it is
+	// waited for any further. Without that, all a failure here can say is how
+	// long it took, which is the one thing that does not identify the cause --
+	// and the cause is a goroutine blocked on something, which the dump names
+	// outright. SIGQUIT is what Go turns into that dump.
+	started := time.Now()
+	select {
+	case waitErr := <-done:
+		if waitErr != nil {
+			t.Errorf("exited with %v, want a clean exit; output:\n%s", waitErr, logs())
+		}
+		if elapsed := time.Since(started); elapsed > promptly {
+			t.Errorf("took %s to exit, want under %s; output:\n%s",
+				elapsed.Round(time.Millisecond), promptly, logs())
+		}
+	case <-time.After(promptly):
+		_ = cmd.Process.Signal(syscall.SIGQUIT)
+		select {
+		case <-done:
+		case <-time.After(25 * time.Second):
+			t.Fatalf("still running 25s after SIGQUIT; output:\n%s", logs())
+		}
+		// Give the dump, which the process writes as it dies, a moment to
+		// reach the pipe reader.
+		time.Sleep(100 * time.Millisecond)
+		t.Fatalf("still running %s after an interrupt, so something is being waited on "+
+			"that should have been cancelled. A shutdown that slow is one waiting out a "+
+			"timeout rather than finishing: http.Server.Shutdown waits for in-flight "+
 			"requests instead of cancelling them, so an open event stream holds it for "+
 			"the whole timeout unless every request context descends from a BaseContext "+
-			"that shutdown cancels. Output:\n%s", elapsed.Round(time.Millisecond), promptly, logs())
+			"that shutdown cancels. The goroutine dump below is from SIGQUIT at that "+
+			"point; look for the one parked in the shutdown path. Output:\n%s",
+			promptly, logs())
 	}
 
 	if opts.WantLogLine != "" && !strings.Contains(logs(), opts.WantLogLine) {
@@ -187,12 +246,15 @@ func freeAddr(t *testing.T) string {
 }
 
 // awaitServing blocks until the service answers on path.
-func awaitServing(t *testing.T, httpAddr, path string, logs func() string) {
+func awaitServing(t *testing.T, client *http.Client, httpAddr, path string, logs func() string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://" + httpAddr + path) //nolint:noctx // short-lived probe
+		resp, err := client.Get("http://" + httpAddr + path) //nolint:noctx // short-lived probe
 		if err == nil {
+			// Drained, not just closed: a body left unread is a connection
+			// the transport cannot reuse and has to replace.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 			_ = resp.Body.Close()
 			return
 		}
@@ -203,7 +265,7 @@ func awaitServing(t *testing.T, httpAddr, path string, logs func() string) {
 
 // openStream attaches to an event stream and returns once the response headers
 // are in, so the handler is known to be running when the signal arrives.
-func openStream(t *testing.T, httpAddr, path string) (*http.Response, context.CancelFunc) {
+func openStream(t *testing.T, client *http.Client, httpAddr, path string) (*http.Response, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
@@ -212,7 +274,7 @@ func openStream(t *testing.T, httpAddr, path string) (*http.Response, context.Ca
 		cancel()
 		t.Fatalf("new request: %v", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
 		t.Fatalf("GET %s: %v", path, err)
