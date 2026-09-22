@@ -1,6 +1,6 @@
 # Examples
 
-Eight fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. A ninth example, `raftctl`, is an operator tool rather than a service.
+Nine fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. A ninth example, `raftctl`, is an operator tool rather than a service.
 
 ---
 
@@ -144,6 +144,34 @@ curl -X POST http://localhost:8001/accounts \
 curl -L -X POST http://localhost:8001/transfers \
      -H 'Content-Type: application/json' \
      -d '{"from":"alice","to":"bob","amount":100,"client_id":"cli1","seq":1}'
+```
+
+---
+
+## `tenants` — EasyRaft with a Raft group per tenant
+
+See [`tenants/`](tenants/) for a multi-tenant store where every tenant is its
+own Raft group, hosted many-to-a-node by an `easyraft.Manager`. It is the only
+example built on the Manager, and it exists for the three things that need
+one:
+
+- **`WithLeaderBalancing`**: groups elect leaders independently and nothing
+  coordinates them, so a host that stayed up while others restarted ends up
+  leading most of them. The controller moves leadership until the counts even
+  out; `cluster.sh` prints them per host.
+- **`WithSharedWAL`**: every group on a host appends to one log, so a burst of
+  writes across tenants costs one `fsync` rather than one each.
+- **`client.WithGroup`**: the client addresses a single group, after which
+  every call is what it would be against a plain `Store` — and it still finds
+  the leader of *that* group and follows it when balancing moves it.
+
+Tenant-to-group mapping is `1 + hash%groups`, never `hash%groups`: a Manager
+routes by group ID and zero means "no group", so a group numbered zero would
+never be reachable. The README covers what a hash costs when the group count
+changes.
+
+```bash
+cd tenants && ./cluster.sh     # 3 nodes, 9 groups, balancing on
 ```
 
 ---

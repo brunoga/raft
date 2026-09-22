@@ -8,6 +8,18 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **`examples/tenants`**, a multi-tenant store where every tenant is its own
+  Raft group, hosted many-to-a-node by an `easyraft.Manager`. It is the only
+  example built on the `Manager`, which until now was undemonstrated
+  entirely, and it is the worked example for `WithLeaderBalancing`,
+  `WithSharedWAL` and `client.WithGroup`.
+
+  It has no CRUD routes of its own: the `Manager` already serves them, and
+  what the example adds is the part the library cannot decide, which is which
+  group a tenant belongs to. The mapping is `1 + hash%groups` rather than
+  `hash%groups`, because a group numbered zero would never be reachable, and
+  a test pins that across every group count from 1 to 16.
+
 - **`examples/ledger` gained a guarded transaction.** Transfers are posted
   into an accounting period, and each transfer's batch carries
   `Txn.CheckRev` on that period's revision -- so one validated while the
