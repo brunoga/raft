@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ---- Unit tests for LeastLeadersBalancer ------------------------------------

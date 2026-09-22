@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/easyraft"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/easyraft"
 )
 
 // refusedAddr returns a loopback address that is guaranteed to refuse

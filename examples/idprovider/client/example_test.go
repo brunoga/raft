@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/brunoga/raft/examples/idprovider/client"
+	"github.com/brunoga/raft/v2/examples/idprovider/client"
 )
 
 func Example() {

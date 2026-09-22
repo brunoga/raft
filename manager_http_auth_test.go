@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // TestManagerHandler_AuthorizerGuardsEveryRoute asserts that when an authorizer

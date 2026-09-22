@@ -85,8 +85,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
-	"github.com/brunoga/raft"
-	pb "github.com/brunoga/raft/transport/grpctransport/internal/raftpb"
+	"github.com/brunoga/raft/v2"
+	pb "github.com/brunoga/raft/v2/transport/grpctransport/internal/raftpb"
 )
 
 // Sentinel errors returned by GRPCTransport. Callers can test for them with

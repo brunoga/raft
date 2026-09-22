@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft/easyraft"
+	"github.com/brunoga/raft/v2/easyraft"
 )
 
 // sseEvent holds one parsed Server-Sent Event.

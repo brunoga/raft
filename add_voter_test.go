@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // TestAddVoter_StagesThroughLearnerRatherThanWeakeningTheQuorum is the reason

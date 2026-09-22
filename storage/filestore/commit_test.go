@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/filestore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/filestore"
 )
 
 // TestCommitIndex_RoundTrips checks the basic contract: what was recorded is

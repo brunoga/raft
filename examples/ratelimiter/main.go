@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/easyraft"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/easyraft"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

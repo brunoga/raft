@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ---- Snapshot files -----------------------------------------------------------

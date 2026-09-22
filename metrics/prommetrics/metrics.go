@@ -35,7 +35,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // Metrics implements raft.Metrics using Prometheus counters and gauges.

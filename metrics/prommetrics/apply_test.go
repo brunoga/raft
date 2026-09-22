@@ -6,8 +6,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/metrics/prommetrics"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/metrics/prommetrics"
 )
 
 // Metrics has to satisfy every optional interface the engine looks for, or the

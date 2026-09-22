@@ -10,7 +10,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 func newKvSM() *KvSM { return &KvSM{data: make(map[string]string)} }

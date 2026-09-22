@@ -3,7 +3,7 @@
 EasyRaft is a high-level abstraction layer over the `brunoga/raft` package. It lets you build strongly-consistent, replicated services by describing **what** data to replicate — not how. Transport, storage, state machine, snapshotting, leader routing, and peer discovery are all handled automatically.
 
 ```
-go get github.com/brunoga/raft/easyraft
+go get github.com/brunoga/raft/v2/easyraft
 ```
 
 > ### Read this before exposing a node
@@ -505,7 +505,7 @@ When `WithDiscovery` is configured, EasyRaft polls the discovery source periodic
 Only the current leader can commit membership changes; `AddServer` calls on followers fail and are retried on the next discovery interval.
 
 ```go
-import "github.com/brunoga/raft/discovery/udpbroadcast"
+import "github.com/brunoga/raft/v2/discovery/udpbroadcast"
 
 d, _ := udpbroadcast.New(&udpbroadcast.Config{
     NodeID: "n1",

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/easyraft"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/easyraft"
 )
 
 func BenchmarkRateLimiter(b *testing.B) {

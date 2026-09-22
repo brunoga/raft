@@ -15,9 +15,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/internal/simnet"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/internal/simnet"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 // recorder captures what the checker reports instead of failing the test.

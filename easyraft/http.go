@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 

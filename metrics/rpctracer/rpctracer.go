@@ -40,7 +40,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // SlogTracer is a raft.Tracer that logs RPC calls via slog.

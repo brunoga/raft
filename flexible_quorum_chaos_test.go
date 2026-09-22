@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft/internal/simnet"
+	"github.com/brunoga/raft/v2/internal/simnet"
 )
 
 // TestSimChaos_QuorumChanges runs the chaos profile while the commit quorum

@@ -8,7 +8,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // command is the payload of a log entry.

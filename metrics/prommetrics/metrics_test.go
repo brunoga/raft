@@ -10,8 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/metrics/prommetrics"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/metrics/prommetrics"
 )
 
 func TestMetrics_StateChange(t *testing.T) {

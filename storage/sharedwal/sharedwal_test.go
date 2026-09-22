@@ -12,8 +12,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/sharedwal"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/sharedwal"
 )
 
 var ctx = context.Background()

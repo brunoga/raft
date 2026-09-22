@@ -180,7 +180,7 @@ curl -L -X POST http://localhost:8001/transfers \
 A high-level Go client is available in the [`client`](./client) package. It handles node discovery, leader redirection, and provides a type-safe API for accounts and transfers.
 
 ```go
-import "github.com/brunoga/raft/examples/ledger/client"
+import "github.com/brunoga/raft/v2/examples/ledger/client"
 
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
 

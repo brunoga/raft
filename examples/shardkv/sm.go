@@ -8,7 +8,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ErrKeyNotFound is returned by Apply when a "del" command targets an absent key.

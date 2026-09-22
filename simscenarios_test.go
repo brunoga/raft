@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/internal/simnet"
-	"github.com/brunoga/raft/storage/memstore"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/internal/simnet"
+	"github.com/brunoga/raft/v2/storage/memstore"
 )
 
 const scenarioTimeout = 5 * time.Second

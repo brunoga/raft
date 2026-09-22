@@ -8,7 +8,7 @@ import (
 
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	pb "github.com/brunoga/raft/transport/grpctransport/internal/raftpb"
+	pb "github.com/brunoga/raft/v2/transport/grpctransport/internal/raftpb"
 )
 
 // ---- Wire compatibility -----------------------------------------------------

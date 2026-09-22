@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // These tests are about the facts metrics cannot carry. A counter of

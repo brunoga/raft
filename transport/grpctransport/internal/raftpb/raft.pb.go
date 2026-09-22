@@ -1125,7 +1125,7 @@ const file_raft_proto_rawDesc = "" +
 	"\n" +
 	"TimeoutNow\x12\x17.raft.TimeoutNowRequest\x1a\x18.raft.TimeoutNowResponse\x12<\n" +
 	"\tReadIndex\x12\x16.raft.ReadIndexRequest\x1a\x17.raft.ReadIndexResponse\x12P\n" +
-	"\x0fBatchHeartbeats\x12\x1d.raft.BatchedHeartbeatRequest\x1a\x1e.raft.BatchedHeartbeatResponseB8Z6github.com/brunoga/raft/transport/grpctransport/internal/raftpbb\x06proto3"
+	"\x0fBatchHeartbeats\x12\x1d.raft.BatchedHeartbeatRequest\x1a\x1e.raft.BatchedHeartbeatResponseBDZBgithub.com/brunoga/raft/v2/transport/grpctransport/internal/raftpbb\x06proto3"
 
 var (
 	file_raft_proto_rawDescOnce sync.Once

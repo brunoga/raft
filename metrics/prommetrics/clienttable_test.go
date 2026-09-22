@@ -6,8 +6,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/metrics/prommetrics"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/metrics/prommetrics"
 )
 
 // Metrics must satisfy this one too, for the same reason as the rest: the

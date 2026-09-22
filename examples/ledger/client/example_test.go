@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/brunoga/raft/examples/ledger/client"
+	"github.com/brunoga/raft/v2/examples/ledger/client"
 )
 
 func Example() {

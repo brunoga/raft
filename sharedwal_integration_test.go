@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/storage/sharedwal"
-	"github.com/brunoga/raft/transport/memtransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/storage/sharedwal"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // TestSharedWAL_ClusterWithTwoGroupsPerHost runs two independent Raft groups

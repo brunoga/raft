@@ -10,10 +10,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/metrics/prommetrics"
-	"github.com/brunoga/raft/storage/memstore"
-	"github.com/brunoga/raft/transport/memtransport"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/metrics/prommetrics"
+	"github.com/brunoga/raft/v2/storage/memstore"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // TestSaturation_SeparatesASlowStateMachineFromSlowConsensus is the question

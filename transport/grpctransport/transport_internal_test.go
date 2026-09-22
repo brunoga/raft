@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // clientConnCount reports how many client connections the transport is

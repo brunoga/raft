@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brunoga/raft/easyraft"
+	"github.com/brunoga/raft/v2/easyraft"
 )
 
 // TestJoin_RefusesAnAddressPeersCannotDial is the failure that made three of

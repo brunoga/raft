@@ -31,7 +31,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// RaftService exposes the four Raft RPCs over gRPC.
+// RaftService exposes the Raft RPCs over gRPC.
 type RaftServiceClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
@@ -113,7 +113,7 @@ func (c *raftServiceClient) BatchHeartbeats(ctx context.Context, in *BatchedHear
 // All implementations must embed UnimplementedRaftServiceServer
 // for forward compatibility.
 //
-// RaftService exposes the four Raft RPCs over gRPC.
+// RaftService exposes the Raft RPCs over gRPC.
 type RaftServiceServer interface {
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)

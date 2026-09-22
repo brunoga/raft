@@ -5,8 +5,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/brunoga/raft"
-	"github.com/brunoga/raft/discovery/dnsdiscovery"
+	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/discovery/dnsdiscovery"
 )
 
 // ---- mock resolver ---------------------------------------------------------

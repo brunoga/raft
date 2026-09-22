@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // TestStatusForError_SeparatesRetryableFromPermanent pins the classification of

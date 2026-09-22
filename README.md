@@ -5,7 +5,7 @@ A production-grade implementation of the [Raft consensus algorithm](https://raft
 **Raft §§ implemented:** leader election, log replication, log compaction (snapshots), cluster membership changes (single-server and joint consensus), leadership transfer, pre-vote, linearizable reads (ReadIndex and clock-based lease reads), an exactly-once client protocol, multi-raft (thousands of independent groups on shared infrastructure), and automatic leader balancing across physical nodes.
 
 ```
-go get github.com/brunoga/raft
+go get github.com/brunoga/raft/v2
 ```
 
 Requires Go 1.26 or newer.
@@ -52,9 +52,9 @@ import (
     "log"
     "time"
 
-    "github.com/brunoga/raft"
-    "github.com/brunoga/raft/storage/memstore"
-    "github.com/brunoga/raft/transport/memtransport"
+    "github.com/brunoga/raft/v2"
+    "github.com/brunoga/raft/v2/storage/memstore"
+    "github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // CounterSM is a simple integer counter state machine.
@@ -561,7 +561,7 @@ for i := 0; i < 20; i++ {
 ### `storage/memstore` — in-memory (tests only)
 
 ```go
-import "github.com/brunoga/raft/storage/memstore"
+import "github.com/brunoga/raft/v2/storage/memstore"
 
 store := memstore.New()
 ```
@@ -571,7 +571,7 @@ Non-durable. Data is lost on process exit. Suitable for unit tests and simulatio
 ### `storage/filestore` — file-backed (production)
 
 ```go
-import "github.com/brunoga/raft/storage/filestore"
+import "github.com/brunoga/raft/v2/storage/filestore"
 
 store, err := filestore.Open("/var/lib/myapp/raft")
 defer store.Close()
@@ -630,7 +630,7 @@ the documentation asks for.
 ### `storage/sharedwal` — one log for every group on a host (multi-Raft)
 
 ```go
-import "github.com/brunoga/raft/storage/sharedwal"
+import "github.com/brunoga/raft/v2/storage/sharedwal"
 
 wal, err := sharedwal.Open("/var/lib/myapp/raft")
 defer wal.Close()
@@ -666,7 +666,7 @@ no-op `Close`: the log is shared, and closing it is `wal.Close`'s job.
 ### `transport/memtransport` — in-process (tests)
 
 ```go
-import "github.com/brunoga/raft/transport/memtransport"
+import "github.com/brunoga/raft/v2/transport/memtransport"
 
 net := memtransport.NewNetwork()
 
@@ -688,7 +688,7 @@ net.Heal("n3")             // reconnect n3
 ### `transport/grpctransport` — gRPC over TCP (production)
 
 ```go
-import "github.com/brunoga/raft/transport/grpctransport"
+import "github.com/brunoga/raft/v2/transport/grpctransport"
 
 tr, err := grpctransport.Listen(":7001", grpctransport.WithTLSConfig(tlsCfg))
 defer tr.Close()
@@ -769,7 +769,7 @@ Implementations must **not block** — they are called synchronously from the ev
 
 ```go
 import (
-    "github.com/brunoga/raft/metrics/prommetrics"
+    "github.com/brunoga/raft/v2/metrics/prommetrics"
     "github.com/prometheus/client_golang/prometheus"
 )
 
@@ -792,7 +792,7 @@ Exported metrics:
 ### RPC tracer (`metrics/rpctracer`)
 
 ```go
-import "github.com/brunoga/raft/metrics/rpctracer"
+import "github.com/brunoga/raft/v2/metrics/rpctracer"
 
 cfg.Tracer = rpctracer.NewSlogTracer(logger)
 // Logs Debug on success, Warn on failure for every outbound RPC.

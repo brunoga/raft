@@ -3,7 +3,7 @@ package raft_test
 import (
 	"time"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // ---- Timings for tests that drive their own ticks ---------------------------

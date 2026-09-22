@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // Network is a shared message bus. All MemTransport instances created from

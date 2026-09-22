@@ -268,7 +268,7 @@ curl -s 'http://localhost:8001/domains/orders/current?consistency=stale'
 A high-level Go client is available in the [`client`](./client) package. It handles node discovery, leader redirection (via 307 redirects), and provides exactly-once semantics for ID allocations using a stable client ID.
 
 ```go
-import "github.com/brunoga/raft/examples/idprovider/client"
+import "github.com/brunoga/raft/v2/examples/idprovider/client"
 
 // Initialize client with seed nodes and a stable client ID.
 // The client ID must be unique per process for exactly-once semantics.

@@ -1,4 +1,4 @@
-module github.com/brunoga/raft
+module github.com/brunoga/raft/v2
 
 go 1.26
 

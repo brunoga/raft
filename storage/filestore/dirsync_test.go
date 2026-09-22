@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/brunoga/raft"
+	"github.com/brunoga/raft/v2"
 )
 
 // These tests cover the one durability rule that leaves no trace in the files

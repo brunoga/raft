@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brunoga/raft/easyraft"
+	"github.com/brunoga/raft/v2/easyraft"
 )
 
 // drain reads everything currently buffered on ch without blocking.

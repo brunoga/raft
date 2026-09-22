@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/brunoga/raft/examples/internal/shutdowncheck"
+	"github.com/brunoga/raft/v2/examples/internal/shutdowncheck"
 )
 
 // TestShutdown_SignalStopsTheProcess is a regression test for a shutdown that

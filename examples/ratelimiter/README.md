@@ -131,7 +131,7 @@ curl -L -X POST http://localhost:8002/quotas/premium-user/mutate \
 A high-level Go client is available in the [`client`](./client) package. It handles node discovery, leader redirection, and provides a type-safe API for managing quotas and requesting tokens.
 
 ```go
-import "github.com/brunoga/raft/examples/ratelimiter/client"
+import "github.com/brunoga/raft/v2/examples/ratelimiter/client"
 
 c := client.New([]string{"http://localhost:8001", "http://localhost:8002"})
 
