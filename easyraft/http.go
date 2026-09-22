@@ -462,12 +462,33 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleList serves GET /{collection}, narrowed by the prefix, limit and
+// after query parameters.
+//
+// The body stays a JSON object of key to value whether or not the request
+// paginates, and the cursor for the next page travels in headers beside it --
+// X-Raft-Next-Cursor, and a Link header with rel="next" that a client can
+// follow without assembling a URL. A response whose shape changed with its
+// query parameters would make every client parse two formats to support one
+// endpoint.
 func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	collection, ok := s.collectionParam(w, r)
 	if !ok {
 		return
 	}
-	stale := r.URL.Query().Get("consistency") == "stale"
+	query := r.URL.Query()
+	stale := query.Get("consistency") == "stale"
+
+	limit := 0
+	if raw := query.Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a non-negative number", s.logger())
+			return
+		}
+		limit = parsed
+	}
+	prefix, after := query.Get("prefix"), query.Get("after")
 
 	if !stale {
 		if err := s.readIndex(r.Context()); err != nil {
@@ -481,13 +502,32 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("X-Raft-Revision", strconv.FormatUint(s.revision, 10))
 
+	keys, next := s.scanKeysLocked(collection, ScanOptions{Prefix: prefix, After: after, Limit: limit})
+	out := make(map[string]json.RawMessage, len(keys))
 	coll := s.collections[collection]
-	if coll == nil {
-		writeJSON(w, http.StatusOK, make(map[string]json.RawMessage), s.logger())
-		return
+	for _, key := range keys {
+		out[key] = coll[key]
+	}
+	if next != "" {
+		w.Header().Set("X-Raft-Next-Cursor", next)
+		w.Header().Set("Link", linkToNextPage(r, next))
 	}
 
-	writeJSON(w, http.StatusOK, coll, s.logger())
+	writeJSON(w, http.StatusOK, out, s.logger())
+}
+
+// linkToNextPage builds the RFC 8288 Link header for the next page: this
+// request's own path and query with after replaced.
+//
+// Built from the request URL rather than from an advertised address, so it
+// carries whatever host the client already reached and needs no configuration
+// to be correct behind a proxy. Only the path and query are used, and the
+// cursor is escaped, so nothing a client sent can widen it into another URL.
+func linkToNextPage(r *http.Request, next string) string {
+	q := r.URL.Query()
+	q.Set("after", next)
+	u := url.URL{Path: r.URL.Path, RawQuery: q.Encode()}
+	return "<" + u.RequestURI() + `>; rel="next"`
 }
 
 type mutateRequest struct {

@@ -344,19 +344,7 @@ func NewStore(opts ...Option) (*Store, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Store{
-		collections:     make(map[string]map[string]json.RawMessage),
-		revisions:       make(map[string]map[string]uint64),
-		mutations:       make(map[string]map[string]mutationFunc),
-		raftPeers:       make(map[raft.NodeID]raftPeerInfo),
-		onChangeFns:     make(map[string]func(rawChangeEvent)),
-		notifyCh:        make(chan changeEvent, notifyQueueDepth),
-		pendingGaps:     make(map[string]struct{}),
-		discoveredAddrs: make(map[raft.NodeID]string),
-		cfg:             c,
-		cancel:          cancel,
-		stopCtx:         ctx,
-	}
+	s := newStoreShell(ctx, cancel, &c)
 
 	if err := s.initRaft(); err != nil {
 		cancel()
@@ -1881,6 +1869,189 @@ func (c *Collection[T]) List(ctx context.Context) (map[string]T, error) {
 	c.store.mu.RLock()
 	defer c.store.mu.RUnlock()
 	return c.listLocked()
+}
+
+// ScanOptions narrows and paginates a [Collection.Scan].
+//
+// The zero value scans the whole collection in one page, which is what
+// [Collection.List] does; every field only ever removes results.
+type ScanOptions struct {
+	// Prefix limits the scan to keys that begin with it. An empty Prefix
+	// matches every key.
+	Prefix string
+
+	// After resumes the scan strictly after this key. It is the Next of the
+	// previous page, and it is a key rather than an offset on purpose: an
+	// offset shifts under every insert before it, so a page boundary would
+	// skip or repeat a key whenever the collection changed between pages.
+	After string
+
+	// Limit caps the number of items in the page. Zero means no cap, and the
+	// page then holds every remaining match.
+	Limit int
+}
+
+// Item is one key of a collection with its value and the revision at which it
+// was last written, as returned by [Collection.Scan].
+type Item[T any] struct {
+	Key      string
+	Value    T
+	Revision uint64
+}
+
+// Page is one page of a [Collection.Scan], in ascending key order.
+type Page[T any] struct {
+	// Items are the matches in this page, ordered by key.
+	Items []Item[T]
+
+	// Next is the cursor to pass as [ScanOptions].After for the page after
+	// this one. It is empty when the scan reached the end of the collection,
+	// which is the only signal that there is nothing more: a page with fewer
+	// items than the limit is not one, because nothing stops a page from
+	// being short.
+	Next string
+}
+
+// Scan returns one page of a collection in ascending key order, with the same
+// linearizable guarantee as [Collection.List].
+//
+// Pages are read one at a time and the collection can change between them, so
+// a scan is not a snapshot of the whole collection. What it does guarantee is
+// that the boundary between two pages neither skips nor repeats a key that did
+// not move: the cursor names a key, not a position. A key written before the
+// cursor after its page was read is missed, and one written after it is seen.
+//
+// Scanning the whole collection page by page:
+//
+//	var opts easyraft.ScanOptions
+//	opts.Prefix, opts.Limit = "session/", 100
+//	for {
+//		page, err := sessions.Scan(ctx, opts)
+//		if err != nil {
+//			return err
+//		}
+//		for _, item := range page.Items {
+//			// ...
+//		}
+//		if page.Next == "" {
+//			break
+//		}
+//		opts.After = page.Next
+//	}
+func (c *Collection[T]) Scan(ctx context.Context, opts ScanOptions) (Page[T], error) {
+	if c.store.cfg.Witness {
+		return Page[T]{}, ErrWitness
+	}
+	if c.store.node == nil {
+		return Page[T]{}, fmt.Errorf("easyraft: node not started")
+	}
+	if err := c.store.readIndex(ctx); err != nil {
+		return Page[T]{}, fmt.Errorf("easyraft: read index: %w", err)
+	}
+	return c.ScanStale(opts)
+}
+
+// ScanStale returns one page from the local state machine without a leader
+// round-trip, as [Collection.ListStale] does. The page may lag the cluster by
+// up to one heartbeat.
+func (c *Collection[T]) ScanStale(opts ScanOptions) (Page[T], error) {
+	if c.store.cfg.Witness {
+		return Page[T]{}, ErrWitness
+	}
+	if opts.Limit < 0 {
+		return Page[T]{}, fmt.Errorf("easyraft: scan limit %d is negative", opts.Limit)
+	}
+
+	c.store.mu.RLock()
+	defer c.store.mu.RUnlock()
+
+	keys, next := c.store.scanKeysLocked(c.name, opts)
+	coll := c.store.collections[c.name]
+	revs := c.store.revisions[c.name]
+
+	page := Page[T]{Items: make([]Item[T], 0, len(keys)), Next: next}
+	for _, key := range keys {
+		var v T
+		if err := json.Unmarshal(coll[key], &v); err != nil {
+			return Page[T]{}, fmt.Errorf("easyraft: decode key %q: %w", key, err)
+		}
+		page.Items = append(page.Items, Item[T]{Key: key, Value: v, Revision: revs[key]})
+	}
+	return page, nil
+}
+
+// scanKeysLocked selects one page of a collection's keys in ascending order,
+// and the cursor for the page after it. The caller must hold s.mu.
+//
+// The collection is a map, so the order has to be produced rather than walked:
+// a page costs one pass over the collection plus a sort of what matched. A
+// prefix therefore pays for the keys it excludes, and paging through a large
+// collection pays that per page. That is the trade the in-memory state machine
+// makes everywhere else too, and the way out of it is a collection that is not
+// held in a map -- not a cursor that pretends to be cheaper than it is.
+//
+// One implementation for both the typed API and the HTTP endpoint, so a page
+// boundary cannot mean one thing to a Go caller and another to a curl.
+func (s *Store) scanKeysLocked(collection string, opts ScanOptions) (keys []string, next string) {
+	coll := s.collections[collection]
+	if coll == nil {
+		return nil, ""
+	}
+
+	keys = make([]string, 0, len(coll))
+	for key := range coll {
+		if opts.Prefix != "" && !strings.HasPrefix(key, opts.Prefix) {
+			continue
+		}
+		if opts.After != "" && key <= opts.After {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	// The cursor is set only when a key was actually left behind. A final
+	// page whose size happens to equal the limit carries none, so a caller
+	// that pages until the cursor is empty makes no round-trip that can only
+	// come back empty.
+	if opts.Limit > 0 && len(keys) > opts.Limit {
+		keys = keys[:opts.Limit]
+		return keys, keys[len(keys)-1]
+	}
+	return keys, ""
+}
+
+// ListPrefix returns every item whose key begins with prefix, with the same
+// linearizable guarantee as [Collection.List]. An empty prefix returns the
+// whole collection.
+//
+// It answers in one call and holds the whole result in memory. Use
+// [Collection.Scan] when the result could be large enough to matter, or when
+// the keys are wanted in order.
+func (c *Collection[T]) ListPrefix(ctx context.Context, prefix string) (map[string]T, error) {
+	page, err := c.Scan(ctx, ScanOptions{Prefix: prefix})
+	if err != nil {
+		return nil, err
+	}
+	return pageMap(page), nil
+}
+
+// ListPrefixStale returns every item whose key begins with prefix, read from
+// the local state machine without a leader round-trip.
+func (c *Collection[T]) ListPrefixStale(prefix string) (map[string]T, error) {
+	page, err := c.ScanStale(ScanOptions{Prefix: prefix})
+	if err != nil {
+		return nil, err
+	}
+	return pageMap(page), nil
+}
+
+func pageMap[T any](page Page[T]) map[string]T {
+	out := make(map[string]T, len(page.Items))
+	for _, item := range page.Items {
+		out[item.Key] = item.Value
+	}
+	return out
 }
 
 // Revision returns the highest revision this store has applied. Every
