@@ -1284,6 +1284,25 @@ easyraft.WithPrometheus(prometheus.DefaultRegisterer)
 
 Prometheus metrics are exposed on `GET /metrics` (behind the authorization hook, if configured). The option must be set before `Start()`.
 
+Two of them are about the state machine rather than the engine, and they are the ones with no bound on them:
+
+| Metric | Is |
+|--------|-----|
+| `easyraft_state_bytes` | approximate bytes of application state held in memory |
+| `easyraft_state_keys` | keys held across every collection, internal ones included |
+
+Both carry `{group, node}`, matching the engine's metrics so a dashboard can join on them, and both are published from the moment a node starts — a gauge that appears only once something happens cannot be alerted on when nothing does. `Store.StateBytes()` and `Store.KeyCount()` are the same numbers in Go.
+
+### How much state can a Store hold?
+
+Every collection is held in memory, and a snapshot is the whole of it encoded. There is no configured limit, and nothing here will stop a store growing until the process is killed.
+
+`easyraft_state_bytes` counts, for each key, the length of the key plus the length of its encoded value. **It undercounts.** A Go map costs considerably more than the bytes it stores — headers, buckets, the slack a map keeps to stay fast, and one allocation per value — so the process's real footprint is a multiple of it, commonly two to three times for small values. What the number is exact about is *growth*, and growth is what decides whether a store is heading for trouble.
+
+Alarm on it well below the memory the process has, and remember that running out is not a single-node failure: every replica holds the same state and reaches the same point at about the same time.
+
+If the state is heading somewhere a process cannot hold, a `Store` is the wrong shape for it. The engine takes any [`raft.StateMachine`](../README.md), so a disk-backed one — an embedded key-value store applying the same entries — is the way past this ceiling, at the cost of the typed collections, transactions, watches and HTTP API this package layers on top.
+
 The same registerer can be passed to every group of a `Manager`: collectors are registered once per registry and each group's series carry a `group` label holding its group ID. A single-group `Store` writes an empty `group` label, so queries that ignore the label are unaffected.
 
 ---

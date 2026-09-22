@@ -596,6 +596,7 @@ func (s *Store) initRaftForManager(groupID uint64, tr raft.Transport, st raft.St
 	// registered once and each group's series carry its own "group" label.
 	if s.cfg.PromRegisterer != nil {
 		rCfg.Metrics = prommetrics.NewForGroup(s.cfg.PromRegisterer, groupID)
+		s.metrics = newStoreMetrics(s.cfg.PromRegisterer, groupID, string(s.cfg.ID))
 	}
 
 	node, err := raft.New(&rCfg)

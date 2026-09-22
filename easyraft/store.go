@@ -329,6 +329,15 @@ type Store struct {
 	// searching every lease for it.
 	leases    map[uint64]*leaseState
 	keyLeases map[string]map[string]uint64
+	// stateBytes and keyCount track how much the state machine is holding,
+	// kept in step by setKeyLocked and dropKeyLocked rather than measured on
+	// demand: a walk of every collection is exactly what a store big enough
+	// for the number to matter cannot afford to do per scrape.
+	stateBytes int64
+	keyCount   int
+	// metrics publishes stateBytes and keyCount. nil when no registerer was
+	// configured, which every call site treats as "do nothing".
+	metrics   *storeMetrics
 	mutations map[string]map[string]mutationFunc
 	node      *raft.Node
 
@@ -941,6 +950,7 @@ func (s *Store) initRaft() error {
 	// 4. Metrics — must be set before raft.New so the node is constructed with metrics wired in.
 	if s.cfg.PromRegisterer != nil {
 		rCfg.Metrics = prommetrics.New(s.cfg.PromRegisterer)
+		s.metrics = newStoreMetrics(s.cfg.PromRegisterer, 0, string(s.cfg.ID))
 	}
 
 	node, err := raft.New(&rCfg)
@@ -2527,6 +2537,50 @@ func (c *Collection[T]) LeaseOf(key string) LeaseID {
 	return LeaseID(c.store.keyLeases[c.name][key])
 }
 
+// StateBytes reports approximately how many bytes of application state this
+// replica is holding: for every key, the length of the key plus the length of
+// its encoded value.
+//
+// It is an approximation on purpose, and it undercounts. A Go map costs
+// considerably more than the bytes it stores -- headers, buckets, the slack a
+// map keeps to stay fast, and one allocation per value -- so the process's
+// real footprint is a multiple of this, commonly two to three times it for
+// small values. What the number is good for is the shape of the curve: it is
+// exact about growth, and growth is what decides whether a store is heading
+// for trouble.
+//
+// # The ceiling this measures
+//
+// A [Store] keeps every collection in memory, and a snapshot is the whole of
+// it encoded at once. So the state has to fit in the process, twice over
+// during a snapshot: once as the live maps and once as the bytes being
+// written, though the encoder streams rather than buffering, which keeps the
+// second copy to a window rather than a second full copy.
+//
+// There is no configured limit, and nothing here will stop a store growing
+// until the process is killed. Watch this number -- it is exported as
+// easyraft_state_bytes when [WithPrometheus] is set -- and alarm on it well
+// before the memory the process has. A cluster that runs out of memory does
+// not fail on one node: every replica holds the same state and reaches the
+// same point at about the same time.
+//
+// Read without the state-machine lock held for long: it is a counter kept in
+// step by each write, not a walk of the collections.
+func (s *Store) StateBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stateBytes
+}
+
+// KeyCount reports how many keys this replica holds across every collection,
+// the internal ones included. Exported as easyraft_state_keys when
+// [WithPrometheus] is set.
+func (s *Store) KeyCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.keyCount
+}
+
 // Revision returns the highest revision this store has applied. Every
 // committed entry that touches a collection advances it, whichever key it
 // touched, so it is a watermark for the store as a whole rather than a
@@ -2952,12 +3006,16 @@ func (s *Store) applyEntry(entry raft.LogEntry) ([]byte, error) {
 	// dispatcher sees a consistent snapshot. Assign nil so the next Apply
 	// starts with a fresh allocation rather than aliasing this one.
 	s.pendingEvents = nil
+	bytes, keys := s.stateBytes, s.keyCount
 	s.mu.Unlock()
 
 	for i := range events {
 		events[i].seq = s.eventSeq.Add(1)
 		s.enqueueEvent(&events[i])
 	}
+	// Published after the lock is released, so a scrape never waits on an
+	// apply and an apply never waits on Prometheus.
+	s.metrics.observe(bytes, keys)
 	return result, err
 }
 
@@ -3016,15 +3074,13 @@ func (u *batchUndo) rollback(s *Store) {
 		if coll == nil {
 			continue
 		}
-		revs := s.revisions[e.collection]
 		if e.existed {
-			coll[e.key] = e.previous
-			if revs != nil {
+			s.setKeyLocked(coll, e.key, e.previous)
+			if revs := s.revisions[e.collection]; revs != nil {
 				revs[e.key] = e.previousRev
 			}
 		} else {
-			delete(coll, e.key)
-			delete(revs, e.key)
+			s.dropKeyLocked(e.collection, coll, e.key)
 		}
 		s.attachKeyToLease(e.collection, e.key, e.previousLease)
 	}
@@ -3147,19 +3203,59 @@ func (s *Store) applyLeaseCommand(cmd *command) ([]byte, error) {
 func (s *Store) deleteLeaseKeysLocked(id uint64, held *leaseState) {
 	for _, collection := range slices.Sorted(maps.Keys(held.Keys)) {
 		coll := s.collections[collection]
-		revs := s.revisions[collection]
 		for _, key := range slices.Sorted(maps.Keys(held.Keys[collection])) {
 			if owner, ok := s.keyLeases[collection][key]; !ok || owner != id {
 				continue // moved to another lease since; not ours to delete
 			}
-			delete(coll, key)
-			delete(revs, key)
+			s.dropKeyLocked(collection, coll, key)
 			delete(s.keyLeases[collection], key)
 			s.pendingEvents = append(s.pendingEvents,
 				changeEvent{collection: collection, key: key, deleted: true})
 		}
 		if len(s.keyLeases[collection]) == 0 {
 			delete(s.keyLeases, collection)
+		}
+	}
+}
+
+// setKeyLocked writes value at key and keeps the running size and count in
+// step. The caller must hold mu and must have created the collection.
+//
+// Every write to a collection goes through it, which is the only way a
+// running total stays true: a single site that assigns to the map directly
+// makes the number wrong from then on, and wrong in a way nothing notices.
+func (s *Store) setKeyLocked(coll map[string]json.RawMessage, key string, value json.RawMessage) {
+	if previous, ok := coll[key]; ok {
+		s.stateBytes -= int64(len(previous))
+	} else {
+		s.keyCount++
+		s.stateBytes += int64(len(key))
+	}
+	coll[key] = value
+	s.stateBytes += int64(len(value))
+}
+
+// dropKeyLocked removes key from a collection, if it is there, and keeps the
+// running size and count in step. The caller must hold mu.
+func (s *Store) dropKeyLocked(collection string, coll map[string]json.RawMessage, key string) {
+	previous, ok := coll[key]
+	if !ok {
+		return
+	}
+	s.stateBytes -= int64(len(previous)) + int64(len(key))
+	s.keyCount--
+	delete(coll, key)
+	delete(s.revisions[collection], key)
+}
+
+// recountLocked measures the whole state from scratch. Used after a restore,
+// which replaces everything at once and so has nothing to adjust from.
+func (s *Store) recountLocked() {
+	s.stateBytes, s.keyCount = 0, 0
+	for _, coll := range s.collections {
+		for key, value := range coll {
+			s.keyCount++
+			s.stateBytes += int64(len(key)) + int64(len(value))
 		}
 	}
 }
@@ -3262,7 +3358,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		if undo != nil {
 			undo.record(s, cmd.Collection, cmd.Key)
 		}
-		coll[cmd.Key] = cmd.Value
+		s.setKeyLocked(coll, cmd.Key, cmd.Value)
 		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
@@ -3274,7 +3370,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		if undo != nil {
 			undo.record(s, cmd.Collection, cmd.Key)
 		}
-		coll[cmd.Key] = cmd.Value
+		s.setKeyLocked(coll, cmd.Key, cmd.Value)
 		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
@@ -3283,7 +3379,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		if undo != nil {
 			undo.record(s, cmd.Collection, cmd.Key)
 		}
-		coll[cmd.Key] = cmd.Value
+		s.setKeyLocked(coll, cmd.Key, cmd.Value)
 		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
@@ -3295,8 +3391,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		if undo != nil {
 			undo.record(s, cmd.Collection, cmd.Key)
 		}
-		delete(coll, cmd.Key)
-		delete(revs, cmd.Key)
+		s.dropKeyLocked(cmd.Collection, coll, cmd.Key)
 		s.attachKeyToLease(cmd.Collection, cmd.Key, 0)
 		if s.applyRev > s.revision {
 			s.revision = s.applyRev
@@ -3326,7 +3421,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		if undo != nil {
 			undo.record(s, cmd.Collection, cmd.Key)
 		}
-		coll[cmd.Key] = newVal
+		s.setKeyLocked(coll, cmd.Key, newVal)
 		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: newVal})
 		return resp, nil
@@ -3561,6 +3656,7 @@ func (s *Store) restore(r io.Reader) error {
 	s.revisions = revisions
 	s.revision = revision
 	s.leases, s.keyLeases = rebuildLeases(leases)
+	s.recountLocked()
 	s.mu.Unlock()
 	return nil
 }
