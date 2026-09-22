@@ -42,6 +42,13 @@ func (n *Node) handleTimeoutNow(req *TimeoutNowRequest, respCh chan rpcResponse)
 	if req.Term > n.currentTerm {
 		n.becomeFollower(req.Term, "")
 	}
+	if n.cfg.Witness {
+		// A witness has no log to lead with. The leader is told the transfer
+		// did not take by a reply in the same term.
+		n.logger.Warn("refusing a leadership transfer: this node is a witness")
+		replyWhenDurable()
+		return
+	}
 	// Skip pre-vote: we were explicitly told to start an election immediately.
 	n.becomeCandidate()
 	replyWhenDurable()
@@ -68,6 +75,10 @@ func (n *Node) handleLeadershipTransfer(msg leadershipTransferMsg) {
 	}
 	if targetPeer == nil {
 		msg.respCh <- fmt.Errorf("raft: unknown transfer target %q", msg.target)
+		return
+	}
+	if targetPeer.Witness {
+		msg.respCh <- fmt.Errorf("raft: cannot transfer leadership to witness %q; a witness holds no entries", msg.target)
 		return
 	}
 	if !targetPeer.Voter {

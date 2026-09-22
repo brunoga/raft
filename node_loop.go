@@ -99,6 +99,14 @@ func (n *Node) tick() {
 		if n.cfg.Voter {
 			n.electionElapsed++
 			if n.electionElapsed >= n.electionTimeout {
+				if n.cfg.Witness {
+					// A witness votes but never stands: it has no log to
+					// lead with. Its clock still runs, and stays expired,
+					// because that is how it knows it has lost its leader
+					// and may grant a pre-vote to whoever stands next.
+					n.electionElapsed = n.electionTimeout
+					break
+				}
 				n.resetElectionTimeout()
 				n.triggerElection()
 			}

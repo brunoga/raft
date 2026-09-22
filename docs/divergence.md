@@ -238,11 +238,24 @@ relaxes when the entry is applied. The entry therefore commits under the larger
 of the two commit quorums, which is on every node the new election quorum can
 be drawn from.
 
-### Learners are not witnesses
+### Witnesses stand in for a replica that is down
 
-A non-voting member here replicates the full log and does not vote. §11.7.2
-describes a *witness*, which votes but does not store the full log. They are
-opposites, and witnesses are not implemented.
+§11.7.2 describes a *witness*: a voter that stores the log's metadata and none
+of its entries. `PeerConfig.Witness` and `Config.Witness` are that. A learner
+(`Voter: false`) is its opposite -- the full log and no vote -- and the two
+are distinct roles.
+
+The divergence is in how a witness's acknowledgement is counted. The
+dissertation counts it like any voter's. Here a leader counts it towards a
+commit quorum only while some full voter that lacks the entry has stopped
+answering. Counting it always would let a fast witness and a slow full
+replica commit entries that live on one full disk; if that disk then fails,
+no survivor holds the entries and no full replica behind them can be elected,
+so the group is stuck until the failed replica returns. Preferring full
+replicas keeps every committed entry on every full replica in a healthy
+group, at the cost of waiting for a slow replica instead of the witness. The
+witness earns its keep when a replica is actually down, which is what it is
+for.
 
 ### A failed durable write stops the node
 
@@ -329,7 +342,8 @@ Stated here rather than discovered later.
   at all: a sum says nothing about *where* the replicas that contributed to
   it are. A member that should not vote is a learner, which is weight zero.
   Cheaper writes, or writes that are on every disk before they are
-  acknowledged, is `SetCommitQuorum`. Leadership on the largest machine is
+  acknowledged, is `SetCommitQuorum`. A cheap tie-breaker in a third site is
+  a witness, which votes in full and stores nothing. Leadership on the largest machine is
   `Config.PreferredLeader`; quorum size is about how many failures a group
   survives, not how fast its members are, and weighting a node up makes the
   group *depend* on it rather than benefit from it.
@@ -349,8 +363,6 @@ Stated here rather than discovered later.
   majority of zones, each contributing a majority of its own members, which
   is Zookeeper's model and which weights only approximate. `MinCommitZones`
   is already half of that.
-- **No witnesses.** A member either replicates the log in full or does not vote;
-  there is no member that votes without storing entries (dissertation §11.7.2).
 - **Lease reads assume bounded clock drift.** `ReadIndex` does not; prefer it
   unless you have measured your clocks.
 - **Recovering from permanent quorum loss is not a safe operation, and cannot

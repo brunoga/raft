@@ -102,6 +102,14 @@ var (
 	// ProposalOverflow at its default.
 	ErrProposalQueueFull = errors.New("raft: proposal queue is full")
 
+	// ErrWitnessMismatch reports that the cluster's membership and a node's
+	// Config disagree about whether it is a witness. New returns it when the
+	// membership recovered from disk disagrees with Config.Witness; a running
+	// full node that applies a membership entry calling it a witness stops
+	// with it, since it would otherwise apply stripped entries. Fix the
+	// Config or the membership, and restart.
+	ErrWitnessMismatch = errors.New("raft: membership and Config disagree about whether this node is a witness")
+
 	// ErrLeaseExpired is returned by ReadIndexLease when the leader does not
 	// currently hold a valid clock-based read lease. The caller should fall back
 	// to ReadIndex (which performs a heartbeat round-trip) or retry after the

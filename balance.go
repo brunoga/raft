@@ -49,7 +49,7 @@ const defaultBalancerMaxLag Index = 1024
 // eligibleTarget reports whether candidate can take leadership of a group
 // currently led by leader.
 func eligibleTarget(leader, candidate GroupStatus, maxLag Index) bool {
-	if candidate.NodeID == leader.NodeID || !candidate.Voter {
+	if candidate.NodeID == leader.NodeID || !candidate.Voter || candidate.Witness {
 		return false
 	}
 	if maxLag == 0 {

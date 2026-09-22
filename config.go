@@ -18,11 +18,28 @@ type PeerConfig struct {
 	// contribute to any quorum, so adding one never weakens the cluster while
 	// it catches up. Promote it with Node.PromoteMember once it has.
 	//
-	// This is not a witness in the sense of the Raft dissertation §11.7.2. A
-	// witness there votes but does not store the full log; a learner here
-	// stores the full log but does not vote. They are opposites, and witnesses
-	// are not implemented.
+	// A learner is the opposite of a witness: it stores the full log and does
+	// not vote, where a witness votes and stores only the log's shape.
 	Voter bool
+
+	// Witness marks a voter that stores the log's index and term for every
+	// entry but never the entries themselves, and never applies anything
+	// (Raft dissertation §11.7.2). It votes and counts towards every quorum
+	// like any voter, so a group of two full replicas and a witness survives
+	// the loss of any one member, at a third of the storage and none of the
+	// state machine a third full replica would cost.
+	//
+	// A witness cannot become leader and cannot be the source of a state
+	// transfer, so a group must keep at least one full voter. The leader
+	// prefers full voters when committing: a witness's acknowledgement
+	// counts towards a commit quorum only while some full voter that lacks
+	// the entry has stopped answering. A witness therefore stands in for a
+	// full replica that is down, not for one that is merely slow, and in a
+	// healthy group every committed entry is on every full replica.
+	//
+	// Witness implies Voter. The node itself must be built with
+	// Config.Witness; a mismatch between the two is refused by New.
+	Witness bool
 }
 
 // ProposalOverflowPolicy says what a node does with a proposal that arrives
@@ -70,8 +87,8 @@ type Config struct {
 	// Voter indicates whether this node is a voting member of the cluster.
 	// A non-voter, usually called a learner, replicates the log and can be
 	// promoted to a voter through a configuration change, but does not vote in
-	// elections or count toward any quorum. See PeerConfig.Voter for why this
-	// is not what Raft calls a witness.
+	// elections or count toward any quorum. A learner is the opposite of a
+	// witness; see PeerConfig.Witness.
 	//
 	// Note that the zero value is false, so a Config assembled by hand rather
 	// than from DefaultConfig describes a non-voter. Validate refuses a
@@ -81,6 +98,23 @@ type Config struct {
 	//
 	// Default: true, via DefaultConfig.
 	Voter bool
+
+	// Witness makes this node a witness: a voter that keeps the index and
+	// term of every log entry but never the entries themselves, and applies
+	// nothing. See PeerConfig.Witness for what a witness is for. A witness
+	// needs no StateMachine (a nil one is accepted) and its storage holds
+	// only the log's shape, so it can run on a small machine in a third
+	// location whose job is to break ties.
+	//
+	// The membership must agree: every other node's view of this node, from
+	// its PeerConfig at bootstrap or the entry that added it, must carry
+	// Witness too. New refuses a node whose recovered membership disagrees
+	// with this field, and a node that later applies a membership entry
+	// contradicting it stops, since a full node fed stripped entries would
+	// apply nothing where its peers applied commands.
+	//
+	// Default: false.
+	Witness bool
 
 	// GroupID identifies the Raft group this node belongs to. It is stamped on
 	// every outbound RPC so that a shared transport (see Manager) can route
@@ -639,8 +673,37 @@ func (c *Config) Validate() error {
 	if c.Storage == nil {
 		return errors.New("raft: Config.Storage must not be nil")
 	}
-	if c.StateMachine == nil {
+	if c.StateMachine == nil && !c.Witness {
 		return errors.New("raft: Config.StateMachine must not be nil")
+	}
+	if c.Witness && !c.Voter {
+		return errors.New("raft: Config.Witness requires Config.Voter: a witness is a voter " +
+			"that stores no entries, and a non-voting one would do nothing at all")
+	}
+	for _, p := range c.Peers {
+		if p.Witness && !p.Voter {
+			return fmt.Errorf("raft: peer %q has Witness without Voter; a witness is a voter", p.ID)
+		}
+	}
+	if c.Witness {
+		full := false
+		for _, p := range c.Peers {
+			if p.Voter && !p.Witness {
+				full = true
+				break
+			}
+		}
+		if !full {
+			return errors.New("raft: a witness needs at least one full voter among Config.Peers; " +
+				"a witness cannot become leader, so a group of witnesses could never elect one")
+		}
+	}
+	if c.PreferredLeader != "" {
+		for _, p := range c.Peers {
+			if p.ID == c.PreferredLeader && p.Witness {
+				return fmt.Errorf("raft: PreferredLeader %q is a witness, which cannot lead", p.ID)
+			}
+		}
 	}
 	if c.Transport == nil {
 		return errors.New("raft: Config.Transport must not be nil")

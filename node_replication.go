@@ -99,6 +99,13 @@ func (n *Node) handleAppendEntries(req *AppendEntriesRequest, respCh chan rpcRes
 		return
 	}
 
+	// A witness keeps the shape of the log and nothing else. The leader
+	// already sends it entries that way; stripping here as well covers a
+	// leader that does not know it is talking to one.
+	if n.cfg.Witness && len(req.Entries) > 0 {
+		req.Entries = stripForWitness(req.Entries)
+	}
+
 	// Append new entries, truncating any conflicting suffix first. writeSeq is
 	// the write this request queued, and stays 0 when it queued none: a
 	// heartbeat, or a request whose entries this node already holds. What the
@@ -286,6 +293,12 @@ func (n *Node) replicateToPeer(peer NodeID) {
 		// Cap at MaxLogEntriesPerRPC.
 		if len(entries) > n.cfg.MaxLogEntriesPerRPC {
 			entries = entries[:n.cfg.MaxLogEntriesPerRPC]
+		}
+		// A witness gets the shape of each entry and not its contents, which
+		// is most of what makes it cheap; stripped before the byte cap so
+		// that the cap measures what is actually sent.
+		if n.isWitnessPeer(peer) {
+			entries = stripForWitness(entries)
 		}
 		entries = capByBytes(entries, n.cfg.MaxBytesPerRPC)
 	}
@@ -583,10 +596,30 @@ func (n *Node) replicatedOnMajority(idx Index, members []PeerConfig, includeSelf
 	if includeSelf && selfVoter && idx <= n.log.stableIndex() {
 		count = 1
 	}
+	// Witnesses are counted last, and only if needed. A witness holds no
+	// entries, so an entry committed on the strength of its acknowledgement
+	// lives on fewer full replicas than the quorum size suggests, and if the
+	// full replicas that have it then fail, no surviving node can supply it
+	// and no full node behind it can be elected. So a leader prefers full
+	// voters: a witness stands in for a full voter that has stopped
+	// answering, not for one that is merely slow. In a healthy group every
+	// committed entry is therefore on every full replica.
+	witnessAcks, fullDown := 0, false
 	for _, p := range members {
-		if p.Voter && n.matchIndex[p.ID] >= idx {
+		switch {
+		case !p.Voter:
+		case p.Witness:
+			if n.matchIndex[p.ID] >= idx {
+				witnessAcks++
+			}
+		case n.matchIndex[p.ID] >= idx:
 			count++
+		case n.peerHealth[p.ID].down:
+			fullDown = true
 		}
+	}
+	if fullDown {
+		count += witnessAcks
 	}
 	total := 0
 	for _, p := range members {
