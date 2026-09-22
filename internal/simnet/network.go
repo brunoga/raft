@@ -156,8 +156,6 @@ type Network struct {
 
 	closeOnce sync.Once
 	closeCh   chan struct{}
-	bgCtx     context.Context
-	bgCancel  context.CancelFunc
 	dupWG     sync.WaitGroup
 }
 
@@ -177,7 +175,6 @@ func New(seed uint64) *Network {
 		closeCh:  make(chan struct{}),
 		start:    time.Now(),
 	}
-	n.bgCtx, n.bgCancel = context.WithCancel(context.Background())
 	return n
 }
 
@@ -322,14 +319,17 @@ func (n *Network) Unregister(id raft.NodeID) {
 	delete(n.handlers, id)
 }
 
-// Close shuts the Network down and waits for any duplicate-delivery goroutines
-// to finish, so that no simulated message can touch a node after a test has
-// returned.
+// Close shuts the Network down and waits for any duplicate delivery the
+// simulator has already committed to, so that no simulated message can touch
+// a node after a test has returned.
+//
+// Waiting is not the same as cancelling, and this waits. A duplicate the plan
+// decided on is part of the run's fault schedule, which is what a seed
+// replays; dropping it because the network happened to close first would make
+// the schedule a description of something that did not happen. What Close
+// does cut short is the wait before the delivery, so closing stays prompt.
 func (n *Network) Close() error {
-	n.closeOnce.Do(func() {
-		close(n.closeCh)
-		n.bgCancel()
-	})
+	n.closeOnce.Do(func() { close(n.closeCh) })
 	n.dupWG.Wait()
 	return nil
 }
@@ -502,12 +502,24 @@ func (n *Network) dispatch(
 // deliverDuplicate re-delivers a request after a delay and throws the response
 // away, modelling a retransmission the sender never sees. Raft must be immune
 // to this: every RPC handler is required to be idempotent.
+//
+// The delay is waited out with a plain timer rather than through sleep,
+// because sleep gives up when the network closes and this delivery must not:
+// it is one the simulator has already committed to and recorded, and Close
+// waits for it. Closing still ends the wait at once, so a duplicate that was
+// due in a millisecond does not hold a test up -- it is delivered rather than
+// dropped, which is the difference that matters.
 func (n *Network) deliverDuplicate(to raft.NodeID, delay time.Duration, call func(raft.Handler) (any, error)) {
 	n.dupWG.Add(1)
 	go func() {
 		defer n.dupWG.Done()
-		if err := n.sleep(n.bgCtx, delay); err != nil {
-			return
+		if delay > 0 {
+			t := time.NewTimer(delay)
+			defer t.Stop()
+			select {
+			case <-t.C:
+			case <-n.closeCh:
+			}
 		}
 		if h := n.handlerFor(to); h != nil {
 			_, _ = call(h)
