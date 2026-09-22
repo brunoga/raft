@@ -115,6 +115,11 @@ var (
 	// has. Read it again, decide whether the change still applies, and retry.
 	ErrRevisionMismatch = errors.New("easyraft: key has changed since the revision given")
 
+	// ErrLeaseNotFound is returned when a lease ID names no live lease. A
+	// lease that expired or was revoked is gone, not empty, so attaching a
+	// key to it fails rather than writing a key nothing will ever remove.
+	ErrLeaseNotFound = errors.New("easyraft: lease not found")
+
 	// ErrWitness is returned by every read against a store built with
 	// [WithWitness]. A witness votes and holds no data, so its collections
 	// are empty by construction; answering a read from them would report
@@ -157,12 +162,15 @@ const collectionQueueDepth = 256
 type opType string
 
 const (
-	opCreate opType = "create"
-	opUpdate opType = "update"
-	opDelete opType = "delete"
-	opUpsert opType = "upsert"
-	opMutate opType = "mutate"
-	opBatch  opType = "batch"
+	opCreate         opType = "create"
+	opUpdate         opType = "update"
+	opDelete         opType = "delete"
+	opUpsert         opType = "upsert"
+	opMutate         opType = "mutate"
+	opBatch          opType = "batch"
+	opLeaseGrant     opType = "lease_grant"
+	opLeaseKeepAlive opType = "lease_keepalive"
+	opLeaseRevoke    opType = "lease_revoke"
 	// opCheck writes nothing. It exists so that a transaction can make its
 	// whole batch conditional on a key it does not otherwise touch, which is
 	// the difference between "swap this value" and "swap this value while
@@ -210,6 +218,67 @@ type command struct {
 	// never been written has -- and "no condition" has to be distinct from
 	// it.
 	IfRev *uint64 `json:"if_rev,omitempty"`
+
+	// Lease attaches the key this command writes to a lease, so that the key
+	// disappears when the lease does. Zero attaches nothing, and on a write
+	// to a key that was attached it detaches the key: a write with no lease
+	// is a statement that the key is no longer anyone's to expire.
+	Lease uint64 `json:"lease,omitempty"`
+
+	// LeaseTTLMillis and LeaseNowMillis carry a lease grant or renewal. The
+	// clock reading travels in the command rather than being taken inside
+	// Apply: Apply runs on every replica, at different times, and on a
+	// replica replaying its log possibly days later. A deadline computed
+	// there would differ on every node, which is the one thing a state
+	// machine may not do.
+	LeaseTTLMillis uint64 `json:"lease_ttl_millis,omitempty"`
+	LeaseNowMillis int64  `json:"lease_now_millis,omitempty"`
+}
+
+// leaseState is one live lease: how long it lives for, when it currently
+// expires, and what it takes with it.
+type leaseState struct {
+	TTLMillis uint64 `json:"ttl_millis"`
+	// ExpiresAtMillis is Unix milliseconds in the clock of whichever node
+	// granted or last renewed the lease. It is compared against the sweeping
+	// leader's clock, which is a different one -- see sweepLeases for what
+	// that costs and why it is the right trade.
+	ExpiresAtMillis int64 `json:"expires_at_millis"`
+	// Keys is the set of keys this lease holds, by collection.
+	Keys map[string]map[string]struct{} `json:"-"`
+}
+
+// leaseKeyList is leaseState.Keys in the form a snapshot stores it: sorted,
+// so that two replicas of the same state write identical bytes.
+type leaseSnapshot struct {
+	ID              uint64     `json:"id"`
+	TTLMillis       uint64     `json:"ttl_millis"`
+	ExpiresAtMillis int64      `json:"expires_at_millis"`
+	Keys            []LeaseKey `json:"keys,omitempty"`
+}
+
+// LeaseKey names one key held by a lease.
+type LeaseKey struct {
+	Collection string `json:"collection"`
+	Key        string `json:"key"`
+}
+
+// LeaseID identifies a lease. It is the index of the Raft entry that granted
+// it, which is unique across the cluster for the life of the log and needs no
+// agreement of its own.
+type LeaseID uint64
+
+// LeaseInfo describes one live lease, as read from the local state machine.
+type LeaseInfo struct {
+	ID LeaseID
+	// TTL is the lease's lifetime, restarted by every keep-alive.
+	TTL time.Duration
+	// ExpiresAt is when the lease currently falls due, in the clock of the
+	// node that granted or last renewed it.
+	ExpiresAt time.Time
+	// Keys are the keys the lease holds, which are deleted together when it
+	// expires or is revoked.
+	Keys []LeaseKey
 }
 
 // raftPeerInfo holds the transport-level details for one cluster member.
@@ -253,7 +322,13 @@ type Store struct {
 	// applyRev is the revision being applied, set by applyEntry for the
 	// duration of one entry. The apply path is one goroutine holding mu, so
 	// it does not need to be threaded through the batch recursion.
-	applyRev  uint64
+	applyRev uint64
+	// leases holds every live lease by ID, and keyLeases is its inverse:
+	// which lease, if any, owns a given key. The inverse is what makes an
+	// ordinary write able to detach a key in constant time rather than
+	// searching every lease for it.
+	leases    map[uint64]*leaseState
+	keyLeases map[string]map[string]uint64
 	mutations map[string]map[string]mutationFunc
 	node      *raft.Node
 
@@ -389,6 +464,9 @@ func (s *Store) closeAfterFailedInit() {
 // 400 that surfaces, thirty seconds later, as a timeout. Refusing here says
 // what is wrong while the operator is still looking at the command they typed.
 func validateAdvertised(c *config) error {
+	if c.KeyLeaseSweepInterval < 0 {
+		return fmt.Errorf("easyraft: WithKeyLeaseSweepInterval(%v) is negative", c.KeyLeaseSweepInterval)
+	}
 	if len(c.JoinAddrs) == 0 {
 		// Nothing is being told where to find this node.
 		return nil
@@ -675,6 +753,41 @@ func (t *Txn) Upsert(collection, key string, value any) error {
 		Collection: collection,
 		Key:        key,
 		Value:      b,
+	})
+	return nil
+}
+
+// CreateWithLease adds a create to the transaction that attaches the key to a
+// lease. The whole transaction fails with [ErrLeaseNotFound] if the lease is
+// gone by the time the entry applies.
+func (t *Txn) CreateWithLease(collection, key string, value any, lease LeaseID) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	t.cmds = append(t.cmds, command{
+		Op:         opCreate,
+		Collection: collection,
+		Key:        key,
+		Value:      b,
+		Lease:      uint64(lease),
+	})
+	return nil
+}
+
+// UpsertWithLease adds an upsert to the transaction that attaches the key to
+// a lease. See [Txn.CreateWithLease].
+func (t *Txn) UpsertWithLease(collection, key string, value any, lease LeaseID) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	t.cmds = append(t.cmds, command{
+		Op:         opUpsert,
+		Collection: collection,
+		Key:        key,
+		Value:      b,
+		Lease:      uint64(lease),
 	})
 	return nil
 }
@@ -994,6 +1107,12 @@ func (s *Store) Start() error {
 	}
 
 	go s.dispatchChanges()
+
+	// A witness applies nothing and so holds no leases; a store with no Raft
+	// node has nothing to propose to.
+	if s.node != nil && !s.cfg.Witness {
+		go s.sweepLeases()
+	}
 
 	// Register our own HTTP address in the metadata collection so others can redirect to us.
 	if s.cfg.HTTPAddr != "" {
@@ -2054,6 +2173,316 @@ func pageMap[T any](page Page[T]) map[string]T {
 	return out
 }
 
+// ---- Key leases ------------------------------------------------------------
+
+// defaultKeyLeaseSweepInterval is how often the leader looks for leases that
+// have fallen due when [WithKeyLeaseSweepInterval] says nothing.
+const defaultKeyLeaseSweepInterval = time.Second
+
+// GrantLease creates a lease with the given time to live and returns its ID.
+// Keys written with [Collection.CreateWithLease] or
+// [Collection.UpsertWithLease] under that ID are deleted together when the
+// lease expires or is revoked.
+//
+// A lease expires unless something renews it. [Store.KeepAlive] renews it
+// once; [Store.KeepAliveLoop] keeps renewing until its context is done, which
+// is what makes a lease a liveness signal: a process that stops, or is
+// partitioned from the leader, stops renewing, and the keys it registered go
+// away without anything having to notice that it died.
+//
+// The TTL must be positive. It is rounded down to whole milliseconds, which
+// is the resolution the deadline is agreed at.
+//
+// # What a TTL does and does not promise
+//
+// The deadline is computed from the clock of the node that grants or renews
+// the lease, and compared against the clock of whichever node is leading when
+// it falls due. Those are different clocks, and the leader checks on an
+// interval. So a key may outlive its TTL by the sweep interval plus however
+// far the two clocks disagree, and after a leader change to a node whose
+// clock runs ahead it may go early. Use a TTL comfortably longer than both --
+// seconds, not milliseconds -- and treat it as "gone reasonably soon after
+// nobody renewed it", not as a deadline anything may depend on for
+// correctness. Nothing here depends on it either: expiry is a proposal like
+// any other write, so every replica removes the keys at the same point in the
+// log whatever its own clock says.
+func (s *Store) GrantLease(ctx context.Context, ttl time.Duration) (LeaseID, error) {
+	if ttl <= 0 {
+		return 0, fmt.Errorf("easyraft: lease TTL %v is not positive", ttl)
+	}
+	millis := ttl.Milliseconds()
+	if millis <= 0 {
+		return 0, fmt.Errorf("easyraft: lease TTL %v is shorter than a millisecond", ttl)
+	}
+
+	raw, err := s.propose(ctx, &command{
+		Op:             opLeaseGrant,
+		LeaseTTLMillis: uint64(millis),
+		LeaseNowMillis: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var id uint64
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return 0, fmt.Errorf("easyraft: decode lease id: %w", err)
+	}
+	return LeaseID(id), nil
+}
+
+// KeepAlive restarts a lease's time to live and returns when it now falls
+// due. Returns [ErrLeaseNotFound] if the lease has already expired or been
+// revoked, which is the signal to grant a new one and register again rather
+// than to retry.
+func (s *Store) KeepAlive(ctx context.Context, id LeaseID) (time.Time, error) {
+	raw, err := s.propose(ctx, &command{
+		Op:             opLeaseKeepAlive,
+		Lease:          uint64(id),
+		LeaseNowMillis: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return time.Time{}, err
+	}
+	var expiresAt int64
+	if err := json.Unmarshal(raw, &expiresAt); err != nil {
+		return time.Time{}, fmt.Errorf("easyraft: decode lease deadline: %w", err)
+	}
+	return time.UnixMilli(expiresAt), nil
+}
+
+// KeepAliveLoop renews a lease until ctx is done, and returns why it stopped.
+//
+// It renews every third of the TTL, so two consecutive failures still leave
+// time for a third attempt before the lease falls due. It returns
+// [ErrLeaseNotFound] as soon as the lease is gone -- a caller that sees that
+// must grant a new lease and register its keys again, because the old ones
+// have already been deleted -- and ctx.Err() when the caller is finished.
+//
+// Every other failure is retried: [ErrNotLeader] during an election, or a
+// transport error, is a normal few hundred milliseconds in the life of a
+// cluster and not a reason to drop a registration.
+//
+// The typical use is one goroutine per process:
+//
+//	lease, err := store.GrantLease(ctx, 15*time.Second)
+//	if err != nil {
+//		return err
+//	}
+//	if err := services.UpsertWithLease(ctx, myID, me, lease); err != nil {
+//		return err
+//	}
+//	go func() { _ = store.KeepAliveLoop(ctx, lease) }()
+func (s *Store) KeepAliveLoop(ctx context.Context, id LeaseID) error {
+	ttl := s.leaseTTL(id)
+	if ttl <= 0 {
+		return ErrLeaseNotFound
+	}
+	interval := ttl / 3
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.stopCtx.Done():
+			return s.stopCtx.Err()
+		case <-ticker.C:
+		}
+
+		if _, err := s.KeepAlive(ctx, id); err != nil {
+			if errors.Is(err, ErrLeaseNotFound) {
+				return err
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Anything else is a cluster in motion rather than a lost lease.
+			s.logger().Debug("easyraft: lease keep-alive failed, will retry",
+				"lease", uint64(id), "err", err)
+		}
+	}
+}
+
+// leaseTTL reads a lease's configured lifetime from local state, or zero if
+// this replica does not know the lease.
+func (s *Store) leaseTTL(id LeaseID) time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	held, ok := s.leases[uint64(id)]
+	if !ok {
+		return 0
+	}
+	return time.Duration(held.TTLMillis) * time.Millisecond
+}
+
+// RevokeLease deletes a lease and every key it holds, in one log entry.
+// Revoking a lease that is already gone succeeds: the outcome the caller asked
+// for is the outcome.
+func (s *Store) RevokeLease(ctx context.Context, id LeaseID) error {
+	_, err := s.propose(ctx, &command{Op: opLeaseRevoke, Lease: uint64(id)})
+	return err
+}
+
+// Lease returns what this replica knows about one lease.
+// Returns [ErrLeaseNotFound] if it holds no such lease.
+//
+// Read from local state without a leader round-trip, so on a follower it is
+// as current as that follower is. A lease is a liveness hint rather than a
+// value to decide on, so this deliberately does not pay for linearizability;
+// read the keys the lease holds if what matters is their content.
+func (s *Store) Lease(id LeaseID) (LeaseInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	held, ok := s.leases[uint64(id)]
+	if !ok {
+		return LeaseInfo{}, ErrLeaseNotFound
+	}
+	return leaseInfo(uint64(id), held), nil
+}
+
+// Leases returns every lease this replica holds, ordered by ID.
+func (s *Store) Leases() []LeaseInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]LeaseInfo, 0, len(s.leases))
+	for _, id := range slices.Sorted(maps.Keys(s.leases)) {
+		out = append(out, leaseInfo(id, s.leases[id]))
+	}
+	return out
+}
+
+func leaseInfo(id uint64, held *leaseState) LeaseInfo {
+	info := LeaseInfo{
+		ID:        LeaseID(id),
+		TTL:       time.Duration(held.TTLMillis) * time.Millisecond,
+		ExpiresAt: time.UnixMilli(held.ExpiresAtMillis),
+	}
+	for _, collection := range slices.Sorted(maps.Keys(held.Keys)) {
+		for _, key := range slices.Sorted(maps.Keys(held.Keys[collection])) {
+			info.Keys = append(info.Keys, LeaseKey{Collection: collection, Key: key})
+		}
+	}
+	return info
+}
+
+// sweepLeases proposes the revocation of every lease that has fallen due, for
+// as long as this node is the leader.
+//
+// Expiry is a proposal rather than something each replica decides for itself,
+// because Apply may not read a clock: it runs on every replica at different
+// times, and again on a replica replaying its log long afterwards. A state
+// machine that deleted keys when it noticed the time had passed would hold
+// different state on every node. Proposing instead puts one revocation at one
+// point in the log, and every replica removes the keys there.
+//
+// Only the leader sweeps, and it does so with its own clock against deadlines
+// set by whichever node granted or last renewed each lease. Two proposals for
+// the same lease across a leader change are harmless: revoking a lease that
+// is already gone applies as a no-op.
+func (s *Store) sweepLeases() {
+	interval := s.cfg.KeyLeaseSweepInterval
+	if interval <= 0 {
+		interval = defaultKeyLeaseSweepInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCtx.Done():
+			return
+		case <-ticker.C:
+		}
+		if s.node == nil || s.node.State() != raft.Leader {
+			continue
+		}
+		for _, id := range s.dueLeases(time.Now().UnixMilli()) {
+			// Its own short budget per lease: a revocation that cannot commit
+			// now is one this node is no longer in a position to make, and
+			// the next leader will find the lease still due.
+			ctx, cancel := context.WithTimeout(s.stopCtx, interval)
+			err := s.RevokeLease(ctx, LeaseID(id))
+			cancel()
+			if err != nil && !errors.Is(err, raft.ErrNotLeader) && s.stopCtx.Err() == nil {
+				s.logger().Warn("easyraft: could not revoke an expired lease",
+					"lease", id, "err", err)
+			}
+		}
+	}
+}
+
+// dueLeases returns the IDs of the leases whose deadline has passed, oldest
+// first, snapshotted under the lock so nothing is proposed while holding it.
+func (s *Store) dueLeases(nowMillis int64) []uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.leases) == 0 {
+		return nil
+	}
+	var due []uint64
+	for _, id := range slices.Sorted(maps.Keys(s.leases)) {
+		if s.leases[id].ExpiresAtMillis <= nowMillis {
+			due = append(due, id)
+		}
+	}
+	return due
+}
+
+// CreateWithLease inserts a new item and attaches it to a lease, so that the
+// key is deleted when the lease expires or is revoked.
+// Returns [ErrKeyExists] if the key already exists, and [ErrLeaseNotFound] if
+// the lease is gone -- in which case nothing is written, rather than a key
+// being left behind with nothing to remove it.
+func (c *Collection[T]) CreateWithLease(ctx context.Context, key string, value T, lease LeaseID) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("easyraft: encode value: %w", err)
+	}
+	_, err = c.store.propose(ctx, &command{
+		Op:         opCreate,
+		Collection: c.name,
+		Key:        key,
+		Value:      b,
+		Lease:      uint64(lease),
+	})
+	return err
+}
+
+// UpsertWithLease writes an item and attaches it to a lease, creating the key
+// if it does not exist. It is the usual way to register something that should
+// disappear when its owner stops renewing: re-registering after a restart is
+// the same call.
+//
+// A key can belong to only one lease. Writing it under a different lease moves
+// it, and writing it with any method that names no lease detaches it -- a key
+// written without a lease is no longer anyone's to expire.
+func (c *Collection[T]) UpsertWithLease(ctx context.Context, key string, value T, lease LeaseID) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("easyraft: encode value: %w", err)
+	}
+	_, err = c.store.propose(ctx, &command{
+		Op:         opUpsert,
+		Collection: c.name,
+		Key:        key,
+		Value:      b,
+		Lease:      uint64(lease),
+	})
+	return err
+}
+
+// LeaseOf returns the lease holding a key, or zero if no lease holds it. Read
+// from local state, like [Store.Lease].
+func (c *Collection[T]) LeaseOf(key string) LeaseID {
+	c.store.mu.RLock()
+	defer c.store.mu.RUnlock()
+	return LeaseID(c.store.keyLeases[c.name][key])
+}
+
 // Revision returns the highest revision this store has applied. Every
 // committed entry that touches a collection advances it, whichever key it
 // touched, so it is a watermark for the store as a whole rather than a
@@ -2496,6 +2925,10 @@ type undoEntry struct {
 	previous    json.RawMessage
 	existed     bool
 	previousRev uint64
+	// previousLease is the lease that held the key before the batch, so a
+	// rolled-back write neither leaves a key attached to a lease it was never
+	// given to nor drops one that already held it.
+	previousLease uint64
 }
 
 // batchUndo is the rollback journal for one transaction. It grows with the
@@ -2516,14 +2949,15 @@ type batchUndo struct {
 // record captures the pre-batch value of key so it can be restored. Repeated
 // writes to the same key each append an entry; replaying the journal in
 // reverse therefore restores the earliest value.
-func (u *batchUndo) record(collection, key string, coll map[string]json.RawMessage, revs map[string]uint64) {
-	previous, existed := coll[key]
+func (u *batchUndo) record(s *Store, collection, key string) {
+	previous, existed := s.collections[collection][key]
 	u.entries = append(u.entries, undoEntry{
-		collection:  collection,
-		key:         key,
-		previous:    previous,
-		existed:     existed,
-		previousRev: revs[key],
+		collection:    collection,
+		key:           key,
+		previous:      previous,
+		existed:       existed,
+		previousRev:   s.revisions[collection][key],
+		previousLease: s.keyLeases[collection][key],
 	})
 }
 
@@ -2531,14 +2965,14 @@ func (u *batchUndo) record(collection, key string, coll map[string]json.RawMessa
 // back with the values they belong to: a key whose write was rolled back was
 // never written, and a revision left behind would refuse the next conditional
 // write against it.
-func (u *batchUndo) rollback(collections map[string]map[string]json.RawMessage, revisions map[string]map[string]uint64) {
+func (u *batchUndo) rollback(s *Store) {
 	for i := len(u.entries) - 1; i >= 0; i-- {
 		e := u.entries[i]
-		coll := collections[e.collection]
+		coll := s.collections[e.collection]
 		if coll == nil {
 			continue
 		}
-		revs := revisions[e.collection]
+		revs := s.revisions[e.collection]
 		if e.existed {
 			coll[e.key] = e.previous
 			if revs != nil {
@@ -2548,10 +2982,12 @@ func (u *batchUndo) rollback(collections map[string]map[string]json.RawMessage, 
 			delete(coll, e.key)
 			delete(revs, e.key)
 		}
+		s.attachKeyToLease(e.collection, e.key, e.previousLease)
 	}
 	for _, name := range u.created {
-		delete(collections, name)
-		delete(revisions, name)
+		delete(s.collections, name)
+		delete(s.revisions, name)
+		delete(s.keyLeases, name)
 	}
 }
 
@@ -2560,6 +2996,128 @@ func (u *batchUndo) rollback(collections map[string]map[string]json.RawMessage, 
 // parent's journal and must not restore anything on its own.
 func (u *batchUndo) restoreRevision(s *Store) {
 	s.revision = u.revision
+}
+
+// attachKeyToLease moves one key onto the lease given, or off whichever lease
+// held it when lease is zero. The caller must hold mu.
+//
+// Both directions in one function because every write does both: attaching a
+// key to a lease has to take it off the one it was on, or two leases would
+// each believe they may delete it and the second to expire would remove a key
+// the first had already replaced.
+func (s *Store) attachKeyToLease(collection, key string, lease uint64) {
+	if previous, ok := s.keyLeases[collection][key]; ok && previous != lease {
+		if held := s.leases[previous]; held != nil {
+			delete(held.Keys[collection], key)
+			if len(held.Keys[collection]) == 0 {
+				delete(held.Keys, collection)
+			}
+		}
+		delete(s.keyLeases[collection], key)
+		if len(s.keyLeases[collection]) == 0 {
+			delete(s.keyLeases, collection)
+		}
+	}
+	if lease == 0 {
+		return
+	}
+	held := s.leases[lease]
+	if held == nil {
+		return // refused before the write; unreachable from applyCommand
+	}
+	if held.Keys == nil {
+		held.Keys = make(map[string]map[string]struct{})
+	}
+	if held.Keys[collection] == nil {
+		held.Keys[collection] = make(map[string]struct{})
+	}
+	held.Keys[collection][key] = struct{}{}
+
+	if s.keyLeases[collection] == nil {
+		s.keyLeases[collection] = make(map[string]uint64)
+	}
+	s.keyLeases[collection][key] = lease
+}
+
+// applyLeaseCommand grants, renews or revokes a lease. The caller must hold
+// mu, and undo must be nil -- see the refusal in applyCommand.
+func (s *Store) applyLeaseCommand(cmd *command) ([]byte, error) {
+	switch cmd.Op {
+	case opLeaseGrant:
+		if cmd.LeaseTTLMillis == 0 {
+			return nil, errors.New("easyraft: a lease needs a positive TTL")
+		}
+		// The entry's own index is the lease ID. It is unique across the
+		// cluster for the life of the log, every replica computes the same
+		// one, and it costs neither a counter to replicate nor a random
+		// number two nodes could collide on.
+		id := s.applyRev
+		s.leases[id] = &leaseState{
+			TTLMillis:       cmd.LeaseTTLMillis,
+			ExpiresAtMillis: cmd.LeaseNowMillis + int64(cmd.LeaseTTLMillis),
+			Keys:            make(map[string]map[string]struct{}),
+		}
+		if s.applyRev > s.revision {
+			s.revision = s.applyRev
+		}
+		return json.Marshal(id)
+
+	case opLeaseKeepAlive:
+		held, ok := s.leases[cmd.Lease]
+		if !ok {
+			return nil, ErrLeaseNotFound
+		}
+		held.ExpiresAtMillis = cmd.LeaseNowMillis + int64(held.TTLMillis)
+		if s.applyRev > s.revision {
+			s.revision = s.applyRev
+		}
+		return json.Marshal(held.ExpiresAtMillis)
+
+	case opLeaseRevoke:
+		held, ok := s.leases[cmd.Lease]
+		if !ok {
+			// Already gone. Revocation is proposed by whichever node is
+			// leading when a lease falls due, and a leader change can put two
+			// proposals for the same lease in the log; the second must not
+			// fail the entry that carries it.
+			return nil, nil
+		}
+		s.deleteLeaseKeysLocked(cmd.Lease, held)
+		delete(s.leases, cmd.Lease)
+		if s.applyRev > s.revision {
+			s.revision = s.applyRev
+		}
+		return nil, nil
+
+	default:
+		return nil, fmt.Errorf("easyraft: unknown lease op %q", cmd.Op)
+	}
+}
+
+// deleteLeaseKeysLocked removes every key a lease holds, emitting the same
+// change events an explicit delete of each would. The caller must hold mu.
+//
+// Keys go in sorted order so that the events a replica emits for one
+// revocation are in the same order on every replica -- a watcher rebuilding
+// state from the stream sees one sequence, not a different one per node.
+func (s *Store) deleteLeaseKeysLocked(id uint64, held *leaseState) {
+	for _, collection := range slices.Sorted(maps.Keys(held.Keys)) {
+		coll := s.collections[collection]
+		revs := s.revisions[collection]
+		for _, key := range slices.Sorted(maps.Keys(held.Keys[collection])) {
+			if owner, ok := s.keyLeases[collection][key]; !ok || owner != id {
+				continue // moved to another lease since; not ours to delete
+			}
+			delete(coll, key)
+			delete(revs, key)
+			delete(s.keyLeases[collection], key)
+			s.pendingEvents = append(s.pendingEvents,
+				changeEvent{collection: collection, key: key, deleted: true})
+		}
+		if len(s.keyLeases[collection]) == 0 {
+			delete(s.keyLeases, collection)
+		}
+	}
 }
 
 // applyCommand applies cmd to the state machine. undo is non-nil while a batch
@@ -2589,7 +3147,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		for i := range cmd.Batch {
 			res, err := s.applyCommand(&cmd.Batch[i], journal)
 			if err != nil {
-				journal.rollback(s.collections, s.revisions)
+				journal.rollback(s)
 				journal.restoreRevision(s)
 				// Discard any partial change events emitted during the batch.
 				s.pendingEvents = s.pendingEvents[:preBatchEventsLen]
@@ -2598,6 +3156,16 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			results = append(results, res)
 		}
 		return json.Marshal(results)
+	}
+
+	switch cmd.Op {
+	case opLeaseGrant, opLeaseKeepAlive, opLeaseRevoke:
+		// Lease bookkeeping names no collection, and a batch cannot roll it
+		// back, so it is refused inside one rather than half-applied.
+		if undo != nil {
+			return nil, fmt.Errorf("easyraft: %s cannot be part of a transaction", cmd.Op)
+		}
+		return s.applyLeaseCommand(cmd)
 	}
 
 	coll, exists := s.collections[cmd.Collection]
@@ -2621,12 +3189,25 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 		return nil, ErrRevisionMismatch
 	}
 
-	// Every write below stamps the entry's own index on the key it wrote.
+	// A write to a key that names a lease must name one that exists, or the
+	// key would be written with nobody to remove it. Checked before anything
+	// is written, next to the revision check, for the same reason.
+	if cmd.Lease != 0 {
+		if _, ok := s.leases[cmd.Lease]; !ok {
+			return nil, ErrLeaseNotFound
+		}
+	}
+
+	// Every write below stamps the entry's own index on the key it wrote, and
+	// moves the key between leases: onto the one the command names, or off
+	// whichever one held it. A write with no lease detaches, because a key
+	// written without one is no longer anyone's to expire.
 	stamp := func(key string) {
 		revs[key] = s.applyRev
 		if s.applyRev > s.revision {
 			s.revision = s.applyRev
 		}
+		s.attachKeyToLease(cmd.Collection, key, cmd.Lease)
 	}
 
 	switch cmd.Op {
@@ -2635,7 +3216,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, ErrKeyExists
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll, revs)
+			undo.record(s, cmd.Collection, cmd.Key)
 		}
 		coll[cmd.Key] = cmd.Value
 		stamp(cmd.Key)
@@ -2647,7 +3228,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, ErrKeyNotFound
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll, revs)
+			undo.record(s, cmd.Collection, cmd.Key)
 		}
 		coll[cmd.Key] = cmd.Value
 		stamp(cmd.Key)
@@ -2656,7 +3237,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 
 	case opUpsert:
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll, revs)
+			undo.record(s, cmd.Collection, cmd.Key)
 		}
 		coll[cmd.Key] = cmd.Value
 		stamp(cmd.Key)
@@ -2668,10 +3249,11 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, ErrKeyNotFound
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll, revs)
+			undo.record(s, cmd.Collection, cmd.Key)
 		}
 		delete(coll, cmd.Key)
 		delete(revs, cmd.Key)
+		s.attachKeyToLease(cmd.Collection, cmd.Key, 0)
 		if s.applyRev > s.revision {
 			s.revision = s.applyRev
 		}
@@ -2698,7 +3280,7 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, err
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll, revs)
+			undo.record(s, cmd.Collection, cmd.Key)
 		}
 		coll[cmd.Key] = newVal
 		stamp(cmd.Key)
@@ -2737,7 +3319,7 @@ func (s *Store) snapshot(w io.Writer) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 
 	s.mu.RLock()
-	err := streamCollections(bw, s.collections, s.revisions, s.revision)
+	err := streamCollections(bw, s.collections, s.revisions, s.revision, s.leaseSnapshotLocked())
 	s.mu.RUnlock()
 
 	if err != nil {
@@ -2762,10 +3344,33 @@ func (s *Store) snapshot(w io.Writer) error {
 const (
 	snapshotRevisionsKey = "__easyraft_revisions__"
 	snapshotRevisionKey  = "__easyraft_revision__"
+	snapshotLeasesKey    = "__easyraft_leases__"
 )
 
+// leaseSnapshotLocked renders the lease table in a fixed order, so that two
+// replicas holding the same leases write identical snapshot bytes. The caller
+// must hold mu.
+func (s *Store) leaseSnapshotLocked() []leaseSnapshot {
+	out := make([]leaseSnapshot, 0, len(s.leases))
+	for _, id := range slices.Sorted(maps.Keys(s.leases)) {
+		held := s.leases[id]
+		entry := leaseSnapshot{
+			ID:              id,
+			TTLMillis:       held.TTLMillis,
+			ExpiresAtMillis: held.ExpiresAtMillis,
+		}
+		for _, collection := range slices.Sorted(maps.Keys(held.Keys)) {
+			for _, key := range slices.Sorted(maps.Keys(held.Keys[collection])) {
+				entry.Keys = append(entry.Keys, LeaseKey{Collection: collection, Key: key})
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 func streamCollections(w *bufio.Writer, collections map[string]map[string]json.RawMessage,
-	revisions map[string]map[string]uint64, revision uint64,
+	revisions map[string]map[string]uint64, revision uint64, leases []leaseSnapshot,
 ) error {
 	if _, err := w.WriteString("{"); err != nil {
 		return err
@@ -2859,6 +3464,27 @@ func streamCollections(w *bufio.Writer, collections map[string]map[string]json.R
 		return err
 	}
 
+	if len(leases) > 0 {
+		if _, err := w.WriteString(","); err != nil {
+			return err
+		}
+		if err := writeJSONString(w, snapshotLeasesKey); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(":"); err != nil {
+			return err
+		}
+		// Small next to the collections and already in a fixed order, so it
+		// is encoded in one go rather than streamed field by field.
+		encoded, err := json.Marshal(leases)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(encoded); err != nil {
+			return err
+		}
+	}
+
 	_, err := w.WriteString("}\n")
 	return err
 }
@@ -2881,7 +3507,7 @@ func writeJSONString(w *bufio.Writer, s string) error {
 func (s *Store) restore(r io.Reader) error {
 	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
 
-	collections, revisions, revision, err := decodeCollections(dec)
+	collections, revisions, revision, leases, err := decodeCollections(dec)
 	if err != nil {
 		return fmt.Errorf("easyraft: restore decode: %w", err)
 	}
@@ -2890,8 +3516,39 @@ func (s *Store) restore(r io.Reader) error {
 	s.collections = collections
 	s.revisions = revisions
 	s.revision = revision
+	s.leases, s.keyLeases = rebuildLeases(leases)
 	s.mu.Unlock()
 	return nil
+}
+
+// rebuildLeases turns the snapshot's flat lease list back into the live table
+// and its inverse. The inverse is derived rather than stored: one place
+// decides which lease owns a key, so a snapshot cannot describe a key as
+// belonging to two leases at once.
+func rebuildLeases(snapshot []leaseSnapshot) (
+	leases map[uint64]*leaseState, keyLeases map[string]map[string]uint64,
+) {
+	leases = make(map[uint64]*leaseState, len(snapshot))
+	keyLeases = make(map[string]map[string]uint64)
+	for _, entry := range snapshot {
+		held := &leaseState{
+			TTLMillis:       entry.TTLMillis,
+			ExpiresAtMillis: entry.ExpiresAtMillis,
+			Keys:            make(map[string]map[string]struct{}),
+		}
+		for _, k := range entry.Keys {
+			if held.Keys[k.Collection] == nil {
+				held.Keys[k.Collection] = make(map[string]struct{})
+			}
+			held.Keys[k.Collection][k.Key] = struct{}{}
+			if keyLeases[k.Collection] == nil {
+				keyLeases[k.Collection] = make(map[string]uint64)
+			}
+			keyLeases[k.Collection][k.Key] = entry.ID
+		}
+		leases[entry.ID] = held
+	}
+	return leases, keyLeases
 }
 
 // decodeCollections reads a snapshot body, tolerating both an empty stream and
@@ -2900,6 +3557,7 @@ func decodeCollections(dec *json.Decoder) (
 	collections map[string]map[string]json.RawMessage,
 	revisions map[string]map[string]uint64,
 	revision uint64,
+	leases []leaseSnapshot,
 	err error,
 ) {
 	collections = make(map[string]map[string]json.RawMessage)
@@ -2907,31 +3565,31 @@ func decodeCollections(dec *json.Decoder) (
 
 	tok, err := dec.Token()
 	if errors.Is(err, io.EOF) {
-		return collections, revisions, 0, nil
+		return collections, revisions, 0, nil, nil
 	}
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, nil, err
 	}
 	if tok == nil {
-		return collections, revisions, 0, nil // JSON null
+		return collections, revisions, 0, nil, nil // JSON null
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil, nil, 0, fmt.Errorf("expected a JSON object, found %v", tok)
+		return nil, nil, 0, nil, fmt.Errorf("expected a JSON object, found %v", tok)
 	}
 
 	for dec.More() {
 		nameTok, err := dec.Token()
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, nil, 0, nil, err
 		}
 		name, ok := nameTok.(string)
 		if !ok {
-			return nil, nil, 0, fmt.Errorf("expected a collection name, found %v", nameTok)
+			return nil, nil, 0, nil, fmt.Errorf("expected a collection name, found %v", nameTok)
 		}
 		switch name {
 		case snapshotRevisionsKey:
 			if err := dec.Decode(&revisions); err != nil {
-				return nil, nil, 0, fmt.Errorf("revisions: %w", err)
+				return nil, nil, 0, nil, fmt.Errorf("revisions: %w", err)
 			}
 			if revisions == nil {
 				revisions = make(map[string]map[string]uint64)
@@ -2939,13 +3597,18 @@ func decodeCollections(dec *json.Decoder) (
 			continue
 		case snapshotRevisionKey:
 			if err := dec.Decode(&revision); err != nil {
-				return nil, nil, 0, fmt.Errorf("revision: %w", err)
+				return nil, nil, 0, nil, fmt.Errorf("revision: %w", err)
+			}
+			continue
+		case snapshotLeasesKey:
+			if err := dec.Decode(&leases); err != nil {
+				return nil, nil, 0, nil, fmt.Errorf("leases: %w", err)
 			}
 			continue
 		}
 		var items map[string]json.RawMessage
 		if err := dec.Decode(&items); err != nil {
-			return nil, nil, 0, fmt.Errorf("collection %q: %w", name, err)
+			return nil, nil, 0, nil, fmt.Errorf("collection %q: %w", name, err)
 		}
 		if items == nil {
 			items = make(map[string]json.RawMessage)
@@ -2954,9 +3617,9 @@ func decodeCollections(dec *json.Decoder) (
 	}
 
 	if _, err := dec.Token(); err != nil { // closing brace
-		return nil, nil, 0, err
+		return nil, nil, 0, nil, err
 	}
-	return collections, revisions, revision, nil
+	return collections, revisions, revision, leases, nil
 }
 
 // raftTickInterval returns the configured tick interval, falling back to the

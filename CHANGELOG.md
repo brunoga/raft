@@ -8,6 +8,34 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **Key leases in easyraft.** `Store.GrantLease` creates a lease with a time
+  to live; keys written under it with `Collection.CreateWithLease` or
+  `UpsertWithLease` are deleted together when it expires or is revoked.
+  `KeepAliveLoop` renews one from a single goroutine until its context is
+  done, which is the service-registry pattern: a process registers itself and
+  its entry goes away on its own when it stops or is partitioned, with no
+  other process having to notice that it died. Over HTTP the lease lives at
+  `/__leases`, and a write attaches to one with `?lease=`.
+
+  Expiry is a proposal by the leader, not something each replica decides for
+  itself. `Apply` may not read a clock -- it runs on every replica at
+  different times, and again on a replica replaying its log days later -- so
+  a state machine that deleted keys when it noticed the time had passed would
+  hold different state on every node. The leader proposes a revocation when a
+  lease falls due and every replica removes the keys at the same point in the
+  log. What that costs is precision, and the README says so plainly: a key
+  may outlive its TTL by the sweep interval plus the disagreement between two
+  clocks, and may go early after a leader change to a node whose clock runs
+  ahead.
+
+  A lease ID is the index of the entry that granted it: unique across the
+  cluster for the life of the log, agreed by everyone, and costing neither a
+  replicated counter nor a random number two nodes could collide on. A key
+  belongs to exactly one lease, a write naming no lease detaches it, and a
+  write under a lease that is gone writes nothing rather than leaving a key
+  with nothing to remove it. Leases travel in snapshots; a snapshot written
+  before this change restores as a store with none.
+
 - **Prefix scans and pagination in easyraft.** `Collection.Scan` returns a
   collection one page at a time in ascending key order, narrowed by a prefix,
   and `ListPrefix` is the one-call form for a result small enough to hold in

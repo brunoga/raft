@@ -244,6 +244,54 @@ err := configs.Upsert(ctx, "db.host", ConfigEntry{Value: "localhost"})
 
 ---
 
+## Key leases — registrations that expire
+
+A lease makes a key disappear when nothing renews it. That is the primitive behind a service registry: a process registers itself, keeps the lease alive while it runs, and its entry goes away on its own when it stops or is partitioned — with no other process having to notice that it died.
+
+```go
+lease, err := store.GrantLease(ctx, 15*time.Second)
+if err != nil {
+    return err
+}
+if err := services.UpsertWithLease(ctx, myID, me, lease); err != nil {
+    return err
+}
+go func() { _ = store.KeepAliveLoop(ctx, lease) }()
+```
+
+`KeepAliveLoop` renews every third of the TTL, so two consecutive failures still leave time for a third attempt. It retries `ErrNotLeader` and transport errors — an election is a normal few hundred milliseconds in the life of a cluster, not a reason to drop a registration — and returns as soon as the lease is gone, which is the signal to grant a new one and register again. `KeepAlive` renews once for a caller that runs its own loop.
+
+| Method | Does |
+|--------|------|
+| `Store.GrantLease(ctx, ttl)` | creates a lease, returns its `LeaseID` |
+| `Store.KeepAlive(ctx, id)` | restarts its TTL, returns the new deadline |
+| `Store.KeepAliveLoop(ctx, id)` | renews until `ctx` is done |
+| `Store.RevokeLease(ctx, id)` | deletes the lease and every key it holds, now |
+| `Store.Lease(id)` / `Store.Leases()` | what this replica knows, from local state |
+| `Collection.CreateWithLease` / `UpsertWithLease` | write a key attached to a lease |
+| `Collection.LeaseOf(key)` | the lease holding a key, or zero |
+
+Revoke on a clean shutdown. A process that exits without revoking leaves its entry for the rest of the TTL, which is the right behaviour for a crash and unnecessarily slow for a planned stop.
+
+**A key belongs to exactly one lease.** Writing it under a different lease moves it; writing it with any method that names no lease detaches it, because a key written without a lease is no longer anyone's to expire. Deleting it releases it, so a later revocation cannot remove whatever was written in its place.
+
+**A write under a lease that is gone writes nothing** and returns `ErrLeaseNotFound`, rather than leaving a key behind with nothing to remove it.
+
+### What a TTL promises
+
+Expiry is a **proposal**, not something each replica decides for itself. `Apply` may not read a clock: it runs on every replica at different times, and again on a replica replaying its log days later, so a state machine that deleted keys when it noticed the time had passed would hold different state on every node. Instead the leader proposes a revocation when a lease falls due, and every replica removes the keys at the same point in the log whatever its own clock says.
+
+That puts the imprecision in one place, and it is worth stating plainly. The deadline is computed from the clock of the node that granted or last renewed the lease, and compared against the clock of whichever node is leading when it falls due. So:
+
+- a key may outlive its TTL by the sweep interval plus however far the two clocks disagree;
+- after a leader change to a node whose clock runs ahead, a key may go early.
+
+Use a TTL comfortably longer than both — seconds, not milliseconds — and treat it as *gone reasonably soon after nobody renewed it*, never as a deadline anything depends on for correctness. If you need "hold this or lose it" semantics that a peer can rely on, pair the lease with [`Txn.CheckRev`](#revisions--compare-and-swap) so the work is conditional on the registration still being the one that was read.
+
+`WithKeyLeaseSweepInterval` sets how often the leader looks for leases that have fallen due; the default is one second, and nothing is proposed at all while no lease is due. It has nothing to do with `WithLeaseReads` or `WithLeaseSafetyMargin`, which are about the leader serving a read without a round-trip.
+
+---
+
 ## Prefix scans and pagination
 
 `List` returns a whole collection in one answer. When a collection is large, or when the keys are namespaced and only one namespace is wanted, `Scan` returns it a page at a time in ascending key order:
@@ -836,11 +884,16 @@ http.ListenAndServe(":8001", mux) // one server, no conflict
 | `DELETE` | `/members/{id}` | Remove a member from the cluster (leader only) |
 | `POST` | `/transfer-leadership` | Transfer leadership: `{"to": "nodeID"}` |
 | `POST` | `/batch` | Atomic multi-collection batch (see below) |
-| `POST` | `/{collection}/{key}` | Create item (201 Created) |
+| `POST` | `/__leases` | Grant a lease: `{"ttl_seconds": 15}` |
+| `GET` | `/__leases` | List leases held by this replica |
+| `GET` | `/__leases/{id}` | Read one lease and the keys it holds |
+| `POST` | `/__leases/{id}/keepalive` | Restart a lease's TTL |
+| `DELETE` | `/__leases/{id}` | Revoke a lease and delete its keys |
+| `POST` | `/{collection}/{key}` | Create item (201 Created) — `?lease=` attaches it |
 | `GET` | `/{collection}/{key}` | Read — linearizable, returns the key's revision as `ETag` |
 | `GET` | `/{collection}/{key}?consistency=stale` | Read — local, no round-trip |
 | `PUT` | `/{collection}/{key}` | Update item — honours `If-Match` |
-| `PATCH` | `/{collection}/{key}` | Upsert item (create or replace) — honours `If-Match` / `If-None-Match` |
+| `PATCH` | `/{collection}/{key}` | Upsert item (create or replace) — honours `If-Match` / `If-None-Match`, `?lease=` attaches it |
 | `DELETE` | `/{collection}/{key}` | Delete item — honours `If-Match` |
 | `GET` | `/{collection}` | List all — linearizable |
 | `GET` | `/{collection}?consistency=stale` | List all — local |
@@ -886,7 +939,7 @@ Same as the `Store` routes above, prefixed with `/groups/{groupID}` (e.g. `GET /
 ]
 ```
 
-Valid `op` values: `create`, `update`, `upsert`, `delete`, `mutate`, `check`.
+Valid `op` values: `create`, `update`, `upsert`, `delete`, `mutate`, `check`. A `create` or `upsert` may carry a `lease`, as the query parameter does on a single-key write.
 
 Any operation may carry an `if_rev` that makes it conditional on the key's current revision, and `check` carries nothing else — it writes nothing and only asserts that a key is at the revision given. A failed condition anywhere in the batch answers `412 Precondition Failed` and writes none of it:
 
@@ -916,6 +969,24 @@ Link: </sessions?limit=100&prefix=user%2F&after=user%2F0099>; rel="next"
 Follow the `Link` header rather than assembling the next URL. It is built from the request's own path and query, so it stays correct behind a proxy with no configuration. The absence of both headers means the page reached the end of the collection; see the note above on why a short page does not.
 
 A `limit` that is not a non-negative number is answered with `400` rather than ignored.
+
+### Leases over HTTP
+
+```
+$ curl -X POST -d '{"ttl_seconds":15}' http://host:8001/__leases
+{"id":412,"ttl_seconds":15,"expires_at":"..."}
+
+$ curl -X PATCH -d '{"addr":"10.0.0.7:8080"}' 'http://host:8001/services/web-1?lease=412'
+HTTP/1.1 204 No Content
+
+$ curl -X POST http://host:8001/__leases/412/keepalive     # every few seconds
+```
+
+Stop renewing and `services/web-1` disappears. `DELETE /__leases/412` removes it at once.
+
+The lease routes live under the reserved `__` prefix because the collection routes are `/{collection}` and `/{collection}/{key}`: a plain `/leases` would shadow a collection of that name, silently and only over HTTP. A `__`-prefixed name is already refused to collections, so nothing a caller can create reaches these routes.
+
+A `lease` that is not the id of a live lease is answered with `404`, and the write is not applied. A `lease` that is not a positive number is answered with `400` rather than treated as "no lease".
 
 ### Conditional requests
 
@@ -1138,6 +1209,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithPreferredLeader(id)` | Node that should hold leadership when possible |
 | `WithMaxClientTableSize(n)` | Bound on the exactly-once table behind `Session` |
 | `WithLeaseSafetyMargin(d)` | What a lease read may assume about clocks |
+| `WithKeyLeaseSweepInterval(d)` | How often the leader looks for expired key leases (default 1s) — unrelated to the read-lease options above |
 | `WithProposalQueue(size, policy)` | Writes that may wait, and what happens to the next one |
 | `WithOnRemoved(fn)` | Called when a committed change removes this node |
 | `WithInsecureTransportAcknowledged()` | Run the gRPC transport in plaintext, on purpose; without this or `WithTLS` the node refuses to start |
@@ -1156,6 +1228,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `easyraft.ErrUnauthorized` | Request carried no usable credential — the HTTP layer answers `401` |
 | `easyraft.ErrForbidden` | Credential is valid but not permitted — the HTTP layer answers `403` |
 | `easyraft.ErrRevisionMismatch` | A conditional write named a revision the key is no longer at — re-read and retry |
+| `easyraft.ErrLeaseNotFound` | The lease named has expired or been revoked — grant a new one and register again |
 | `easyraft.ErrReservedCollection` | Request named a `__`-prefixed internal collection |
 | `raft.ErrObsoleteSeqNum` | Exactly-once sequence number is below one already recorded for that client |
 

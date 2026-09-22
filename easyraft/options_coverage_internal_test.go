@@ -53,6 +53,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithPreferredLeader("n1"),
 		WithMaxClientTableSize(1000),
 		WithLeaseSafetyMargin(15 * time.Millisecond),
+		WithKeyLeaseSweepInterval(250 * time.Millisecond),
 		WithProposalQueue(512, raft.ProposalOverflowReject),
 		WithOnRemoved(func() {}),
 		WithHTTPTLS(&tls.Config{MinVersion: tls.VersionTLS13}),

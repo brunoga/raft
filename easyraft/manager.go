@@ -113,6 +113,8 @@ func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg *conf
 	return &Store{
 		collections:     make(map[string]map[string]json.RawMessage),
 		revisions:       make(map[string]map[string]uint64),
+		leases:          make(map[uint64]*leaseState),
+		keyLeases:       make(map[string]map[string]uint64),
 		mutations:       make(map[string]map[string]mutationFunc),
 		raftPeers:       make(map[raft.NodeID]raftPeerInfo),
 		onChangeFns:     make(map[string]func(rawChangeEvent)),
@@ -292,6 +294,11 @@ func (m *Manager) Start() error {
 		// one that was never started and closing the shared transport.
 		g.store.started.Store(true)
 		go g.store.dispatchChanges()
+		// Each group expires its own leases. A witness applies nothing and so
+		// holds none.
+		if !g.store.cfg.Witness {
+			go g.store.sweepLeases()
+		}
 		// Advertise this node's HTTP address so the cluster can redirect clients.
 		if g.store.cfg.HTTPAddr != "" {
 			go g.store.advertiseMetadata()
