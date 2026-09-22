@@ -2,6 +2,7 @@ package easyraft
 
 import (
 	"context"
+	"time"
 
 	"github.com/brunoga/raft/v2"
 )
@@ -136,6 +137,55 @@ func (e *EasyRaft[T]) ListStale() (map[string]T, error) {
 // List returns all items in the collection with linearizable consistency.
 func (e *EasyRaft[T]) List(ctx context.Context) (map[string]T, error) {
 	return e.collection.List(ctx)
+}
+
+// GrantLease creates a lease with the given time to live. Keys written with
+// [EasyRaft.CreateWithLease] or [EasyRaft.UpsertWithLease] under it are
+// deleted together when it expires or is revoked. See [Store.GrantLease] for
+// what a TTL does and does not promise.
+func (e *EasyRaft[T]) GrantLease(ctx context.Context, ttl time.Duration) (LeaseID, error) {
+	return e.store.GrantLease(ctx, ttl)
+}
+
+// KeepAlive restarts a lease's time to live and reports when it now falls due.
+func (e *EasyRaft[T]) KeepAlive(ctx context.Context, id LeaseID) (time.Time, error) {
+	return e.store.KeepAlive(ctx, id)
+}
+
+// KeepAliveLoop renews a lease until ctx is done. See [Store.KeepAliveLoop].
+func (e *EasyRaft[T]) KeepAliveLoop(ctx context.Context, id LeaseID) error {
+	return e.store.KeepAliveLoop(ctx, id)
+}
+
+// RevokeLease deletes a lease and every key it holds, in one log entry.
+func (e *EasyRaft[T]) RevokeLease(ctx context.Context, id LeaseID) error {
+	return e.store.RevokeLease(ctx, id)
+}
+
+// Lease returns what this replica knows about one lease.
+func (e *EasyRaft[T]) Lease(id LeaseID) (LeaseInfo, error) {
+	return e.store.Lease(id)
+}
+
+// Leases returns every lease this replica holds, ordered by ID.
+func (e *EasyRaft[T]) Leases() []LeaseInfo {
+	return e.store.Leases()
+}
+
+// CreateWithLease inserts a new item attached to a lease.
+func (e *EasyRaft[T]) CreateWithLease(ctx context.Context, key string, value T, lease LeaseID) error {
+	return e.collection.CreateWithLease(ctx, key, value, lease)
+}
+
+// UpsertWithLease writes an item attached to a lease, creating the key if it
+// does not exist.
+func (e *EasyRaft[T]) UpsertWithLease(ctx context.Context, key string, value T, lease LeaseID) error {
+	return e.collection.UpsertWithLease(ctx, key, value, lease)
+}
+
+// LeaseOf returns the lease holding a key, or zero if none does.
+func (e *EasyRaft[T]) LeaseOf(key string) LeaseID {
+	return e.collection.LeaseOf(key)
 }
 
 // Scan returns one page of the collection in ascending key order, narrowed

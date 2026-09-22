@@ -118,6 +118,10 @@ type config struct {
 	// about clocks. Set via [WithLeaseSafetyMargin].
 	LeaseSafetyMargin time.Duration
 
+	// KeyLeaseSweepInterval is how often the leader looks for expired key
+	// leases. Set via [WithKeyLeaseSweepInterval].
+	KeyLeaseSweepInterval time.Duration
+
 	// ProposalQueueSize and ProposalOverflow govern how many writes may wait
 	// for the event loop and what happens to the next one. Set via
 	// [WithProposalQueue].
@@ -561,6 +565,22 @@ func WithPreferredLeader(id raft.NodeID) Option {
 // change a running group with [Store.SetMaxClientTableSize].
 func WithMaxClientTableSize(entries int) Option {
 	return func(c *config) { c.MaxClientTableSize = entries }
+}
+
+// WithKeyLeaseSweepInterval sets how often the leader looks for key leases
+// that have fallen due, which bounds how long a key can outlive the TTL of
+// the lease holding it.
+//
+// This is about the leases granted by [Store.GrantLease], which make a key
+// disappear when nothing renews it. It has nothing to do with
+// [WithLeaseReads] or [WithLeaseSafetyMargin], which are about the leader
+// serving a read without a round-trip.
+//
+// A shorter interval expires keys closer to their deadline and proposes a
+// little more often; nothing is proposed at all while no lease is due. The
+// default is one second. Zero keeps the default; a negative value is refused.
+func WithKeyLeaseSweepInterval(d time.Duration) Option {
+	return func(c *config) { c.KeyLeaseSweepInterval = d }
 }
 
 // WithLeaseSafetyMargin shortens the read lease behind [WithLeaseReads] and

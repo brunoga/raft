@@ -82,6 +82,9 @@ type batchOp struct {
 	// a "check" operation with only a collection, key and if_rev is how a
 	// batch is guarded on a key it does not write.
 	IfRev *uint64 `json:"if_rev,omitempty"`
+	// Lease attaches the key this operation writes to a lease, as the lease
+	// query parameter does on a single-key write.
+	Lease uint64 `json:"lease,omitempty"`
 }
 
 // ---- Authorization middleware ----------------------------------------------
@@ -161,6 +164,17 @@ func (s *Store) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /members/{id}", guard(s.handleRemoveMember))
 	mux.HandleFunc("POST /transfer-leadership", guard(s.handleTransferLeadership))
 	mux.HandleFunc("POST /batch", guard(s.handleBatch))
+
+	// Under the reserved "__" prefix rather than at /leases. The collection
+	// routes below are /{collection} and /{collection}/{key}, so a plain
+	// /leases would shadow a collection of that name -- silently, and only
+	// over HTTP. A "__" name is already refused to collections, so nothing a
+	// caller can create reaches here.
+	mux.HandleFunc("POST /__leases", guard(s.handleGrantLease))
+	mux.HandleFunc("GET /__leases", guard(s.handleListLeases))
+	mux.HandleFunc("GET /__leases/{id}", guard(s.handleReadLease))
+	mux.HandleFunc("DELETE /__leases/{id}", guard(s.handleRevokeLease))
+	mux.HandleFunc("POST /__leases/{id}/keepalive", guard(s.handleKeepAlive))
 
 	// Multi-collection routing: /{collection}/{key}
 	mux.HandleFunc("POST /{collection}/{key}", guard(s.handleCreate))
@@ -301,6 +315,23 @@ func conditionFrom(w http.ResponseWriter, r *http.Request, logger *slog.Logger) 
 	return nil, true
 }
 
+// leaseFrom reads the lease query parameter, which attaches the key a write
+// creates to a lease. Absent means no lease, which on a write to a key that
+// had one detaches it.
+func leaseFrom(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (lease uint64, ok bool) {
+	raw := r.URL.Query().Get("lease")
+	if raw == "" {
+		return 0, true
+	}
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest,
+			"lease must be the id returned by POST /__leases", logger)
+		return 0, false
+	}
+	return id, true
+}
+
 func (s *Store) collectionParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 	name := r.PathValue("collection")
 	if isReservedCollection(name) {
@@ -323,11 +354,17 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	lease, ok := leaseFrom(w, r, s.logger())
+	if !ok {
+		return
+	}
+
 	_, err := s.propose(r.Context(), &command{
 		Op:         opCreate,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
+		Lease:      lease,
 	})
 	if err != nil {
 		s.handleRPCError(w, r, err)
@@ -422,6 +459,10 @@ func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	lease, ok := leaseFrom(w, r, s.logger())
+	if !ok {
+		return
+	}
 
 	_, err := s.propose(r.Context(), &command{
 		Op:         opUpsert,
@@ -429,6 +470,7 @@ func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		Key:        key,
 		Value:      val,
 		IfRev:      ifRev,
+		Lease:      lease,
 	})
 	if err != nil {
 		s.handleRPCError(w, r, err)
@@ -752,6 +794,7 @@ func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 			MutateName: op.MutateName,
 			MutateArgs: op.MutateArgs,
 			IfRev:      op.IfRev,
+			Lease:      op.Lease,
 		}
 	}
 
@@ -764,6 +807,126 @@ func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(raw)
+}
+
+// ---- Lease types -----------------------------------------------------------
+
+// grantLeaseRequest is the body of POST /leases.
+type grantLeaseRequest struct {
+	// TTLSeconds is the lease's lifetime. Seconds rather than a duration
+	// string because this is the field a client in any language has to fill
+	// in, and a number needs no parser.
+	TTLSeconds float64 `json:"ttl_seconds"`
+}
+
+// leaseResponse describes one lease.
+type leaseResponse struct {
+	ID         uint64     `json:"id"`
+	TTLSeconds float64    `json:"ttl_seconds"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	Keys       []LeaseKey `json:"keys,omitempty"`
+}
+
+func leaseResponseFrom(info LeaseInfo) leaseResponse {
+	return leaseResponse{
+		ID:         uint64(info.ID),
+		TTLSeconds: info.TTL.Seconds(),
+		ExpiresAt:  info.ExpiresAt,
+		Keys:       info.Keys,
+	}
+}
+
+// leaseIDParam reads the {id} path segment.
+func (s *Store) leaseIDParam(w http.ResponseWriter, r *http.Request) (LeaseID, bool) {
+	raw := r.PathValue("id")
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "lease id must be a number", s.logger())
+		return 0, false
+	}
+	return LeaseID(id), true
+}
+
+// handleGrantLease handles POST /leases.
+func (s *Store) handleGrantLease(w http.ResponseWriter, r *http.Request) {
+	var req grantLeaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), s.logger())
+		return
+	}
+	if req.TTLSeconds <= 0 {
+		writeError(w, http.StatusBadRequest, "ttl_seconds must be positive", s.logger())
+		return
+	}
+
+	id, err := s.GrantLease(r.Context(), time.Duration(req.TTLSeconds*float64(time.Second)))
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	info, err := s.Lease(id)
+	if err != nil {
+		// Granted, then expired or revoked before this node read it back. The
+		// grant is what the caller asked for, so report it rather than an
+		// error, with what is known about it.
+		info = LeaseInfo{ID: id, TTL: time.Duration(req.TTLSeconds * float64(time.Second))}
+	}
+	writeJSON(w, http.StatusCreated, leaseResponseFrom(info), s.logger())
+}
+
+// handleKeepAlive handles POST /leases/{id}/keepalive.
+func (s *Store) handleKeepAlive(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.leaseIDParam(w, r)
+	if !ok {
+		return
+	}
+	expiresAt, err := s.KeepAlive(r.Context(), id)
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	info, err := s.Lease(id)
+	if err != nil {
+		info = LeaseInfo{ID: id, ExpiresAt: expiresAt}
+	}
+	writeJSON(w, http.StatusOK, leaseResponseFrom(info), s.logger())
+}
+
+// handleRevokeLease handles DELETE /leases/{id}.
+func (s *Store) handleRevokeLease(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.leaseIDParam(w, r)
+	if !ok {
+		return
+	}
+	if err := s.RevokeLease(r.Context(), id); err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleReadLease handles GET /leases/{id}, from local state.
+func (s *Store) handleReadLease(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.leaseIDParam(w, r)
+	if !ok {
+		return
+	}
+	info, err := s.Lease(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, ErrLeaseNotFound.Error(), s.logger())
+		return
+	}
+	writeJSON(w, http.StatusOK, leaseResponseFrom(info), s.logger())
+}
+
+// handleListLeases handles GET /leases, from local state.
+func (s *Store) handleListLeases(w http.ResponseWriter, _ *http.Request) {
+	infos := s.Leases()
+	out := make([]leaseResponse, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, leaseResponseFrom(info))
+	}
+	writeJSON(w, http.StatusOK, out, s.logger())
 }
 
 func (s *Store) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -936,7 +1099,8 @@ func (s *Store) handleRPCError(w http.ResponseWriter, r *http.Request, err error
 // two packages export, so wrapped errors are classified correctly.
 func statusForError(err error) int {
 	switch {
-	case errors.Is(err, ErrKeyNotFound), errors.Is(err, raft.ErrGroupNotFound),
+	case errors.Is(err, ErrKeyNotFound), errors.Is(err, ErrLeaseNotFound),
+		errors.Is(err, raft.ErrGroupNotFound),
 		errors.Is(err, raft.ErrNotFound), errors.Is(err, raft.ErrNotMember):
 		return http.StatusNotFound
 
@@ -995,6 +1159,12 @@ func (m *Manager) serveHTTP() error {
 	mux.HandleFunc("DELETE /groups/{groupID}/members/{id}", guard(m.handleRemoveMember))
 	mux.HandleFunc("POST /groups/{groupID}/transfer-leadership", guard(m.handleTransferLeadership))
 	mux.HandleFunc("POST /groups/{groupID}/batch", guard(m.handleBatch))
+
+	mux.HandleFunc("POST /groups/{groupID}/__leases", guard(m.handleGrantLease))
+	mux.HandleFunc("GET /groups/{groupID}/__leases", guard(m.handleListLeases))
+	mux.HandleFunc("GET /groups/{groupID}/__leases/{id}", guard(m.handleReadLease))
+	mux.HandleFunc("DELETE /groups/{groupID}/__leases/{id}", guard(m.handleRevokeLease))
+	mux.HandleFunc("POST /groups/{groupID}/__leases/{id}/keepalive", guard(m.handleKeepAlive))
 
 	// Multi-Raft routing: /groups/{groupID}/{collection}/{key}
 	mux.HandleFunc("POST /groups/{groupID}/{collection}/{key}", guard(m.handleCreate))
@@ -1110,6 +1280,26 @@ func (m *Manager) handleTransferLeadership(w http.ResponseWriter, r *http.Reques
 
 func (m *Manager) handleBatch(w http.ResponseWriter, r *http.Request) {
 	m.withStore(w, r, (*Store).handleBatch)
+}
+
+func (m *Manager) handleGrantLease(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleGrantLease)
+}
+
+func (m *Manager) handleListLeases(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleListLeases)
+}
+
+func (m *Manager) handleReadLease(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleReadLease)
+}
+
+func (m *Manager) handleRevokeLease(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleRevokeLease)
+}
+
+func (m *Manager) handleKeepAlive(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleKeepAlive)
 }
 
 func (m *Manager) handleStatus(w http.ResponseWriter, r *http.Request) {
