@@ -332,6 +332,68 @@ func leaseFrom(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (lea
 	return id, true
 }
 
+// Headers that carry the exactly-once identity of a write. A client that
+// retries after a lost response repeats both, and the write applies once.
+const (
+	clientIDHeader = "X-Raft-Client-Id"
+	seqNumHeader   = "X-Raft-Seq"
+)
+
+// onceIDFrom reads the exactly-once identity of a write, if it carries one.
+//
+// Without it a retry after a timeout is a second write: the caller cannot
+// tell a request that never arrived from a response that was lost, and over
+// HTTP that is the common case rather than the rare one. With it the cluster
+// remembers the (client, sequence) pair and replays the first answer.
+//
+// Both headers or neither. One of them is a client that meant to be
+// deduplicated and is not, which is worth an error rather than a silent
+// ordinary write.
+func onceIDFrom(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (id OnceID, once, ok bool) {
+	clientID := strings.TrimSpace(r.Header.Get(clientIDHeader))
+	rawSeq := strings.TrimSpace(r.Header.Get(seqNumHeader))
+
+	switch {
+	case clientID == "" && rawSeq == "":
+		return OnceID{}, false, true
+	case clientID == "" || rawSeq == "":
+		writeError(w, http.StatusBadRequest,
+			clientIDHeader+" and "+seqNumHeader+" must be given together", logger)
+		return OnceID{}, false, false
+	}
+
+	seq, err := strconv.ParseUint(rawSeq, 10, 64)
+	if err != nil || seq == 0 {
+		writeError(w, http.StatusBadRequest,
+			seqNumHeader+" must be a sequence number above zero", logger)
+		return OnceID{}, false, false
+	}
+	return OnceID{ClientID: raft.NodeID(clientID), SeqNum: seq}, true, true
+}
+
+// proposeWrite proposes cmd, deduplicated when the request carried an
+// exactly-once identity. One place, so that every write route gets the same
+// treatment rather than whichever ones remembered to ask.
+func (s *Store) proposeWrite(w http.ResponseWriter, r *http.Request, cmd *command) ([]byte, bool) {
+	id, once, ok := onceIDFrom(w, r, s.logger())
+	if !ok {
+		return nil, false
+	}
+
+	var raw []byte
+	var err error
+	if once {
+		raw, err = s.proposeOnce(r.Context(), id.ClientID, id.SeqNum, cmd)
+	} else {
+		raw, err = s.propose(r.Context(), cmd)
+	}
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return nil, false
+	}
+	return raw, true
+}
+
 func (s *Store) collectionParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 	name := r.PathValue("collection")
 	if isReservedCollection(name) {
@@ -359,15 +421,13 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.propose(r.Context(), &command{
+	if _, ok := s.proposeWrite(w, r, &command{
 		Op:         opCreate,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
 		Lease:      lease,
-	})
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	}); !ok {
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -428,15 +488,13 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.propose(r.Context(), &command{
+	if _, ok := s.proposeWrite(w, r, &command{
 		Op:         opUpdate,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
 		IfRev:      ifRev,
-	})
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	}); !ok {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -464,16 +522,14 @@ func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.propose(r.Context(), &command{
+	if _, ok := s.proposeWrite(w, r, &command{
 		Op:         opUpsert,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
 		IfRev:      ifRev,
 		Lease:      lease,
-	})
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	}); !ok {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -491,14 +547,12 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.propose(r.Context(), &command{
+	if _, ok := s.proposeWrite(w, r, &command{
 		Op:         opDelete,
 		Collection: collection,
 		Key:        key,
 		IfRev:      ifRev,
-	})
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	}); !ok {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -595,7 +649,7 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.propose(r.Context(), &command{
+	resp, ok := s.proposeWrite(w, r, &command{
 		Op:         opMutate,
 		Collection: collection,
 		Key:        key,
@@ -603,8 +657,7 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 		MutateArgs: req.Args,
 		IfRev:      ifRev,
 	})
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	if !ok {
 		return
 	}
 
@@ -798,9 +851,8 @@ func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	raw, err := s.propose(r.Context(), &command{Op: opBatch, Batch: cmds})
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	raw, ok := s.proposeWrite(w, r, &command{Op: opBatch, Batch: cmds})
+	if !ok {
 		return
 	}
 
@@ -859,11 +911,30 @@ func (s *Store) handleGrantLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := s.GrantLease(r.Context(), time.Duration(req.TTLSeconds*float64(time.Second)))
-	if err != nil {
-		s.handleRPCError(w, r, err)
+	// Through the same write path as everything else, so that a client
+	// repeating a grant after a lost response gets the lease it already has
+	// rather than a second one nothing will ever renew.
+	ttl := time.Duration(req.TTLSeconds * float64(time.Second))
+	millis := ttl.Milliseconds()
+	if millis <= 0 {
+		writeError(w, http.StatusBadRequest, "ttl_seconds is shorter than a millisecond", s.logger())
 		return
 	}
+	raw, ok := s.proposeWrite(w, r, &command{
+		Op:             opLeaseGrant,
+		LeaseTTLMillis: uint64(millis),
+		LeaseNowMillis: time.Now().UnixMilli(),
+	})
+	if !ok {
+		return
+	}
+	var granted uint64
+	if err := json.Unmarshal(raw, &granted); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode lease id: "+err.Error(), s.logger())
+		return
+	}
+	id := LeaseID(granted)
+
 	info, err := s.Lease(id)
 	if err != nil {
 		// Granted, then expired or revoked before this node read it back. The

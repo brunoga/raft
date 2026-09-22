@@ -884,6 +884,7 @@ http.ListenAndServe(":8001", mux) // one server, no conflict
 | `DELETE` | `/members/{id}` | Remove a member from the cluster (leader only) |
 | `POST` | `/transfer-leadership` | Transfer leadership: `{"to": "nodeID"}` |
 | `POST` | `/batch` | Atomic multi-collection batch (see below) |
+| | *every write route* | `X-Raft-Client-Id` + `X-Raft-Seq` make a write exactly-once |
 | `POST` | `/__leases` | Grant a lease: `{"ttl_seconds": 15}` |
 | `GET` | `/__leases` | List leases held by this replica |
 | `GET` | `/__leases/{id}` | Read one lease and the keys it holds |
@@ -1160,6 +1161,65 @@ Rebinding a *known* member's address is refused and logged regardless, unless `C
 `dnsdiscovery` is exactly as trustworthy as the records it reads — use a resolver you control.
 
 And as above: discovered peers join as learners, so no discovery source can change the quorum on its own. See [Discovery](#discovery).
+
+---
+
+## Talking to a cluster from outside — `easyraft/client`
+
+The HTTP API is small enough to call with `net/http` directly, and doing so means reimplementing the same four things in every service: find the leader, follow it when it moves, decide which failures are worth retrying, and turn status codes back into errors worth branching on. [`easyraft/client`](client/) does those four things.
+
+```go
+c, err := client.New(client.WithEndpoints("node1:8001", "node2:8001", "node3:8001"))
+if err != nil {
+    return err
+}
+users := client.Collection[User](c, "users")
+
+if err := users.Create(ctx, "alice", User{Name: "Alice"}); err != nil {
+    return err
+}
+value, rev, err := users.ReadRev(ctx, "alice")
+```
+
+Point it at any node. Writes reach the leader by following the `307` the others answer with, and the client remembers which endpoint that was for next time. A node that is down costs one connection attempt.
+
+`Coll[T]` mirrors `Collection[T]` method for method — `Create`, `Read`, `ReadRev`, `Update`, `UpdateIf`, `Upsert`, `UpsertIf`, `Delete`, `DeleteIf`, `Mutate`, `MutateIf`, `List`, `Scan`, `CreateWithLease`, `UpsertWithLease` — so a service that moves from embedding a node to talking to one changes where its handle comes from and nothing else.
+
+Failures come back as the same error values an in-process caller sees: `ErrKeyNotFound`, `ErrKeyExists`, `ErrRevisionMismatch`, `ErrLeaseNotFound` and the rest. Anything unrecognised arrives as a `client.Error` carrying the status and body.
+
+Leases, batches and cluster information are on the `Client`: `GrantLease`, `KeepAlive`, `KeepAliveLoop`, `RevokeLease`, `Batch`, `Members`, `Status`, `Health`, `TransferLeadership`, `RemoveServer`. `WithGroup(n)` addresses one group of a `Manager`.
+
+### What gets retried, and what does not
+
+A write that gets no answer is the hard case: the caller cannot tell a request that never arrived from a response that was lost, and over HTTP that is the common case rather than the rare one. Retrying blindly can apply a write twice, so this package retries only what is safe:
+
+- **reads**, always;
+- **writes carrying an exactly-once identity**, which the cluster deduplicates;
+- **conditional writes**, which are idempotent by construction — a second attempt is refused with `ErrRevisionMismatch` rather than applied again.
+
+An ordinary `Create` or `Mutate` with no identity is attempted once. To make one safe to retry, give it an identity:
+
+```go
+session := easyraft.NewSession("worker-7")
+
+id := session.Next()
+err := orders.Exactly(id).Create(ctx, key, order)  // retried, applied once
+```
+
+Hold the same `id` across the retries of one logical write; that is what makes it exactly-once. `Client.GrantLeaseOnce` and `Client.BatchOnce` take one for the same reason.
+
+Following a redirect is not a retry — it is the cluster saying where the leader is — so it happens for every request, safe to repeat or not.
+
+### Exactly-once over HTTP
+
+Two headers carry the identity, so a client in any language gets the same guarantee:
+
+```
+X-Raft-Client-Id: worker-7
+X-Raft-Seq: 42
+```
+
+They apply to every write route, including `/batch`, `/{collection}/{key}/mutate` and `POST /__leases`. Both or neither: one of them is a client that meant to be deduplicated and is not, which is answered with `400`. A sequence number below one already recorded for that client is answered with `409`.
 
 ---
 
