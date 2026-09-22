@@ -1,6 +1,7 @@
 package easyraft
 
 import (
+	"context"
 	"crypto/tls"
 	"log/slog"
 	"net/http"
@@ -42,6 +43,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithBearerTokenAuth("token"),
 		WithInsecureHTTPAcknowledged(),
 		WithInsecureTransportAcknowledged(),
+		WithPeerAuthorizer(func(context.Context, string) error { return nil }),
 		WithHTTPTLS(&tls.Config{MinVersion: tls.VersionTLS13}),
 		WithLeaseReads(),
 		WithJoinAddr("http://127.0.0.1:8002"),
