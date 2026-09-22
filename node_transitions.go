@@ -55,6 +55,7 @@ func (n *Node) applyFollowerTransition(leaderID NodeID) {
 	n.leaseSendTime = time.Time{} // clear so the next term doesn't reuse an old send time
 	n.quorumAcks = nil
 	n.leaderQuorumElapsed = 0
+	n.departing = nil
 	if n.hbPumps != nil {
 		n.stopHBPumps() // signal pump goroutines to exit
 	}
@@ -159,6 +160,7 @@ func (n *Node) becomeLeader() {
 	n.leaderNopCommitted = false
 	n.quorumAcks = make(map[NodeID]bool, len(n.cfg.Peers))
 	n.leaderQuorumElapsed = 0
+	n.departing = nil
 
 	// Initialise nextIndex to leader's last log index + 1.
 	nextIdx := n.log.lastLogIndex() + 1

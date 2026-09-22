@@ -505,6 +505,27 @@ type Config struct {
 	// Default: nil (the failure is logged at error level and nothing else).
 	OnFatal func(error)
 
+	// OnRemoved is an optional callback invoked once, from its own goroutine,
+	// when a committed configuration change removes this node from the
+	// cluster. It fires whether the node removed itself (a leader that left
+	// through ReconfigureCluster) or was removed by another node.
+	//
+	// A removed node is not stopped: it goes on running as a non-voting
+	// follower that nobody replicates to, which is deliberate, so that
+	// whatever owns it can decide what to do -- shut it down, wipe its
+	// storage, keep it for inspection. This callback is where that decision
+	// is made, and it may call Stop on the node. The same transition is
+	// reported as EventPeerRemoved with Peer set to this node's own ID, for a
+	// consumer that already watches Events.
+	//
+	// It is not invoked again when a restarted node replays the removal from
+	// its own log: it reports the removal committing, not the state of being
+	// removed. Read Members after a restart to find out whether this node is
+	// still part of the cluster it started in.
+	//
+	// Default: nil.
+	OnRemoved func()
+
 	// PreferredLeader is an optional node ID that should hold leadership
 	// whenever possible. When a node that is not the preferred leader wins an
 	// election, it will automatically initiate a leadership transfer to the

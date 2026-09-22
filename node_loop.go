@@ -120,6 +120,9 @@ func (n *Node) tick() {
 				n.broadcastReadBarrier()
 			}
 		}
+		if len(n.departing) > 0 {
+			n.tickDepartures()
+		}
 		// Leadership transfer timeout: if the target hasn't started an election
 		// within one election timeout, abort the transfer.
 		if n.transferTarget != "" {

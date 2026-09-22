@@ -16,6 +16,24 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   rather than hold a goroutine on it. `Node.ProposalQueueDepth` reports the
   occupancy, which is the number to alert on before either happens.
 
+- `Config.OnRemoved`, a callback invoked once, from its own goroutine, when a
+  committed configuration change removes this node from the cluster. A
+  removed node is deliberately not stopped, so that whatever owns it decides
+  what to do with it; this is where that decision goes, and it may call
+  `Stop`.
+
+### Fixed
+
+- A node removed by the leader was usually never told. The leader dropped
+  its heartbeat pump and progress tracking the moment it appended the
+  removal entry, so unless the entry happened to reach the node first, it
+  never saw the change commit: it went on believing it was a voter, timed
+  out, and campaigned against a cluster that ignored it, for ever. The leader
+  now keeps replicating to a removed peer — without counting it towards
+  anything — until it has acknowledged a commit index covering its removal,
+  bounded by a few election timeouts so that a peer removed because it is
+  dead does not keep a pump for ever.
+
 ## v1.1.0
 
 ### Added

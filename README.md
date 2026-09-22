@@ -1186,17 +1186,26 @@ less than the highest seen for that client. Retrying with the same `seqNum`
 will never succeed. Advance `seqNum` and retry with the new value, or
 investigate why the sequence number went backwards.
 
-### Removing a leader
+### A removed node is told, but not stopped
 
-`RemoveServer(ctx, leaderID)` is safe — the leader commits the removal entry,
-then steps down as a follower. The remaining peers elect a new leader. However,
-the removed leader does not call `Stop()` automatically; the caller is
-responsible for shutting it down after the removal is committed.
+A node removed by `RemoveServer` or `ReconfigureCluster` learns of it: the
+leader keeps replicating to it until it has acknowledged the removal entry
+and a commit index covering it, at which point it steps down to a non-voting
+follower and `Config.OnRemoved` fires. That is where the decision about what
+to do with it belongs — shut it down, wipe its storage, keep it for
+inspection — and the callback may call `Stop`. The same transition is on the
+`Events` stream as `EventPeerRemoved` with `Peer` set to the node's own ID.
 
-For leader self-removal as part of a larger reconfiguration, prefer
-`ReconfigureCluster` — it uses joint consensus, which keeps a quorum available
-throughout the two-phase transition and avoids the brief window where the
-single-server change could leave the cluster without a quorum.
+The courtesy is bounded. A removed node that cannot be reached within a few
+election timeouts, or that is so far behind it would need a snapshot, is
+given up on; if it comes back later it will find nobody replicating to it,
+and `OnRemoved` will not fire. Restart it against the current membership, or
+retire it.
+
+`RemoveServer(ctx, leaderID)` works — the leader commits the removal, then
+steps down — but for leader self-removal as part of a larger reconfiguration
+prefer `ReconfigureCluster`, whose joint consensus keeps a quorum available
+throughout the two-phase transition.
 
 ### No dynamic `TickInterval` changes
 
