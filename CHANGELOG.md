@@ -4,6 +4,23 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## Unreleased
+
+### Fixed
+
+- `easyraft.WithTLS` authenticated the connection and then trusted whatever
+  the peer claimed to be. Every Raft RPC names the node it comes from, and
+  nothing was binding that name to the certificate that carried it, so any
+  holder of any certificate from the configured CA could claim to be the
+  leader and make the cluster step down. A configuration whose `ClientAuth`
+  is `tls.RequireAndVerifyClientCert` now also gets
+  `grpctransport.MTLSPeerAuthorizer`. Weaker settings get none, because a
+  check against a certificate that may not be there would refuse every RPC,
+  and instead log a warning that the Raft port is open to any client that
+  can reach it. The new `easyraft.WithPeerAuthorizer` replaces the default
+  for certificates that carry node identity somewhere other than the Common
+  Name or DNS names.
+
 ## v2.0.0
 
 The import path is now `github.com/brunoga/raft/v2`, because this release

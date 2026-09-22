@@ -166,6 +166,7 @@ func (m *Manager) Start() error {
 	})
 
 	// 1. Shared Transport
+	warnIfPeersUnauthorized(&m.cfg, m.logger())
 	tr, err := grpctransport.Listen(m.cfg.RaftAddr, transportOptions(&m.cfg)...)
 	if err != nil {
 		return fmt.Errorf("listen grpc: %w", err)

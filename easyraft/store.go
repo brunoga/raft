@@ -78,6 +78,7 @@ package easyraft
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -403,10 +404,55 @@ func validateSecurity(c *config, servesHTTP bool) error {
 // validateSecurity has already established that one of the two branches
 // applies.
 func transportOptions(c *config) []grpctransport.Option {
-	if c.TLS != nil {
-		return []grpctransport.Option{grpctransport.WithTLSConfig(c.TLS)}
+	if c.TLS == nil {
+		return []grpctransport.Option{grpctransport.WithInsecure()}
 	}
-	return []grpctransport.Option{grpctransport.WithInsecure()}
+	opts := []grpctransport.Option{grpctransport.WithTLSConfig(c.TLS)}
+	if auth := peerAuthorizerFor(c); auth != nil {
+		opts = append(opts, grpctransport.WithPeerAuthorizer(auth))
+	}
+	return opts
+}
+
+// peerAuthorizerFor returns the check that binds the node ID an RPC claims to
+// the certificate that carried it, or nil when there is nothing to bind it
+// to.
+//
+// An explicit one always wins. Otherwise the default applies exactly when it
+// can work: the certificate has to be there and have been verified, which is
+// what tls.RequireAndVerifyClientCert guarantees and what every weaker
+// setting does not. Installing it against a configuration that does not
+// require client certificates would refuse every inbound RPC, which is a
+// worse failure than the one it is guarding against.
+func peerAuthorizerFor(c *config) grpctransport.PeerAuthorizer {
+	if c.PeerAuthorizer != nil {
+		return c.PeerAuthorizer
+	}
+	if c.TLS != nil && c.TLS.ClientAuth == tls.RequireAndVerifyClientCert {
+		return grpctransport.MTLSPeerAuthorizer(nil)
+	}
+	return nil
+}
+
+// warnIfPeersUnauthorized logs, once per store or manager, that Raft RPCs are
+// encrypted but the peers sending them are not being identified.
+//
+// It is a warning rather than a refusal because the identification may be
+// happening somewhere this package cannot see -- a service mesh terminating
+// mTLS, a network that only peers can reach. What it must not do is stay
+// quiet: TLS without client certificates leaves the Raft port open to anyone
+// who can reach it, and one AppendEntries carrying a high term from anyone at
+// all makes every node step down.
+func warnIfPeersUnauthorized(c *config, logger *slog.Logger) {
+	if c.TLS == nil || peerAuthorizerFor(c) != nil {
+		return
+	}
+	logger.Warn("easyraft: Raft RPCs are encrypted but their senders are not identified: "+
+		"the TLS configuration does not require and verify client certificates, so any "+
+		"host that can reach this port can claim to be any node. Set "+
+		"ClientAuth: tls.RequireAndVerifyClientCert, or pass WithPeerAuthorizer if peers "+
+		"are identified elsewhere.",
+		"addr", c.RaftAddr, "client_auth", c.TLS.ClientAuth.String())
 }
 
 // advertiseRaftAddr is what peers are told to dial to reach this node's Raft
@@ -628,6 +674,7 @@ func (s *Store) initRaft() error {
 		return fmt.Errorf("easyraft: WithRaftAddr is required")
 	}
 
+	warnIfPeersUnauthorized(&s.cfg, s.logger())
 	tr, err := grpctransport.Listen(s.cfg.RaftAddr, transportOptions(&s.cfg)...)
 	if err != nil {
 		return fmt.Errorf("listen grpc: %w", err)

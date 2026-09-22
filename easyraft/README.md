@@ -719,10 +719,30 @@ Three separate surfaces, each configured on its own: the Raft transport, the HTT
 ### Raft transport (gRPC)
 
 ```go
-easyraft.WithTLS(tlsConfig)
+easyraft.WithTLS(&tls.Config{
+    Certificates: []tls.Certificate{nodeCert},
+    RootCAs:      pool,
+    ClientCAs:    pool,
+    // Every node is both a client and a server here, so require both ends
+    // to prove who they are. Anything weaker leaves the Raft port open to
+    // any client that can reach it.
+    ClientAuth:   tls.RequireAndVerifyClientCert,
+})
 ```
 
 The same `*tls.Config` is applied to both the gRPC server listener and all outbound client connections. It does **not** cover the HTTP API.
+
+**Authentication is not authorization.** TLS establishes that the peer holds a certificate your CA issued. It says nothing about *which* node that peer is, and every Raft RPC names the node it claims to come from — so without a check binding the two, any holder of any certificate from that CA can claim to be the leader and make the whole cluster step down.
+
+A configuration with `ClientAuth: tls.RequireAndVerifyClientCert` therefore also gets a peer authorizer, matching the claimed node ID against the certificate's Common Name and DNS names. Pass `WithPeerAuthorizer` when your certificates carry identity elsewhere:
+
+```go
+easyraft.WithPeerAuthorizer(grpctransport.MTLSPeerAuthorizer(
+    func(cert *x509.Certificate) []string { return cert.URIs[0:1] ... },
+))
+```
+
+A TLS configuration that does **not** require client certificates gets no authorizer — installing one where no verified certificate exists would refuse every inbound RPC — and the node logs a warning at startup, because such a listener authenticates the server to its clients and leaves the clients anonymous.
 
 Without it, `NewStore` and `NewManager` return an error unless
 `WithInsecureTransportAcknowledged` is passed. A Raft peer is fully trusted, so

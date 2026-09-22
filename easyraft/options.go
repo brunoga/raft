@@ -8,6 +8,7 @@ import (
 
 	"github.com/brunoga/raft/v2"
 	"github.com/brunoga/raft/v2/discovery"
+	"github.com/brunoga/raft/v2/transport/grpctransport"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -70,6 +71,13 @@ type config struct {
 	// Without it, or TLS, NewStore and NewManager refuse to start. Set via
 	// [WithInsecureTransportAcknowledged].
 	AcknowledgeInsecureTransport bool
+
+	// PeerAuthorizer decides whether the node a Raft RPC claims to come from
+	// is the node that sent it. Set via [WithPeerAuthorizer]; left nil, a
+	// configuration whose TLS requires and verifies client certificates gets
+	// grpctransport.MTLSPeerAuthorizer, which is the one that matches the
+	// certificate's identity against the claim.
+	PeerAuthorizer grpctransport.PeerAuthorizer
 
 	// HTTPTLS, when set, makes the built-in HTTP server serve HTTPS and makes
 	// leader redirects use the https scheme. Set via [WithHTTPTLS]. It is
@@ -378,8 +386,40 @@ func WithLeaveOnStop() Option {
 	return func(c *config) { c.LeaveOnStop = true }
 }
 
+// WithPeerAuthorizer decides whether the node a Raft RPC claims to come from
+// is really the node that sent it, replacing the default that [WithTLS]
+// installs.
+//
+// Authentication is not authorization. TLS establishes that the peer holds a
+// certificate your CA issued; it says nothing about which node that peer is,
+// and every Raft RPC names the node it claims to come from. Without a check
+// binding the two, any holder of any certificate from that CA can claim to
+// be the leader and make the whole cluster step down.
+//
+// The default, installed whenever [WithTLS] is given a configuration that
+// requires and verifies client certificates, is
+// grpctransport.MTLSPeerAuthorizer with its own identity extraction: the
+// certificate's Common Name and DNS names. Pass this when your certificates
+// carry node identity somewhere else -- a URI SAN, an organizational unit --
+// or when you want a different policy entirely.
+func WithPeerAuthorizer(fn grpctransport.PeerAuthorizer) Option {
+	return func(c *config) { c.PeerAuthorizer = fn }
+}
+
 // WithTLS sets the TLS configuration for Raft RPCs. It does not affect the
 // HTTP API; use [WithHTTPTLS] for that.
+//
+// A configuration whose ClientAuth is tls.RequireAndVerifyClientCert -- which
+// is what a Raft mesh wants, since every node is both a client and a server
+// -- also gets a peer authorizer, binding the node ID an RPC claims to the
+// identity in the certificate that carried it. See [WithPeerAuthorizer] for
+// why the certificate alone is not enough, and for how to change the policy.
+//
+// A configuration without it authenticates the server to its clients and
+// leaves the clients anonymous, which on a Raft port means anyone who can
+// reach it can claim to be the leader. The store logs a warning at startup
+// in that case; it does not refuse, because a deployment may be
+// authenticating peers somewhere else entirely, such as a service mesh.
 func WithTLS(tlsCfg *tls.Config) Option {
 	return func(c *config) {
 		c.TLS = tlsCfg
