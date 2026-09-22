@@ -77,6 +77,7 @@ package easyraft
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -168,6 +169,7 @@ const (
 	opUpsert         opType = "upsert"
 	opMutate         opType = "mutate"
 	opBatch          opType = "batch"
+	opImport         opType = "import"
 	opLeaseGrant     opType = "lease_grant"
 	opLeaseKeepAlive opType = "lease_keepalive"
 	opLeaseRevoke    opType = "lease_revoke"
@@ -233,6 +235,47 @@ type command struct {
 	// machine may not do.
 	LeaseTTLMillis uint64 `json:"lease_ttl_millis,omitempty"`
 	LeaseNowMillis int64  `json:"lease_now_millis,omitempty"`
+
+	// Import carries one chunk of a backup being loaded back in. A backup
+	// can be larger than any single entry may be, so it arrives in pieces
+	// that accumulate in the state machine and are swapped into place by the
+	// last one -- see importState.
+	Import *importChunk `json:"import,omitempty"`
+}
+
+// importChunk is one piece of a backup on its way back into the state
+// machine.
+type importChunk struct {
+	// Token identifies one import. A chunk whose token does not match the
+	// import in progress starts a new one, discarding what was staged: two
+	// operators importing at once must not have their backups interleaved
+	// into a state that is neither.
+	Token string `json:"token"`
+	// Seq is this chunk's position, counting from zero. A chunk out of order
+	// fails the entry rather than being written to the wrong place.
+	Seq int `json:"seq"`
+	// Data is the raw backup bytes of this chunk.
+	Data []byte `json:"data,omitempty"`
+	// Final marks the last chunk. Applying it decodes everything staged and
+	// replaces the state machine with it, in this one entry, so no replica is
+	// ever half-imported.
+	Final bool `json:"final,omitempty"`
+	// Abort discards whatever is staged and imports nothing.
+	Abort bool `json:"abort,omitempty"`
+}
+
+// importState is a backup being loaded, held in the state machine so that it
+// survives a leader change: an import that had to start again because the
+// leader moved would be an import that could never finish on a cluster
+// changing leaders faster than it copies.
+//
+// It costs memory. While an import is in flight the store holds the encoded
+// backup on top of the state it is about to replace, so the peak is both --
+// see Store.Import.
+type importState struct {
+	token string
+	seq   int
+	buf   []byte
 }
 
 // leaseState is one live lease: how long it lives for, when it currently
@@ -335,6 +378,11 @@ type Store struct {
 	// for the number to matter cannot afford to do per scrape.
 	stateBytes int64
 	keyCount   int
+	// importing is the backup currently being loaded, if any. Replicated
+	// state: it is part of the snapshot, because a replica that restored from
+	// one while an import was in flight and did not have the staged bytes
+	// would apply the final chunk differently from every other replica.
+	importing *importState
 	// metrics publishes stateBytes and keyCount. nil when no registerer was
 	// configured, which every call site treats as "do nothing".
 	metrics   *storeMetrics
@@ -887,6 +935,9 @@ func (s *Store) raftConfig(peers []raft.PeerConfig, tr raft.Transport, st raft.S
 	cfg.MinCommitZones = s.cfg.MinCommitZones
 	cfg.PreferredLeader = s.cfg.PreferredLeader
 	cfg.LeaseSafetyMargin = s.cfg.LeaseSafetyMargin
+	if s.cfg.MaxProposalBytes > 0 {
+		cfg.MaxProposalBytes = s.cfg.MaxProposalBytes
+	}
 	cfg.ProposalQueueSize = s.cfg.ProposalQueueSize
 	cfg.ProposalOverflow = s.cfg.ProposalOverflow
 	cfg.OnRemoved = s.cfg.OnRemoved
@@ -2537,6 +2588,187 @@ func (c *Collection[T]) LeaseOf(key string) LeaseID {
 	return LeaseID(c.store.keyLeases[c.name][key])
 }
 
+// ---- Backup and restore ----------------------------------------------------
+
+// Backup writes this replica's application state to w, and reports the
+// revision it describes.
+//
+// It confirms with the leader that this replica is current before reading, so
+// the backup is a point in time the cluster agrees on rather than whatever
+// this node happened to have. Use [Store.BackupStale] to skip that, from a
+// follower chosen precisely so the leader is not disturbed.
+//
+// The state is held under the read lock for the whole pass, so local reads
+// wait while it is written. It is streamed rather than buffered, so it costs
+// a window of memory rather than a second copy of the state; on a large store
+// the thing to watch is the time reads spend waiting, which is the time it
+// takes to write the backup wherever it is going.
+//
+// The format is the snapshot format, which is JSON and is not a stable
+// interface: a backup is for putting back into a cluster of this library
+// through [Store.Import], not for reading with other tools. What is promised
+// is that a backup taken by one version restores into a later one.
+func (s *Store) Backup(ctx context.Context, w io.Writer) (revision uint64, err error) {
+	if s.cfg.Witness {
+		return 0, ErrWitness
+	}
+	if s.node == nil {
+		return 0, errors.New("easyraft: node not started")
+	}
+	if err := s.readIndex(ctx); err != nil {
+		return 0, fmt.Errorf("easyraft: read index: %w", err)
+	}
+	return s.BackupStale(w)
+}
+
+// BackupStale writes this replica's state to w without confirming with the
+// leader that the replica is current. The backup may lag the cluster by up to
+// a heartbeat; what it will not be is inconsistent, because it is taken under
+// one lock.
+func (s *Store) BackupStale(w io.Writer) (revision uint64, err error) {
+	if s.cfg.Witness {
+		return 0, ErrWitness
+	}
+	// Read before the snapshot rather than after, so the revision reported is
+	// one the bytes definitely contain rather than one a write in between
+	// might have moved past.
+	s.mu.RLock()
+	revision = s.revision
+	s.mu.RUnlock()
+
+	if err := s.snapshot(w); err != nil {
+		return 0, err
+	}
+	return revision, nil
+}
+
+// importChunkOverhead is roughly what a chunk costs beyond its data: the
+// command envelope, the token, and base64 expansion, since a []byte field
+// travels as base64 in JSON and grows by a third.
+const importChunkOverhead = 4096
+
+// Import replaces the whole state machine with a backup read from r.
+//
+// The replacement is a single log entry, so every replica swaps at the same
+// point and none of them is ever half-imported. A backup can be larger than
+// any one entry may carry, so the bytes are sent in chunks that accumulate in
+// the state machine first; a failure at any chunk leaves the old state
+// exactly as it was.
+//
+// Import replaces rather than merges. Keys the cluster holds that the backup
+// does not are gone afterwards, as are leases. Revisions come from the
+// backup, except that the store's own revision never goes backwards, so a
+// conditional write built on a revision read before the import is still
+// refused after it.
+//
+// # What this costs
+//
+// While an import is in flight the cluster holds the encoded backup on top of
+// the state it is about to replace, on every replica. Peak memory is
+// therefore both at once. On a store near the ceiling described in
+// [Store.StateBytes] that matters, and the way round it is to import into a
+// fresh cluster rather than over a full one.
+//
+// # What this does not do
+//
+// Nothing stops writes while it runs. An import into a cluster still taking
+// them will replace whatever they wrote between the backup and the swap, and
+// they will see the state change under them. Stop the writers, or import into
+// a cluster nothing has been told about yet.
+func (s *Store) Import(ctx context.Context, r io.Reader) error {
+	if s.node == nil {
+		return errors.New("easyraft: node not started")
+	}
+
+	chunkSize := s.node.MaxProposalBytes() - importChunkOverhead
+	if s.node.MaxProposalBytes() <= 0 {
+		// Nothing limits a proposal, which does not make one entry per
+		// backup a good idea: the entry still has to be written, replicated
+		// and held in memory by every node at once.
+		chunkSize = 1 << 20
+	}
+	if chunkSize < 1024 {
+		return fmt.Errorf("easyraft: proposals are limited to %d bytes, which leaves no room "+
+			"to import in", s.node.MaxProposalBytes())
+	}
+	// Base64 in the JSON envelope costs a third on top, so the raw slice has
+	// to be smaller than the entry it becomes.
+	chunkSize = chunkSize * 3 / 4
+
+	token := fmt.Sprintf("%s-%d", s.cfg.ID, time.Now().UnixNano())
+	buf := make([]byte, chunkSize)
+	seq := 0
+	var pending []byte
+
+	send := func(data []byte, final bool) error {
+		_, err := s.propose(ctx, &command{
+			Op: opImport,
+			Import: &importChunk{
+				Token: token,
+				Seq:   seq,
+				Data:  data,
+				Final: final,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("easyraft: import chunk %d: %w", seq, err)
+		}
+		seq++
+		return nil
+	}
+
+	// One chunk is held back so the last one can be marked final: the swap
+	// has to be the entry that carries the last of the bytes, not an extra
+	// entry after them, or a crash in between would leave a staged import
+	// nothing ever commits.
+	for {
+		n, readErr := io.ReadFull(r, buf)
+		if n > 0 {
+			if pending != nil {
+				if err := send(pending, false); err != nil {
+					s.abortImport(token)
+					return err
+				}
+			}
+			pending = make([]byte, n)
+			copy(pending, buf[:n])
+		}
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+			break
+		}
+		if readErr != nil {
+			s.abortImport(token)
+			return fmt.Errorf("easyraft: read backup: %w", readErr)
+		}
+	}
+	if pending == nil {
+		return errors.New("easyraft: the backup is empty")
+	}
+	if err := send(pending, true); err != nil {
+		s.abortImport(token)
+		return err
+	}
+	return nil
+}
+
+// abortImport discards a partly-staged import, so that a failed one does not
+// leave its bytes in the state machine until something else overwrites them.
+//
+// Best effort: the import has already failed, and the reason it failed is the
+// one worth reporting. A staged import that survives is discarded by the next
+// import anyway.
+func (s *Store) abortImport(token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.propose(ctx, &command{
+		Op:     opImport,
+		Import: &importChunk{Token: token, Abort: true},
+	}); err != nil {
+		s.logger().Warn("easyraft: could not discard a failed import",
+			"token", token, "err", err)
+	}
+}
+
 // StateBytes reports approximately how many bytes of application state this
 // replica is holding: for every key, the length of the key plus the length of
 // its encoded value.
@@ -3006,7 +3238,7 @@ func (s *Store) applyEntry(entry raft.LogEntry) ([]byte, error) {
 	// dispatcher sees a consistent snapshot. Assign nil so the next Apply
 	// starts with a fresh allocation rather than aliasing this one.
 	s.pendingEvents = nil
-	bytes, keys := s.stateBytes, s.keyCount
+	size, keys := s.stateBytes, s.keyCount
 	s.mu.Unlock()
 
 	for i := range events {
@@ -3015,7 +3247,7 @@ func (s *Store) applyEntry(entry raft.LogEntry) ([]byte, error) {
 	}
 	// Published after the lock is released, so a scrape never waits on an
 	// apply and an apply never waits on Prometheus.
-	s.metrics.observe(bytes, keys)
+	s.metrics.observe(size, keys)
 	return result, err
 }
 
@@ -3194,6 +3426,68 @@ func (s *Store) applyLeaseCommand(cmd *command) ([]byte, error) {
 	}
 }
 
+// applyImport puts one chunk of a backup into effect. The caller must hold
+// mu, and undo must be nil -- see the refusal in applyCommand.
+//
+// The whole point is the last line of the Final branch: the state machine is
+// replaced in one entry. Every replica applies that entry at the same place
+// in the log, so none of them is ever half-imported, and a failure at any
+// earlier chunk leaves the old state exactly as it was.
+func (s *Store) applyImport(chunk *importChunk) error {
+	if chunk == nil {
+		return errors.New("easyraft: import entry carries no chunk")
+	}
+	if chunk.Abort {
+		s.importing = nil
+		return nil
+	}
+
+	if chunk.Seq == 0 {
+		// A new import discards whatever was staged, so an abandoned one --
+		// an operator who stopped, a client that died -- does not have to be
+		// cleaned up before the next attempt.
+		s.importing = &importState{token: chunk.Token}
+	}
+	if s.importing == nil || s.importing.token != chunk.Token {
+		return fmt.Errorf("easyraft: import %q: no such import is in progress", chunk.Token)
+	}
+	if chunk.Seq != s.importing.seq {
+		return fmt.Errorf("easyraft: import %q: chunk %d arrived where %d was expected",
+			chunk.Token, chunk.Seq, s.importing.seq)
+	}
+	s.importing.buf = append(s.importing.buf, chunk.Data...)
+	s.importing.seq++
+
+	if !chunk.Final {
+		return nil
+	}
+
+	decoded, err := decodeSnapshot(json.NewDecoder(bytes.NewReader(s.importing.buf)))
+	if err != nil {
+		// Staging is dropped, so a corrupt backup costs the memory it took
+		// and nothing else. The state machine is untouched.
+		s.importing = nil
+		return fmt.Errorf("easyraft: import %q: %w", chunk.Token, err)
+	}
+
+	s.collections = decoded.collections
+	s.revisions = decoded.revisions
+	s.leases, s.keyLeases = rebuildLeases(decoded.leases)
+	s.importing = nil
+	s.recountLocked()
+	// The imported revisions describe the log the backup came from, not this
+	// one. Keeping the higher of the two means a conditional write against a
+	// revision read before the import is still refused, and every key written
+	// after it gets a revision above everything the backup carried.
+	if decoded.revision > s.revision {
+		s.revision = decoded.revision
+	}
+	if s.applyRev > s.revision {
+		s.revision = s.applyRev
+	}
+	return nil
+}
+
 // deleteLeaseKeysLocked removes every key a lease holds, emitting the same
 // change events an explicit delete of each would. The caller must hold mu.
 //
@@ -3299,6 +3593,12 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 	}
 
 	switch cmd.Op {
+	case opImport:
+		if undo != nil {
+			return nil, errors.New("easyraft: an import cannot be part of a transaction")
+		}
+		return nil, s.applyImport(cmd.Import)
+
 	case opLeaseGrant, opLeaseKeepAlive, opLeaseRevoke:
 		// Lease bookkeeping names no collection, and a batch cannot roll it
 		// back, so it is refused inside one rather than half-applied.
@@ -3458,7 +3758,8 @@ func (s *Store) snapshot(w io.Writer) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 
 	s.mu.RLock()
-	err := streamCollections(bw, s.collections, s.revisions, s.revision, s.leaseSnapshotLocked())
+	err := streamCollections(bw, s.collections, s.revisions, s.revision,
+		s.leaseSnapshotLocked(), importSnapshotOf(s.importing))
 	s.mu.RUnlock()
 
 	if err != nil {
@@ -3484,6 +3785,7 @@ const (
 	snapshotRevisionsKey = "__easyraft_revisions__"
 	snapshotRevisionKey  = "__easyraft_revision__"
 	snapshotLeasesKey    = "__easyraft_leases__"
+	snapshotImportKey    = "__easyraft_import__"
 )
 
 // leaseSnapshotLocked renders the lease table in a fixed order, so that two
@@ -3508,8 +3810,35 @@ func (s *Store) leaseSnapshotLocked() []leaseSnapshot {
 	return out
 }
 
+// importSnapshot is a partly-received backup as a snapshot stores it.
+//
+// It has to be in the snapshot. A replica that restored from one while an
+// import was in flight, and came back with nothing staged, would apply the
+// final chunk differently from every other replica -- which is divergence
+// with no error and nothing in the log to explain it.
+type importSnapshot struct {
+	Token string `json:"token"`
+	Seq   int    `json:"seq"`
+	Data  []byte `json:"data,omitempty"`
+}
+
+func importSnapshotOf(state *importState) *importSnapshot {
+	if state == nil {
+		return nil
+	}
+	return &importSnapshot{Token: state.token, Seq: state.seq, Data: state.buf}
+}
+
+func importStateOf(snapshot *importSnapshot) *importState {
+	if snapshot == nil {
+		return nil
+	}
+	return &importState{token: snapshot.Token, seq: snapshot.Seq, buf: snapshot.Data}
+}
+
 func streamCollections(w *bufio.Writer, collections map[string]map[string]json.RawMessage,
 	revisions map[string]map[string]uint64, revision uint64, leases []leaseSnapshot,
+	staged *importSnapshot,
 ) error {
 	if _, err := w.WriteString("{"); err != nil {
 		return err
@@ -3624,6 +3953,25 @@ func streamCollections(w *bufio.Writer, collections map[string]map[string]json.R
 		}
 	}
 
+	if staged != nil {
+		if _, err := w.WriteString(","); err != nil {
+			return err
+		}
+		if err := writeJSONString(w, snapshotImportKey); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(":"); err != nil {
+			return err
+		}
+		encoded, err := json.Marshal(staged)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(encoded); err != nil {
+			return err
+		}
+	}
+
 	_, err := w.WriteString("}\n")
 	return err
 }
@@ -3646,16 +3994,17 @@ func writeJSONString(w *bufio.Writer, s string) error {
 func (s *Store) restore(r io.Reader) error {
 	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
 
-	collections, revisions, revision, leases, err := decodeCollections(dec)
+	decoded, err := decodeSnapshot(dec)
 	if err != nil {
 		return fmt.Errorf("easyraft: restore decode: %w", err)
 	}
 
 	s.mu.Lock()
-	s.collections = collections
-	s.revisions = revisions
-	s.revision = revision
-	s.leases, s.keyLeases = rebuildLeases(leases)
+	s.collections = decoded.collections
+	s.revisions = decoded.revisions
+	s.revision = decoded.revision
+	s.leases, s.keyLeases = rebuildLeases(decoded.leases)
+	s.importing = importStateOf(decoded.staged)
 	s.recountLocked()
 	s.mu.Unlock()
 	return nil
@@ -3691,75 +4040,89 @@ func rebuildLeases(snapshot []leaseSnapshot) (
 	return leases, keyLeases
 }
 
-// decodeCollections reads a snapshot body, tolerating both an empty stream and
+// snapshotContents is everything a snapshot holds, which is more than the
+// collections it started as: revisions, the store's watermark, leases, and a
+// partly-received import. Returned as one value because five results and an
+// error is a signature nobody can read, and because every caller wants all of
+// it.
+type snapshotContents struct {
+	collections map[string]map[string]json.RawMessage
+	revisions   map[string]map[string]uint64
+	revision    uint64
+	leases      []leaseSnapshot
+	staged      *importSnapshot
+}
+
+// decodeSnapshot reads a snapshot body, tolerating both an empty stream and
 // an explicit JSON null (either of which means "no state").
-func decodeCollections(dec *json.Decoder) (
-	collections map[string]map[string]json.RawMessage,
-	revisions map[string]map[string]uint64,
-	revision uint64,
-	leases []leaseSnapshot,
-	err error,
-) {
-	collections = make(map[string]map[string]json.RawMessage)
-	revisions = make(map[string]map[string]uint64)
+func decodeSnapshot(dec *json.Decoder) (snapshotContents, error) {
+	out := snapshotContents{
+		collections: make(map[string]map[string]json.RawMessage),
+		revisions:   make(map[string]map[string]uint64),
+	}
 
 	tok, err := dec.Token()
 	if errors.Is(err, io.EOF) {
-		return collections, revisions, 0, nil, nil
+		return out, nil
 	}
 	if err != nil {
-		return nil, nil, 0, nil, err
+		return snapshotContents{}, err
 	}
 	if tok == nil {
-		return collections, revisions, 0, nil, nil // JSON null
+		return out, nil // JSON null
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil, nil, 0, nil, fmt.Errorf("expected a JSON object, found %v", tok)
+		return snapshotContents{}, fmt.Errorf("expected a JSON object, found %v", tok)
 	}
 
 	for dec.More() {
 		nameTok, err := dec.Token()
 		if err != nil {
-			return nil, nil, 0, nil, err
+			return snapshotContents{}, err
 		}
 		name, ok := nameTok.(string)
 		if !ok {
-			return nil, nil, 0, nil, fmt.Errorf("expected a collection name, found %v", nameTok)
+			return snapshotContents{}, fmt.Errorf("expected a collection name, found %v", nameTok)
 		}
 		switch name {
 		case snapshotRevisionsKey:
-			if err := dec.Decode(&revisions); err != nil {
-				return nil, nil, 0, nil, fmt.Errorf("revisions: %w", err)
+			if err := dec.Decode(&out.revisions); err != nil {
+				return snapshotContents{}, fmt.Errorf("revisions: %w", err)
 			}
-			if revisions == nil {
-				revisions = make(map[string]map[string]uint64)
+			if out.revisions == nil {
+				out.revisions = make(map[string]map[string]uint64)
 			}
 			continue
 		case snapshotRevisionKey:
-			if err := dec.Decode(&revision); err != nil {
-				return nil, nil, 0, nil, fmt.Errorf("revision: %w", err)
+			if err := dec.Decode(&out.revision); err != nil {
+				return snapshotContents{}, fmt.Errorf("revision: %w", err)
 			}
 			continue
 		case snapshotLeasesKey:
-			if err := dec.Decode(&leases); err != nil {
-				return nil, nil, 0, nil, fmt.Errorf("leases: %w", err)
+			if err := dec.Decode(&out.leases); err != nil {
+				return snapshotContents{}, fmt.Errorf("leases: %w", err)
+			}
+			continue
+		case snapshotImportKey:
+			if err := dec.Decode(&out.staged); err != nil {
+				return snapshotContents{}, fmt.Errorf("staged import: %w", err)
 			}
 			continue
 		}
 		var items map[string]json.RawMessage
 		if err := dec.Decode(&items); err != nil {
-			return nil, nil, 0, nil, fmt.Errorf("collection %q: %w", name, err)
+			return snapshotContents{}, fmt.Errorf("collection %q: %w", name, err)
 		}
 		if items == nil {
 			items = make(map[string]json.RawMessage)
 		}
-		collections[name] = items
+		out.collections[name] = items
 	}
 
 	if _, err := dec.Token(); err != nil { // closing brace
-		return nil, nil, 0, nil, err
+		return snapshotContents{}, err
 	}
-	return collections, revisions, revision, leases, nil
+	return out, nil
 }
 
 // raftTickInterval returns the configured tick interval, falling back to the

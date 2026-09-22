@@ -884,6 +884,8 @@ http.ListenAndServe(":8001", mux) // one server, no conflict
 | `DELETE` | `/members/{id}` | Remove a member from the cluster (leader only) |
 | `POST` | `/transfer-leadership` | Transfer leadership: `{"to": "nodeID"}` |
 | `POST` | `/batch` | Atomic multi-collection batch (see below) |
+| `GET` | `/__backup` | Stream the whole state; revision in `X-Raft-Revision` |
+| `POST` | `/__restore` | Replace the whole state with the backup in the body |
 | | *every write route* | `X-Raft-Client-Id` + `X-Raft-Seq` make a write exactly-once |
 | `POST` | `/__leases` | Grant a lease: `{"ttl_seconds": 15}` |
 | `GET` | `/__leases` | List leases held by this replica |
@@ -1164,6 +1166,36 @@ And as above: discovered peers join as learners, so no discovery source can chan
 
 ---
 
+## Backup and restore
+
+`Backup` writes a cluster's state to an `io.Writer` and reports the revision it describes. `Import` replaces a cluster's state with one.
+
+```go
+var backup bytes.Buffer
+revision, err := store.Backup(ctx, &backup)
+```
+
+```go
+err := store.Import(ctx, bytes.NewReader(backup))
+```
+
+Over HTTP the same two are `GET /__backup` and `POST /__restore`, and `client.Backup` / `client.Restore` wrap them. `BackupStale` reads from whichever replica answers without confirming with the leader, which is how to take a backup from a follower and leave the leader alone — a stale backup is still internally consistent, because it is taken under one lock.
+
+**An import replaces; it does not merge.** Keys the cluster holds that the backup does not are gone afterwards, as are leases. Revisions come from the backup, except that the store's own revision never goes backwards, so a conditional write built on a revision read before the import is still refused after it.
+
+**The swap is a single log entry.** A backup can be larger than any one entry may carry, so the bytes are sent in chunks that accumulate in the state machine first; only the entry carrying the last chunk decodes them and replaces the state. Every replica swaps at the same point in the log, none of them is ever half-imported, and a failure at any chunk — a corrupt backup, a leader change, a cancelled context — leaves the old state exactly as it was.
+
+The staged bytes are part of the snapshot. They have to be: a replica that restored from a snapshot mid-import and came back with nothing staged would apply the final chunk differently from every other replica, which is divergence with no error and nothing in the log to explain it.
+
+**Two things it does not do.**
+
+- *It does not stop writes.* An import into a cluster still taking them will replace whatever they wrote between the backup and the swap, and they will see the state change under them. Stop the writers, or import into a cluster nothing has been told about yet.
+- *It is not free on memory.* While an import is in flight the cluster holds the encoded backup on top of the state it is about to replace, on every replica, so peak memory is both at once. On a store near the ceiling above, import into a fresh cluster rather than over a full one.
+
+The format is the snapshot format. It is JSON, and it is not a stable interface: a backup is for putting back into a cluster of this library, not for reading with other tools. What is promised is that a backup taken by one version restores into a later one.
+
+---
+
 ## Talking to a cluster from outside — `easyraft/client`
 
 The HTTP API is small enough to call with `net/http` directly, and doing so means reimplementing the same four things in every service: find the leader, follow it when it moves, decide which failures are worth retrying, and turn status codes back into errors worth branching on. [`easyraft/client`](client/) does those four things.
@@ -1345,6 +1377,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithInsecureTransportAcknowledged()` | Run the gRPC transport in plaintext, on purpose; without this or `WithTLS` the node refuses to start |
 | `WithPrometheus(registerer)` | Enable Prometheus metrics |
 | `WithTransport(tr)` | Use `tr` for Raft RPCs instead of listening on `WithRaftAddr`; the store never closes it |
+| `WithMaxProposalBytes(n)` | Cap a single command; zero takes the limit from the transport |
 | `WithRaftTiming(tick, heartbeat, electionMin, electionMax)` | Override Raft timing (easyraft defaults: 100 ms tick/heartbeat, 1–2 s election) |
 
 ---

@@ -1,11 +1,13 @@
 package client_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -742,5 +744,87 @@ func TestClient_MutationResultsComeBack(t *testing.T) {
 	}
 	if _, err := remote.MutateIf(ctx, "hits", "add", 1, rev); err != nil {
 		t.Errorf("MutateIf on the current revision: %v", err)
+	}
+}
+
+// TestClient_BackupAndRestore covers moving a cluster's state over HTTP,
+// which is how an operator takes a backup without a Go program embedded in
+// the cluster.
+func TestClient_BackupAndRestore(t *testing.T) {
+	source := startServing(t, 3)
+	source.cluster.Start()
+	waitAdvertised(t, source)
+
+	sc := source.client(t)
+	users := client.Collection[User](sc, "users")
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	for i := range 30 {
+		if err := users.Create(ctx, fmt.Sprintf("user-%02d", i), User{Name: "u", Age: i}); err != nil {
+			t.Fatalf("Create %d: %v", i, err)
+		}
+	}
+
+	var backup bytes.Buffer
+	revision, err := sc.Backup(ctx, &backup)
+	if err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	if revision == 0 {
+		t.Error("Backup reported revision 0")
+	}
+	if backup.Len() == 0 {
+		t.Fatal("Backup wrote nothing")
+	}
+
+	// A stale backup from whichever node answers is also usable.
+	var stale bytes.Buffer
+	if _, staleErr := sc.BackupStale(ctx, &stale); staleErr != nil {
+		t.Fatalf("BackupStale: %v", staleErr)
+	}
+	if stale.Len() == 0 {
+		t.Error("BackupStale wrote nothing")
+	}
+
+	// Into a different cluster, through a client pointed at a follower, so
+	// the restore has to be redirected before its body is sent.
+	target := startServing(t, 3)
+	target.cluster.Start()
+	waitAdvertised(t, target)
+	follower := (target.cluster.LeaderIndex() + 1) % 3
+	tc := target.client(t, follower)
+	targetUsers := client.Collection[User](tc, "users")
+
+	if createErr := targetUsers.Create(ctx, "stranger", User{Name: "gone soon"}); createErr != nil {
+		t.Fatal(createErr)
+	}
+	after, restoreErr := tc.Restore(ctx, bytes.NewReader(backup.Bytes()))
+	if restoreErr != nil {
+		t.Fatalf("Restore: %v", restoreErr)
+	}
+	if after == 0 {
+		t.Error("Restore reported revision 0")
+	}
+
+	if _, strangerErr := targetUsers.ReadStale(ctx, "stranger"); !errors.Is(strangerErr, easyraft.ErrKeyNotFound) {
+		t.Errorf("a key the backup did not contain survived the restore: %v", strangerErr)
+	}
+	for _, i := range []int{0, 15, 29} {
+		got, readErr := targetUsers.Read(ctx, fmt.Sprintf("user-%02d", i))
+		if readErr != nil {
+			t.Fatalf("user-%02d is missing after the restore: %v", i, readErr)
+		}
+		if got.Age != i {
+			t.Errorf("user-%02d came back as %+v", i, got)
+		}
+	}
+
+	// A backup that is not a backup is refused and changes nothing.
+	if _, badErr := tc.Restore(ctx, strings.NewReader("not a backup")); badErr == nil {
+		t.Error("a body that is not a backup was accepted")
+	}
+	if _, stillThereErr := targetUsers.Read(ctx, "user-00"); stillThereErr != nil {
+		t.Errorf("the refused restore removed the imported state: %v", stillThereErr)
 	}
 }

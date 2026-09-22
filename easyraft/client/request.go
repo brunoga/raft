@@ -43,6 +43,14 @@ type response struct {
 	header http.Header
 }
 
+// streamedResponse is a response whose body is handed over unread, for the
+// one call where reading it into memory would defeat the point.
+type streamedResponse struct {
+	status int
+	body   io.ReadCloser
+	header http.Header
+}
+
 // do runs a request, following redirects to the leader and retrying what may
 // be retried, and returns the first response that is neither.
 func (c *Client) do(ctx context.Context, req *request) (*response, error) {
@@ -135,16 +143,52 @@ func (c *Client) callFollowingLeader(ctx context.Context, endpoint string, req *
 	return nil, fmt.Errorf("easyraft/client: more than %d leader redirects in one attempt", maxRedirects)
 }
 
-// call makes one HTTP request. It returns a redirect target instead of a
-// response when the node points at the leader.
+// call makes one HTTP request and reads the response. It returns a redirect
+// target instead of a response when the node points at the leader.
 func (c *Client) call(ctx context.Context, endpoint string, req *request) (*response, string, error) {
-	var body io.Reader = http.NoBody
-	if req.body != nil {
-		encoded, err := encodeBody(req.body)
-		if err != nil {
-			return nil, "", err
-		}
-		body = bytes.NewReader(encoded)
+	httpResp, redirect, err := c.send(ctx, endpoint, req)
+	if err != nil || redirect != "" {
+		return nil, redirect, err
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+
+	raw, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("easyraft/client: %s: read response: %w", endpoint, err)
+	}
+	if httpResp.StatusCode >= 400 {
+		return nil, "", errorFor(endpoint, httpResp.StatusCode, raw)
+	}
+	return &response{status: httpResp.StatusCode, body: raw, header: httpResp.Header}, "", nil
+}
+
+// callStreaming is call without reading the body, for a response the caller
+// means to copy rather than hold. An error response is still read, because an
+// error message is a line and the caller has nowhere to put it.
+func (c *Client) callStreaming(ctx context.Context, endpoint string, req *request) (*streamedResponse, string, error) {
+	httpResp, redirect, err := c.send(ctx, endpoint, req)
+	if err != nil || redirect != "" {
+		return nil, redirect, err
+	}
+	if httpResp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBody))
+		_ = httpResp.Body.Close()
+		return nil, "", errorFor(endpoint, httpResp.StatusCode, raw)
+	}
+	return &streamedResponse{
+		status: httpResp.StatusCode,
+		body:   httpResp.Body,
+		header: httpResp.Header,
+	}, "", nil
+}
+
+// send builds and performs one request, and reports a leader redirect rather
+// than following it. The response body is left unread and open unless a
+// redirect was returned, in which case it is drained and closed here.
+func (c *Client) send(ctx context.Context, endpoint string, req *request) (*http.Response, string, error) {
+	body, err := requestBody(req)
+	if err != nil {
+		return nil, "", err
 	}
 
 	target := endpoint + c.group + req.path
@@ -169,12 +213,12 @@ func (c *Client) call(ctx context.Context, endpoint string, req *request) (*resp
 	if err != nil {
 		return nil, "", fmt.Errorf("easyraft/client: %s: %w", endpoint, err)
 	}
-	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode == http.StatusTemporaryRedirect ||
 		httpResp.StatusCode == http.StatusPermanentRedirect {
 		location := httpResp.Header.Get("Location")
 		_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, maxErrorBody))
+		_ = httpResp.Body.Close()
 		if location == "" {
 			return nil, "", fmt.Errorf("easyraft/client: %s redirected with no Location", endpoint)
 		}
@@ -187,15 +231,76 @@ func (c *Client) call(ctx context.Context, endpoint string, req *request) (*resp
 		}
 		return nil, origin, nil
 	}
+	return httpResp, "", nil
+}
 
-	raw, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("easyraft/client: %s: read response: %w", endpoint, err)
+// requestBody turns a request's body into something to send: nothing, a
+// reader handed over as-is, or a value encoded as JSON.
+func requestBody(req *request) (io.Reader, error) {
+	switch body := req.body.(type) {
+	case nil:
+		return http.NoBody, nil
+	case readerBody:
+		return body.r, nil
+	default:
+		encoded, err := encodeBody(req.body)
+		if err != nil {
+			return nil, err
+		}
+		return bytes.NewReader(encoded), nil
 	}
-	if httpResp.StatusCode >= 400 {
-		return nil, "", errorFor(endpoint, httpResp.StatusCode, raw)
+}
+
+// stream runs a request and hands back the body unread, so the caller can
+// copy it somewhere rather than hold it.
+//
+// It follows leader redirects and moves on to another endpoint the same way
+// do does, but it does not retry: a retry would have to discard however much
+// of the body the caller has already consumed, which is not this function's
+// to decide.
+func (c *Client) stream(ctx context.Context, req *request) (*streamedResponse, error) {
+	var lastErr error
+	for _, endpoint := range c.order() {
+		resp, err := c.streamFollowingLeader(ctx, endpoint, req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !worthAnotherEndpoint(err) {
+			return nil, err
+		}
 	}
-	return &response{status: httpResp.StatusCode, body: raw, header: httpResp.Header}, "", nil
+	if lastErr == nil {
+		lastErr = errors.New("easyraft/client: no endpoints configured")
+	}
+	return nil, fmt.Errorf("%w: %w", ErrNoEndpoint, lastErr)
+}
+
+func (c *Client) streamFollowingLeader(ctx context.Context, endpoint string, req *request) (
+	*streamedResponse, error,
+) {
+	for range maxRedirects {
+		resp, redirect, err := c.callStreaming(ctx, endpoint, req)
+		if err != nil {
+			return nil, err
+		}
+		if redirect == "" {
+			c.rememberLeader(endpoint)
+			return resp, nil
+		}
+		next, err := normalizeEndpoint(redirect)
+		if err != nil {
+			return nil, fmt.Errorf("easyraft/client: %s redirected to an unusable address: %w", endpoint, err)
+		}
+		if next == endpoint {
+			return nil, fmt.Errorf("easyraft/client: %s redirected to itself", endpoint)
+		}
+		endpoint = next
+	}
+	return nil, fmt.Errorf("easyraft/client: more than %d leader redirects in one attempt", maxRedirects)
 }
 
 // encodeBody turns a request body into JSON, passing through anything that is
