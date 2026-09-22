@@ -522,11 +522,38 @@ defer func() {
 }()
 ```
 
+Group IDs start at 1. A `Manager` routes every inbound RPC by the group ID it carries, and zero is what a single-group node's RPCs carry, so a group numbered zero would never be reachable: it would get no votes, no appends and no election, and sit in `PreCandidate` for ever with nothing in its own log to say why. `AddStore(0)` is refused.
+
 `AddStore` accepts the same options as `NewStore`. Options set on the `Manager` (e.g. `WithID`, `WithPeers`) are inherited by stores; store-level options override them — including `WithPrometheus`, whose registerer every group shares. Each group's series are told apart by a `group` label.
 
 `Manager.Start` does not hold its lock while a group joins its cluster, so `GetStore` and the HTTP handlers stay responsive even when a join is waiting out its 30-second retry budget against a seed that is still coming up.
 
 ---
+
+### Balancing leaders across hosts
+
+Groups elect leaders independently and nothing coordinates them. Left alone, a host that stayed up while others restarted ends up leading most of them — and a leader does the replication, serves the linearizable reads and takes every write, so one host doing all of it is both a bottleneck and the failure that hurts most.
+
+```go
+easyraft.WithLeaderBalancing(map[raft.HostID]string{
+    "n1": "10.0.0.1:8001",
+    "n2": "10.0.0.2:8001",
+    "n3": "10.0.0.3:8001",
+}, 30*time.Second)
+```
+
+A host's ID is the node ID its `Manager` was built with, since one `Manager` is one physical node, and the map must include this one. This node is asked directly; the others over HTTP at `/__balance/status` and `/__balance/transfer`, behind the same authorization hook as everything else and carrying whatever credential `WithBearerTokenAuth` set.
+
+Every host may run it. Two controllers whose views disagree would hand a group back and forth, which is what the cooldown below exists to stop.
+
+**A transfer is an election, so a balanced cluster is worth more than a perfectly balanced one.** Four things keep it from costing more than it saves:
+
+- a group is left alone for a cooldown after it moves — five intervals by default;
+- a round where any host fails to report is skipped entirely, rather than planned from a view that would move leaders away from a node that merely went quiet;
+- leadership only ever moves to a voter, since a learner cannot win an election;
+- and only to a replica close enough to the leader to take over, because one that is far behind would have to catch up first, turning a rebalance into an outage for that group.
+
+Pass `raft.WithGroupCooldown`, `raft.WithStatusTimeout` and `raft.WithTransferTimeout` through to tune those. Balancing is off unless asked for: a cluster that reshuffles itself without being told to is worse than an uneven one.
 
 ### One log for every group
 
@@ -1378,6 +1405,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithPrometheus(registerer)` | Enable Prometheus metrics |
 | `WithTransport(tr)` | Use `tr` for Raft RPCs instead of listening on `WithRaftAddr`; the store never closes it |
 | `WithMaxProposalBytes(n)` | Cap a single command; zero takes the limit from the transport |
+| `WithLeaderBalancing(hosts, d, opts...)` | Keep group leadership spread across hosts (`Manager` only) |
 | `WithRaftTiming(tick, heartbeat, electionMin, electionMax)` | Override Raft timing (easyraft defaults: 100 ms tick/heartbeat, 1–2 s election) |
 
 ---

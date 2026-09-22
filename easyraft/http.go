@@ -1306,6 +1306,11 @@ func (m *Manager) serveHTTP() error {
 	mux.HandleFunc("POST /groups/{groupID}/transfer-leadership", guard(m.handleTransferLeadership))
 	mux.HandleFunc("POST /groups/{groupID}/batch", guard(m.handleBatch))
 
+	// Not under /groups/{groupID}: these are about the node as a whole, which
+	// is what a balance controller plans over.
+	mux.HandleFunc("GET /__balance/status", guard(m.handleBalanceStatus))
+	mux.HandleFunc("POST /__balance/transfer", guard(m.handleBalanceTransfer))
+
 	mux.HandleFunc("GET /groups/{groupID}/__backup", guard(m.handleBackup))
 	mux.HandleFunc("POST /groups/{groupID}/__restore", guard(m.handleRestore))
 	mux.HandleFunc("POST /groups/{groupID}/__leases", guard(m.handleGrantLease))
