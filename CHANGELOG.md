@@ -277,6 +277,13 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Fixed
 
+- `Manager` ignored `WithHTTPMux`. A `Store` has always registered its routes
+  on a mux the caller supplied, so an application can serve its own routes on
+  the same port; a `Manager` always built one of its own, so the option
+  compiled, read as set, and did nothing. An application that wanted one port
+  had no way to say so and no way to find out it had failed to -- easyraft's
+  routes simply were not there.
+
 - `easyraft/client` gave up before a leader election finished. The default
   retry budget was four attempts doubling from 50ms -- about 350ms in total
   -- while an election takes an election timeout, one to two seconds with the
