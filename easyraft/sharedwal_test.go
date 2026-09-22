@@ -113,7 +113,11 @@ func TestManager_SharedWAL(t *testing.T) {
 		}
 		v, readErr := counters2[g].Read(ctx, "k")
 		if readErr != nil {
-			t.Fatalf("group %d read after restart: %v", g, readErr)
+			all, listErr := counters2[g].ListStale()
+			st := s.Status()
+			t.Fatalf("group %d read after restart: %v; collection holds %v (%v); "+
+				"status: group=%d state=%v term=%d applied=%d",
+				g, readErr, all, listErr, st.GroupID, st.State, st.Term, st.LastApplied)
 		}
 		if v.Value != g {
 			t.Errorf("group %d holds %d after restart, want %d — groups are sharing more than a log",
