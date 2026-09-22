@@ -838,6 +838,16 @@ Three separate surfaces, each configured on its own: the Raft transport, the HTT
 
 ### Raft transport (gRPC)
 
+From PEM files, which is the common case and the one that is easy to get wrong:
+
+```go
+easyraft.WithTLSFiles("node.crt", "node.key", "ca.crt")
+```
+
+That builds exactly the configuration below: the authority trusted in both directions, because every node here is both a client and a server, and client certificates required *and verified*, because anything weaker leaves the Raft port open to any client that can reach it. The files are read when the store is constructed, so a wrong path fails there rather than at the first connection between two nodes.
+
+Or build it yourself:
+
 ```go
 easyraft.WithTLS(&tls.Config{
     Certificates: []tls.Certificate{nodeCert},
@@ -981,6 +991,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithSnapCount(n)` | Log entries between automatic snapshots (default 1000) |
 | `WithLogger(logger)` | Custom `*slog.Logger` |
 | `WithTLS(tlsConfig)` | TLS for the gRPC transport (not the HTTP API — see `WithHTTPTLS`) |
+| `WithTLSFiles(cert, key, ca)` | The same, built from PEM files as a Raft mesh needs it |
 | `WithPeerAuthorizer(fn)` | Bind the node ID a Raft RPC claims to the certificate that carried it |
 | `WithWitness()` | This node votes and holds no data |
 | `WithWitnessPeers(ids...)` | Which peers from `WithPeers` are witnesses |

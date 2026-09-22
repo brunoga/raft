@@ -80,6 +80,9 @@ func NewManager(opts ...Option) (*Manager, error) {
 	if c.ID == "" {
 		return nil, fmt.Errorf("easyraft: WithID is required for Manager")
 	}
+	if err := resolveTLSFiles(&c); err != nil {
+		return nil, err
+	}
 	if err := validateSecurity(&c, true); err != nil {
 		return nil, err
 	}

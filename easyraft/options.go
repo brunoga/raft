@@ -77,6 +77,14 @@ type config struct {
 	// [WithWitness].
 	Witness bool
 
+	// TLSCertFile, TLSKeyFile and TLSCAFile are the PEM files [WithTLSFiles]
+	// builds the Raft transport's mutual TLS from. They are read when the
+	// store or manager is constructed, not here, so that a missing or
+	// malformed file is an error the caller is handed rather than a panic.
+	TLSCertFile string
+	TLSKeyFile  string
+	TLSCAFile   string
+
 	// SharedWAL makes every group on a Manager share one write-ahead log at
 	// the Manager's DataDir. Set via [WithSharedWAL]; ignored by a plain
 	// Store, which has only one group to write for.
@@ -595,6 +603,42 @@ func WithProposalQueue(size int, overflow raft.ProposalOverflowPolicy) Option {
 // where that decision goes, and it may call [Store.Stop].
 func WithOnRemoved(fn func()) Option {
 	return func(c *config) { c.OnRemoved = fn }
+}
+
+// WithTLSFiles configures mutual TLS for the Raft transport from PEM files:
+// this node's certificate and private key, and the certificate authority
+// that issued every node's.
+//
+// It exists because the configuration a Raft mesh needs is the one that is
+// easy to get wrong. Every node is both a client and a server, so the
+// authority goes in as both RootCAs and ClientCAs, and client certificates
+// have to be required *and verified* -- anything weaker leaves the Raft port
+// open to any client that can reach it. Getting that right also means the
+// peer authorizer is installed, binding the node ID an RPC claims to the
+// certificate that carried it; see [WithPeerAuthorizer] for why that is a
+// separate thing from holding a valid certificate.
+//
+// The equivalent by hand:
+//
+//	cert, _ := tls.LoadX509KeyPair(certFile, keyFile)
+//	pool := x509.NewCertPool()
+//	pem, _ := os.ReadFile(caFile)
+//	pool.AppendCertsFromPEM(pem)
+//	easyraft.WithTLS(&tls.Config{
+//	    Certificates: []tls.Certificate{cert},
+//	    RootCAs:      pool,
+//	    ClientCAs:    pool,
+//	    ClientAuth:   tls.RequireAndVerifyClientCert,
+//	    MinVersion:   tls.VersionTLS13,
+//	})
+//
+// The files are read when the store or manager is constructed, so a path
+// that is wrong fails there rather than at the first connection between two
+// nodes. It does not affect the HTTP API; use [WithHTTPTLS] for that.
+func WithTLSFiles(certFile, keyFile, caFile string) Option {
+	return func(c *config) {
+		c.TLSCertFile, c.TLSKeyFile, c.TLSCAFile = certFile, keyFile, caFile
+	}
 }
 
 // WithPeerAuthorizer decides whether the node a Raft RPC claims to come from
