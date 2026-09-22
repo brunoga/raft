@@ -2044,6 +2044,20 @@ func (n *Node) proposalLimit() int {
 	return limit - reserved
 }
 
+// MaxProposalBytes reports the largest command [Node.Propose] will accept,
+// or zero when nothing limits it.
+//
+// It is [Config.MaxProposalBytes] when that is set, and otherwise what the
+// transport says it can carry less the headroom the request and entry framing
+// need. A caller that has to split a large piece of work into several
+// proposals -- restoring a state machine from a backup, say -- needs the
+// number rather than a guess at it: a guess that is too big fails at the
+// worst moment, and one that is too small makes an operation take many times
+// the entries it should.
+func (n *Node) MaxProposalBytes() int {
+	return n.proposalLimit()
+}
+
 // proposalFramingReserve is the minimum headroom left for request and entry
 // framing when deriving a proposal limit from the transport.
 const proposalFramingReserve = 4096

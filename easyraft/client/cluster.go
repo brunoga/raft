@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -210,6 +211,89 @@ func (c *Client) Leases(ctx context.Context) ([]Lease, error) {
 		out = append(out, r.lease())
 	}
 	return out, nil
+}
+
+// ---- Backup and restore ----------------------------------------------------
+
+// Backup copies the cluster's state to w and reports the revision it
+// describes.
+//
+// The body is streamed rather than buffered, so a large backup costs a window
+// of memory rather than all of it. A failure partway through is reported as
+// an error here even though the response already claimed success: the headers
+// go out before the first byte, so a truncated download cannot be a status
+// code. Check the error, and check the import.
+func (c *Client) Backup(ctx context.Context, w io.Writer) (revision uint64, err error) {
+	return c.backup(ctx, w, false)
+}
+
+// BackupStale copies the state from whichever node answers, without that node
+// confirming it is current with the leader. Use it to take a backup from a
+// follower and leave the leader alone.
+func (c *Client) BackupStale(ctx context.Context, w io.Writer) (revision uint64, err error) {
+	return c.backup(ctx, w, true)
+}
+
+func (c *Client) backup(ctx context.Context, w io.Writer, stale bool) (revision uint64, err error) {
+	query := ""
+	if stale {
+		query = "consistency=stale"
+	}
+	resp, err := c.stream(ctx, &request{
+		method:     http.MethodGet,
+		path:       "/__backup",
+		query:      query,
+		idempotent: true,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.body.Close() }()
+
+	if raw := resp.header.Get("X-Raft-Revision"); raw != "" {
+		revision, _ = strconv.ParseUint(raw, 10, 64)
+	}
+	if _, err := io.Copy(w, resp.body); err != nil {
+		return 0, fmt.Errorf("easyraft/client: backup ended early after %d bytes read: %w",
+			revision, err)
+	}
+	return revision, nil
+}
+
+// Restore replaces the cluster's whole state with the backup read from r, and
+// reports the revision it is at afterwards.
+//
+// It replaces rather than merges: keys the cluster holds that the backup does
+// not are gone afterwards, as are leases. The swap itself is a single entry,
+// so no replica is ever half-imported and a failure leaves the old state
+// exactly as it was.
+//
+// Nothing stops writes while it runs. Stop the writers, or restore into a
+// cluster nothing has been told about yet. It is attempted once: a restore
+// that half-ran and was retried would send the whole backup again, and the
+// caller is better placed to decide whether to.
+func (c *Client) Restore(ctx context.Context, r io.Reader) (revision uint64, err error) {
+	resp, err := c.do(ctx, &request{
+		method: http.MethodPost,
+		path:   "/__restore",
+		body:   readerBody{r},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var decoded struct {
+		Revision uint64 `json:"revision"`
+	}
+	if err := json.Unmarshal(resp.body, &decoded); err != nil {
+		return 0, fmt.Errorf("easyraft/client: decode restore result: %w", err)
+	}
+	return decoded.Revision, nil
+}
+
+// readerBody marks a request body that comes from a reader rather than a
+// value to encode.
+type readerBody struct {
+	r io.Reader
 }
 
 // ---- Cluster ---------------------------------------------------------------

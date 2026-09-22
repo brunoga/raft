@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -170,6 +171,8 @@ func (s *Store) registerRoutes(mux *http.ServeMux) {
 	// /leases would shadow a collection of that name -- silently, and only
 	// over HTTP. A "__" name is already refused to collections, so nothing a
 	// caller can create reaches here.
+	mux.HandleFunc("GET /__backup", guard(s.handleBackup))
+	mux.HandleFunc("POST /__restore", guard(s.handleRestore))
 	mux.HandleFunc("POST /__leases", guard(s.handleGrantLease))
 	mux.HandleFunc("GET /__leases", guard(s.handleListLeases))
 	mux.HandleFunc("GET /__leases/{id}", guard(s.handleReadLease))
@@ -861,6 +864,78 @@ func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(raw)
 }
 
+// handleBackup handles GET /__backup, streaming the state machine to the
+// client.
+//
+// The revision travels in a header rather than the body, because the body is
+// the backup and nothing else: what comes out here is exactly what
+// POST /__restore takes back in.
+func (s *Store) handleBackup(w http.ResponseWriter, r *http.Request) {
+	stale := r.URL.Query().Get("consistency") == "stale"
+	if !stale {
+		if err := s.readIndex(r.Context()); err != nil {
+			s.handleRPCError(w, r, err)
+			return
+		}
+	}
+
+	// The headers go out before the first byte of a stream that may take a
+	// while, so a failure partway cannot be reported by status code. A
+	// truncated body is the only signal left, which is why the length the
+	// client should have seen is not promised: check the import, not the
+	// download.
+	revision, err := s.currentRevision()
+	if err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Raft-Revision", strconv.FormatUint(revision, 10))
+	w.Header().Set("Content-Disposition", `attachment; filename="easyraft-backup.json"`)
+
+	if _, err := s.BackupStale(w); err != nil {
+		// Too late for a status code; the client sees a short body and the
+		// operator sees this.
+		s.logger().Error("easyraft: backup failed partway through", "err", err)
+	}
+}
+
+// currentRevision reports what this replica has applied, or refuses when it
+// holds nothing to report.
+func (s *Store) currentRevision() (uint64, error) {
+	if s.cfg.Witness {
+		return 0, ErrWitness
+	}
+	return s.Revision(), nil
+}
+
+// maxRestoreBody bounds what POST /__restore will read. A backup is large by
+// nature, so the bound is generous; what it stops is an unbounded read into
+// memory from a client that never ends its body.
+const maxRestoreBody = 1 << 30
+
+// handleRestore handles POST /__restore, replacing the state machine with
+// the backup in the request body.
+func (s *Store) handleRestore(w http.ResponseWriter, r *http.Request) {
+	// Refused here rather than partway through, because the alternative is
+	// streaming the whole backup to a node that was only ever going to
+	// redirect, and then streaming it again to the leader.
+	if s.node == nil {
+		writeError(w, http.StatusServiceUnavailable, "node not started", s.logger())
+		return
+	}
+	if s.node.State() != raft.Leader {
+		s.handleRPCError(w, r, raft.ErrNotLeader)
+		return
+	}
+
+	if err := s.Import(r.Context(), io.LimitReader(r.Body, maxRestoreBody)); err != nil {
+		s.handleRPCError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]uint64{"revision": s.Revision()}, s.logger())
+}
+
 // ---- Lease types -----------------------------------------------------------
 
 // grantLeaseRequest is the body of POST /leases.
@@ -1231,6 +1306,8 @@ func (m *Manager) serveHTTP() error {
 	mux.HandleFunc("POST /groups/{groupID}/transfer-leadership", guard(m.handleTransferLeadership))
 	mux.HandleFunc("POST /groups/{groupID}/batch", guard(m.handleBatch))
 
+	mux.HandleFunc("GET /groups/{groupID}/__backup", guard(m.handleBackup))
+	mux.HandleFunc("POST /groups/{groupID}/__restore", guard(m.handleRestore))
 	mux.HandleFunc("POST /groups/{groupID}/__leases", guard(m.handleGrantLease))
 	mux.HandleFunc("GET /groups/{groupID}/__leases", guard(m.handleListLeases))
 	mux.HandleFunc("GET /groups/{groupID}/__leases/{id}", guard(m.handleReadLease))
@@ -1351,6 +1428,14 @@ func (m *Manager) handleTransferLeadership(w http.ResponseWriter, r *http.Reques
 
 func (m *Manager) handleBatch(w http.ResponseWriter, r *http.Request) {
 	m.withStore(w, r, (*Store).handleBatch)
+}
+
+func (m *Manager) handleBackup(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleBackup)
+}
+
+func (m *Manager) handleRestore(w http.ResponseWriter, r *http.Request) {
+	m.withStore(w, r, (*Store).handleRestore)
 }
 
 func (m *Manager) handleGrantLease(w http.ResponseWriter, r *http.Request) {

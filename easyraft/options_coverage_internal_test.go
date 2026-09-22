@@ -55,6 +55,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithMaxClientTableSize(1000),
 		WithLeaseSafetyMargin(15 * time.Millisecond),
 		WithKeyLeaseSweepInterval(250 * time.Millisecond),
+		WithMaxProposalBytes(1 << 20),
 		WithTransport(memtransport.NewNetwork().NewTransport("n1")),
 		WithProposalQueue(512, raft.ProposalOverflowReject),
 		WithOnRemoved(func() {}),

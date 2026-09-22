@@ -8,6 +8,35 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **Backup and restore.** `Store.Backup` writes a cluster's state to an
+  `io.Writer` and reports the revision it describes; `Store.Import` replaces a
+  cluster's state with one. Over HTTP they are `GET /__backup` and
+  `POST /__restore`, wrapped by `client.Backup` and `client.Restore`.
+  `BackupStale` reads from a follower without disturbing the leader, and is
+  still internally consistent because it is taken under one lock.
+
+  The swap is a single log entry. A backup can be larger than any one entry
+  may carry, so the bytes are sent in chunks that accumulate in the state
+  machine and are decoded by the entry carrying the last of them. Every
+  replica swaps at the same point in the log, none is ever half-imported, and
+  a failure at any chunk leaves the old state exactly as it was.
+
+  The staged bytes travel in snapshots. They have to: a replica that restored
+  from one mid-import and came back with nothing staged would apply the final
+  chunk differently from every other replica, which is divergence with no
+  error and nothing in the log to explain it.
+
+  The README says the two things an import does not do: it does not stop
+  writes, and it is not free on memory -- while one is in flight the cluster
+  holds the encoded backup on top of the state it is about to replace, on
+  every replica.
+
+- **`raft.Node.MaxProposalBytes`** reports the largest command `Propose` will
+  accept, and **`easyraft.WithMaxProposalBytes`** sets it. A caller splitting
+  a large piece of work across proposals needs the number rather than a guess
+  at it: a guess that is too big fails at the worst moment, and one that is
+  too small makes an operation take many times the entries it should.
+
 - **The in-memory ceiling is now visible.** `Store.StateBytes()` and
   `Store.KeyCount()` report how much application state a replica is holding,
   exported as `easyraft_state_bytes` and `easyraft_state_keys` with the same

@@ -126,6 +126,10 @@ type config struct {
 	// build. Set via [WithTransport].
 	Transport raft.Transport
 
+	// MaxProposalBytes caps the size of a single command. Set via
+	// [WithMaxProposalBytes].
+	MaxProposalBytes int
+
 	// ProposalQueueSize and ProposalOverflow govern how many writes may wait
 	// for the event loop and what happens to the next one. Set via
 	// [WithProposalQueue].
@@ -569,6 +573,25 @@ func WithPreferredLeader(id raft.NodeID) Option {
 // change a running group with [Store.SetMaxClientTableSize].
 func WithMaxClientTableSize(entries int) Option {
 	return func(c *config) { c.MaxClientTableSize = entries }
+}
+
+// WithMaxProposalBytes caps the size of a single command, refusing a larger
+// one with [raft.ErrProposalTooLarge] rather than accepting it.
+//
+// This exists because a command that cannot be replicated is far worse than
+// one that is refused: it is appended to the leader's log, rejected by the
+// transport on every send, and retried for ever, while every later proposal
+// queues behind it and the group stops making progress with nothing having
+// reported an error.
+//
+// Zero takes the limit from the transport, which is the right answer
+// whenever the transport knows one. Set this when it does not, or to hold
+// writes well below what the transport would allow.
+//
+// [Store.Import] divides a backup into chunks that fit inside this, so
+// lowering it makes an import take more entries rather than failing.
+func WithMaxProposalBytes(n int) Option {
+	return func(c *config) { c.MaxProposalBytes = n }
 }
 
 // WithTransport uses tr for Raft RPCs instead of building a gRPC transport
