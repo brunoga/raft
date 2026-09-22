@@ -1391,7 +1391,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithID(id)` | Node ID — required |
 | `WithRaftAddr(addr)` | gRPC listen address for Raft RPCs — required |
 | `WithHTTPAddr(addr)` | HTTP listen address; enables the REST API and sets the advertised URL for leader redirects |
-| `WithHTTPMux(mux)` | Register EasyRaft routes on an existing mux instead of starting a dedicated server; pair with `WithHTTPAddr` for redirect advertising |
+| `WithHTTPMux(mux)` | Register EasyRaft routes on an existing mux instead of starting a dedicated server; pair with `WithHTTPAddr` for redirect advertising. Works for a `Store` and a `Manager` alike |
 | `WithHTTPAuth(fn)` | Authorize every HTTP request with `func(*http.Request) error` |
 | `WithBearerTokenAuth(token)` | Require `Authorization: Bearer <token>` inbound, and send it on outbound join/leave requests |
 | `WithHTTPTLS(tlsConfig)` | Serve the HTTP API over TLS; leader redirects then use `https` |

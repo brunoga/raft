@@ -1287,7 +1287,7 @@ func statusForError(err error) int {
 // ---- Manager HTTP server ---------------------------------------------------
 
 func (m *Manager) serveHTTP() error {
-	if m.cfg.HTTPAddr == "" {
+	if m.cfg.HTTPAddr == "" && m.cfg.HTTPMux == nil {
 		return nil
 	}
 	logger := m.logger()
@@ -1297,7 +1297,14 @@ func (m *Manager) serveHTTP() error {
 		return authorized(m.cfg.HTTPAuth, logger, h)
 	}
 
-	mux := http.NewServeMux()
+	// A caller's own mux, when there is one, so an application serving its
+	// own routes does so on one port rather than two. A Store has always
+	// honoured this; a Manager silently did not, which meant the option
+	// compiled, read as set, and did nothing.
+	mux := m.cfg.HTTPMux
+	if mux == nil {
+		mux = http.NewServeMux()
+	}
 
 	// Cluster management per Raft group.
 	mux.HandleFunc("POST /groups/{groupID}/join", guard(m.handleJoin))
@@ -1331,6 +1338,13 @@ func (m *Manager) serveHTTP() error {
 	mux.HandleFunc("GET /status", guard(m.handleStatus))
 	mux.HandleFunc("GET /health", guard(m.handleHealth))
 	mux.Handle("GET /metrics", guard(promhttp.Handler().ServeHTTP))
+
+	// The caller's mux is the caller's to serve, so the routes are registered
+	// and nothing is listened on here.
+	if m.cfg.HTTPMux != nil {
+		warnIfHTTPUnreachable(m.cfg.HTTPAddr, logger)
+		return nil
+	}
 
 	ln, err := net.Listen("tcp", m.cfg.HTTPAddr)
 	if err != nil {
