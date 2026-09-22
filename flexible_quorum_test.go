@@ -149,10 +149,26 @@ func TestFlexibleQuorum_CommitOnTwo(t *testing.T) {
 func TestFlexibleQuorum_BackToMajority(t *testing.T) {
 	c := newCluster(t, 3)
 	leader := c.nodes[c.WaitLeader(electionTimeout)]
-	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
-	defer cancel()
 
-	if err := leader.SetCommitQuorum(ctx, 3); err != nil {
+	// Ticked throughout, because a configuration change has to be replicated
+	// to commit and a cluster nobody ticks replicates only what a proposal
+	// happens to carry with it. The reconnected follower in particular is
+	// caught up by a heartbeat, which is a thing that happens on a tick.
+	stopTicking := tickWhile(c.nodes...)
+	defer stopTicking()
+
+	// A context per call rather than one for the test: a single budget spent
+	// across an election, a write that is meant to time out, and a wait for
+	// the cluster to agree is a budget that runs out on a loaded machine,
+	// and the failure then lands on whichever call was last.
+	setQuorum := func(node *raft.Node, quorum int) error {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+		defer cancel()
+		return node.SetCommitQuorum(ctx, quorum)
+	}
+
+	if err := setQuorum(leader, 3); err != nil {
 		t.Fatalf("SetCommitQuorum(3): %v", err)
 	}
 	waitCommitQuorum(t, c, 3)
@@ -169,7 +185,7 @@ func TestFlexibleQuorum_BackToMajority(t *testing.T) {
 	if leader == nil {
 		t.Fatal("no leader after healing")
 	}
-	if err := leader.SetCommitQuorum(ctx, 0); err != nil {
+	if err := setQuorum(leader, 0); err != nil {
 		t.Fatalf("SetCommitQuorum(0): %v", err)
 	}
 	waitCommitQuorum(t, c, 0)

@@ -135,7 +135,8 @@ func Run(t *testing.T, opts Options) {
 
 func runOnce(t *testing.T, bin string, opts Options, attach bool) {
 	t.Helper()
-	raftAddr, httpAddr := freeAddr(t), freeAddr(t)
+	addrs := freeAddrs(t, 2)
+	raftAddr, httpAddr := addrs[0], addrs[1]
 	dataDir := filepath.Join(t.TempDir(), "data")
 
 	cmd := exec.Command(bin, opts.Args(raftAddr, httpAddr, dataDir)...)
@@ -231,18 +232,31 @@ func build(t *testing.T, pkg string) string {
 	return bin
 }
 
-// freeAddr returns a loopback address nothing is listening on.
-func freeAddr(t *testing.T) string {
+// freeAddrs returns n distinct loopback addresses nothing is listening on.
+//
+// Every listener is held open until all n have been chosen. Picking them one
+// at a time, each released before the next is asked for, lets the kernel hand
+// the same port out twice -- and a service given one address for its Raft
+// port and its HTTP port binds the first, fails the second, and exits before
+// it has answered anything.
+func freeAddrs(t *testing.T, n int) []string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	lns := make([]net.Listener, 0, n)
+	addrs := make([]string, 0, n)
+	for range n {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		lns = append(lns, l)
+		addrs = append(addrs, l.Addr().String())
 	}
-	addr := l.Addr().String()
-	if closeErr := l.Close(); closeErr != nil {
-		t.Fatalf("close: %v", closeErr)
+	for _, l := range lns {
+		if err := l.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
 	}
-	return addr
+	return addrs
 }
 
 // awaitServing blocks until the service answers on path.
