@@ -8,6 +8,31 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **`easyraft/client`**, a Go client for talking to an easyraft cluster from
+  a process that is not part of it. It finds the leader, follows it when it
+  moves, retries what is safe to retry, and returns the same error values an
+  in-process caller sees -- `ErrKeyNotFound`, `ErrRevisionMismatch`,
+  `ErrLeaseNotFound` and the rest -- so a service that moves from embedding a
+  node to talking to one changes where its handle comes from and nothing
+  else. `Coll[T]` mirrors `Collection[T]` method for method; leases, batches
+  and cluster information are on the `Client`.
+
+  What it will not do is retry a write that could apply twice. A caller
+  cannot tell a request that never arrived from a response that was lost, so
+  reads are retried, writes carrying an exactly-once identity are retried
+  because the cluster deduplicates them, and conditional writes are retried
+  because a second attempt is refused by the revision the first one moved.
+  An ordinary `Create` with no identity is attempted once. Following a
+  redirect is not a retry and always happens.
+
+- **Exactly-once writes over HTTP.** `X-Raft-Client-Id` and `X-Raft-Seq` on
+  any write route make it deduplicated, which is what lets a retry after a
+  lost response be safe rather than a second write. They cover every write
+  including `/batch`, mutations and a lease grant -- a repeated grant used to
+  leave a second lease nothing would ever renew. Both headers or neither: one
+  of them is a client that meant to be deduplicated and is not, which is
+  answered with `400` rather than applied as an ordinary write.
+
 - **`easyraft/easyrafttest`**, which runs real easyraft clusters inside a
   test process on an in-memory network a test can cut and heal. Every node is
   a real `Store` running the real engine; the only thing replaced is the wire
@@ -148,6 +173,13 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
     the exactly-once table, a durable write that failed.
 
 ### Changed
+
+- A node now advertises its HTTP address with an exponential backoff starting
+  at 50ms rather than retrying on a fixed 5-second timer. The first attempt
+  almost always fails, because `Start` runs before any election has finished
+  and there is nobody to propose to yet -- so every cluster spent five
+  seconds after startup answering writes on its followers with a 503 naming a
+  leader they could not redirect to. It is now a few hundred milliseconds.
 
 - `NewStore` now builds its `Store` through `newStoreShell`, which it already
   documented itself as doing while keeping a second copy of the same literal.

@@ -1155,10 +1155,22 @@ func (s *Store) Start() error {
 // election in progress at startup makes an early failure the common case
 // rather than an exceptional one.
 func (s *Store) advertiseMetadata() {
-	// Retry until we successfully register our HTTP address with the leader.
-	// This ensures that after a leadership rotation, every node's URL is known.
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Retry until this node's HTTP address is registered with the leader, so
+	// that after a leadership rotation every node's URL is known.
+	//
+	// The first attempt almost always fails, because Start runs before any
+	// election has finished and there is nobody to propose to yet. So the
+	// delay starts short and doubles: a fresh cluster advertises within a few
+	// hundred milliseconds of electing a leader, rather than whenever a fixed
+	// timer next happened to fire. Until it does, every follower answers a
+	// write with 503 and the name of a leader it cannot redirect to -- five
+	// seconds of that at every startup is five seconds of a cluster that is
+	// up and not usable.
+	const (
+		firstRetry = 50 * time.Millisecond
+		maxRetry   = 5 * time.Second
+	)
+	retry := firstRetry
 
 	for {
 		if s.node == nil {
@@ -1189,7 +1201,10 @@ func (s *Store) advertiseMetadata() {
 		select {
 		case <-s.stopCtx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(retry):
+		}
+		if retry < maxRetry {
+			retry *= 2
 		}
 	}
 }
