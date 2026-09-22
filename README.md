@@ -657,7 +657,7 @@ net.Heal("n3")             // reconnect n3
 ```go
 import "github.com/brunoga/raft/transport/grpctransport"
 
-tr, err := grpctransport.Listen(":7001")
+tr, err := grpctransport.Listen(":7001", grpctransport.WithTLSConfig(tlsCfg))
 defer tr.Close()
 
 // Register peers before starting the node.
@@ -677,19 +677,26 @@ tr.SetGroupLookup(mgr.Lookup)
 
 `SetGroupLookup` also enables **heartbeat batching** — see [Multi-Raft](#multi-raft--thousands-of-groups-on-shared-infrastructure).
 
-**TLS / mTLS** via `WithTLSConfig`:
+**Transport security is not optional.** `Listen` returns
+`ErrNoTransportSecurity` unless told what to do about it:
 
 ```go
 // tlsCfg should have Certificates, RootCAs/ClientCAs, and ClientAuth set.
 tr, err := grpctransport.Listen(":7001",
     grpctransport.WithTLSConfig(tlsCfg),
+    grpctransport.WithPeerAuthorizer(grpctransport.MTLSPeerAuthorizer(nil)),
 )
+
+// A local cluster or a network trusted for other reasons: say so.
+tr, err := grpctransport.Listen("127.0.0.1:7001", grpctransport.WithInsecure())
 ```
 
 `WithTLSConfig` applies the same `*tls.Config` to both the server listener and
 all outbound client connections. Pass separate configs to
 `WithServerOptions(grpc.Creds(...))` / `WithDialOptions(grpc.WithTransportCredentials(...))`
-if server and client configs must differ.
+if server and client configs must differ, together with `WithCustomCredentials`
+so that `Listen` adds none of its own. `WithInsecure` is the explicit choice to
+run in plaintext; a transport created with it logs a warning once.
 
 Default keepalive settings are applied automatically; override them the same way.
 
@@ -1179,16 +1186,21 @@ entry at the same point — but only if `MaxClientTableSize` is identical across
 the group. A node with a smaller table forgets requests its peers still
 remember, and the replicas diverge.
 
-### The transport is not authenticated by default
+### Nothing listens open by accident, but plaintext is still a choice
 
-`grpctransport` is plaintext unless configured otherwise, and any host that can
-complete a connection can claim to be the leader and force the cluster to step
-down. Use `WithTLSConfig` together with `WithPeerAuthorizer`, which checks the
-claimed node identity against the verified certificate.
+A Raft peer is fully trusted: any host that can complete a connection to the
+transport can claim to be the leader and force the cluster to step down. So
+`grpctransport.Listen` refuses to start without `WithTLSConfig` unless
+`WithInsecure` says plaintext is intended, and `Manager.Handler` answers every
+request with `403` unless given `WithRequestAuthorizer` or
+`WithInsecureHandlerAcknowledged`; `easyraft` applies the same rule to its
+transport and its HTTP API. TLS authenticates the connection; pair it with
+`WithPeerAuthorizer`, which checks the claimed node identity against the
+verified certificate, or any certificate from the CA can impersonate any node.
 
-`Manager.Handler` is likewise open unless given `WithRequestAuthorizer`. Its
-`POST /transfer` endpoint moves leadership, so reaching it is enough to keep a
-cluster permanently mid-election.
+What the library cannot judge is whether the network a plaintext transport
+was asked for is really trusted. That decision, and its consequences, stay
+with the operator who made it.
 
 ### `ErrObsoleteSeqNum` must not be retried
 

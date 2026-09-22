@@ -105,18 +105,18 @@ func authorized(auth func(*http.Request) error, logger *slog.Logger, h http.Hand
 }
 
 // warnIfHTTPUnauthenticated logs, once per store or manager, that the HTTP API
-// is being served without an authorization hook. The API can add and remove
-// cluster members, so an unauthenticated listener is a cluster-control plane
-// open to anyone who can reach it.
+// is being served without an authorization hook. Construction refuses that
+// unless WithInsecureHTTPAcknowledged was passed, so by the time this runs the
+// exposure has been acknowledged; it is still logged, because the API can add
+// and remove cluster members and the log is where an operator looks first.
 func warnIfHTTPUnauthenticated(cfg *config, logger *slog.Logger) {
-	if cfg.HTTPAuth != nil || cfg.AcknowledgeInsecureHTTP {
+	if cfg.HTTPAuth != nil {
 		return
 	}
-	logger.Warn("easyraft: the HTTP API is being served WITHOUT authentication. "+
-		"Anyone who can reach this listener can add or remove cluster members, "+
-		"transfer leadership, and write to every collection. "+
-		"Configure easyraft.WithHTTPAuth or easyraft.WithBearerTokenAuth, "+
-		"or acknowledge the exposure with easyraft.WithInsecureHTTPAcknowledged.",
+	logger.Warn("easyraft: the HTTP API is being served WITHOUT authentication "+
+		"(acknowledged with WithInsecureHTTPAcknowledged). Anyone who can reach "+
+		"this listener can add or remove cluster members, transfer leadership, "+
+		"and write to every collection.",
 		"addr", cfg.HTTPAddr)
 }
 

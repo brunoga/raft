@@ -29,7 +29,7 @@ func BenchmarkRateLimiter(b *testing.B) {
 			easyraft.WithRaftAddr(peers[id]),
 			easyraft.WithDataDir(filepath.Join(tmpDir, string(id))),
 			easyraft.WithPeers(peers),
-			easyraft.WithSnapCount(10000), // Increase threshold for bench
+			easyraft.WithSnapCount(10000), // Increase threshold for bench, easyraft.WithInsecureTransportAcknowledged()
 		)
 		if err != nil {
 			b.Fatalf("failed to create store %s: %v", id, err)

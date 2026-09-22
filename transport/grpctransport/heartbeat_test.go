@@ -17,6 +17,7 @@ import (
 // batching enabled. Both are closed when the test finishes.
 func batchingPair(t *testing.T, groups map[uint64]raft.Handler, opts ...grpctransport.Option) (send, recv *grpctransport.GRPCTransport) {
 	t.Helper()
+	opts = append([]grpctransport.Option{grpctransport.WithInsecure()}, opts...)
 
 	recv, err := grpctransport.Listen("127.0.0.1:0", opts...)
 	if err != nil {

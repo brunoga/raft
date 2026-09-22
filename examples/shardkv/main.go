@@ -152,7 +152,7 @@ func run() error {
 	//   2. Enables heartbeat batching: all G heartbeats per peer per tick are
 	//      coalesced into one BatchHeartbeats RPC, reducing network cost from
 	//      O(G×P) to O(P) per tick interval.
-	tr, err := grpctransport.Listen(*raftAddr)
+	tr, err := grpctransport.Listen(*raftAddr, grpctransport.WithInsecure())
 	if err != nil {
 		return fmt.Errorf("grpctransport.Listen: %w", err)
 	}

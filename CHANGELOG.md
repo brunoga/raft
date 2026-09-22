@@ -42,6 +42,34 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   bounded by a few election timeouts so that a peer removed because it is
   dead does not keep a pump for ever.
 
+### Changed
+
+- **Breaking: nothing listens open by accident any more.** Every listener
+  that was plaintext or unauthenticated by default now refuses to start
+  unless that is asked for explicitly. A Raft peer is fully trusted, so an
+  open transport is a cluster anyone who can reach the port can take over;
+  the previous behaviour was a warning in the log, which is the wrong place
+  for the only notice.
+
+  - `grpctransport.Listen` returns the new `ErrNoTransportSecurity` unless
+    given `WithTLSConfig`, the new `WithInsecure` (plaintext, on purpose,
+    still warned about once), or the new `WithCustomCredentials` (the
+    credentials come through `WithServerOptions` and `WithDialOptions`).
+  - `Manager.Handler` answers every request with `403 Forbidden`, and logs an
+    error once, unless given `WithRequestAuthorizer` or
+    `WithInsecureHandlerAcknowledged`.
+  - `easyraft.NewStore` and `easyraft.NewManager` return an error when the
+    Raft transport has no `WithTLS` and no new
+    `WithInsecureTransportAcknowledged`, and when an HTTP API would be served
+    (`WithHTTPAddr` or `WithHTTPMux`) with no `WithHTTPAuth` or
+    `WithBearerTokenAuth` and no `WithInsecureHTTPAcknowledged`.
+
+  Migration: a deployment that was relying on plaintext or an open API adds
+  the matching acknowledgement option and behaves as before. The examples
+  have been updated the same way. This is the one change in the series that
+  breaks a working configuration on purpose, which is why it is called out
+  here rather than folded into an "Added" entry.
+
 ## v1.1.0
 
 ### Added

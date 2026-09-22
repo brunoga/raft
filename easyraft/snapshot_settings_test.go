@@ -85,6 +85,7 @@ func TestStore_DefaultConfigurationDoesNotWarn(t *testing.T) {
 	s, err := NewStore(
 		WithID("n1"),
 		WithRaftAddr("127.0.0.1:0"),
+		WithInsecureTransportAcknowledged(),
 		WithDataDir(t.TempDir()),
 		WithLogger(slog.New(slog.NewTextHandler(&buf, nil))),
 	)
@@ -106,6 +107,7 @@ func TestStore_ExplicitSnapCountDoesNotWarn(t *testing.T) {
 	s, err := NewStore(
 		WithID("n1"),
 		WithRaftAddr("127.0.0.1:0"),
+		WithInsecureTransportAcknowledged(),
 		WithDataDir(t.TempDir()),
 		WithSnapCount(50),
 		WithLogger(slog.New(slog.NewTextHandler(&buf, nil))),

@@ -51,6 +51,7 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(peers),
 		easyraft.WithDiscovery(d1, 200*time.Millisecond),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -70,6 +71,7 @@ func TestEasyRaft_UDPDiscovery(t *testing.T) {
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
 		easyraft.WithPeers(peers),
 		easyraft.WithDiscovery(d2, 200*time.Millisecond),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +134,7 @@ func TestEasyRaft_Basic(t *testing.T) {
 		easyraft.WithRaftAddr(n1Addr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(peers),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -218,6 +221,8 @@ func TestEasyRaft_HTTP(t *testing.T) {
 		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -285,6 +290,7 @@ func TestStore_MultiCollection(t *testing.T) {
 		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -335,6 +341,7 @@ func TestStore_Txn(t *testing.T) {
 		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -385,6 +392,7 @@ func TestStore_Txn_Rollback(t *testing.T) {
 		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -450,6 +458,7 @@ func TestStore_ProposeOnce(t *testing.T) {
 		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -504,6 +513,8 @@ func TestManager_MultiRaft(t *testing.T) {
 		easyraft.WithRaftAddr(raftAddr),
 		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -573,6 +584,8 @@ func TestEasyRaft_Join(t *testing.T) {
 		easyraft.WithHTTPAddr(n1HTTPAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": n1RaftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -601,6 +614,7 @@ func TestEasyRaft_Join(t *testing.T) {
 		easyraft.WithRaftAddr(n2RaftAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
 		easyraft.WithJoinAddr(n1HTTPAddr),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -644,6 +658,8 @@ func TestEasyRaft_Members(t *testing.T) {
 		easyraft.WithHTTPAddr(n1HTTPAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(peers),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -654,6 +670,8 @@ func TestEasyRaft_Members(t *testing.T) {
 		easyraft.WithHTTPAddr(n2HTTPAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n2")),
 		easyraft.WithPeers(peers),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -733,6 +751,8 @@ func TestEasyRaft_Batch(t *testing.T) {
 		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
+		easyraft.WithInsecureTransportAcknowledged(),
+		easyraft.WithInsecureHTTPAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -803,6 +823,7 @@ func TestEasyRaft_LeaveOnStop(t *testing.T) {
 		opts := []easyraft.Option{
 			easyraft.WithID(raft.NodeID(id)),
 			easyraft.WithRaftAddr(raftAddr),
+			easyraft.WithInsecureTransportAcknowledged(),
 			easyraft.WithDataDir(filepath.Join(tmpDir, id)),
 			easyraft.WithPeers(peers),
 		}

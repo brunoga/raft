@@ -100,10 +100,31 @@ func TestManagerHandler_RefusalDoesNotLeakTheReason(t *testing.T) {
 	}
 }
 
-// TestManagerHandler_WithoutAuthorizerStillServes pins that the option is
-// additive: existing callers keep working, with a warning rather than a
-// breaking change.
-func TestManagerHandler_WithoutAuthorizerStillServes(t *testing.T) {
+// TestManagerHandler_WithoutAuthorizerRefuses pins that a handler given
+// neither an authorizer nor the acknowledgement serves nothing: every request
+// is answered 403, so an endpoint nobody meant to leave open is never open by
+// accident.
+func TestManagerHandler_WithoutAuthorizerRefuses(t *testing.T) {
+	mgr := raft.NewManager()
+	t.Cleanup(mgr.StopAll)
+
+	handler := mgr.Handler()
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/status"},
+		{http.MethodPost, "/transfer"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"group_id":1,"to":"n2"}`))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s %s on an unconfigured handler returned %d, want 403", tc.method, tc.path, rec.Code)
+		}
+	}
+}
+
+// TestManagerHandler_AcknowledgedInsecureServes pins that the acknowledgement
+// is what turns the open handler on.
+func TestManagerHandler_AcknowledgedInsecureServes(t *testing.T) {
 	mgr := raft.NewManager()
 	t.Cleanup(mgr.StopAll)
 

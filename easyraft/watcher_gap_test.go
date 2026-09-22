@@ -237,6 +237,7 @@ func TestStore_SlowHandlerDoesNotStarveOtherCollections(t *testing.T) {
 		easyraft.WithRaftAddr(freePort(t)),
 		easyraft.WithDataDir(t.TempDir()),
 		easyraft.WithLogger(quietLogger()),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)

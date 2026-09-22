@@ -20,14 +20,14 @@ func TestTimeoutNow_PreservesGroupID(t *testing.T) {
 	const groupID = 12
 
 	h := newRecordingHandler()
-	recv, err := grpctransport.Listen("127.0.0.1:0")
+	recv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen recv: %v", err)
 	}
 	defer func() { _ = recv.Close() }()
 	recv.SetGroupLookup(func(gid uint64) (raft.Handler, bool) { return h, gid == groupID })
 
-	send, err := grpctransport.Listen("127.0.0.1:0")
+	send, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen send: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestTimeoutNow_PreservesGroupID(t *testing.T) {
 // single case that does not need it. With two handlers registered, every
 // inbound RPC failed outright.
 func TestNodeIDHeader_RoutesToTheAddressedHandler(t *testing.T) {
-	srv, err := grpctransport.Listen("127.0.0.1:0")
+	srv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestNodeIDHeader_RoutesToTheAddressedHandler(t *testing.T) {
 	srv.Register("n1", h1)
 	srv.Register("n2", h2)
 
-	cli, err := grpctransport.Listen("127.0.0.1:0")
+	cli, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestNodeIDHeader_RoutesToTheAddressedHandler(t *testing.T) {
 // TestNodeIDHeader_RoutesEveryRPC checks that the addressing header is stamped
 // on all five RPCs, not only the one that happened to be exercised.
 func TestNodeIDHeader_RoutesEveryRPC(t *testing.T) {
-	srv, err := grpctransport.Listen("127.0.0.1:0")
+	srv, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestNodeIDHeader_RoutesEveryRPC(t *testing.T) {
 	srv.Register("n1", newRecordingHandler())
 	srv.Register("n2", target)
 
-	cli, err := grpctransport.Listen("127.0.0.1:0")
+	cli, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}

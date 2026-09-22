@@ -10,7 +10,7 @@ go get github.com/brunoga/raft/easyraft
 >
 > Two subsystems reshape cluster membership, and both are permissive by default so that existing deployments keep working:
 >
-> - **The HTTP API is unauthenticated unless you configure a hook.** Anyone who can reach the `WithHTTPAddr` listener can `POST /join` to add a member, `DELETE /members/{id}` to shrink the cluster, transfer leadership, or write to any collection. Set `WithBearerTokenAuth` (or `WithHTTPAuth`), bind the listener to a management interface rather than all interfaces, and use `WithHTTPTLS` when it is not on a trusted link. A node started without a hook logs a warning at startup; `WithInsecureHTTPAcknowledged` silences it once you have mitigated the exposure elsewhere.
+> - **Both listeners need a security decision before a node starts.** The Raft transport refuses to run without `WithTLS` unless `WithInsecureTransportAcknowledged` says plaintext is intended, and the HTTP API refuses to serve without `WithBearerTokenAuth` (or `WithHTTPAuth`) unless `WithInsecureHTTPAcknowledged` says an open API is intended. Anyone who can reach the `WithHTTPAddr` listener can `POST /join` to add a member, `DELETE /members/{id}` to shrink the cluster, transfer leadership, or write to any collection, so bind it to a management interface rather than all interfaces and use `WithHTTPTLS` when it is not on a trusted link. The acknowledgements are for exposure mitigated elsewhere — a loopback bind, a service mesh, a network policy — and a node started with one logs a warning.
 > - **Peer discovery trusts its source.** `udpbroadcast` accepts any datagram on the subnet unless you give it a shared secret. Discovered peers therefore join as **non-voting learners** by default, so a rogue announcement cannot change the quorum; `WithDiscoveryAsVoter` opts out of that.
 >
 > The [Security](#security) section covers both in full.
@@ -724,6 +724,13 @@ easyraft.WithTLS(tlsConfig)
 
 The same `*tls.Config` is applied to both the gRPC server listener and all outbound client connections. It does **not** cover the HTTP API.
 
+Without it, `NewStore` and `NewManager` return an error unless
+`WithInsecureTransportAcknowledged` is passed. A Raft peer is fully trusted, so
+a plaintext transport is a cluster anyone who can reach the port can take over;
+the acknowledgement is for a network trusted for reasons outside easyraft (a
+loopback bind for a local cluster, a private link, a mesh that terminates TLS
+in front of the process), and the transport logs a warning once when used.
+
 ### HTTP API
 
 The HTTP API is a cluster control plane: `POST /join` adds a member, `DELETE /members/{id}` removes one, `POST /transfer-leadership` moves leadership, and the CRUD routes write to every collection. Anyone who can reach the listener can do all of that.
@@ -769,7 +776,7 @@ easyraft.WithHTTPAuth(func(r *http.Request) error {
 
 The hook runs before **every** easyraft route, reads included — a hook covering only writes would be a trap, since `GET /members` maps out the cluster. Routes registered on your own mux are unaffected.
 
-**Without a hook the API stays open**, so upgrading breaks nothing, and the node logs a warning once at startup. `WithInsecureHTTPAcknowledged` silences it when the exposure is mitigated elsewhere (a loopback bind, a service mesh, a network policy).
+**Without a hook the node refuses to start** when it would serve the API (`WithHTTPAddr` or `WithHTTPMux`), unless `WithInsecureHTTPAcknowledged` says an open API is intended because the exposure is mitigated elsewhere (a loopback bind, a service mesh, a network policy). A node started that way logs a warning once.
 
 #### Reserved collections
 
@@ -822,7 +829,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithHTTPAuth(fn)` | Authorize every HTTP request with `func(*http.Request) error` |
 | `WithBearerTokenAuth(token)` | Require `Authorization: Bearer <token>` inbound, and send it on outbound join/leave requests |
 | `WithHTTPTLS(tlsConfig)` | Serve the HTTP API over TLS; leader redirects then use `https` |
-| `WithInsecureHTTPAcknowledged()` | Silence the startup warning about an unauthenticated HTTP API |
+| `WithInsecureHTTPAcknowledged()` | Serve the HTTP API without an authorization hook, on purpose; without this or a hook the node refuses to start |
 | `WithDataDir(dir)` | Persistent storage directory — required |
 | `WithPeers(map[NodeID]string)` | Static initial peer list |
 | `WithJoinAddr(addrs...)` | HTTP address(es) of seed nodes to join on startup |
@@ -834,6 +841,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `WithSnapCount(n)` | Log entries between automatic snapshots (default 1000) |
 | `WithLogger(logger)` | Custom `*slog.Logger` |
 | `WithTLS(tlsConfig)` | TLS for the gRPC transport (not the HTTP API — see `WithHTTPTLS`) |
+| `WithInsecureTransportAcknowledged()` | Run the gRPC transport in plaintext, on purpose; without this or `WithTLS` the node refuses to start |
 | `WithPrometheus(registerer)` | Enable Prometheus metrics |
 | `WithRaftTiming(tick, heartbeat, electionMin, electionMax)` | Override Raft timing (easyraft defaults: 100 ms tick/heartbeat, 1–2 s election) |
 

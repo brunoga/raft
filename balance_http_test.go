@@ -26,7 +26,7 @@ func TestManagerHTTP_Status(t *testing.T) {
 	node.Start()
 	defer node.Stop()
 
-	srv := httptest.NewServer(mgr.Handler())
+	srv := httptest.NewServer(mgr.Handler(raft.WithInsecureHandlerAcknowledged()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/status")
@@ -119,7 +119,7 @@ func TestManagerHTTP_Transfer_OK(t *testing.T) {
 		t.Skip("node 0 is not the leader; skipping transfer test")
 	}
 
-	srv := httptest.NewServer(mgr.Handler())
+	srv := httptest.NewServer(mgr.Handler(raft.WithInsecureHandlerAcknowledged()))
 	defer srv.Close()
 
 	body, _ := json.Marshal(map[string]any{"group_id": 1, "to": "b"})
@@ -161,7 +161,7 @@ done:
 // group returns 404.
 func TestManagerHTTP_Transfer_NotFound(t *testing.T) {
 	mgr := raft.NewManager()
-	srv := httptest.NewServer(mgr.Handler())
+	srv := httptest.NewServer(mgr.Handler(raft.WithInsecureHandlerAcknowledged()))
 	defer srv.Close()
 
 	body, _ := json.Marshal(map[string]any{"group_id": 99, "to": "x"})
@@ -178,7 +178,7 @@ func TestManagerHTTP_Transfer_NotFound(t *testing.T) {
 // TestManagerHTTP_Transfer_BadJSON verifies that a malformed body returns 400.
 func TestManagerHTTP_Transfer_BadJSON(t *testing.T) {
 	mgr := raft.NewManager()
-	srv := httptest.NewServer(mgr.Handler())
+	srv := httptest.NewServer(mgr.Handler(raft.WithInsecureHandlerAcknowledged()))
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/transfer", "application/json",
@@ -203,7 +203,7 @@ func TestHTTPNodeProvider_StatusAll(t *testing.T) {
 	node.Start()
 	defer node.Stop()
 
-	srv := httptest.NewServer(mgr.Handler())
+	srv := httptest.NewServer(mgr.Handler(raft.WithInsecureHandlerAcknowledged()))
 	defer srv.Close()
 
 	provider := raft.NewHTTPNodeProvider(srv.URL, nil)
@@ -267,7 +267,7 @@ func TestBalanceController_HTTPProviders_ConvergesUniform(t *testing.T) {
 	// Start one httptest server per physical node.
 	servers := make([]*httptest.Server, numPhysical)
 	for p := range numPhysical {
-		servers[p] = httptest.NewServer(c.mgrs[p].Handler())
+		servers[p] = httptest.NewServer(c.mgrs[p].Handler(raft.WithInsecureHandlerAcknowledged()))
 	}
 	t.Cleanup(func() {
 		for _, s := range servers {

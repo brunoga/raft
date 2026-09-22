@@ -28,7 +28,7 @@ func (t *GRPCTransport) clientConnCount() int {
 // its keepalive timer and its resolver goroutines would stay alive for the rest
 // of the process.
 func TestClose_SendAfterCloseLeaksNoConnection(t *testing.T) {
-	tr, err := Listen("127.0.0.1:0")
+	tr, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestClose_SendAfterCloseLeaksNoConnection(t *testing.T) {
 // path and dial a fresh connection instead of reporting that the transport is
 // gone.
 func TestClose_EmptyAppendEntriesAfterCloseReturnsError(t *testing.T) {
-	tr, err := Listen("127.0.0.1:0")
+	tr, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestClose_EmptyAppendEntriesAfterCloseReturnsError(t *testing.T) {
 // TestClose_IsIdempotent verifies that closing twice is harmless, since
 // deferred cleanup commonly runs alongside an explicit shutdown.
 func TestClose_IsIdempotent(t *testing.T) {
-	tr, err := Listen("127.0.0.1:0")
+	tr, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,14 +131,14 @@ func TestClose_IsIdempotent(t *testing.T) {
 // concurrent sends. Every send must either complete or report that the
 // transport closed, and none may leave a connection behind.
 func TestClose_ConcurrentWithInFlightSends(t *testing.T) {
-	srv, err := Listen("127.0.0.1:0")
+	srv, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = srv.Close() }()
 	srv.Register("srv", stubHandler{})
 
-	tr, err := Listen("127.0.0.1:0")
+	tr, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestClose_ConcurrentWithInFlightSends(t *testing.T) {
 // it: the socket, its keepalive timer and its resolver goroutines would
 // outlive the peer for the rest of the process.
 func TestRemovePeer_RacingClientForLeaksNoConnection(t *testing.T) {
-	tr, err := Listen("127.0.0.1:0")
+	tr, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestRemovePeer_RacingClientForLeaksNoConnection(t *testing.T) {
 // Close that lands while a send is dialling must not leave the fresh
 // connection behind in a map Close has already drained.
 func TestClose_RacingClientForLeaksNoConnection(t *testing.T) {
-	tr, err := Listen("127.0.0.1:0")
+	tr, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestClose_BoundedWhenHandlerIsWedged(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 
-	srv, err := Listen("127.0.0.1:0", WithCloseTimeout(250*time.Millisecond))
+	srv, err := Listen("127.0.0.1:0", WithCloseTimeout(250*time.Millisecond), WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestClose_BoundedWhenHandlerIsWedged(t *testing.T) {
 		},
 	})
 
-	cli, err := Listen("127.0.0.1:0")
+	cli, err := Listen("127.0.0.1:0", WithInsecure())
 	if err != nil {
 		t.Fatal(err)
 	}

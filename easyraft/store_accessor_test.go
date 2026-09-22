@@ -34,6 +34,7 @@ func TestEasyRaft_StoreIsReachable(t *testing.T) {
 		easyraft.WithRaftAddr(addr),
 		easyraft.WithDataDir(filepath.Join(tmpDir, "n1")),
 		easyraft.WithPeers(map[raft.NodeID]string{"n1": addr}),
+		easyraft.WithInsecureTransportAcknowledged(),
 	)
 	if err != nil {
 		t.Fatal(err)

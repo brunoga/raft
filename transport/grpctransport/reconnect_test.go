@@ -34,13 +34,13 @@ func freePort(t *testing.T) string {
 func TestReconnect_RestartedPeerIsReachedQuickly(t *testing.T) {
 	addr := freePort(t)
 
-	srv, err := grpctransport.Listen(addr)
+	srv, err := grpctransport.Listen(addr, grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
 	srv.Register("srv", newRecordingHandler())
 
-	cli, err := grpctransport.Listen("127.0.0.1:0")
+	cli, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestReconnect_RestartedPeerIsReachedQuickly(t *testing.T) {
 	}
 
 	// Bring the peer back at the same address.
-	restarted, err := grpctransport.Listen(addr)
+	restarted, err := grpctransport.Listen(addr, grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("restart server: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestReconnect_ConnectionSurvivesBeyondThirtySeconds(t *testing.T) {
 func TestReconnect_BackoffIsConfigured(t *testing.T) {
 	addr := freePort(t)
 
-	srv, err := grpctransport.Listen(addr)
+	srv, err := grpctransport.Listen(addr, grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestReconnect_BackoffIsConfigured(t *testing.T) {
 	// A backoff far longer than the test's patience. Every reconnect attempt
 	// after the first failure must wait it out.
 	cli, err := grpctransport.Listen("127.0.0.1:0",
-		grpctransport.WithReconnectBackoff(90*time.Second, 120*time.Second))
+		grpctransport.WithReconnectBackoff(90*time.Second, 120*time.Second), grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("Listen client: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestReconnect_BackoffIsConfigured(t *testing.T) {
 	failCancel()
 
 	// Bring it straight back at the same address.
-	restarted, err := grpctransport.Listen(addr)
+	restarted, err := grpctransport.Listen(addr, grpctransport.WithInsecure())
 	if err != nil {
 		t.Fatalf("restart server: %v", err)
 	}

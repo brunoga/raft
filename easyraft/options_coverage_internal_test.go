@@ -41,6 +41,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithHTTPAuth(func(*http.Request) error { return nil }),
 		WithBearerTokenAuth("token"),
 		WithInsecureHTTPAcknowledged(),
+		WithInsecureTransportAcknowledged(),
 		WithHTTPTLS(&tls.Config{MinVersion: tls.VersionTLS13}),
 		WithLeaseReads(),
 		WithJoinAddr("http://127.0.0.1:8002"),

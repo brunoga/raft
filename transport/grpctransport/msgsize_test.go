@@ -80,6 +80,7 @@ func (h *recordingHandler) HandleReadIndex(_ context.Context, req *raft.ReadInde
 // the test finishes.
 func pairedTransports(t *testing.T, opts ...grpctransport.Option) (client, server *grpctransport.GRPCTransport) {
 	t.Helper()
+	opts = append([]grpctransport.Option{grpctransport.WithInsecure()}, opts...)
 	srv, err := grpctransport.Listen("127.0.0.1:0", opts...)
 	if err != nil {
 		t.Fatalf("Listen server: %v", err)
@@ -265,7 +266,7 @@ func TestWithMaxMessageSize_RaisesLimit(t *testing.T) {
 // oversized command reaches the log and jams it.
 func TestMaxMessageBytes_ReportsTheConfiguredLimit(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
-		tr, err := grpctransport.Listen("127.0.0.1:0")
+		tr, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
@@ -279,7 +280,7 @@ func TestMaxMessageBytes_ReportsTheConfiguredLimit(t *testing.T) {
 
 	t.Run("configured", func(t *testing.T) {
 		const limit = 8 << 20
-		tr, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithMaxMessageSize(limit))
+		tr, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithMaxMessageSize(limit), grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
@@ -291,7 +292,7 @@ func TestMaxMessageBytes_ReportsTheConfiguredLimit(t *testing.T) {
 	})
 
 	t.Run("satisfies the interface", func(t *testing.T) {
-		tr, err := grpctransport.Listen("127.0.0.1:0")
+		tr, err := grpctransport.Listen("127.0.0.1:0", grpctransport.WithInsecure())
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}

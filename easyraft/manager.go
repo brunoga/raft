@@ -52,6 +52,9 @@ func NewManager(opts ...Option) (*Manager, error) {
 	if c.ID == "" {
 		return nil, fmt.Errorf("easyraft: WithID is required for Manager")
 	}
+	if err := validateSecurity(&c, true); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
@@ -163,11 +166,7 @@ func (m *Manager) Start() error {
 	})
 
 	// 1. Shared Transport
-	var trOpts []grpctransport.Option
-	if m.cfg.TLS != nil {
-		trOpts = append(trOpts, grpctransport.WithTLSConfig(m.cfg.TLS))
-	}
-	tr, err := grpctransport.Listen(m.cfg.RaftAddr, trOpts...)
+	tr, err := grpctransport.Listen(m.cfg.RaftAddr, transportOptions(&m.cfg)...)
 	if err != nil {
 		return fmt.Errorf("listen grpc: %w", err)
 	}

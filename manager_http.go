@@ -35,10 +35,12 @@ func WithRequestAuthorizer(fn RequestAuthorizer) HandlerOption {
 	}
 }
 
-// WithInsecureHandlerAcknowledged silences the warning that is otherwise logged
-// when a handler is served with no authorizer. Use it when the listener is
-// genuinely unreachable from outside a trusted boundary, so that the warning
-// stays meaningful everywhere else.
+// WithInsecureHandlerAcknowledged lets a handler serve with no authorizer.
+// Without it, or WithRequestAuthorizer, the handler Manager.Handler returns
+// refuses every request. Use it when the listener is genuinely unreachable
+// from outside a trusted boundary -- a loopback bind, a service mesh, a
+// network policy -- and nowhere else. A handler served this way logs a warning
+// once.
 func WithInsecureHandlerAcknowledged() HandlerOption {
 	return func(c *handlerConfig) { c.insecureAcknowled = true }
 }
@@ -76,20 +78,35 @@ func BearerTokenAuthorizer(token string) RequestAuthorizer {
 // These endpoints are not read-only. Anyone who can reach /transfer can move
 // leadership of any group to any member, repeatedly, which is enough to keep a
 // cluster permanently mid-election. Pass WithRequestAuthorizer to require
-// credentials. A handler served without one logs a warning at startup, which
-// WithInsecureHandlerAcknowledged silences for the case where the listener is
-// genuinely inside a trusted boundary.
+// credentials. A handler given neither that nor WithInsecureHandlerAcknowledged
+// refuses every request with 403 Forbidden and logs why, so that an endpoint
+// nobody meant to leave open is never open by accident; the acknowledgement is
+// for the case where the listener is genuinely inside a trusted boundary.
 func (m *Manager) Handler(opts ...HandlerOption) http.Handler {
 	cfg := &handlerConfig{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	if cfg.authorize == nil && !cfg.insecureAcknowled {
+		// Refuse rather than serve open. The endpoints move leadership, and an
+		// operator who wanted them reachable without credentials has an option
+		// that says so; one who forgot gets a 403 and a log line, not a
+		// cluster anyone can keep mid-election.
+		warnInsecureManagerHandler.Do(func() {
+			slog.Error("manager HTTP endpoints are DISABLED: no authorizer was configured. " +
+				"Pass raft.WithRequestAuthorizer to require credentials, or " +
+				"raft.WithInsecureHandlerAcknowledged if the listener is not reachable " +
+				"from outside a trusted boundary")
+		})
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "manager endpoints are disabled: no request authorizer is configured",
+				http.StatusForbidden)
+		})
+	}
+	if cfg.authorize == nil {
 		warnInsecureManagerHandler.Do(func() {
 			slog.Warn("manager HTTP endpoints are being served WITHOUT authorization: " +
-				"anyone who can reach this listener can move leadership of any group. " +
-				"Pass raft.WithRequestAuthorizer, or raft.WithInsecureHandlerAcknowledged " +
-				"if the listener is not reachable from outside a trusted boundary")
+				"anyone who can reach this listener can move leadership of any group")
 		})
 	}
 
