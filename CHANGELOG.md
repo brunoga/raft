@@ -8,6 +8,23 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **The in-memory ceiling is now visible.** `Store.StateBytes()` and
+  `Store.KeyCount()` report how much application state a replica is holding,
+  exported as `easyraft_state_bytes` and `easyraft_state_keys` with the same
+  `{group, node}` labels the engine's metrics carry. Both are published from
+  the moment a node starts, since a gauge that appears only once something
+  happens cannot be alerted on when nothing does.
+
+  The size is a running total kept in step by each write rather than a walk
+  of every collection, because a walk is exactly what a store big enough for
+  the number to matter cannot afford per scrape. It counts each key plus its
+  encoded value, and the README says plainly that this undercounts the
+  process's real footprint -- Go map overhead sits on top -- while being
+  exact about growth, which is the part worth alarming on. The README also
+  says what to do when the state will not fit: a disk-backed
+  `raft.StateMachine` under the engine, giving up what this package layers on
+  top.
+
 - **`easyraft/client`**, a Go client for talking to an easyraft cluster from
   a process that is not part of it. It finds the leader, follows it when it
   moves, retries what is safe to retry, and returns the same error values an
