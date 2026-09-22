@@ -89,29 +89,42 @@ func TestSharedWAL_ClusterWithTwoGroupsPerHost(t *testing.T) {
 		}
 	})
 
+	// Ticked for the whole test rather than around each write. Ticking only
+	// while a write is in flight leaves every node in the other group
+	// unticked in between, and a follower that is not ticked times out and
+	// calls an election: the log of a run that failed this way is a column of
+	// rising terms.
+	stopTicking := tickWhile(all()...)
+	t.Cleanup(stopTicking)
+
 	leaderOf := func(g int) *raft.Node {
-		deadline := time.Now().Add(electionTimeout)
-		for time.Now().Before(deadline) {
-			for _, n := range nodes[g] {
-				n.Tick()
-				if n.State() == raft.Leader {
-					return n
-				}
+		for _, n := range nodes[g] {
+			if n.State() == raft.Leader {
+				return n
 			}
-			time.Sleep(time.Millisecond)
 		}
-		t.Fatalf("group %d: no leader", g)
 		return nil
 	}
+	// Leadership can move between finding a leader and writing to it, which
+	// is not a failure -- it is what a cluster does. Retry until one of them
+	// takes the write or the budget for it runs out.
 	propose := func(g int, cmd string) {
 		t.Helper()
-		leader := leaderOf(g)
-		stop := tickWhile(all()...)
-		defer stop()
-		ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if _, err := leader.Propose(ctx, []byte(cmd)); err != nil {
-			t.Fatalf("group %d: Propose(%s): %v", g, cmd, err)
+		var last error
+		for {
+			if leader := leaderOf(g); leader != nil {
+				_, last = leader.Propose(ctx, []byte(cmd))
+				if last == nil {
+					return
+				}
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("group %d: Propose(%s) never took: %v", g, cmd, last)
+			case <-time.After(5 * time.Millisecond):
+			}
 		}
 	}
 
@@ -143,10 +156,18 @@ func TestSharedWAL_ClusterWithTwoGroupsPerHost(t *testing.T) {
 	if got := w.Groups(); len(got) != groups {
 		t.Fatalf("host 0 knows groups %v after restart, want %d", got, groups)
 	}
+	restarted := make([]*raft.Node, 0, groups)
 	for g := range groups {
 		sms[g][0] = &kvSM{data: make(map[string]string)}
 		nodes[g][0] = build(g, 0, sms[g][0])
+		restarted = append(restarted, nodes[g][0])
 	}
+	// The ticker started above holds the nodes it was given, which are the
+	// ones these replaced. Tick the new ones too rather than leaving them to
+	// whatever their peers happen to send.
+	stopRestartedTicking := tickWhile(restarted...)
+	t.Cleanup(stopRestartedTicking)
+
 	for g := range groups {
 		propose(g, fmt.Sprintf("after=g%d", g))
 	}
