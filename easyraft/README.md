@@ -1206,7 +1206,23 @@ revision, err := store.Backup(ctx, &backup)
 err := store.Import(ctx, bytes.NewReader(backup))
 ```
 
-Over HTTP the same two are `GET /__backup` and `POST /__restore`, and `client.Backup` / `client.Restore` wrap them. `BackupStale` reads from whichever replica answers without confirming with the leader, which is how to take a backup from a follower and leave the leader alone — a stale backup is still internally consistent, because it is taken under one lock.
+Over HTTP the same two are `GET /__backup` and `POST /__restore`, and `client.Backup` / `client.Restore` wrap them:
+
+```bash
+# Take one. The revision it describes comes back in a header.
+curl -sS -D headers.txt -o backup.json http://host:8001/__backup
+grep -i x-raft-revision headers.txt
+
+# From a follower instead, leaving the leader alone.
+curl -sS -o backup.json 'http://host:8001/__backup?consistency=stale'
+
+# Put it back. Answers {"revision":N} once the swap has committed.
+curl -sS -X POST --data-binary @backup.json http://host:8001/__restore
+```
+
+A restore is refused by a node that is not the leader, with a `307` to the one that is — before the body is read, so `curl -L` resends it to the right place rather than uploading it twice.
+
+`BackupStale` reads from whichever replica answers without confirming with the leader, which is how to take a backup from a follower and leave the leader alone — a stale backup is still internally consistent, because it is taken under one lock.
 
 **An import replaces; it does not merge.** Keys the cluster holds that the backup does not are gone afterwards, as are leases. Revisions come from the backup, except that the store's own revision never goes backwards, so a conditional write built on a revision read before the import is still refused after it.
 
