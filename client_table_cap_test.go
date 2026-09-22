@@ -159,7 +159,12 @@ func TestClientTableCap_SnapshotCarriesTheBound(t *testing.T) {
 		}
 		net.Register("n1", n.Handler())
 		n.Start()
-		deadline := time.Now().Add(3 * time.Second)
+		// Generous on purpose. What is being waited for is a handful of
+		// election timeouts, which is milliseconds of work; the budget is
+		// for a machine running the rest of the suite beside this, where a
+		// sleep between ticks is not the millisecond it asks for. A failure
+		// here should mean stuck, not busy.
+		deadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(deadline) && n.State() != raft.Leader {
 			n.Tick()
 			time.Sleep(time.Millisecond)
@@ -180,7 +185,7 @@ func TestClientTableCap_SnapshotCarriesTheBound(t *testing.T) {
 			t.Fatalf("ProposeOnce: %v", err)
 		}
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) && n.SnapshotIndex() == 0 {
 		n.Tick()
 		time.Sleep(time.Millisecond)
