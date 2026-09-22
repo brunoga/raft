@@ -256,6 +256,15 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Fixed
 
+- `easyraft/client` gave up before a leader election finished. The default
+  retry budget was four attempts doubling from 50ms -- about 350ms in total
+  -- while an election takes an election timeout, one to two seconds with the
+  default Raft timings. Since `503` with *no leader currently elected* is the
+  commonest retryable answer, the client failed at exactly the moment it
+  exists to paper over. It is now six attempts from 100ms, about two and a
+  half seconds, exported as `DefaultRetryAttempts` and `DefaultRetryBackoff`.
+  `WithRetry` still lowers it.
+
 - `Manager.AddStore(0)` is now refused rather than accepted. A `Manager`
   routes every inbound RPC by the group ID it carries, and zero is what a
   single-group node's RPCs carry, so the transport refuses it: a group

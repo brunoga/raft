@@ -1267,6 +1267,8 @@ err := orders.Exactly(id).Create(ctx, key, order)  // retried, applied once
 
 Hold the same `id` across the retries of one logical write; that is what makes it exactly-once. `Client.GrantLeaseOnce` and `Client.BatchOnce` take one for the same reason.
 
+The default budget is six attempts, doubling from 100ms, which is about two and a half seconds in total. That is sized to outlast a leader election rather than to fail quickly: `503` with *no leader currently elected* is the commonest retryable answer, and an election takes an election timeout — one to two seconds with the default Raft timings. A client that gave up sooner would fail at exactly the moment it exists to paper over. `WithRetry` lowers it for a caller that would rather hear about a cluster in motion. It bounds attempts, not time; the context decides how long a call may take.
+
 Following a redirect is not a retry — it is the cluster saying where the leader is — so it happens for every request, safe to repeat or not.
 
 ### Exactly-once over HTTP

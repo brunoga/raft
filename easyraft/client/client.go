@@ -156,13 +156,40 @@ func WithTimeout(d time.Duration) Option {
 
 // WithRetry sets how many times a retryable request is attempted and the
 // delay between attempts, which doubles up to a second. Attempts below one
-// mean one attempt. The default is four attempts starting at 50ms.
+// mean one attempt.
+//
+// The default is [DefaultRetryAttempts] attempts starting at
+// [DefaultRetryBackoff], which is chosen to outlast a leader election rather
+// than to fail quickly. Lower it for a caller that would rather hear about a
+// cluster in motion than wait for it.
 func WithRetry(attempts int, initialBackoff time.Duration) Option {
 	return func(c *Client) {
 		c.attempts = attempts
 		c.backoff = initialBackoff
 	}
 }
+
+// The default retry budget, and why it is this size.
+//
+// The condition worth retrying is almost always a cluster between leaders:
+// 503 is the one status easyraft promises a client may retry unchanged, and
+// "no leader currently elected" is what it says while an election runs. An
+// election takes an election timeout, which with easyraft's default Raft
+// timings is one to two seconds.
+//
+// So the budget has to outlast one. Doubling from 100ms and capped at a
+// second, six attempts wait about two and a half seconds in total, which
+// covers a leader change with room to spare. A shorter budget makes the
+// client fail at exactly the moment it exists to paper over -- and a caller
+// that would rather hear about a cluster in motion can say so with
+// [WithRetry].
+//
+// This is a bound on attempts, not on time: the context the caller passes is
+// what decides how long a call may take.
+const (
+	DefaultRetryAttempts = 6
+	DefaultRetryBackoff  = 100 * time.Millisecond
+)
 
 // noRedirect stops the HTTP client following a redirect on its own, because
 // a 307 carries the information this package exists to track.
@@ -174,8 +201,8 @@ func noRedirect(*http.Request, []*http.Request) error {
 func New(opts ...Option) (*Client, error) {
 	c := &Client{
 		http:     &http.Client{Timeout: 10 * time.Second, CheckRedirect: noRedirect},
-		attempts: 4,
-		backoff:  50 * time.Millisecond,
+		attempts: DefaultRetryAttempts,
+		backoff:  DefaultRetryBackoff,
 	}
 	for _, o := range opts {
 		o(c)
