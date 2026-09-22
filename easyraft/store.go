@@ -1328,6 +1328,33 @@ func (s *Store) Leader() raft.NodeID {
 // A storage close failure is the last opportunity to learn that the on-disk
 // Raft log may not be intact, which decides whether this node can be restarted
 // or has to be rebuilt from a peer.
+// Shutdown stops the store like [Store.Stop], but gives up waiting when ctx is
+// done and returns ctx.Err().
+//
+// It exists because [Store.Stop] finishes what it has started: storage writes the
+// node already accepted are carried out rather than abandoned, which is what
+// makes an orderly restart keep the tail of its log instead of fetching it
+// back from a peer, and a departure under [WithLeaveOnStop] is waited for.
+// A disk that has hung rather than failed, or a leader that cannot be reached
+// to accept the departure, holds [Store.Stop] there. A process that has to come
+// down on a deadline needs a way to say so.
+//
+// Giving up does not cancel the shutdown. It carries on in the background, so
+// the store is then neither running nor finished, and its data directory
+// must not be reopened by another process. Prefer [Store.Stop] where there is no
+// deadline to meet.
+func (s *Store) Shutdown(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() { done <- s.Stop() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		s.logger().Warn("easyraft: shutdown deadline passed; the store is still stopping")
+		return ctx.Err()
+	}
+}
+
 func (s *Store) Stop() error {
 	s.stopOnce.Do(func() { s.stopErr = s.stop() })
 	return s.stopErr
