@@ -138,6 +138,45 @@ func (e *EasyRaft[T]) List(ctx context.Context) (map[string]T, error) {
 	return e.collection.List(ctx)
 }
 
+// ReadRev returns an item and the revision at which it was last written,
+// with linearizable consistency. Pass the revision to [EasyRaft.UpdateIf] to
+// make the write conditional on nothing having changed in between.
+func (e *EasyRaft[T]) ReadRev(ctx context.Context, key string) (value T, rev uint64, err error) {
+	return e.collection.ReadRev(ctx, key)
+}
+
+// ReadStaleRev returns an item and its revision from local state.
+func (e *EasyRaft[T]) ReadStaleRev(key string) (value T, rev uint64, err error) {
+	return e.collection.ReadStaleRev(key)
+}
+
+// UpdateIf replaces an existing item only if its revision is still rev.
+// Returns [ErrRevisionMismatch] if it is not.
+func (e *EasyRaft[T]) UpdateIf(ctx context.Context, key string, value T, rev uint64) error {
+	return e.collection.UpdateIf(ctx, key, value, rev)
+}
+
+// UpsertIf writes an item only if its revision is rev; zero asserts that the
+// key does not exist.
+func (e *EasyRaft[T]) UpsertIf(ctx context.Context, key string, value T, rev uint64) error {
+	return e.collection.UpsertIf(ctx, key, value, rev)
+}
+
+// DeleteIf removes an item only if its revision is still rev.
+func (e *EasyRaft[T]) DeleteIf(ctx context.Context, key string, rev uint64) error {
+	return e.collection.DeleteIf(ctx, key, rev)
+}
+
+// MutateIf runs a registered mutation only if the key's revision is rev.
+func (e *EasyRaft[T]) MutateIf(ctx context.Context, key, name string, args []byte, rev uint64) ([]byte, error) {
+	return e.collection.MutateIf(ctx, key, name, args, rev)
+}
+
+// Revision returns the highest revision this node has applied.
+func (e *EasyRaft[T]) Revision() uint64 {
+	return e.store.Revision()
+}
+
 // OnChange registers fn to be called whenever a committed write modifies the
 // default collection. fn receives the key, the new typed value (nil on delete),
 // and a deleted flag. Call before [EasyRaft.Start].

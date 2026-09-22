@@ -244,6 +244,61 @@ err := configs.Upsert(ctx, "db.host", ConfigEntry{Value: "localhost"})
 
 ---
 
+## Revisions — compare-and-swap
+
+Every key carries a **revision**: the index of the log entry that last wrote it. Read it with `ReadRev`, and hand it back to a conditional write, which applies only while the key is still at that revision:
+
+```go
+value, rev, err := configs.ReadRev(ctx, "db.host")
+if err != nil {
+    return err
+}
+value.Port = 5433
+
+err = configs.UpdateIf(ctx, "db.host", value, rev)
+if errors.Is(err, easyraft.ErrRevisionMismatch) {
+    // Somebody wrote the key in between. Read it again and redo the work.
+}
+```
+
+That loop is a read-modify-write that loses nothing without holding a lock. A plain `Read` followed by `Update` is two log entries with a window between them, and a write that lands in the window is overwritten with no error; `UpdateIf` turns the same race into `ErrRevisionMismatch` and a retry.
+
+The condition is checked on every replica as the entry applies, not on the leader before it proposes. It therefore holds against every other entry in the log, whatever order they commit in and whichever node proposed them.
+
+| Method | Applies only if |
+|--------|-----------------|
+| `UpdateIf(ctx, key, value, rev)` | the key exists and is at `rev` |
+| `UpsertIf(ctx, key, value, rev)` | the key is at `rev` — `0` means it does not exist |
+| `DeleteIf(ctx, key, rev)` | the key exists and is at `rev` |
+| `MutateIf(ctx, key, name, args, rev)` | the key exists and is at `rev` |
+
+A revision of `0` is the one a caller can name without reading: the revision of a key that has never been written. `UpsertIf(ctx, key, value, 0)` is therefore create-if-absent, and unlike `Create` it also refuses a key that was deleted and recreated since.
+
+`ReadStaleRev` returns a revision from the local replica without a leader round-trip. A stale revision is still a safe basis for a conditional write — it is either current or behind, and a conditional write on a revision that has moved is refused. Reading stale costs a retry, never a lost update.
+
+`Store.Revision()` returns the highest revision this replica has applied, a watermark for the store as a whole rather than for one key.
+
+### When to use a mutation instead
+
+A registered mutation is already an atomic read-modify-write in a single entry, and needs no revision. Reach for a conditional write when the new value is computed somewhere a mutation cannot run — in a browser, in another service, from a human decision — and the write has to be refused if the world moved while that was happening.
+
+### Guarding a transaction
+
+`Txn.CheckRev` adds a condition on a key the transaction does not write. It is how a batch is made conditional on something outside itself — a lease still held, a configuration not yet superseded:
+
+```go
+_, err := store.Txn(ctx, func(tx *easyraft.Txn) error {
+    if err := tx.CheckRev("leases", "shard-7", leaseRev); err != nil {
+        return err
+    }
+    return tx.Upsert("work", "item-1", result)
+})
+```
+
+If any condition in a transaction fails, the whole batch fails with `ErrRevisionMismatch` and none of it is written. `Txn.UpdateIf`, `Txn.UpsertIf` and `Txn.DeleteIf` carry the same condition on a key the transaction does write.
+
+---
+
 ## Change notifications
 
 `OnChange` registers a callback that fires on **every replica** after each committed write is applied to that collection's local state — outside the state-machine lock, in a dedicated dispatcher goroutine. This is the primitive for building watch/subscribe flows.
@@ -749,14 +804,14 @@ http.ListenAndServe(":8001", mux) // one server, no conflict
 | `POST` | `/transfer-leadership` | Transfer leadership: `{"to": "nodeID"}` |
 | `POST` | `/batch` | Atomic multi-collection batch (see below) |
 | `POST` | `/{collection}/{key}` | Create item (201 Created) |
-| `GET` | `/{collection}/{key}` | Read — linearizable |
+| `GET` | `/{collection}/{key}` | Read — linearizable, returns the key's revision as `ETag` |
 | `GET` | `/{collection}/{key}?consistency=stale` | Read — local, no round-trip |
-| `PUT` | `/{collection}/{key}` | Update item |
-| `PATCH` | `/{collection}/{key}` | Upsert item (create or replace) |
-| `DELETE` | `/{collection}/{key}` | Delete item |
+| `PUT` | `/{collection}/{key}` | Update item — honours `If-Match` |
+| `PATCH` | `/{collection}/{key}` | Upsert item (create or replace) — honours `If-Match` / `If-None-Match` |
+| `DELETE` | `/{collection}/{key}` | Delete item — honours `If-Match` |
 | `GET` | `/{collection}` | List all — linearizable |
 | `GET` | `/{collection}?consistency=stale` | List all — local |
-| `POST` | `/{collection}/{key}/mutate` | Run named mutation |
+| `POST` | `/{collection}/{key}/mutate` | Run named mutation — honours `If-Match` |
 | `GET` | `/status` | Cluster status (JSON) |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/metrics` | Prometheus metrics |
@@ -797,7 +852,35 @@ Same as the `Store` routes above, prefixed with `/groups/{groupID}` (e.g. `GET /
 ]
 ```
 
-Valid `op` values: `create`, `update`, `upsert`, `delete`, `mutate`.
+Valid `op` values: `create`, `update`, `upsert`, `delete`, `mutate`, `check`.
+
+Any operation may carry an `if_rev` that makes it conditional on the key's current revision, and `check` carries nothing else — it writes nothing and only asserts that a key is at the revision given. A failed condition anywhere in the batch answers `412 Precondition Failed` and writes none of it:
+
+```json
+[
+  { "op": "check",  "collection": "leases", "key": "shard-7", "if_rev": 41 },
+  { "op": "upsert", "collection": "work",   "key": "item-1", "value": {"done":true} }
+]
+```
+
+### Conditional requests
+
+A `GET` of a single key returns the key's revision as an `ETag`, and both a `GET` of a key and a `GET` of a collection return the replica's own watermark as `X-Raft-Revision`. Handing an `ETag` back as `If-Match` makes the next write conditional on it:
+
+```
+$ curl -i http://host:8001/configs/db.host
+HTTP/1.1 200 OK
+ETag: 412
+X-Raft-Revision: 419
+
+$ curl -X PUT -H 'If-Match: 412' -d '{"port":5433}' http://host:8001/configs/db.host
+HTTP/1.1 204 No Content
+
+$ curl -X PUT -H 'If-Match: 412' -d '{"port":5434}' http://host:8001/configs/db.host
+HTTP/1.1 412 Precondition Failed
+```
+
+`If-None-Match: *` requires that the key does not exist, which on `PATCH` is create-if-absent. Quoted and unquoted ETags are both accepted. Anything else — `If-Match: *`, a weak validator, a list of ETags, both headers at once — is answered with `400` rather than applied unconditionally, because a guess about which one the caller meant is a lost update.
 
 ### Leader routing
 
@@ -820,6 +903,7 @@ The redirect host comes only from the internal metadata collection — which HTT
 | `404 Not Found` | `ErrKeyNotFound`, unknown collection, unknown group |
 | `408 Request Timeout` | The request context expired before the entry committed |
 | `409 Conflict` | `ErrKeyExists`, `raft.ErrObsoleteSeqNum`, a config change or leadership transfer already in progress |
+| `412 Precondition Failed` | `ErrRevisionMismatch` — an `If-Match`, `If-None-Match` or batch `if_rev` did not hold |
 | `503 Service Unavailable` | No leader elected, leader's address unknown, node stopped, request cancelled |
 
 ### Mutation request body
@@ -1017,6 +1101,7 @@ The same registerer can be passed to every group of a `Manager`: collectors are 
 | `easyraft.ErrNotLeader` | This node is not the leader; retry on the leader |
 | `easyraft.ErrUnauthorized` | Request carried no usable credential — the HTTP layer answers `401` |
 | `easyraft.ErrForbidden` | Credential is valid but not permitted — the HTTP layer answers `403` |
+| `easyraft.ErrRevisionMismatch` | A conditional write named a revision the key is no longer at — re-read and retry |
 | `easyraft.ErrReservedCollection` | Request named a `__`-prefixed internal collection |
 | `raft.ErrObsoleteSeqNum` | Exactly-once sequence number is below one already recorded for that client |
 

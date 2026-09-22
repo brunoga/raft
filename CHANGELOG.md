@@ -8,6 +8,42 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **Compare-and-swap in easyraft.** Every key now carries a revision -- the
+  index of the log entry that last wrote it -- and every write can be made
+  conditional on it. `Collection.ReadRev` returns a value with its revision;
+  `UpdateIf`, `UpsertIf`, `DeleteIf` and `MutateIf` apply only while the key
+  is still at the revision given, and return the new `ErrRevisionMismatch`
+  when it has moved.
+
+  This closes the one race a store like this leaves open: a `Read` followed
+  by an `Update` is two log entries, and a write that lands between them is
+  overwritten with no error. A registered mutation already avoided that, but
+  only for a value computable inside the state machine. A conditional write
+  covers the rest -- a value decided in a browser, in another service, or by
+  a person -- without a lock.
+
+  The condition is evaluated on every replica as the entry applies, not on
+  the leader before it proposes, so it holds against every other entry in
+  the log whatever order they commit in.
+
+  - `Txn.CheckRev` guards a whole transaction on a key it does not write, and
+    `Txn.UpdateIf` / `UpsertIf` / `DeleteIf` carry the same condition on keys
+    it does. A failed condition fails the batch and writes none of it.
+  - Over HTTP the existing headers carry it: a single-key `GET` returns the
+    key's revision as an `ETag`, `If-Match` makes a `PUT`, `PATCH`, `DELETE`
+    or mutation conditional on it, `If-None-Match: *` requires that the key
+    does not exist, and a failed condition answers `412 Precondition Failed`.
+    A batch operation may carry `if_rev`, and the new `check` operation
+    carries nothing else. Anything the store cannot check exactly -- a weak
+    validator, a list of ETags, `If-Match: *` -- is refused with `400` rather
+    than applied unconditionally, since guessing which one the caller meant
+    is the lost update the feature exists to prevent.
+  - `Store.Revision()` reports the highest revision this replica has applied.
+  - Revisions travel in snapshots, so a replica restored from one refuses and
+    accepts exactly what the replica that wrote it would. A snapshot written
+    before this change restores as a store whose keys have never been
+    written, so an upgrade needs no migration.
+
 - easyraft can reach the batteries v2 added to the engine. Every one of them
   was unreachable through the high-level layer, which is the layer most
   services use.
