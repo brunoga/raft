@@ -62,8 +62,9 @@ func TestSnapshotFrame_CarriesTheCap(t *testing.T) {
 
 	// A cap of zero is a recorded bound of "unlimited", not an absent one.
 	buf.Reset()
-	if err := writeSnapshotFrame(&buf, &snapshotFrame{hasClientTableCap: true},
-		func(io.Writer) error { return nil }); err != nil {
+	err = writeSnapshotFrame(&buf, &snapshotFrame{hasClientTableCap: true},
+		func(io.Writer) error { return nil })
+	if err != nil {
 		t.Fatal(err)
 	}
 	frame, _, err = readSnapshotFrame(&buf)
@@ -73,7 +74,8 @@ func TestSnapshotFrame_CarriesTheCap(t *testing.T) {
 
 	// The wrapper that records no cap still writes a readable frame.
 	buf.Reset()
-	if err := writeWrappedSnapshot(&buf, table, &ms, func(io.Writer) error { return nil }); err != nil {
+	err = writeWrappedSnapshot(&buf, table, &ms, func(io.Writer) error { return nil })
+	if err != nil {
 		t.Fatal(err)
 	}
 	frame, _, err = readSnapshotFrame(&buf)
