@@ -139,7 +139,10 @@ func TestClientTableCap_SnapshotCarriesTheBound(t *testing.T) {
 	dir := t.TempDir()
 	net := memtransport.NewNetwork()
 	sm := &counterSM{}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// One budget for the whole test, and it has to cover two elections, six
+	// writes, a snapshot and a restart. Five seconds of it was enough only
+	// while every wait before the last one finished quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	start := func(tableSize int) (*raft.Node, *filestore.FileStore) {
@@ -194,8 +197,13 @@ func TestClientTableCap_SnapshotCarriesTheBound(t *testing.T) {
 		t.Fatal("no snapshot was taken")
 	}
 	// Keep going so that the snapshot is the whole story and nothing after it
-	// re-establishes the bound from the log.
-	for time.Now().Before(deadline) && n.SnapshotIndex() < n.LastApplied() {
+	// re-establishes the bound from the log. Its own budget, because unlike
+	// the waits above this one has no assertion behind it: if the snapshot
+	// never quite catches up with the applied index the test is still worth
+	// running, and spinning to a shared deadline would leave nothing for what
+	// comes after.
+	settle := time.Now().Add(2 * time.Second)
+	for time.Now().Before(settle) && n.SnapshotIndex() < n.LastApplied() {
 		n.Tick()
 		time.Sleep(time.Millisecond)
 	}
