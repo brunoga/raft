@@ -252,3 +252,121 @@ func TestClient_ContextCancelled_StopsRetries(t *testing.T) {
 		t.Fatal("expected error with cancelled context")
 	}
 }
+
+// TestClient_GetRev reads the revision out of the ETag, which is what a
+// conditional write has to name.
+func TestClient_GetRev(t *testing.T) {
+	mux, baseURL := newTestServer(t)
+	mux.HandleFunc("GET /configs/{key}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", "412")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ConfigEntry{Value: "localhost", Version: 7})
+	})
+
+	c := New([]string{baseURL})
+	entry, rev, err := c.GetRev(context.Background(), "db.host", false)
+	if err != nil {
+		t.Fatalf("GetRev: %v", err)
+	}
+	if entry.Value != "localhost" {
+		t.Errorf("GetRev returned %+v", entry)
+	}
+	if rev != 412 {
+		t.Errorf("GetRev returned revision %d, want the ETag's 412", rev)
+	}
+
+	// Get is GetRev without the revision, so it must still work.
+	if got, getErr := c.Get(context.Background(), "db.host", false); getErr != nil || got.Value != "localhost" {
+		t.Errorf("Get returned %+v, %v", got, getErr)
+	}
+}
+
+// TestClient_GetRev_QuotedAndMissingETag covers the two shapes a server can
+// answer with that are not a bare number.
+func TestClient_GetRev_QuotedAndMissingETag(t *testing.T) {
+	mux, baseURL := newTestServer(t)
+	mux.HandleFunc("GET /configs/{key}", func(w http.ResponseWriter, r *http.Request) {
+		switch r.PathValue("key") {
+		case "quoted":
+			w.Header().Set("ETag", `"9"`)
+		case "unusable":
+			w.Header().Set("ETag", "not-a-number")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ConfigEntry{Value: "v"})
+	})
+
+	c := New([]string{baseURL})
+	if _, rev, err := c.GetRev(context.Background(), "quoted", false); err != nil || rev != 9 {
+		t.Errorf("a quoted ETag gave revision %d, %v", rev, err)
+	}
+	// No ETag at all is revision zero rather than an error: zero is the
+	// revision of a key that has never been written, and a conditional write
+	// naming it is refused rather than misapplied.
+	if _, rev, err := c.GetRev(context.Background(), "none", false); err != nil || rev != 0 {
+		t.Errorf("a missing ETag gave revision %d, %v", rev, err)
+	}
+	// An ETag that is not a revision is an error, because silently treating
+	// it as zero would turn a conditional write into a create-if-absent.
+	if _, _, err := c.GetRev(context.Background(), "unusable", false); err == nil {
+		t.Error("an unusable ETag was accepted")
+	}
+}
+
+// TestClient_SetIf sends the condition and reports a refused one as
+// ErrRevisionMismatch rather than retrying it.
+func TestClient_SetIf(t *testing.T) {
+	mux, baseURL := newTestServer(t)
+	var attempts int
+	mux.HandleFunc("PUT /configs/{key}", func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		switch {
+		case r.Header.Get("If-Match") == "7":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Header.Get("If-None-Match") == "*":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusPreconditionFailed)
+		}
+	})
+
+	c := New([]string{baseURL})
+	ctx := context.Background()
+
+	if err := c.SetIf(ctx, "db.host", "localhost", 7); err != nil {
+		t.Fatalf("SetIf on a matching revision: %v", err)
+	}
+	// Zero is create-if-absent, which travels as If-None-Match.
+	if err := c.SetIf(ctx, "db.host", "localhost", 0); err != nil {
+		t.Fatalf("SetIf(rev 0): %v", err)
+	}
+
+	attempts = 0
+	err := c.SetIf(ctx, "db.host", "localhost", 99)
+	if !errors.Is(err, ErrRevisionMismatch) {
+		t.Fatalf("SetIf on a stale revision: %v, want ErrRevisionMismatch", err)
+	}
+	if attempts != 1 {
+		t.Errorf("a refused condition was retried %d times; it would fail identically", attempts)
+	}
+}
+
+// TestClient_DeleteIf covers the conditional delete.
+func TestClient_DeleteIf(t *testing.T) {
+	mux, baseURL := newTestServer(t)
+	mux.HandleFunc("DELETE /configs/{key}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Match") == "5" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusPreconditionFailed)
+	})
+
+	c := New([]string{baseURL})
+	if err := c.DeleteIf(context.Background(), "db.host", 5); err != nil {
+		t.Fatalf("DeleteIf on a matching revision: %v", err)
+	}
+	if err := c.DeleteIf(context.Background(), "db.host", 6); !errors.Is(err, ErrRevisionMismatch) {
+		t.Errorf("DeleteIf on a stale revision: %v, want ErrRevisionMismatch", err)
+	}
+}

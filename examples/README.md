@@ -96,6 +96,7 @@ See [`configsvc/`](configsvc/) for a distributed configuration service built on 
 - **`Collection.Upsert`**: atomic create-or-update in a single log entry.
 - **SSE watch streams**: `GET /watch/{key}` and `GET /watch` — any node can serve watchers; each fires independently from its own `OnChange` callback.
 - **Deterministic versioning**: `ConfigEntry.Version` is set by the HTTP handler before proposing so all replicas apply the same value.
+- **Compare-and-swap**: a `GET` returns the key's revision as an `ETag`; handing it back as `If-Match` makes the next write apply only while the key is still at it, and `412` otherwise. The revision, not the `Version` field — a timestamp is the wrong thing to compare against, since two writers in the same nanosecond get the same one.
 - **`WithJoinAddr`**: same one-at-a-time cluster growth as `ratelimiter`.
 
 ```bash

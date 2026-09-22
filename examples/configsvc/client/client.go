@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/brunoga/raft/v2/examples/internal/exampleutil"
@@ -29,6 +30,12 @@ var (
 	// ErrNotLeader is returned when the request reaches a follower and no
 	// redirect is available. This is transient; retrying usually succeeds.
 	ErrNotLeader = exampleutil.ErrNotLeader
+
+	// ErrRevisionMismatch is returned by a conditional write whose key has
+	// been written since the revision given. Read it again, decide whether
+	// the change still applies, and retry -- that loop is the whole point of
+	// the condition.
+	ErrRevisionMismatch = errors.New("config key has changed since the revision given")
 )
 
 // ConfigEntry is the value stored in the "configs" collection.
@@ -57,15 +64,19 @@ type Client struct {
 func New(addrs []string) *Client {
 	c := exampleutil.NewClient(addrs)
 	c.ErrorMapper = func(status int, _ string) error {
-		if status == http.StatusNotFound {
+		switch status {
+		case http.StatusNotFound:
 			return ErrNotFound
+		case http.StatusPreconditionFailed:
+			return ErrRevisionMismatch
 		}
 		return nil
 	}
 	return &Client{inner: c}
 }
 
-// Set upserts a config entry with an updated version timestamp.
+// Set upserts a config entry with an updated version timestamp. It is
+// last-writer-wins: whatever was there is replaced.
 func (c *Client) Set(ctx context.Context, key, value string) error {
 	body, err := json.Marshal(map[string]string{"value": value})
 	if err != nil {
@@ -74,19 +85,96 @@ func (c *Client) Set(ctx context.Context, key, value string) error {
 	return c.inner.Do(ctx, 0, http.MethodPut, "/configs/"+key, body, nil, isTerminal)
 }
 
+// SetIf writes a value only while the key is still at the revision given,
+// which is the one [Client.GetRev] returned. It returns [ErrRevisionMismatch]
+// if the key has been written since.
+//
+// This is what turns a read and a write into a read-modify-write that loses
+// nothing: without it the two are separate log entries, and a write that
+// lands between them is overwritten with no error.
+//
+// A revision of zero means the key has never been written, so SetIf(ctx, key,
+// value, 0) is create-if-absent.
+func (c *Client) SetIf(ctx context.Context, key, value string, rev uint64) error {
+	body, err := json.Marshal(map[string]string{"value": value})
+	if err != nil {
+		return err
+	}
+	return c.inner.Do(ctx, 0, http.MethodPut, "/configs/"+key, body, nil, isTerminal,
+		ifMatch(rev))
+}
+
+// DeleteIf removes a key only while it is still at the revision given.
+func (c *Client) DeleteIf(ctx context.Context, key string, rev uint64) error {
+	return c.inner.Do(ctx, 0, http.MethodDelete, "/configs/"+key, nil, nil, isTerminal,
+		ifMatch(rev))
+}
+
+// ifMatch builds the conditional header for a revision. Zero is sent as
+// If-None-Match: * -- "the key does not exist" -- because that is what a
+// revision of zero means and what the server accepts for it.
+func ifMatch(rev uint64) exampleutil.RequestOption {
+	return func(r *http.Request) {
+		if rev == 0 {
+			r.Header.Set("If-None-Match", "*")
+			return
+		}
+		r.Header.Set("If-Match", strconv.FormatUint(rev, 10))
+	}
+}
+
 // Get retrieves a config entry. If stale is true it performs a local read from
 // any node; otherwise it performs a linearizable read.
 // Returns ErrNotFound if the key does not exist.
 func (c *Client) Get(ctx context.Context, key string, stale bool) (ConfigEntry, error) {
+	entry, _, err := c.GetRev(ctx, key, stale)
+	return entry, err
+}
+
+// GetRev retrieves a config entry and the revision at which it was last
+// written. Pass the revision to [Client.SetIf] or [Client.DeleteIf] to make
+// the next write conditional on nothing having changed in between.
+//
+// The revision is the index of the Raft entry that wrote the key, which the
+// server returns as an ETag. It is not the Version field on the entry: that
+// is a timestamp this service chose to expose, and a timestamp is the wrong
+// thing to compare against, since two writers in the same nanosecond get the
+// same one.
+//
+// A stale read still returns a usable revision. It is either current or
+// behind, and a conditional write on a revision that has moved is refused --
+// so reading stale costs a retry, never a lost update.
+func (c *Client) GetRev(ctx context.Context, key string, stale bool) (ConfigEntry, uint64, error) {
 	path := "/configs/" + key
 	if stale {
 		path += "?consistency=stale"
 	}
-	var entry ConfigEntry
-	if err := c.inner.Do(ctx, 0, http.MethodGet, path, nil, &entry, isTerminal); err != nil {
-		return ConfigEntry{}, err
+
+	var (
+		entry ConfigEntry
+		rev   uint64
+		parse error
+	)
+	capture := exampleutil.ObserveResponse(func(resp *http.Response) {
+		etag := strings.Trim(resp.Header.Get("ETag"), `"`)
+		if etag == "" {
+			return
+		}
+		parsed, err := strconv.ParseUint(etag, 10, 64)
+		if err != nil {
+			parse = fmt.Errorf("configsvc: unusable ETag %q: %w", etag, err)
+			return
+		}
+		rev = parsed
+	})
+
+	if err := c.inner.Do(ctx, 0, http.MethodGet, path, nil, &entry, isTerminal, capture); err != nil {
+		return ConfigEntry{}, 0, err
 	}
-	return entry, nil
+	if parse != nil {
+		return ConfigEntry{}, 0, parse
+	}
+	return entry, rev, nil
 }
 
 // Delete removes a config entry. Returns ErrNotFound if the key does not exist.
@@ -221,5 +309,9 @@ func (c *Client) streamSSE(ctx context.Context, body io.ReadCloser, ch chan<- Ch
 // isTerminal reports whether err should stop the retry loop immediately.
 // Domain errors are terminal; network errors and ErrNotLeader are retried.
 func isTerminal(err error) bool {
-	return errors.Is(err, ErrNotFound)
+	// A failed condition is an answer, not a failure to reach the cluster.
+	// Retrying it unchanged would fail identically every time, and the retry
+	// that is wanted is a fresh read followed by a fresh decision -- which is
+	// the caller's to make, not this loop's.
+	return errors.Is(err, ErrNotFound) || errors.Is(err, ErrRevisionMismatch)
 }
