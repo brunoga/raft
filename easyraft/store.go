@@ -386,7 +386,11 @@ type Store struct {
 	httpListener net.Listener
 	httpServer   *http.Server
 	transport    raft.Transport
-	storage      raft.Storage
+	// ownsTransport records that this store opened the transport itself, and
+	// so is the one that must close it. A Manager's groups share one and it
+	// is closed once, by the Manager, after every group has stopped.
+	ownsTransport bool
+	storage       raft.Storage
 }
 
 // NewStore creates a Store that can manage multiple typed collections.
@@ -445,7 +449,7 @@ func NewStore(opts ...Option) (*Store, error) {
 // error that made construction fail, and that is the one the caller needs;
 // replacing or padding it with a failure from unwinding would bury the cause.
 func (s *Store) closeAfterFailedInit() {
-	if closer, ok := s.transport.(io.Closer); ok {
+	if closer, ok := s.transport.(io.Closer); ok && s.ownsTransport {
 		_ = closer.Close()
 	}
 	if closer, ok := s.storage.(io.Closer); ok {
@@ -935,6 +939,7 @@ func (s *Store) initRaft() error {
 
 	tr.Register(s.cfg.ID, node.Handler())
 	s.transport = tr
+	s.ownsTransport = true
 	s.storage = st
 
 	// 5. Discovery: wire both transport-level connectivity and Raft membership.
@@ -1575,9 +1580,16 @@ func (s *Store) stop() error {
 	}
 	if running {
 		s.node.Stop()
-	} else if closer, ok := s.transport.(io.Closer); ok {
-		// Never started: the node holds nothing, but the transport is already
-		// listening and must be released.
+	}
+	// The transport is listening from the moment the store was constructed,
+	// whether or not the node was ever started, and nothing else closes it:
+	// Node.Stop unregisters this node's handler but leaves the listener
+	// alone, because a transport can be shared by several groups and is not
+	// the node's to close. So the store closes the one it opened, in both
+	// cases -- otherwise a process that stops a store cannot rebind its Raft
+	// address, and one that creates and destroys stores leaks a listener and
+	// its goroutines every time.
+	if closer, ok := s.transport.(io.Closer); ok && s.ownsTransport {
 		if err := closer.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("easyraft: close transport: %w", err))
 		}
