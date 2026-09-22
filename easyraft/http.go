@@ -76,6 +76,12 @@ type batchOp struct {
 	Value      json.RawMessage `json:"value,omitempty"`
 	MutateName string          `json:"mutate_name,omitempty"`
 	MutateArgs json.RawMessage `json:"mutate_args,omitempty"`
+	// IfRev makes this operation conditional on the key's revision, the same
+	// condition the If-Match header carries on a single-key request. Any
+	// operation in the batch whose condition fails fails the whole batch, so
+	// a "check" operation with only a collection, key and if_rev is how a
+	// batch is guarded on a key it does not write.
+	IfRev *uint64 `json:"if_rev,omitempty"`
 }
 
 // ---- Authorization middleware ----------------------------------------------
@@ -244,6 +250,57 @@ func serveOn(srv *http.Server, ln net.Listener, tlsCfg *tls.Config) error {
 // collections are refused outright: they hold easyraft's own cluster metadata,
 // and letting a client write one would let it choose where leader redirects
 // point.
+// conditionFrom reads a conditional-request header and turns it into the
+// revision a write must match, using the two HTTP headers that already mean
+// this:
+//
+//	If-Match: "7"       apply only if the key is still at revision 7
+//	If-None-Match: *    apply only if the key does not exist
+//
+// Nothing else is accepted. A weak validator or a list of ETags would have to
+// be answered with a guess about which one the caller meant, and a guess here
+// is a lost update; a request that asks for something this store cannot check
+// is refused rather than applied unconditionally.
+//
+// The returned pointer is nil when neither header is present, which is an
+// ordinary unconditional write. ok is false when a header was present and
+// unusable, in which case the response has already been written.
+func conditionFrom(w http.ResponseWriter, r *http.Request, logger *slog.Logger) (rev *uint64, ok bool) {
+	ifMatch := strings.TrimSpace(r.Header.Get("If-Match"))
+	ifNone := strings.TrimSpace(r.Header.Get("If-None-Match"))
+
+	switch {
+	case ifMatch != "" && ifNone != "":
+		writeError(w, http.StatusBadRequest,
+			"If-Match and If-None-Match cannot both be given", logger)
+		return nil, false
+
+	case ifNone != "":
+		if ifNone != "*" {
+			writeError(w, http.StatusBadRequest,
+				`If-None-Match accepts only "*", which requires that the key does not exist`, logger)
+			return nil, false
+		}
+		var zero uint64
+		return &zero, true
+
+	case ifMatch != "":
+		if ifMatch == "*" {
+			writeError(w, http.StatusBadRequest,
+				`If-Match: "*" is not supported; give the revision from the ETag of a read`, logger)
+			return nil, false
+		}
+		parsed, err := strconv.ParseUint(strings.Trim(ifMatch, `"`), 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest,
+				"If-Match must be the revision from the ETag of a read, as a decimal number", logger)
+			return nil, false
+		}
+		return &parsed, true
+	}
+	return nil, true
+}
+
 func (s *Store) collectionParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 	name := r.PathValue("collection")
 	if isReservedCollection(name) {
@@ -308,6 +365,11 @@ func (s *Store) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The key's own revision as an ETag, so a client can hand it straight back
+	// as If-Match; the store-wide watermark beside it, for a client tracking
+	// how far this replica has applied.
+	w.Header().Set("ETag", strconv.FormatUint(s.revisions[collection][key], 10))
+	w.Header().Set("X-Raft-Revision", strconv.FormatUint(s.revision, 10))
 	writeJSON(w, http.StatusOK, raw, s.logger())
 }
 
@@ -324,11 +386,17 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifRev, ok := conditionFrom(w, r, s.logger())
+	if !ok {
+		return
+	}
+
 	_, err := s.propose(r.Context(), &command{
 		Op:         opUpdate,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
+		IfRev:      ifRev,
 	})
 	if err != nil {
 		s.handleRPCError(w, r, err)
@@ -350,11 +418,17 @@ func (s *Store) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifRev, ok := conditionFrom(w, r, s.logger())
+	if !ok {
+		return
+	}
+
 	_, err := s.propose(r.Context(), &command{
 		Op:         opUpsert,
 		Collection: collection,
 		Key:        key,
 		Value:      val,
+		IfRev:      ifRev,
 	})
 	if err != nil {
 		s.handleRPCError(w, r, err)
@@ -370,10 +444,16 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("key")
 
+	ifRev, ok := conditionFrom(w, r, s.logger())
+	if !ok {
+		return
+	}
+
 	_, err := s.propose(r.Context(), &command{
 		Op:         opDelete,
 		Collection: collection,
 		Key:        key,
+		IfRev:      ifRev,
 	})
 	if err != nil {
 		s.handleRPCError(w, r, err)
@@ -398,6 +478,8 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	w.Header().Set("X-Raft-Revision", strconv.FormatUint(s.revision, 10))
 
 	coll := s.collections[collection]
 	if coll == nil {
@@ -426,12 +508,18 @@ func (s *Store) handleMutate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ifRev, ok := conditionFrom(w, r, s.logger())
+	if !ok {
+		return
+	}
+
 	resp, err := s.propose(r.Context(), &command{
 		Op:         opMutate,
 		Collection: collection,
 		Key:        key,
 		MutateName: req.Name,
 		MutateArgs: req.Args,
+		IfRev:      ifRev,
 	})
 	if err != nil {
 		s.handleRPCError(w, r, err)
@@ -594,6 +682,11 @@ func (s *Store) handleTransferLeadership(w http.ResponseWriter, r *http.Request)
 // Request body:
 //
 //	[{"op":"create","collection":"col","key":"k","value":{...}}, ...]
+//
+// An operation may carry an "if_rev" that makes it conditional on the key's
+// current revision, and the operation "check" carries nothing else: it writes
+// nothing and only asserts that a key is at the revision given. A failed
+// condition fails the whole batch with 412 and writes none of it.
 func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 	var ops []batchOp
 	if err := json.NewDecoder(r.Body).Decode(&ops); err != nil {
@@ -618,6 +711,7 @@ func (s *Store) handleBatch(w http.ResponseWriter, r *http.Request) {
 			Value:      op.Value,
 			MutateName: op.MutateName,
 			MutateArgs: op.MutateArgs,
+			IfRev:      op.IfRev,
 		}
 	}
 
@@ -815,6 +909,9 @@ func statusForError(err error) int {
 
 	case errors.Is(err, ErrReservedCollection):
 		return http.StatusForbidden
+
+	case errors.Is(err, ErrRevisionMismatch):
+		return http.StatusPreconditionFailed
 
 	case errors.Is(err, raft.ErrProposalTooLarge):
 		return http.StatusRequestEntityTooLarge

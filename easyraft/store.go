@@ -110,6 +110,11 @@ var (
 	// collection.
 	ErrKeyExists = errors.New("easyraft: key already exists")
 
+	// ErrRevisionMismatch is returned by a conditional write whose key has
+	// moved on: the revision the caller expected is not the revision the key
+	// has. Read it again, decide whether the change still applies, and retry.
+	ErrRevisionMismatch = errors.New("easyraft: key has changed since the revision given")
+
 	// ErrWitness is returned by every read against a store built with
 	// [WithWitness]. A witness votes and holds no data, so its collections
 	// are empty by construction; answering a read from them would report
@@ -158,6 +163,11 @@ const (
 	opUpsert opType = "upsert"
 	opMutate opType = "mutate"
 	opBatch  opType = "batch"
+	// opCheck writes nothing. It exists so that a transaction can make its
+	// whole batch conditional on a key it does not otherwise touch, which is
+	// the difference between "swap this value" and "swap this value while
+	// that other one has not moved".
+	opCheck opType = "check"
 )
 
 // changeEvent is an internal notification emitted after each successful write
@@ -194,6 +204,12 @@ type command struct {
 	MutateName string          `json:"mutate_name,omitempty"`
 	MutateArgs json.RawMessage `json:"mutate_args,omitempty"`
 	Batch      []command       `json:"batch,omitempty"`
+	// IfRev, when set, makes the operation conditional: it applies only if
+	// the key's current revision is this one. A pointer rather than a value
+	// because zero is a revision a caller can mean -- the one a key that has
+	// never been written has -- and "no condition" has to be distinct from
+	// it.
+	IfRev *uint64 `json:"if_rev,omitempty"`
 }
 
 // raftPeerInfo holds the transport-level details for one cluster member.
@@ -223,8 +239,23 @@ type readIndexer interface {
 type Store struct {
 	mu          sync.RWMutex
 	collections map[string]map[string]json.RawMessage
-	mutations   map[string]map[string]mutationFunc
-	node        *raft.Node
+	// revisions records, per collection and key, the revision at which the
+	// key was last written. A key that is not there has revision zero, which
+	// is why a conditional write names the revision it expects rather than
+	// asking whether one exists.
+	//
+	// The revision is the index of the Raft entry that wrote it: already
+	// monotonic, already agreed by the cluster, and free. revision is the
+	// highest of them, so a caller can say what the store as a whole has
+	// seen.
+	revisions map[string]map[string]uint64
+	revision  uint64
+	// applyRev is the revision being applied, set by applyEntry for the
+	// duration of one entry. The apply path is one goroutine holding mu, so
+	// it does not need to be threaded through the batch recursion.
+	applyRev  uint64
+	mutations map[string]map[string]mutationFunc
+	node      *raft.Node
 
 	// reader establishes read linearizability. It is the Raft node in
 	// production and is overridable in tests.
@@ -315,6 +346,7 @@ func NewStore(opts ...Option) (*Store, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Store{
 		collections:     make(map[string]map[string]json.RawMessage),
+		revisions:       make(map[string]map[string]uint64),
 		mutations:       make(map[string]map[string]mutationFunc),
 		raftPeers:       make(map[raft.NodeID]raftPeerInfo),
 		onChangeFns:     make(map[string]func(rawChangeEvent)),
@@ -1551,7 +1583,9 @@ func AddCollection[T any](s *Store, name string) *Collection[T] {
 
 // RegisterMutation registers a named read-modify-write function for this
 // collection. Mutations are the correct way to update a value based on its
-// current state — a Read followed by Update is not atomic.
+// current state — a Read followed by Update is not atomic. When the new value
+// cannot be computed inside the state machine, [Collection.ReadRev] and
+// [Collection.UpdateIf] make the same read-modify-write safe from outside.
 //
 // fn is called inside [raft.StateMachine].Apply, which runs on every replica
 // during both normal operation and log replay after a restart or snapshot
@@ -1849,6 +1883,218 @@ func (c *Collection[T]) List(ctx context.Context) (map[string]T, error) {
 	return c.listLocked()
 }
 
+// Revision returns the highest revision this store has applied. Every
+// committed entry that touches a collection advances it, whichever key it
+// touched, so it is a watermark for the store as a whole rather than a
+// counter of writes: it is the Raft index of the last entry applied, and it
+// skips the indexes taken by entries that changed no key.
+//
+// It is read from the local state machine, so on a follower it is as current
+// as that follower is. Pair it with [Collection.ReadRev] when what matters is
+// the revision of one key.
+func (s *Store) Revision() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.revision
+}
+
+// ReadRev returns an item together with the revision at which it was last
+// written, with the same linearizable guarantee as [Collection.Read].
+//
+// The revision is what makes a read-modify-write safe without a mutation: read
+// the value and its revision, compute the next value, then pass that revision
+// to [Collection.UpdateIf]. If anything wrote the key in between, the update
+// is refused with [ErrRevisionMismatch] rather than silently overwriting it.
+// Returns [ErrKeyNotFound] if the key does not exist.
+func (c *Collection[T]) ReadRev(ctx context.Context, key string) (value T, rev uint64, err error) {
+	var empty T
+	if c.store.cfg.Witness {
+		return empty, 0, ErrWitness
+	}
+	if c.store.node == nil {
+		return empty, 0, fmt.Errorf("easyraft: node not started")
+	}
+	if err := c.store.readIndex(ctx); err != nil {
+		return empty, 0, fmt.Errorf("easyraft: read index: %w", err)
+	}
+	return c.ReadStaleRev(key)
+}
+
+// ReadStaleRev returns an item and its revision from the local state machine
+// without a leader round-trip, as [Collection.ReadStale] does.
+//
+// A stale read is still a usable basis for a conditional write: the revision
+// it returns is either current or behind, and a conditional write on a
+// revision that has moved is refused. The cost of reading stale here is a
+// retry, never a lost update.
+func (c *Collection[T]) ReadStaleRev(key string) (value T, rev uint64, err error) {
+	var val T
+	if c.store.cfg.Witness {
+		return val, 0, ErrWitness
+	}
+	c.store.mu.RLock()
+	defer c.store.mu.RUnlock()
+
+	coll := c.store.collections[c.name]
+	if coll == nil {
+		return val, 0, ErrKeyNotFound
+	}
+	raw, ok := coll[key]
+	if !ok {
+		return val, 0, ErrKeyNotFound
+	}
+	if err := json.Unmarshal(raw, &val); err != nil {
+		return val, 0, fmt.Errorf("easyraft: decode value: %w", err)
+	}
+	return val, c.store.revisions[c.name][key], nil
+}
+
+// UpdateIf replaces an existing item only if its current revision is rev,
+// which is the revision [Collection.ReadRev] returned for it.
+//
+// Returns [ErrRevisionMismatch] if the key has been written since, and
+// [ErrKeyNotFound] if it no longer exists. The condition is evaluated on every
+// replica as the entry applies, not on the leader before proposing, so it
+// holds against every other write in the log rather than against a snapshot of
+// the leader taken some time earlier.
+//
+// A rev of zero means the key has never been written, which for an update is
+// a condition no existing key can satisfy. Use [Collection.UpsertIf] when
+// creating the key is the intended outcome.
+func (c *Collection[T]) UpdateIf(ctx context.Context, key string, value T, rev uint64) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("easyraft: encode value: %w", err)
+	}
+	_, err = c.store.propose(ctx, &command{
+		Op:         opUpdate,
+		Collection: c.name,
+		Key:        key,
+		Value:      b,
+		IfRev:      &rev,
+	})
+	return err
+}
+
+// UpsertIf writes an item only if its current revision is rev. Passing zero
+// asks for the key to be created and refuses if anything already holds it,
+// which is [Collection.Create] with the added guarantee that a delete and a
+// recreate in between is also caught.
+//
+// Returns [ErrRevisionMismatch] if the key's revision is not rev.
+func (c *Collection[T]) UpsertIf(ctx context.Context, key string, value T, rev uint64) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("easyraft: encode value: %w", err)
+	}
+	_, err = c.store.propose(ctx, &command{
+		Op:         opUpsert,
+		Collection: c.name,
+		Key:        key,
+		Value:      b,
+		IfRev:      &rev,
+	})
+	return err
+}
+
+// DeleteIf removes an item only if its current revision is rev.
+//
+// Returns [ErrRevisionMismatch] if the key has been written since it was read,
+// and [ErrKeyNotFound] if it is already gone.
+func (c *Collection[T]) DeleteIf(ctx context.Context, key string, rev uint64) error {
+	_, err := c.store.propose(ctx, &command{
+		Op:         opDelete,
+		Collection: c.name,
+		Key:        key,
+		IfRev:      &rev,
+	})
+	return err
+}
+
+// MutateIf runs a registered mutation only if the key's current revision is
+// rev. The mutation function is not called at all when the condition fails, so
+// a refused conditional mutation costs nothing beyond the log entry.
+//
+// Most read-modify-write work needs no condition: a mutation already runs
+// atomically against the current value. MutateIf is for the case where the
+// decision to mutate was made from an earlier read and must not survive a
+// change to the key in between.
+func (c *Collection[T]) MutateIf(ctx context.Context, key, name string, args []byte, rev uint64) ([]byte, error) {
+	return c.store.propose(ctx, &command{
+		Op:         opMutate,
+		Collection: c.name,
+		Key:        key,
+		MutateName: name,
+		MutateArgs: args,
+		IfRev:      &rev,
+	})
+}
+
+// UpdateIf adds a conditional update to the transaction. If the key's
+// revision is not rev when the entry applies, the whole transaction fails
+// with [ErrRevisionMismatch] and nothing in it is written.
+func (t *Txn) UpdateIf(collection, key string, value any, rev uint64) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	t.cmds = append(t.cmds, command{
+		Op:         opUpdate,
+		Collection: collection,
+		Key:        key,
+		Value:      b,
+		IfRev:      &rev,
+	})
+	return nil
+}
+
+// UpsertIf adds a conditional upsert to the transaction. See [Txn.UpdateIf]
+// for what a failed condition does to the rest of the batch.
+func (t *Txn) UpsertIf(collection, key string, value any, rev uint64) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	t.cmds = append(t.cmds, command{
+		Op:         opUpsert,
+		Collection: collection,
+		Key:        key,
+		Value:      b,
+		IfRev:      &rev,
+	})
+	return nil
+}
+
+// DeleteIf adds a conditional delete to the transaction. See [Txn.UpdateIf]
+// for what a failed condition does to the rest of the batch.
+func (t *Txn) DeleteIf(collection, key string, rev uint64) error {
+	t.cmds = append(t.cmds, command{
+		Op:         opDelete,
+		Collection: collection,
+		Key:        key,
+		IfRev:      &rev,
+	})
+	return nil
+}
+
+// CheckRev adds a guard to the transaction: the batch applies only if key is
+// at revision rev. It writes nothing itself, and its entry in the returned
+// [TxnResults] is nil.
+//
+// This is how a transaction is made conditional on a key it does not write —
+// a lease still held, a configuration not yet superseded — which is the part
+// a per-operation condition cannot express. A rev of zero asserts that the key
+// does not exist.
+func (t *Txn) CheckRev(collection, key string, rev uint64) error {
+	t.cmds = append(t.cmds, command{
+		Op:         opCheck,
+		Collection: collection,
+		Key:        key,
+		IfRev:      &rev,
+	})
+	return nil
+}
+
 // AddServer registers addr with the transport and adds id as a voting member
 // of the Raft cluster. This must be called on the leader; it returns
 // [ErrNotLeader] otherwise. Blocks until the membership change is committed.
@@ -2046,6 +2292,7 @@ func (s *Store) applyEntry(entry raft.LogEntry) ([]byte, error) {
 
 	s.mu.Lock()
 	s.pendingEvents = s.pendingEvents[:0]
+	s.applyRev = uint64(entry.Index)
 	result, err := s.applyCommand(&cmd, nil)
 	// Drop events for collections nobody is listening to — the internal
 	// metadata collection, most of all — so they cannot take up queue room
@@ -2073,10 +2320,11 @@ func (s *Store) applyEntry(entry raft.LogEntry) ([]byte, error) {
 // undoEntry records one key's value before a batch touched it, so a failed
 // batch can be rolled back without copying whole collections.
 type undoEntry struct {
-	collection string
-	key        string
-	previous   json.RawMessage
-	existed    bool
+	collection  string
+	key         string
+	previous    json.RawMessage
+	existed     bool
+	previousRev uint64
 }
 
 // batchUndo is the rollback journal for one transaction. It grows with the
@@ -2087,38 +2335,60 @@ type batchUndo struct {
 	// created lists collections the batch brought into existence, which must
 	// disappear again if it is rolled back.
 	created []string
+	// revision is the store-wide watermark as it stood before the batch. A
+	// batch that rolls back wrote nothing, so the watermark it moved has to
+	// move back too -- otherwise Revision would report progress made by an
+	// entry that changed no key.
+	revision uint64
 }
 
 // record captures the pre-batch value of key so it can be restored. Repeated
 // writes to the same key each append an entry; replaying the journal in
 // reverse therefore restores the earliest value.
-func (u *batchUndo) record(collection, key string, coll map[string]json.RawMessage) {
+func (u *batchUndo) record(collection, key string, coll map[string]json.RawMessage, revs map[string]uint64) {
 	previous, existed := coll[key]
 	u.entries = append(u.entries, undoEntry{
-		collection: collection,
-		key:        key,
-		previous:   previous,
-		existed:    existed,
+		collection:  collection,
+		key:         key,
+		previous:    previous,
+		existed:     existed,
+		previousRev: revs[key],
 	})
 }
 
-// rollback undoes every recorded mutation, most recent first.
-func (u *batchUndo) rollback(collections map[string]map[string]json.RawMessage) {
+// rollback undoes every recorded mutation, most recent first. Revisions go
+// back with the values they belong to: a key whose write was rolled back was
+// never written, and a revision left behind would refuse the next conditional
+// write against it.
+func (u *batchUndo) rollback(collections map[string]map[string]json.RawMessage, revisions map[string]map[string]uint64) {
 	for i := len(u.entries) - 1; i >= 0; i-- {
 		e := u.entries[i]
 		coll := collections[e.collection]
 		if coll == nil {
 			continue
 		}
+		revs := revisions[e.collection]
 		if e.existed {
 			coll[e.key] = e.previous
+			if revs != nil {
+				revs[e.key] = e.previousRev
+			}
 		} else {
 			delete(coll, e.key)
+			delete(revs, e.key)
 		}
 	}
 	for _, name := range u.created {
 		delete(collections, name)
+		delete(revisions, name)
 	}
+}
+
+// restoreRevision is the second half of a rollback: the watermark the batch
+// advanced. Kept apart from rollback because a nested batch shares its
+// parent's journal and must not restore anything on its own.
+func (u *batchUndo) restoreRevision(s *Store) {
+	s.revision = u.revision
 }
 
 // applyCommand applies cmd to the state machine. undo is non-nil while a batch
@@ -2141,14 +2411,15 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return json.Marshal(results)
 		}
 
-		journal := &batchUndo{}
+		journal := &batchUndo{revision: s.revision}
 		preBatchEventsLen := len(s.pendingEvents)
 
 		results := make([]json.RawMessage, 0, len(cmd.Batch))
 		for i := range cmd.Batch {
 			res, err := s.applyCommand(&cmd.Batch[i], journal)
 			if err != nil {
-				journal.rollback(s.collections)
+				journal.rollback(s.collections, s.revisions)
+				journal.restoreRevision(s)
 				// Discard any partial change events emitted during the batch.
 				s.pendingEvents = s.pendingEvents[:preBatchEventsLen]
 				return nil, err
@@ -2166,6 +2437,26 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			undo.created = append(undo.created, cmd.Collection)
 		}
 	}
+	revs, hasRevs := s.revisions[cmd.Collection]
+	if !hasRevs {
+		revs = make(map[string]uint64)
+		s.revisions[cmd.Collection] = revs
+	}
+
+	// A conditional write applies only against the revision it names. Checked
+	// before anything else the operation would do, including a mutation
+	// function, so a refused write leaves nothing behind.
+	if cmd.IfRev != nil && revs[cmd.Key] != *cmd.IfRev {
+		return nil, ErrRevisionMismatch
+	}
+
+	// Every write below stamps the entry's own index on the key it wrote.
+	stamp := func(key string) {
+		revs[key] = s.applyRev
+		if s.applyRev > s.revision {
+			s.revision = s.applyRev
+		}
+	}
 
 	switch cmd.Op {
 	case opCreate:
@@ -2173,9 +2464,10 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, ErrKeyExists
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll)
+			undo.record(cmd.Collection, cmd.Key, coll, revs)
 		}
 		coll[cmd.Key] = cmd.Value
+		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
 
@@ -2184,17 +2476,19 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, ErrKeyNotFound
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll)
+			undo.record(cmd.Collection, cmd.Key, coll, revs)
 		}
 		coll[cmd.Key] = cmd.Value
+		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
 
 	case opUpsert:
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll)
+			undo.record(cmd.Collection, cmd.Key, coll, revs)
 		}
 		coll[cmd.Key] = cmd.Value
+		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: cmd.Value})
 		return nil, nil
 
@@ -2203,9 +2497,13 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, ErrKeyNotFound
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll)
+			undo.record(cmd.Collection, cmd.Key, coll, revs)
 		}
 		delete(coll, cmd.Key)
+		delete(revs, cmd.Key)
+		if s.applyRev > s.revision {
+			s.revision = s.applyRev
+		}
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, deleted: true})
 		return nil, nil
 
@@ -2229,11 +2527,24 @@ func (s *Store) applyCommand(cmd *command, undo *batchUndo) ([]byte, error) {
 			return nil, err
 		}
 		if undo != nil {
-			undo.record(cmd.Collection, cmd.Key, coll)
+			undo.record(cmd.Collection, cmd.Key, coll, revs)
 		}
 		coll[cmd.Key] = newVal
+		stamp(cmd.Key)
 		s.pendingEvents = append(s.pendingEvents, changeEvent{collection: cmd.Collection, key: cmd.Key, value: newVal})
 		return resp, nil
+
+	case opCheck:
+		// A check carries no value and takes no action, so without a condition
+		// it asserts nothing. Refused rather than treated as success: a batch
+		// that meant to be guarded and silently was not is the failure this
+		// operation exists to prevent.
+		if cmd.IfRev == nil {
+			return nil, fmt.Errorf("easyraft: check on %q/%q has no revision to check",
+				cmd.Collection, cmd.Key)
+		}
+		// The condition above is the whole operation.
+		return nil, nil
 
 	default:
 		return nil, fmt.Errorf("easyraft: unknown op %q", cmd.Op)
@@ -2255,7 +2566,7 @@ func (s *Store) snapshot(w io.Writer) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 
 	s.mu.RLock()
-	err := streamCollections(bw, s.collections)
+	err := streamCollections(bw, s.collections, s.revisions, s.revision)
 	s.mu.RUnlock()
 
 	if err != nil {
@@ -2269,7 +2580,22 @@ func (s *Store) snapshot(w io.Writer) error {
 
 // streamCollections writes collections as a JSON object without materialising
 // an intermediate copy of the data.
-func streamCollections(w *bufio.Writer, collections map[string]map[string]json.RawMessage) error {
+// Revisions travel beside the collections under two reserved names rather
+// than in a wrapper around them. They are spelled like every other internal
+// name in this package, which is what keeps them out of the way of a future
+// internal collection as well as of a caller's. A collection whose name begins with two
+// underscores is already refused to callers, so neither can collide with one;
+// and a snapshot written before revisions existed simply has neither key,
+// which decodes as a store that has never recorded one. That is what keeps
+// this readable by a node that is newer than the snapshot it starts on.
+const (
+	snapshotRevisionsKey = "__easyraft_revisions__"
+	snapshotRevisionKey  = "__easyraft_revision__"
+)
+
+func streamCollections(w *bufio.Writer, collections map[string]map[string]json.RawMessage,
+	revisions map[string]map[string]uint64, revision uint64,
+) error {
 	if _, err := w.WriteString("{"); err != nil {
 		return err
 	}
@@ -2310,6 +2636,58 @@ func streamCollections(w *bufio.Writer, collections map[string]map[string]json.R
 			return err
 		}
 	}
+
+	if len(collections) > 0 {
+		if _, err := w.WriteString(","); err != nil {
+			return err
+		}
+	}
+	if err := writeJSONString(w, snapshotRevisionsKey); err != nil {
+		return err
+	}
+	if _, err := w.WriteString(":{"); err != nil {
+		return err
+	}
+	for i, name := range slices.Sorted(maps.Keys(revisions)) {
+		if i > 0 {
+			if _, err := w.WriteString(","); err != nil {
+				return err
+			}
+		}
+		if err := writeJSONString(w, name); err != nil {
+			return err
+		}
+		if _, err := w.WriteString(":{"); err != nil {
+			return err
+		}
+		keys := revisions[name]
+		for j, key := range slices.Sorted(maps.Keys(keys)) {
+			if j > 0 {
+				if _, err := w.WriteString(","); err != nil {
+					return err
+				}
+			}
+			if err := writeJSONString(w, key); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, ":%d", keys[key]); err != nil {
+				return err
+			}
+		}
+		if _, err := w.WriteString("}"); err != nil {
+			return err
+		}
+	}
+	if _, err := w.WriteString("},"); err != nil {
+		return err
+	}
+	if err := writeJSONString(w, snapshotRevisionKey); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, ":%d", revision); err != nil {
+		return err
+	}
+
 	_, err := w.WriteString("}\n")
 	return err
 }
@@ -2332,48 +2710,71 @@ func writeJSONString(w *bufio.Writer, s string) error {
 func (s *Store) restore(r io.Reader) error {
 	dec := json.NewDecoder(bufio.NewReaderSize(r, 64<<10))
 
-	collections, err := decodeCollections(dec)
+	collections, revisions, revision, err := decodeCollections(dec)
 	if err != nil {
 		return fmt.Errorf("easyraft: restore decode: %w", err)
 	}
 
 	s.mu.Lock()
 	s.collections = collections
+	s.revisions = revisions
+	s.revision = revision
 	s.mu.Unlock()
 	return nil
 }
 
 // decodeCollections reads a snapshot body, tolerating both an empty stream and
 // an explicit JSON null (either of which means "no state").
-func decodeCollections(dec *json.Decoder) (map[string]map[string]json.RawMessage, error) {
-	collections := make(map[string]map[string]json.RawMessage)
+func decodeCollections(dec *json.Decoder) (
+	collections map[string]map[string]json.RawMessage,
+	revisions map[string]map[string]uint64,
+	revision uint64,
+	err error,
+) {
+	collections = make(map[string]map[string]json.RawMessage)
+	revisions = make(map[string]map[string]uint64)
 
 	tok, err := dec.Token()
 	if errors.Is(err, io.EOF) {
-		return collections, nil
+		return collections, revisions, 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, 0, err
 	}
 	if tok == nil {
-		return collections, nil // JSON null
+		return collections, revisions, 0, nil // JSON null
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil, fmt.Errorf("expected a JSON object, found %v", tok)
+		return nil, nil, 0, fmt.Errorf("expected a JSON object, found %v", tok)
 	}
 
 	for dec.More() {
 		nameTok, err := dec.Token()
 		if err != nil {
-			return nil, err
+			return nil, nil, 0, err
 		}
 		name, ok := nameTok.(string)
 		if !ok {
-			return nil, fmt.Errorf("expected a collection name, found %v", nameTok)
+			return nil, nil, 0, fmt.Errorf("expected a collection name, found %v", nameTok)
+		}
+		switch name {
+		case snapshotRevisionsKey:
+			if err := dec.Decode(&revisions); err != nil {
+				return nil, nil, 0, fmt.Errorf("revisions: %w", err)
+			}
+			if revisions == nil {
+				revisions = make(map[string]map[string]uint64)
+			}
+			continue
+		case snapshotRevisionKey:
+			if err := dec.Decode(&revision); err != nil {
+				return nil, nil, 0, fmt.Errorf("revision: %w", err)
+			}
+			continue
 		}
 		var items map[string]json.RawMessage
 		if err := dec.Decode(&items); err != nil {
-			return nil, fmt.Errorf("collection %q: %w", name, err)
+			return nil, nil, 0, fmt.Errorf("collection %q: %w", name, err)
 		}
 		if items == nil {
 			items = make(map[string]json.RawMessage)
@@ -2382,9 +2783,9 @@ func decodeCollections(dec *json.Decoder) (map[string]map[string]json.RawMessage
 	}
 
 	if _, err := dec.Token(); err != nil { // closing brace
-		return nil, err
+		return nil, nil, 0, err
 	}
-	return collections, nil
+	return collections, revisions, revision, nil
 }
 
 // raftTickInterval returns the configured tick interval, falling back to the

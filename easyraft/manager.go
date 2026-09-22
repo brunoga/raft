@@ -112,6 +112,7 @@ func (m *Manager) logger() *slog.Logger {
 func newStoreShell(stopCtx context.Context, cancel context.CancelFunc, cfg *config) *Store {
 	return &Store{
 		collections:     make(map[string]map[string]json.RawMessage),
+		revisions:       make(map[string]map[string]uint64),
 		mutations:       make(map[string]map[string]mutationFunc),
 		raftPeers:       make(map[raft.NodeID]raftPeerInfo),
 		onChangeFns:     make(map[string]func(rawChangeEvent)),
