@@ -22,6 +22,25 @@ var (
 // RequestOption is a callback that can modify an outgoing HTTP request.
 type RequestOption func(*http.Request)
 
+// responseHookKey identifies the response hook carried on a request context.
+type responseHookKey struct{}
+
+// ObserveResponse returns a RequestOption that hands the final response to fn
+// before its body is read.
+//
+// It exists for the things a caller needs that are not in the body. An ETag
+// is the one that matters here: a conditional write has to name the revision
+// a read returned, and that travels in a header.
+//
+// fn sees the response the request finally got, not a redirect on the way to
+// it. A 307 carries the leader's address and nothing about the resource, so
+// observing one would hand the caller a header set belonging to no answer.
+func ObserveResponse(fn func(*http.Response)) RequestOption {
+	return func(r *http.Request) {
+		*r = *r.WithContext(context.WithValue(r.Context(), responseHookKey{}, fn))
+	}
+}
+
 // ErrorMapper translates a non-2xx, non-307, non-503 HTTP response into a
 // domain-specific error. Return nil to fall through to the default
 // "server error N: body" formatting.
@@ -158,6 +177,12 @@ func (c *Client) doOnce(ctx context.Context, shardID uint64, addr, method, path 
 		c.mu.Unlock()
 
 		return c.doOnce(ctx, shardID, newBase, method, path, body, result, true, opts...)
+	}
+
+	// Past the redirect branch above, so this is the response the request
+	// finally got.
+	if hook, ok := req.Context().Value(responseHookKey{}).(func(*http.Response)); ok {
+		hook(resp)
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {

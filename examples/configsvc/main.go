@@ -12,6 +12,21 @@
 // ratelimiter example: the timestamp is encoded in the request args so every
 // replica applies the same value rather than reading the clock inside Apply.
 //
+// Writes are last-writer-wins by default, and compare-and-swap when the
+// caller says so. A GET returns the key's revision as an ETag; handing it
+// back as If-Match makes the next write apply only while the key is still at
+// it, and 412 otherwise. That is the difference between setting a value
+// somebody typed and setting one computed from the value already there --
+// the second is a read and a write with a window between them, and a write
+// that lands in the window is silently overwritten unless the second is
+// conditional.
+//
+// Note which number the condition uses: the revision, not Version. A
+// timestamp is the wrong thing to compare against, because two writers in the
+// same nanosecond get the same one and a clock that steps back produces one
+// that has already been used. The revision is the index of the entry that
+// wrote the key: unique, agreed by the cluster, and never backwards.
+//
 // Change notifications use [easyraft.Collection.OnChange], which fires on
 // every replica immediately after each committed write is applied to the local
 // state machine — outside the Raft lock. Watchers never need to poll; they
@@ -20,9 +35,11 @@
 // # HTTP API
 //
 //	PUT    /configs/{key}   — set a value (body: {"value":"..."})
-//	GET    /configs/{key}   — linearizable read
+//	                          If-Match: <etag>   apply only at that revision
+//	                          If-None-Match: *   apply only if absent
+//	GET    /configs/{key}   — linearizable read; revision in the ETag header
 //	GET    /configs/{key}?consistency=stale  — local read
-//	DELETE /configs/{key}   — delete
+//	DELETE /configs/{key}   — delete, honouring If-Match
 //	GET    /configs         — list all (linearizable)
 //	GET    /watch/{key}     — SSE stream for a single key
 //	GET    /watch           — SSE stream for all keys
@@ -42,6 +59,13 @@
 //	# Set a value (must hit leader, or follow the 307 redirect)
 //	curl -L -X PUT http://localhost:8001/configs/db.host \
 //	     -H 'Content-Type: application/json' -d '{"value":"localhost"}'
+//
+//	# Change it only if nobody else did first
+//	etag=$(curl -sS -D- -o/dev/null http://localhost:8002/configs/db.host \
+//	       | awk '/[Ee][Tt]ag:/ {print $2}' | tr -d '\r')
+//	curl -L -X PUT -H "If-Match: $etag" \
+//	     -H 'Content-Type: application/json' -d '{"value":"db.internal"}' \
+//	     http://localhost:8001/configs/db.host
 package main
 
 import (
@@ -55,6 +79,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -86,18 +111,41 @@ func newServer(store *easyraft.Store, configs *easyraft.Collection[ConfigEntry])
 	return &server{store: store, configs: configs, watcher: w}
 }
 
-// setConfig upserts a config entry with the current timestamp as version.
-func (s *server) setConfig(ctx context.Context, key, value string) error {
-	return s.configs.Upsert(ctx, key, ConfigEntry{
+// setConfig writes a config entry with the current timestamp as version.
+//
+// rev makes the write conditional: it applies only while the key is still at
+// that revision, and is refused with easyraft.ErrRevisionMismatch otherwise.
+// A nil rev writes unconditionally, which is last-writer-wins.
+func (s *server) setConfig(ctx context.Context, key, value string, rev *uint64) error {
+	entry := ConfigEntry{
 		Value:   value,
 		Version: time.Now().UnixNano(),
-	})
+	}
+	if rev == nil {
+		return s.configs.Upsert(ctx, key, entry)
+	}
+	return s.configs.UpsertIf(ctx, key, entry, *rev)
 }
 
+// handleSet serves PUT /configs/{key}.
+//
+// Without a condition it is last-writer-wins, which is what a configuration
+// service usually wants for a value somebody typed. With If-Match it is a
+// compare-and-swap against the revision a GET returned, which is what it
+// wants for a value something computed from the one already there --
+// incrementing a counter, adding an entry to a list, flipping a flag based on
+// its current state. Those are two log entries with a window between them,
+// and a write that lands in the window is silently overwritten unless the
+// second one is conditional.
 func (s *server) handleSet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if key == "" {
 		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+
+	rev, ok := conditionFrom(w, r)
+	if !ok {
 		return
 	}
 
@@ -109,13 +157,61 @@ func (s *server) handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.setConfig(r.Context(), key, body.Value); err != nil {
+	if err := s.setConfig(r.Context(), key, body.Value, rev); err != nil {
+		if errors.Is(err, easyraft.ErrRevisionMismatch) {
+			http.Error(w, "the key has changed since the revision given",
+				http.StatusPreconditionFailed)
+			return
+		}
 		// The store knows the leader's advertised address and answers with a
 		// redirect, so a write that reached a follower still lands.
 		s.store.WriteHTTPError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// conditionFrom reads the revision a conditional write must match, from the
+// headers HTTP already has for the job.
+//
+//	If-Match: "7"       apply only if the key is still at revision 7
+//	If-None-Match: *    apply only if the key does not exist
+//
+// Nothing else is accepted. A weak validator or a list of ETags would have to
+// be answered with a guess about which one the caller meant, and a guess here
+// is the lost update the condition was asked for to prevent.
+//
+// A nil revision with ok true means the caller asked for no condition.
+func conditionFrom(w http.ResponseWriter, r *http.Request) (rev *uint64, ok bool) {
+	ifMatch := strings.TrimSpace(r.Header.Get("If-Match"))
+	ifNone := strings.TrimSpace(r.Header.Get("If-None-Match"))
+
+	switch {
+	case ifMatch == "" && ifNone == "":
+		return nil, true
+
+	case ifMatch != "" && ifNone != "":
+		http.Error(w, "If-Match and If-None-Match cannot both be given", http.StatusBadRequest)
+		return nil, false
+
+	case ifNone != "":
+		if ifNone != "*" {
+			http.Error(w, `If-None-Match accepts only "*"`, http.StatusBadRequest)
+			return nil, false
+		}
+		// Revision zero is the revision of a key that has never been written,
+		// so this is create-if-absent.
+		var zero uint64
+		return &zero, true
+
+	default:
+		parsed, err := strconv.ParseUint(strings.Trim(ifMatch, `"`), 10, 64)
+		if err != nil {
+			http.Error(w, "If-Match must be the ETag of a read", http.StatusBadRequest)
+			return nil, false
+		}
+		return &parsed, true
+	}
 }
 
 func (s *server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -127,12 +223,13 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		entry ConfigEntry
+		rev   uint64
 		err   error
 	)
 	if r.URL.Query().Get("consistency") == "stale" {
-		entry, err = s.configs.ReadStale(key)
+		entry, rev, err = s.configs.ReadStaleRev(key)
 	} else {
-		entry, err = s.configs.Read(r.Context(), key)
+		entry, rev, err = s.configs.ReadRev(r.Context(), key)
 	}
 
 	if err != nil {
@@ -143,6 +240,14 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// The revision, not the Version field below it. Version is this service's
+	// own data -- a timestamp it chose to expose -- and a timestamp is the
+	// wrong thing to compare against: two writers in the same nanosecond get
+	// the same one, and a clock that steps back produces one that has already
+	// been used. The revision is the index of the entry that wrote the key,
+	// so it is unique, agreed by the cluster, and never goes backwards.
+	w.Header().Set("ETag", strconv.FormatUint(rev, 10))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(entry)
 }
@@ -154,9 +259,25 @@ func (s *server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.configs.Delete(r.Context(), key); err != nil {
+	rev, ok := conditionFrom(w, r)
+	if !ok {
+		return
+	}
+
+	var err error
+	if rev == nil {
+		err = s.configs.Delete(r.Context(), key)
+	} else {
+		err = s.configs.DeleteIf(r.Context(), key, *rev)
+	}
+	if err != nil {
 		if errors.Is(err, easyraft.ErrKeyNotFound) {
 			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, easyraft.ErrRevisionMismatch) {
+			http.Error(w, "the key has changed since the revision given",
+				http.StatusPreconditionFailed)
 			return
 		}
 		// The store knows the leader's advertised address and answers with a

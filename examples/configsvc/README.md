@@ -17,6 +17,7 @@ This example focuses on **watch/subscribe** — a pattern none of the other exam
 Additional patterns:
 
 - **`Collection.Upsert`** — atomic create-or-update with no race window between checking existence and writing.
+- **`Collection.ReadRev` / `UpsertIf` / `DeleteIf`** — compare-and-swap, for the writes that are last-writer-wins only by accident. See below.
 - **`Collection.OnChange`** — callback fired after each committed write, outside the Raft lock, on every replica.
 - **`easyraft.Watcher[T]`** — generic pub/sub fan-out that converts `OnChange` events into buffered Go channels; wired with `configs.OnChange(watcher.Notify)`.
 - **`Watcher[T].ServeSSE`** — streams `ChangeEvent[T]` values to HTTP clients as Server-Sent Events; handles headers, snapshot-on-connect, and live events.
@@ -30,14 +31,45 @@ Additional patterns:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `PUT` | `/configs/{key}` | Set a value (create or update) |
-| `GET` | `/configs/{key}` | Read — linearizable |
+| `PUT` | `/configs/{key}` | Set a value (create or update); honours `If-Match` and `If-None-Match` |
+| `GET` | `/configs/{key}` | Read — linearizable; the key's revision comes back as `ETag` |
 | `GET` | `/configs/{key}?consistency=stale` | Read — local, no round-trip |
-| `DELETE` | `/configs/{key}` | Delete |
+| `DELETE` | `/configs/{key}` | Delete; honours `If-Match` |
 | `GET` | `/configs` | List all — linearizable |
 | `GET` | `/configs?consistency=stale` | List all — local |
 | `GET` | `/watch/{key}` | SSE stream for one key |
 | `GET` | `/watch` | SSE stream for all keys |
+
+---
+
+## Compare-and-swap
+
+Setting a value somebody typed is last-writer-wins, and that is fine. Setting one *computed from the value already there* is not: a read and a write are two log entries, and a write that lands between them is silently overwritten.
+
+A `GET` returns the key's revision as an `ETag`. Hand it back as `If-Match` and the write applies only while the key is still at it:
+
+```bash
+etag=$(curl -sS -D- -o/dev/null http://localhost:8002/configs/db.host \
+       | awk '/[Ee][Tt]ag:/ {print $2}' | tr -d '\r')
+
+curl -L -X PUT -H "If-Match: $etag" \
+     -H 'Content-Type: application/json' -d '{"value":"db.internal"}' \
+     http://localhost:8001/configs/db.host
+```
+
+A second write with the same ETag answers `412 Precondition Failed`, and nothing is written. Re-read, redo the work, retry — that loop is a read-modify-write that loses nothing without holding a lock.
+
+`If-None-Match: *` requires the key to be absent, which is how a caller claims one without overwriting whoever got there first. Anything else — a weak validator, a list of ETags, both headers at once — is answered with `400` rather than applied unconditionally, because a guess about which one the caller meant is the lost update the condition was asked for to prevent.
+
+### Which number to compare against
+
+The `ETag` carries the **revision**, not the `Version` field in the body. That distinction is the point.
+
+`Version` is this service's own data: a timestamp it chose to expose. A timestamp is the wrong thing to compare against — two writers in the same nanosecond get the same one, and a clock that steps back produces one that has already been used. The revision is the index of the Raft entry that wrote the key: unique across the cluster, agreed by everyone, and never backwards.
+
+### When to reach for a mutation instead
+
+If the new value can be computed *inside* the state machine, register a mutation instead — it is one atomic entry and needs no condition or retry, as the [`ratelimiter`](../ratelimiter/) example shows. Compare-and-swap is for the case a mutation cannot cover: a value decided in a browser, in another service, or by a person.
 
 ---
 
@@ -57,6 +89,14 @@ err := c.Set(ctx, "db.host", "localhost")
 entry, err := c.Get(ctx, "db.host", false)
 if errors.Is(err, client.ErrNotFound) {
     log.Println("key does not exist")
+}
+
+// Compare-and-swap: read with the revision, write it back only if nothing
+// moved in between.
+entry, rev, err := c.GetRev(ctx, "db.host", false)
+err = c.SetIf(ctx, "db.host", entry.Value+".internal", rev)
+if errors.Is(err, client.ErrRevisionMismatch) {
+    // Somebody wrote the key first. Read it again and redo the work.
 }
 
 // Delete a key.

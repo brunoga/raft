@@ -8,6 +8,16 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Added
 
+- **`examples/configsvc` gained compare-and-swap.** A `GET` returns the key's
+  revision as an `ETag`, `If-Match` makes the next write conditional on it,
+  `If-None-Match: *` is create-if-absent, and a failed condition answers
+  `412`. The Go client gained `GetRev`, `SetIf` and `DeleteIf`.
+
+  Which number the condition uses is the point the example now makes: the
+  revision, not the `Version` field it already exposed. A timestamp is the
+  wrong thing to compare against, because two writers in the same nanosecond
+  get the same one and a clock that steps back produces one already used.
+
 - **`examples/serviceregistry`**, a service registry where instances register
   themselves under a lease and disappear when they stop renewing it. It is the
   worked example for key leases, `KeepAliveLoop`, prefix scans and pagination,
