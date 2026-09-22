@@ -318,11 +318,37 @@ Stated here rather than discovered later.
   the README. Sharing one write-ahead log across groups needs a storage
   abstraction that spans them rather than one per node, which is an
   architectural change rather than a missing option.
-- **No weighted quorums.** A quorum is a count of voters, not a sum of
-  weights. The count is configurable -- `SetCommitQuorum` trades the commit
-  quorum against the election quorum, see below -- and placement can be
-  constrained with `Config.MinCommitZones`, but a voter cannot count for more
-  than one.
+- **No weighted quorums, deliberately.** A quorum is a count of voters, not a
+  sum of weights: a voter cannot count for more than one. Weights would be
+  safe -- a weighted majority intersects another weighted majority exactly as
+  a plain one does -- so this is a choice rather than a limit of the model.
+
+  It is a choice because the things people reach for weights to express are
+  already here, and expressed better. A write that must survive losing a
+  whole failure domain is `Config.MinCommitZones`, which weights cannot say
+  at all: a sum says nothing about *where* the replicas that contributed to
+  it are. A member that should not vote is a learner, which is weight zero.
+  Cheaper writes, or writes that are on every disk before they are
+  acknowledged, is `SetCommitQuorum`. Leadership on the largest machine is
+  `Config.PreferredLeader`; quorum size is about how many failures a group
+  survives, not how fast its members are, and weighting a node up makes the
+  group *depend* on it rather than benefit from it.
+
+  What weights would add is a misconfiguration with no good error. Any node
+  whose weight exceeds half the total becomes mandatory -- no quorum can be
+  formed without it -- so the group quietly stops tolerating its loss, and
+  nothing about the configuration looks wrong until that node is the one
+  that fails. The bound would also have to be replicated like the commit
+  quorum, and would collide with it: `SetCommitQuorum(3)` would mean three
+  voters or three weight units, and every decision site would have to pick.
+
+  The seam is there if a deployment ever needs it. Every quorum decision goes
+  through one pair of functions in `quorum.go` and the membership entry
+  already carries per-peer role bits, so a weight is additive rather than a
+  redesign. The case that would justify it is hierarchical quorums -- a
+  majority of zones, each contributing a majority of its own members, which
+  is Zookeeper's model and which weights only approximate. `MinCommitZones`
+  is already half of that.
 - **No witnesses.** A member either replicates the log in full or does not vote;
   there is no member that votes without storing entries (dissertation §11.7.2).
 - **Lease reads assume bounded clock drift.** `ReadIndex` does not; prefer it
