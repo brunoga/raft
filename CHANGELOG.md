@@ -43,9 +43,9 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
     collections, spelled like every other internal name in the package so
     that no collection can collide with them. A replica restored from one
     refuses and accepts exactly what the replica that wrote it would. A
-    snapshot
-    written before this change has neither name and restores as a store
-    whose keys have never been written, so an upgrade needs no migration.
+    snapshot written before this change has neither name and restores as a
+    store whose keys have never been written, so an upgrade needs no
+    migration.
 
 - easyraft can reach the batteries v2 added to the engine. Every one of them
   was unreachable through the high-level layer, which is the layer most
