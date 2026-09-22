@@ -22,6 +22,14 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   what to do with it; this is where that decision goes, and it may call
   `Stop`.
 
+- `Config.LeaseSafetyMargin` bounds what a lease read assumes about clocks.
+  It is taken off the `ElectionTimeoutMin` lease, so a follower whose clock
+  runs a little fast cannot hold an election inside a lease the leader still
+  believes in, and it is the tolerance beyond which wall-clock time running
+  ahead of monotonic time — which is what a paused or live-migrated VM looks
+  like on resume — drops the lease rather than serving from it. `DefaultConfig`
+  sets 15 ms; zero keeps the previous behaviour exactly.
+
 ### Fixed
 
 - A node removed by the leader was usually never told. The leader dropped

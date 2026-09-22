@@ -356,6 +356,11 @@ type Node struct {
 	// election timers when they receive the heartbeat — not when the leader
 	// receives their ACK.
 	leaseSendTime time.Time
+	// leaseBase is the instant the current lease was granted from, kept with
+	// its monotonic reading so that a suspend -- which stops the monotonic
+	// clock while the wall clock keeps going -- can be detected as the two
+	// diverging. See leaseClockJumped.
+	leaseBase time.Time
 
 	// readIndexCh carries ReadIndex requests from callers into the event loop.
 	readIndexCh chan readIndexMsg

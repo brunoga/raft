@@ -53,6 +53,7 @@ func (n *Node) applyFollowerTransition(leaderID NodeID) {
 	n.readBatchAcks = nil
 	n.leaseExpiry = time.Time{}   // invalidate the read lease on step-down
 	n.leaseSendTime = time.Time{} // clear so the next term doesn't reuse an old send time
+	n.leaseBase = time.Time{}
 	n.quorumAcks = nil
 	n.leaderQuorumElapsed = 0
 	n.departing = nil

@@ -116,6 +116,37 @@ type Config struct {
 	// Typical production value: 150 ms. Default: 150 ms.
 	ElectionTimeoutMin time.Duration
 
+	// LeaseSafetyMargin shortens the read lease ReadIndexLease relies on, and
+	// sets how much the wall clock and the monotonic clock may disagree
+	// before the lease is treated as expired.
+	//
+	// A lease read is served without contacting any follower, on the strength
+	// of an argument about time: no follower can have elected another leader
+	// yet, because none has gone without a heartbeat for ElectionTimeoutMin.
+	// That argument is only as good as the clocks. Go measures elapsed time on
+	// the monotonic clock, which no NTP correction can move, but two things
+	// can still break it. Clock rates differ between machines, so a
+	// follower's ElectionTimeoutMin may be shorter than this node's; the
+	// margin is taken off the lease to cover that. And a machine that is
+	// suspended -- a virtual machine paused or live-migrated -- has a
+	// monotonic clock that does not advance while the wall clock does, so
+	// on resume it believes far less time has passed than really has. A
+	// leader that resumes from a suspend longer than an election timeout
+	// would serve stale reads from a lease it thinks it still holds. When
+	// this is set, a lease is also checked against the wall clock, and one
+	// under which the two clocks have diverged by more than the margin is
+	// treated as expired.
+	//
+	// Zero keeps the lease at exactly ElectionTimeoutMin and skips the
+	// divergence check, which is the behaviour before this field existed.
+	// Must be less than ElectionTimeoutMin. A lease that has expired is not
+	// an error the caller has to handle beyond falling back to ReadIndex,
+	// which ReadIndexLease documents.
+	//
+	// Default: 15 ms, via DefaultConfig (a tenth of the default
+	// ElectionTimeoutMin).
+	LeaseSafetyMargin time.Duration
+
 	// ElectionTimeoutMax is the upper bound of the randomised election timeout.
 	// The actual timeout per election attempt is sampled uniformly from
 	// [ElectionTimeoutMin, ElectionTimeoutMax). A wider spread reduces the
@@ -558,6 +589,7 @@ func DefaultConfig() Config {
 		ElectionTimeoutMin:  150 * time.Millisecond,
 		ElectionTimeoutMax:  300 * time.Millisecond,
 		HeartbeatInterval:   50 * time.Millisecond,
+		LeaseSafetyMargin:   15 * time.Millisecond,
 		MaxLogEntriesPerRPC: 64,
 		MaxBytesPerRPC:      1 << 20, // 1 MiB
 		SnapshotThreshold:   10_000,
@@ -607,6 +639,13 @@ func (c *Config) Validate() error {
 	}
 	if c.ElectionTimeoutMin < 2*c.HeartbeatInterval {
 		return errors.New("raft: ElectionTimeoutMin must be at least 2× HeartbeatInterval")
+	}
+	if c.LeaseSafetyMargin < 0 {
+		return errors.New("raft: LeaseSafetyMargin must not be negative")
+	}
+	if c.LeaseSafetyMargin >= c.ElectionTimeoutMin {
+		return errors.New("raft: LeaseSafetyMargin must be less than ElectionTimeoutMin, " +
+			"otherwise no lease read could ever be served")
 	}
 	if c.MaxLogEntriesPerRPC <= 0 {
 		return errors.New("raft: MaxLogEntriesPerRPC must be positive")
