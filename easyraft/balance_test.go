@@ -113,6 +113,50 @@ func (c *balanceCluster) waitAllLed(t *testing.T) {
 	t.Fatalf("not every group found a leader; counts are %v", c.leaderCounts())
 }
 
+// pileOnto moves every group's leadership to one host, which is the state a
+// rolling restart leaves behind. A transfer is aimed at whichever host
+// currently leads the group, since only a leader can hand leadership on.
+func (c *balanceCluster) pileOnto(t *testing.T, host int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for _, g := range c.groups {
+		deadline := time.Now().Add(20 * time.Second)
+		arrived := false
+		for time.Now().Before(deadline) && !arrived {
+			if c.leaderOf(ctx, g) == host {
+				arrived = true
+				break
+			}
+			for _, m := range c.managers {
+				if err := m.TransferGroupLeadership(ctx, g, c.ids[host]); err == nil {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		// Every group has to have reached the target at least once, or the
+		// test that follows is measuring a pile-up that never happened.
+		if !arrived {
+			t.Fatalf("group %d never moved to %s; counts are %v",
+				g, c.ids[host], c.leaderCounts())
+		}
+	}
+}
+
+// leaderOf returns the index of the host leading g, or -1.
+func (c *balanceCluster) leaderOf(ctx context.Context, g uint64) int {
+	for i, m := range c.managers {
+		for _, status := range m.StatusAll(ctx) {
+			if status.GroupID == g && status.State == raft.Leader {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func spread(counts []int) int {
 	lo, hi := counts[0], counts[0]
 	for _, n := range counts[1:] {
@@ -140,18 +184,14 @@ func TestLeaderBalancing_SpreadsLeadersAcrossHosts(t *testing.T) {
 
 	// Pile every group onto one host, which is the state a rolling restart
 	// leaves behind.
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	target := c.ids[0]
-	for _, g := range c.groups {
-		for _, m := range c.managers {
-			if err := m.TransferGroupLeadership(ctx, g, target); err == nil {
-				break
-			}
-		}
-	}
+	c.pileOnto(t, 0)
 
-	// The controllers pull it apart again.
+	// pileOnto fails the test unless every group reached the target host, so
+	// by here the pile-up definitely happened. What it may not still be is
+	// visible: the controllers run every 200ms and will already have started
+	// undoing it, which is the point.
+	//
+	// The controllers pull it apart.
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		counts := c.leaderCounts()
@@ -178,21 +218,21 @@ func TestLeaderBalancing_OffByDefault(t *testing.T) {
 	})
 	c.waitAllLed(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	for _, g := range c.groups {
-		for _, m := range c.managers {
-			if err := m.TransferGroupLeadership(ctx, g, c.ids[0]); err == nil {
-				break
-			}
-		}
-	}
+	c.pileOnto(t, 0)
 
-	// Give a controller, if one were running, several intervals to act.
+	// Whatever the pile-up achieved is what should still be there. Comparing
+	// against the counts as they actually are, rather than against a perfect
+	// pile-up, keeps this test about the one thing it is for: that nothing
+	// moves leadership when nothing was asked to.
+	before := c.leaderCounts()
 	time.Sleep(2 * time.Second)
-	counts := c.leaderCounts()
-	if counts[0] < groups {
-		t.Errorf("leadership moved with no balancing configured; counts are %v", counts)
+	after := c.leaderCounts()
+	if fmt.Sprint(before) != fmt.Sprint(after) {
+		t.Errorf("leadership moved with no balancing configured: %v became %v", before, after)
+	}
+	if spread(before) < 2 {
+		t.Fatalf("the pile-up left the counts at %v, so there was nothing for a balancer "+
+			"to have undone", before)
 	}
 }
 
@@ -355,27 +395,47 @@ func TestLeaderBalancing_StatusEndpointReportsEveryGroup(t *testing.T) {
 		}
 	}
 
-	// And the transfer half moves a group to the other host.
-	var moved uint64
-	for _, status := range statuses {
-		if status.State == raft.Leader {
-			moved = status.GroupID
+	// And the transfer half moves a group to another host.
+	//
+	// Which host leads which group is whatever the elections decided, so the
+	// transfer is aimed from wherever the leader actually is rather than from
+	// host 0. Assuming host 0 leads something passes locally and fails on a
+	// machine whose elections went the other way.
+	var (
+		moved    uint64
+		fromHost = -1
+	)
+	for host, m := range c.managers {
+		for _, status := range m.StatusAll(ctx) {
+			if status.State == raft.Leader {
+				moved, fromHost = status.GroupID, host
+				break
+			}
+		}
+		if fromHost >= 0 {
 			break
 		}
 	}
-	if err := provider.TransferGroupLeadership(ctx, moved, c.ids[1]); err != nil {
-		t.Fatalf("TransferGroupLeadership over HTTP: %v", err)
+	if fromHost < 0 {
+		t.Fatalf("no host leads any group; counts are %v", c.leaderCounts())
+	}
+	destIndex := (fromHost + 1) % len(c.managers)
+
+	fromProvider := raft.NewHTTPNodeProvider("http://"+c.httpAddrs[fromHost]+"/__balance", nil)
+	if err := fromProvider.TransferGroupLeadership(ctx, moved, c.ids[destIndex]); err != nil {
+		t.Fatalf("TransferGroupLeadership of group %d from %s over HTTP: %v",
+			moved, c.ids[fromHost], err)
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, status := range c.managers[1].StatusAll(ctx) {
+		for _, status := range c.managers[destIndex].StatusAll(ctx) {
 			if status.GroupID == moved && status.State == raft.Leader {
 				return
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Errorf("group %d did not move to %s", moved, c.ids[1])
+	t.Errorf("group %d did not move from %s to %s", moved, c.ids[fromHost], c.ids[destIndex])
 }
 
 // TestManager_GroupZeroIsRefused pins the trap this guard exists for. A
