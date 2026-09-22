@@ -1077,7 +1077,7 @@ in neighbouring groups on the same machine. Multi-raft addresses
 independent apply pipelines) but not hardware-resource contention. Production
 systems address this through per-shard I/O throttling, hot-shard detection,
 and partition migration — layers built above the Raft library. See
-[`examples/shardkv`](../examples/shardkv/) for a working end-to-end example
+[`examples/shardkv`](examples/shardkv/) for a working end-to-end example
 and its README for a fuller discussion of the trade-offs.
 
 ### Scale boundaries
