@@ -10,9 +10,8 @@
 //
 // [Collection] is a type-safe namespace within a Store. Multiple collections
 // can share a single Store (and thus a single Raft group). Each collection
-// provides Create, Read, Update, Delete, List, and Mutate operations, plus
-// exactly-once variants (CreateOnce, UpdateOnce, DeleteOnce, MutateOnce) for
-// idempotent retries across network failures.
+// provides Create, Read, Update, Delete, List, Scan and Mutate operations,
+// plus the conditional and exactly-once variants described below.
 //
 // [EasyRaft] is a convenience wrapper that binds one Store to one Collection
 // named "default". Use it when your service manages a single entity type.
@@ -42,6 +41,58 @@
 // whenever retrying a write on ErrNotLeader or context timeout to avoid
 // duplicate application. [Collection.Exactly] offers the same guarantee with
 // named fields instead of positional arguments; see [Session] and [OnceID].
+// Over HTTP the same guarantee travels in the X-Raft-Client-Id and X-Raft-Seq
+// headers.
+//
+// # Revisions and conditional writes
+//
+// Every key carries the index of the log entry that last wrote it.
+// [Collection.ReadRev] returns it, and [Collection.UpdateIf],
+// [Collection.UpsertIf], [Collection.DeleteIf] and [Collection.MutateIf]
+// apply only while the key is still at the revision given, returning
+// [ErrRevisionMismatch] when it has moved.
+//
+// That is a read-modify-write that loses nothing, without a lock, for the
+// case a mutation cannot cover: a new value computed somewhere the state
+// machine does not run. [Txn.CheckRev] extends it to a whole transaction,
+// making a batch conditional on a key it does not write.
+//
+// # Key leases
+//
+// [Store.GrantLease] creates a lease with a time to live;
+// [Collection.CreateWithLease] and [Collection.UpsertWithLease] attach keys to
+// it, and they are deleted together when it expires or is revoked.
+// [Store.KeepAliveLoop] renews one from a single goroutine for as long as its
+// context lives.
+//
+// This is the primitive behind a service registry: a process registers itself
+// and its entry goes away on its own when it stops or is partitioned. Expiry
+// is proposed by the leader rather than decided by each replica, because Apply
+// may not read a clock — see [Store.GrantLease] for what a TTL does and does
+// not promise.
+//
+// # Scanning
+//
+// [Collection.Scan] walks a collection a page at a time in key order,
+// narrowed by a prefix, and [Collection.ListPrefix] is the one-call form. The
+// cursor in a page is a key rather than an offset, so nothing already
+// returned comes back when the collection changes between pages.
+//
+// # Backup and restore
+//
+// [Store.Backup] writes a replica's state to an io.Writer and [Store.Import]
+// replaces a cluster's state with one. An import is a single log entry
+// whatever the size of the backup, so no replica is ever half-imported and a
+// failure leaves the old state exactly as it was.
+//
+// # How much a Store can hold
+//
+// Every collection is held in memory and there is no configured limit.
+// [Store.StateBytes] and [Store.KeyCount] report what a replica is holding,
+// exported as easyraft_state_bytes and easyraft_state_keys when
+// [WithPrometheus] is set. Watch them: running out of memory is not a
+// single-node failure, because every replica holds the same state and reaches
+// the same point at about the same time.
 //
 // # Security
 //
@@ -51,6 +102,17 @@
 // trustworthy as its source, which is why discovered peers join as non-voting
 // learners unless [WithDiscoveryAsVoter] says otherwise. See the package
 // README for the full picture.
+//
+// # Related packages
+//
+// [github.com/brunoga/raft/v2/easyraft/client] talks to a cluster from a
+// process that is not part of one, finding the leader and following it when
+// it moves, and returning the same error values an in-process caller sees.
+//
+// [github.com/brunoga/raft/v2/easyraft/easyrafttest] runs real clusters
+// inside a test process on an in-memory network a test can partition and
+// heal, so a service can be tested against the real library rather than a
+// mock of it.
 //
 // # Getting started
 //
