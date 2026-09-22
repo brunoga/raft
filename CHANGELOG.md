@@ -261,7 +261,9 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   single-group node's RPCs carry, so the transport refuses it: a group
   numbered zero got no votes, no appends and no election, and sat in
   `PreCandidate` for ever with nothing in its own log to say why. The error
-  says so and says to number groups from one.
+  says so and says to number groups from one. Refusing a call that used to
+  be accepted is not a breaking change here: no cluster can have been
+  relying on a group that never took a write.
 
 - `Store.Stop` left the Raft listener open. `Node.Stop` unregisters the
   node's handler but does not close the transport -- correctly, since a
