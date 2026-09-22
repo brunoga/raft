@@ -798,6 +798,16 @@ func (t *GRPCTransport) Close() error {
 		<-stopped
 	}
 
+	// The listener, explicitly. GracefulStop closes the listeners the server
+	// is serving on, but Listen hands the listener to Serve in a goroutine:
+	// a Close that arrives before that goroutine runs finds a server with no
+	// listener to close, and the port is then released some time later, when
+	// Serve finally runs and finds the server already stopped. Closing it
+	// here makes the address free by the time Close returns, which is what a
+	// caller rebinding it needs. net.Listener.Close on an already-closed
+	// listener returns an error, and that one is not worth reporting.
+	_ = t.listener.Close()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, cc := range t.clients {

@@ -136,6 +136,23 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Fixed
 
+- `Store.Stop` left the Raft listener open. `Node.Stop` unregisters the
+  node's handler but does not close the transport -- correctly, since a
+  transport can be shared by several groups -- and the store only closed one
+  it had never started. A service that restarts its store in process could
+  not rebind its Raft address, and one that creates and destroys stores
+  leaked a listener and its goroutines every time. The store now closes the
+  transport it opened, whether or not the node ran, and a `Manager`'s groups
+  still leave the shared one to the `Manager`.
+
+- `grpctransport.Close` could return while the address was still taken.
+  `GracefulStop` closes the listeners the server is serving on, but `Listen`
+  hands the listener to `Serve` in a goroutine; a `Close` that arrived before
+  that goroutine ran found a server with no listener, and the port was
+  released some tens of milliseconds later when `Serve` discovered the server
+  was already stopped. `Close` now closes the listener itself, so the address
+  is free by the time it returns.
+
 - A single-voter leader answered a linearizable read before committing
   anything in its own term, which after a restart meant answering from a
   commit index of zero. The commit index is not persisted -- a restarting
