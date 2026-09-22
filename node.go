@@ -703,7 +703,7 @@ func New(cfg *Config) (*Node, error) {
 		electionMaxTicks:  electionMaxTicks,
 		tickCh:            make(chan struct{}, 1),
 		rpcCh:             make(chan rpcEnvelope, 1024),
-		proposeCh:         make(chan proposeMsg, 1024),
+		proposeCh:         make(chan proposeMsg, proposalQueueSize(cfg)),
 		readIndexCh:       make(chan readIndexMsg, 64),
 		transferCh:        make(chan leadershipTransferMsg, 4),
 		stopCh:            make(chan struct{}),
@@ -913,6 +913,10 @@ func (n *Node) Tick() {
 // ctx controls the caller-side wait: cancelling it unblocks Propose and
 // returns ctx.Err(). It does not set the deadline on outbound Raft RPCs —
 // use [Config.RPCTimeout] for that.
+//
+// The command first waits for room in the proposal queue, whose size is
+// [Config.ProposalQueueSize]. When the queue is full, [Config.ProposalOverflow]
+// decides between waiting for space and returning ErrProposalQueueFull.
 func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	// Non-blocking pre-check: if the node is stopped or broken, return
 	// immediately rather than racing with a buffered proposeCh.
@@ -925,12 +929,20 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 
 	respCh := make(chan result[[]byte], 1)
 	msg := proposeMsg{cmd: cmd, respCh: respCh, submitted: n.now()}
-	select {
-	case n.proposeCh <- msg:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-n.stopCh:
-		return nil, n.stoppedErr()
+	if n.cfg.ProposalOverflow == ProposalOverflowReject {
+		select {
+		case n.proposeCh <- msg:
+		default:
+			return nil, ErrProposalQueueFull
+		}
+	} else {
+		select {
+		case n.proposeCh <- msg:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-n.stopCh:
+			return nil, n.stoppedErr()
+		}
 	}
 	select {
 	case r := <-respCh:
@@ -946,6 +958,28 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 // Safe for concurrent use.
 func (n *Node) ID() NodeID {
 	return n.cfg.ID
+}
+
+// proposalQueueSize resolves Config.ProposalQueueSize, with zero meaning the
+// default.
+func proposalQueueSize(cfg *Config) int {
+	if cfg.ProposalQueueSize > 0 {
+		return cfg.ProposalQueueSize
+	}
+	return DefaultProposalQueueSize
+}
+
+// ProposalQueueDepth returns how many proposals are waiting for the event loop,
+// out of the [Config.ProposalQueueSize] the queue holds. Safe for concurrent
+// use.
+//
+// It is the measurement to watch for a node whose event loop is falling
+// behind. A depth that sits near the capacity means proposals are waiting on
+// something other than the disk -- a slow state machine, a long snapshot,
+// heavy replication -- and with ProposalOverflowReject it is the point at which
+// callers start seeing ErrProposalQueueFull.
+func (n *Node) ProposalQueueDepth() int {
+	return len(n.proposeCh)
 }
 
 // isSingleVoter returns true if this node is the only voting member of the

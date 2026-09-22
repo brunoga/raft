@@ -521,6 +521,8 @@ cfg.Transport = tr                          // required
 | `MaxBytesPerRPC` | `1 MiB` | Maximum total payload per AppendEntries RPC. A count limit alone says nothing about message size. `0` means no byte limit. |
 | `MaxInflightRPCs` | `4` | Per-peer pipeline depth (concurrent unacknowledged AppendEntries RPCs). |
 | `MaxUnstableLogBytes` | `64 MiB` | Log entries a node will hold in memory waiting on storage. Past it, `Propose` returns `ErrWriteBacklogFull` on a leader, and a follower refuses an AppendEntries with it. This is the backpressure that replaces waiting for the disk. |
+| `ProposalQueueSize` | `1024` | Proposals that may wait for the event loop at once. The event loop drains the queue in one go, so it is also the batch size for storage writes. |
+| `ProposalOverflow` | `Wait` | What `Propose` does when the queue is full: `ProposalOverflowWait` blocks until there is room or the context is done; `ProposalOverflowReject` returns `ErrProposalQueueFull` at once. `ProposalQueueDepth()` reports the occupancy. |
 | `SnapshotThreshold` | `10000` | Entries past the last snapshot that trigger an automatic snapshot. `0` disables auto-snapshots. |
 | `TrailingLogs` | `1024` | Entries retained behind the snapshot point, so a slightly-behind follower catches up from the log instead of needing a full state transfer. Capped at `SnapshotThreshold-1` in use. |
 | `SnapshotChunkSize` | `1 MiB` | Maximum bytes per InstallSnapshot chunk. Leave room for framing: a chunk sized at exactly the transport's message limit does not fit. `0` sends snapshots as a single RPC. |
@@ -1205,7 +1207,7 @@ after `Start()` has no effect.
 
 When using `filestore` with many simultaneously-active groups, each group issues its own `fsync` on every log append. G concurrent writers produce up to G fsyncs per replication round. On NVMe storage this is usually acceptable up to ~100–200 concurrent writers; on network-attached or spinning storage the accumulated latency spikes will cause election timeouts well below that threshold. For write-heavy deployments above ~200 groups, use a shared-WAL `Storage` implementation that amortises fsyncs across groups. See [Scale boundaries](#scale-boundaries) in the Multi-Raft section.
 
-### Backpressure bounds the write backlog, not the proposal queue
+### Backpressure has two limits: the write backlog and the proposal queue
 
 `Config.MaxUnstableLogBytes` caps how much log a leader will hold in memory
 waiting for storage; beyond it `Propose` and `ProposeOnce` are refused with
@@ -1213,12 +1215,15 @@ waiting for storage; beyond it `Propose` and `ProposeOnce` are refused with
 disk that has fallen behind, and it is what keeps a node with stalled storage
 from growing its backlog until the process dies.
 
-It does not bound the proposal queue itself. The internal `proposeCh` has a
-fixed capacity of 1,024, and when the event loop falls behind for a reason
-other than the disk — a slow state machine, a long snapshot, heavy replication
-— `Propose` blocks at channel entry until space is available or `ctx` is
-cancelled. Cancel the context to bound the wait, and add a semaphore or token
-bucket ahead of `Propose` if you need to shed load rather than wait for it.
+The proposal queue is bounded separately. `Config.ProposalQueueSize` (default
+1,024) is how many proposals may wait for the event loop at once, and when the
+event loop falls behind for a reason other than the disk — a slow state
+machine, a long snapshot, heavy replication — `Config.ProposalOverflow`
+decides what happens to the next one. The default, `ProposalOverflowWait`,
+blocks `Propose` until there is room or `ctx` is done. `ProposalOverflowReject`
+returns `ErrProposalQueueFull` at once, for a caller that would rather shed the
+request than hold a goroutine on it. `Node.ProposalQueueDepth()` reports the
+occupancy, so the queue filling up can be seen before either happens.
 
 ---
 
