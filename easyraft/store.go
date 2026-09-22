@@ -79,6 +79,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +88,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -303,6 +305,9 @@ func NewStore(opts ...Option) (*Store, error) {
 	if err := validateAdvertised(&c); err != nil {
 		return nil, err
 	}
+	if err := resolveTLSFiles(&c); err != nil {
+		return nil, err
+	}
 	if err := validateSecurity(&c, true); err != nil {
 		return nil, err
 	}
@@ -392,6 +397,49 @@ func validateAdvertised(c *config) error {
 //
 // servesHTTP says whether this configuration will serve the HTTP API at all;
 // a Manager's stores share the manager's listener and are checked there.
+// resolveTLSFiles turns the paths [WithTLSFiles] recorded into the TLS
+// configuration the transport uses.
+//
+// Reading them here rather than in the option is what lets a wrong path be an
+// error the caller is handed, at construction, instead of a connection that
+// silently never establishes between two nodes.
+func resolveTLSFiles(c *config) error {
+	if c.TLSCertFile == "" && c.TLSKeyFile == "" && c.TLSCAFile == "" {
+		return nil
+	}
+	if c.TLSCertFile == "" || c.TLSKeyFile == "" || c.TLSCAFile == "" {
+		return errors.New("easyraft: WithTLSFiles needs all three of a certificate, " +
+			"a key and a certificate authority")
+	}
+	if c.TLS != nil {
+		return errors.New("easyraft: WithTLS and WithTLSFiles both set the Raft " +
+			"transport's TLS; use one or the other")
+	}
+	cert, err := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
+	if err != nil {
+		return fmt.Errorf("easyraft: load Raft TLS certificate: %w", err)
+	}
+	pem, err := os.ReadFile(c.TLSCAFile)
+	if err != nil {
+		return fmt.Errorf("easyraft: read Raft TLS authority: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return fmt.Errorf("easyraft: %s holds no certificate a pool would accept", c.TLSCAFile)
+	}
+	c.TLS = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		ClientCAs:    pool,
+		// Every node here is both a client and a server, so both ends prove
+		// who they are. This is also what makes the peer authorizer
+		// applicable; see peerAuthorizerFor.
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		MinVersion: tls.VersionTLS13,
+	}
+	return nil
+}
+
 func validateSecurity(c *config, servesHTTP bool) error {
 	if c.TLS == nil && !c.AcknowledgeInsecureTransport {
 		return fmt.Errorf("easyraft: the Raft transport has no TLS configuration; pass WithTLS, " +

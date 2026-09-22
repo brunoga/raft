@@ -23,6 +23,13 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   - **`WithMaxClientTableSize`**, with `Store.MaxClientTableSize` and
     `Store.SetMaxClientTableSize` for the bound the group has agreed.
   - **`WithLeaseSafetyMargin`**, `WithProposalQueue` and `WithOnRemoved`.
+  - **`WithTLSFiles(cert, key, ca)`** builds the Raft transport's mutual
+    TLS from PEM files, which is the configuration easiest to get wrong: the
+    authority has to be trusted in both directions, since every node is both
+    a client and a server, and client certificates have to be required *and
+    verified*, since anything weaker leaves the Raft port open to any client
+    that can reach it. The files are read at construction, so a wrong path
+    fails there rather than at the first connection between two nodes.
   - **`Store.Shutdown(ctx)` and `Manager.Shutdown(ctx)`**, which stop like
     `Stop` but give up waiting when the context is done. `Stop` finishes
     what it started -- accepted storage writes, and a departure under
