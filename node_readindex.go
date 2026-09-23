@@ -71,6 +71,17 @@ func (n *Node) handleReadIndex(msg readIndexMsg) {
 	// restart. That is the linearizability violation this check exists to
 	// prevent, and the one node case is where it is easiest to hit.
 	if !n.leaderNopCommitted {
+		// A lease read is the exception. It asked to be answered from the
+		// lease or not at all, and this is the not at all: there is nothing
+		// sound to answer from yet, and queueing it would hand the caller the
+		// round-trip it opted out of -- for however long the no-op takes to
+		// commit, which on a leader that has just lost its followers is until
+		// the context expires. Rejecting says the same thing an expired lease
+		// says, and callers already fall back to ReadIndex on it.
+		if msg.useLease {
+			msg.resolver.reject(ErrLeaseExpired)
+			return
+		}
 		n.pendingReads = append(n.pendingReads, msg.resolver)
 		return
 	}
