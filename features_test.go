@@ -188,10 +188,16 @@ func (c *manualClock) Advance(d time.Duration) {
 // TestReadIndexLease_ErrLeaseExpiredOnFreshLeader verifies that ReadIndexLease
 // returns ErrLeaseExpired when the leader has not yet completed a heartbeat
 // quorum round (no lease is held).
+//
+// WaitLeader returns the moment a node enters Leader state, which is before
+// its no-op commits, so this arrives on either side of that commit depending
+// on how the scheduler feels. Both sides must answer the same way, and until
+// the fix that came with this comment they did not: the side that arrived
+// first was queued behind the no-op and then answered by a full barrier round,
+// so the test failed roughly one run in seven. The window itself is covered
+// deliberately by the test below.
 func TestReadIndexLease_ErrLeaseExpiredOnFreshLeader(t *testing.T) {
 	c := newCluster(t, 3)
-	// WaitLeader ticks the cluster but does NOT run a full ReadIndex barrier,
-	// so leaseExpiry starts as zero.
 	leaderIdx := c.WaitLeader(electionTimeout)
 	leader := c.nodes[leaderIdx]
 
@@ -202,6 +208,84 @@ func TestReadIndexLease_ErrLeaseExpiredOnFreshLeader(t *testing.T) {
 	_, err := leader.ReadIndexLease(ctx)
 	if !errors.Is(err, raft.ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired on fresh leader, got %v", err)
+	}
+}
+
+// TestReadIndexLease_ErrLeaseExpiredBeforeTheNopCommits pins down the window
+// the test above can only stumble into.
+//
+// A leader may not serve a read until it has committed an entry of its own
+// term, so a ReadIndex that arrives first is queued until the no-op lands. A
+// lease read is not a read that can be queued: the caller asked to be answered
+// from the lease or told there is none, and it has a fallback ready for the
+// second answer. Queueing it instead hands it the round-trip it opted out of,
+// for as long as the no-op takes -- on a leader that has just lost its
+// followers, until the context expires.
+//
+// The window is one log write wide, which is why the write is held open here
+// rather than raced for.
+func TestReadIndexLease_ErrLeaseExpiredBeforeTheNopCommits(t *testing.T) {
+	store := newGateStore()
+
+	net := memtransport.NewNetwork()
+	cfg := raft.DefaultConfig()
+	cfg.ID = "n1"
+	cfg.Storage = store
+	cfg.StateMachine = &kvSM{data: make(map[string]string)}
+	cfg.Transport = net.NewTransport("n1")
+	cfg.TickInterval = 0 // Manual ticks.
+	node, err := raft.New(&cfg)
+	if err != nil {
+		t.Fatalf("raft.New: %v", err)
+	}
+	net.Register("n1", node.Handler())
+	node.Start()
+	// Registered before the gate, so that teardown runs in the only order that
+	// terminates: cleanups are last-registered-first, and a node cannot stop
+	// while a write it accepted is still held.
+	t.Cleanup(node.Stop)
+
+	// Hold the log so the no-op this node is about to append cannot land.
+	// Hard-state writes are left alone, since the election needs them.
+	release := store.hold(t)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && node.State() != raft.Leader {
+		node.Tick()
+		time.Sleep(time.Millisecond)
+	}
+	if node.State() != raft.Leader {
+		t.Fatal("the single voter did not become leader")
+	}
+
+	// It calls itself leader with its no-op still unwritten. A lease read taken
+	// now has to come back, and come back saying there is no lease.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, rerr := node.ReadIndexLease(ctx)
+		done <- rerr
+	}()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case rerr := <-done:
+			if !errors.Is(rerr, raft.ErrLeaseExpired) {
+				t.Fatalf("ReadIndexLease before the no-op committed returned %v, want ErrLeaseExpired", rerr)
+			}
+			release()
+			return
+		case <-ticker.C:
+			node.Tick()
+		case <-time.After(3 * time.Second):
+			release()
+			t.Fatal("ReadIndexLease never returned while the no-op was held: " +
+				"it was queued behind the no-op instead of being answered from the lease it asked about")
+		}
 	}
 }
 
@@ -341,11 +425,50 @@ established:
 	}
 }
 
+// barrierDelayHandler wraps a follower's handler and advances a clock the
+// first time a read-barrier AppendEntries arrives, which is the one moment a
+// simulated round-trip can be inserted honestly: after the leader captured its
+// send time, before it can see an acknowledgement.
+type barrierDelay struct {
+	clk  *manualClock
+	rtt  time.Duration
+	once sync.Once
+	seen chan struct{}
+}
+
+// barrierDelayHandler wraps one follower. Every follower shares the same
+// barrierDelay, so the round-trip is added once for the barrier round rather
+// than once per follower that receives it.
+type barrierDelayHandler struct {
+	raft.Handler
+	delay *barrierDelay
+}
+
+func (h *barrierDelayHandler) HandleAppendEntries(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	if req.ReadBarrier != 0 {
+		h.delay.once.Do(func() {
+			h.delay.clk.Advance(h.delay.rtt)
+			close(h.delay.seen)
+		})
+	}
+	return h.Handler.HandleAppendEntries(ctx, req)
+}
+
 // TestReadIndexLease_ExpiryFromSendTime verifies that the read lease expiry is
 // anchored to the heartbeat send time, not the ACK receive time. If there is a
 // simulated clock advance between the heartbeat send and the quorum ACK, the
 // lease should expire at sendTime+ElectionTimeoutMin, not at a later time.
+//
+// The round-trip is simulated inside the followers' handlers rather than by
+// advancing the clock next to a tick and trusting the two to interleave. The
+// barrier goes out when the ReadIndex reaches the event loop, not on a tick,
+// so a test that advances the clock a millisecond after asking for the read is
+// racing that goroutine: lose the race and the send time is captured after the
+// advance, the lease runs 100ms longer than the test thinks, and the
+// assertion below fails. That is a flake, and it failed under load.
 func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
+	const rtt = 100 * time.Millisecond
+
 	clk := newManualClock()
 	c := newClusterWith(t, 3, func(cfg *raft.Config) {
 		cfg.Clock = clk
@@ -353,7 +476,39 @@ func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
 	leaderIdx := c.WaitLeader(electionTimeout)
 	leader := c.nodes[leaderIdx]
 
-	// Start a ReadIndex which will trigger broadcastReadBarrier (send time = T0).
+	// Wait for the no-op to commit before measuring anything. Until it does, a
+	// ReadIndex is queued rather than barriered, and the barrier that
+	// eventually carries it is not the one this test is timing.
+	nopCtx, nopCancel := context.WithTimeout(context.Background(), electionTimeout)
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-nopCtx.Done():
+				return
+			case <-ticker.C:
+				c.Tick()
+			}
+		}
+	}()
+	if _, err := leader.ReadIndex(nopCtx); err != nil {
+		nopCancel()
+		t.Fatalf("ReadIndex (nop wait): %v", err)
+	}
+	nopCancel()
+
+	// From here the followers add the round-trip themselves, on the first
+	// barrier they see. T0 is whatever the clock reads when that barrier is
+	// sent; the ACKs then arrive at T0+rtt.
+	delay := &barrierDelay{clk: clk, rtt: rtt, seen: make(chan struct{})}
+	for i, id := range c.ids {
+		if i == leaderIdx {
+			continue
+		}
+		c.net.Register(id, &barrierDelayHandler{Handler: c.nodes[i].Handler(), delay: delay})
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
 	defer cancel()
 	riCh := make(chan error, 1)
@@ -362,12 +517,8 @@ func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
 		riCh <- err
 	}()
 
-	// Tick once so the read-barrier heartbeat is dispatched (send time captured).
-	// Then simulate a 100ms RTT by advancing the clock before ACKs arrive.
-	c.TickN(1)
-	clk.Advance(100 * time.Millisecond) // simulated RTT delay
-
-	// Continue ticking until ReadIndex resolves — ACKs now arrive at T0+100ms.
+	// Tick until ReadIndex resolves. The followers advance the clock by rtt as
+	// the barrier reaches them, so it resolves with the clock at T0+rtt.
 	deadline := time.Now().Add(electionTimeout)
 	for time.Now().Before(deadline) {
 		c.Tick()
@@ -384,6 +535,12 @@ func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
 	t.Fatal("ReadIndex timed out")
 
 leaseSet:
+	select {
+	case <-delay.seen:
+	default:
+		t.Fatal("no read barrier reached a follower, so nothing simulated the round-trip")
+	}
+
 	// Clock is now at T0+100ms. The lease expiry should be T0+150ms, i.e. only
 	// 50ms in the "future" from the current clock position — NOT T0+250ms.
 	// Advancing by 60ms (T0+160ms) must expire the lease.
