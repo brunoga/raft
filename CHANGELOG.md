@@ -4,6 +4,46 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## v2.1.1
+
+Three fixes, no API change. Two came out of the nightly soak, which repeats
+the suite to catch what fails one run in several; the third was reported by
+someone running an example.
+
+### Fixed
+
+- **A lease read arriving before the leader's no-op committed was answered
+  with a quorum round instead of being declined.** `ReadIndexLease` has a
+  two-outcome contract -- answer from a valid lease, or report
+  `ErrLeaseExpired` so the caller can fall back -- and `handleReadIndex`
+  checked `leaderNopCommitted` before it looked at the lease, so a read in
+  that window was queued as an ordinary one and answered later by the full
+  barrier round the caller had opted out of. On a leader that has just lost
+  its followers, "later" is until the context expires. It now reports
+  `ErrLeaseExpired` there. Nothing is served that was not served before: the
+  request is declined rather than answered, so Raft §8 is untouched and the
+  fallback every caller already has does the rest.
+
+- **The simulation's invariant checker asserted on a torn read.** The soak
+  reported 41 Leader Completeness violations against one node, claiming it
+  was missing every committed index it had ever held -- which is not what a
+  safety violation looks like. `readLog` reads the durable log in three
+  calls while the node keeps writing to it, and a truncate-and-re-append can
+  shorten the range between the second call and the third. The error was
+  swallowed and returned as nil, which is indistinguishable from a node
+  holding nothing. The engine was never at fault.
+
+- **`examples/tenants/cluster.sh` started 1000 Raft groups and then tried to
+  execute a directory.** `GROUPS` is a bash special variable holding the
+  user's group IDs, so `GROUPS=9` was silently ignored and `--groups
+  "$GROUPS"` passed the user's primary group ID. Before that could even be
+  reached, the binary was built to a path that is the example's own package
+  directory -- `go build -o` into an existing directory writes the binary
+  inside it and reports success -- so every node died at startup with an
+  error that went only to its log file. The wait loop printed dots either
+  way; it now checks the nodes are alive and prints the log of the first one
+  that is not.
+
 ## v2.1.0
 
 Everything here is additive. A `v2.0.0` deployment upgrades by changing the
