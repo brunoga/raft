@@ -23,6 +23,8 @@
 /examples/*/ratelimiter
 /examples/*/serviceregistry
 /examples/*/agent-bin
+/examples/*/tenants-bin
+/examples/*/tenantctl-bin
 /examples/*/shardkv
 /examples/*/watchtower
 /cmd/kvd/kvd
