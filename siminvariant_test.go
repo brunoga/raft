@@ -67,12 +67,6 @@ type checkedNode struct {
 	node *raft.Node // nil while the node is crashed
 }
 
-func (cn *checkedNode) current() *raft.Node {
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
-	return cn.node
-}
-
 // committedEntry is an entry a leader has declared committed, plus the term in
 // which it did so.
 //
@@ -127,6 +121,11 @@ type invariantChecker struct {
 	lastCommit map[raft.NodeID]raft.Index
 	seen       map[string]bool // violation dedup
 	violations []string
+	// skipped counts the node views a sweep threw away as torn reads. A
+	// handful over a run is the truncate-and-re-append window being caught in
+	// the act; a large number means the checker is looking at much less than
+	// it thinks it is, and finish reports it either way.
+	skipped int
 
 	stopCh chan struct{}
 	doneCh chan struct{}
@@ -170,10 +169,15 @@ func (c *invariantChecker) addNode(id raft.NodeID, store *simnet.FaultStore) *ch
 // volatile, so the monotonicity baseline is reset here: a node that restarts
 // legitimately comes back with commitIndex 0 and relearns it from the leader.
 func (c *invariantChecker) attach(id raft.NodeID, n *raft.Node) {
+	// Both locks, in the order readVolatile takes them: resetting the baseline
+	// and swapping the node in have to look atomic to a sweep, or the sweep
+	// can read the outgoing node's commit index, be overtaken by this reset,
+	// and then install that index as the incoming node's baseline -- which the
+	// node that comes back at 0 would immediately appear to violate.
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	cn := c.nodes[id]
 	delete(c.lastCommit, id)
-	c.mu.Unlock()
 	if cn == nil {
 		return
 	}
@@ -186,9 +190,9 @@ func (c *invariantChecker) attach(id raft.NodeID, n *raft.Node) {
 // volatile state is not.
 func (c *invariantChecker) detach(id raft.NodeID) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	cn := c.nodes[id]
 	delete(c.lastCommit, id)
-	c.mu.Unlock()
 	if cn == nil {
 		return
 	}
@@ -353,21 +357,63 @@ func (c *invariantChecker) nodeList() []*checkedNode {
 // readLog returns everything currently on a node's log, plus the index its
 // snapshot covers. Reading straight from the store rather than from the Node
 // deliberately bypasses every injected fault: the checker wants the truth.
-func readLog(store *simnet.FaultStore) ([]raft.LogEntry, raft.Index) {
-	snap := store.SnapshotIndex()
-	first, err := store.FirstIndex()
-	if err != nil || first == 0 {
-		return nil, snap
+//
+// The three store calls are not one atomic read, and the node writes to the
+// store throughout. An AppendEntries that replaces a conflicting suffix
+// truncates and re-appends as two separate writes, so the range computed from
+// FirstIndex and LastIndex can already have been shortened by the time
+// GetLogEntries runs -- and the store rejects a range that runs past its end.
+//
+// A rejected read says nothing about what the node holds. Reporting it as an
+// empty log is not conservative, it is a false accusation: an empty log makes
+// every committed entry look missing, which is how a healthy node that was
+// once a leader came to be reported as having lost the whole log. Retry,
+// because the window is short, and say so when even that fails.
+//
+// The snapshot index is read after the log for the same reason. Read first, it
+// can predate a compaction the log read already reflects, leaving entries that
+// were compacted away looking simply absent. Read after, it covers at least
+// every compaction the log reflects.
+func readLog(store *simnet.FaultStore) (entries []raft.LogEntry, snapAt raft.Index, ok bool) {
+	const attempts = 5
+	for range attempts {
+		first, err := store.FirstIndex()
+		if err != nil {
+			continue
+		}
+		if first == 0 {
+			return nil, store.SnapshotIndex(), true // no entries on disk
+		}
+		last, err := store.LastIndex()
+		if err != nil || last < first {
+			continue
+		}
+		entries, err := store.GetLogEntries(context.Background(), first, last+1)
+		if err != nil {
+			continue
+		}
+		return entries, store.SnapshotIndex(), true
 	}
-	last, err := store.LastIndex()
-	if err != nil || last < first {
-		return nil, snap
+	return nil, 0, false
+}
+
+// describesApplied reports whether a log read accounts for everything the node
+// says it has applied.
+//
+// It is the second half of the torn-read defence. A read can succeed and still
+// be a snapshot of an intermediate state -- taken between the truncation of a
+// conflicting suffix and the append that replaces it -- and such a read
+// understates the log. An applied entry is a committed entry, and a committed
+// entry is never truncated, so a log that does not reach the node's applied
+// index cannot be a faithful picture of what the node holds. The volatile
+// state was read before the log, so this can only ever fire on a log that is
+// genuinely behind, never on one that is merely newer.
+func describesApplied(v nodeSnapshot) bool {
+	if v.applied == 0 || v.applied <= v.snapAt {
+		return true
 	}
-	entries, err := store.GetLogEntries(context.Background(), first, last+1)
-	if err != nil {
-		return nil, snap
-	}
-	return entries, snap
+	_, ok := entryAt(v.log, v.applied)
+	return ok
 }
 
 // entryAt returns the entry at index from a contiguous log slice.
@@ -391,6 +437,54 @@ type nodeSnapshot struct {
 	applied raft.Index
 	term    raft.Term
 	leader  bool
+	// usable is false when the log read failed or came back describing less
+	// than the node has already applied. Such a view is a torn read of a store
+	// that is being written to, not a statement about the node, and every
+	// whole-log check skips it. Sweeps run every few milliseconds, so the cost
+	// of sitting one out is nothing next to the cost of asserting on it.
+	usable bool
+}
+
+// readVolatile reads one node's volatile state, and holds its commit index
+// against the monotonicity baseline while it is there.
+//
+// The read happens under the checker's lock because the node's own
+// CommitAdvanced hook writes that same baseline. Read outside the lock, this
+// goroutine can be descheduled between reading the index and recording it,
+// long enough for the hook to record a later one -- and the stale value it
+// then presents is reported as a commit index that went backwards. It never
+// did: setCommitIndex only ever moves forward. Nothing here blocks, so holding
+// the lock across the reads costs nothing: every one of them is an atomic
+// load.
+//
+// A node that is down has no volatile state worth reading; zeroes are returned
+// and nothing is recorded.
+func (c *invariantChecker) readVolatile(cn *checkedNode) (commit, applied raft.Index, term raft.Term, leader bool) {
+	c.mu.Lock()
+	cn.mu.Lock()
+	n := cn.node
+	cn.mu.Unlock()
+	if n == nil {
+		c.mu.Unlock()
+		return 0, 0, 0, false
+	}
+	// Read what has been applied before what has been committed, so the pair
+	// can only understate how far the node has got, never overstate it.
+	applied = n.LastApplied()
+	commit = n.CommitIndex()
+	term = n.Term()
+	leader = n.State() == raft.Leader
+	prev, seen := c.lastCommit[cn.id]
+	if !seen || commit >= prev {
+		c.lastCommit[cn.id] = commit
+	}
+	c.mu.Unlock()
+
+	if seen && commit < prev {
+		c.fail("Monotonic commit",
+			"node %s commit index went backwards: %d → %d", cn.id, prev, commit)
+	}
+	return commit, applied, term, leader
 }
 
 // sweep performs one full pass: refresh every log, then check the properties
@@ -408,29 +502,30 @@ func (c *invariantChecker) sweep() {
 		// holds what it replaced. Only what the node has applied is bounded by
 		// what the disk holds, which is why the checks below are stated over
 		// that rather than over the commit index.
-		var commit, applied raft.Index
-		var term raft.Term
-		leader := false
-		if n := cn.current(); n != nil {
-			// Read what has been applied before what has been committed, so
-			// the pair can only understate how far the node has got, never
-			// overstate it.
-			applied = n.LastApplied()
-			commit = n.CommitIndex()
-			term = n.Term()
-			leader = n.State() == raft.Leader
-			c.noteCommit(cn.id, commit)
-		}
-		log, snapAt := readLog(cn.store)
-		views = append(views, nodeSnapshot{
+		commit, applied, term, leader := c.readVolatile(cn)
+		log, snapAt, read := readLog(cn.store)
+		v := nodeSnapshot{
 			cn: cn, log: log, snapAt: snapAt,
 			commit: commit, applied: applied, term: term, leader: leader,
-		})
+		}
+		v.usable = read && describesApplied(v)
+		if !v.usable {
+			c.mu.Lock()
+			c.skipped++
+			c.mu.Unlock()
+		}
+		views = append(views, v)
 	}
 
 	// Log Matching.
 	for i := range views {
+		if !views[i].usable {
+			continue
+		}
 		for j := i + 1; j < len(views); j++ {
+			if !views[j].usable {
+				continue
+			}
 			c.checkLogMatching(views[i].cn.id, views[i].log, views[j].cn.id, views[j].log)
 		}
 	}
@@ -438,12 +533,12 @@ func (c *invariantChecker) sweep() {
 	// Record what leaders consider committed, then hold every other node's
 	// committed prefix against it.
 	for _, v := range views {
-		if v.leader {
+		if v.usable && v.leader {
 			c.recordCommitted(v.cn.id, v.term, v.log, v.commit)
 		}
 	}
 	for _, v := range views {
-		if !v.leader {
+		if v.usable && !v.leader {
 			c.checkCommittedPrefix(v.cn.id, v.log, v.commit, v.applied)
 		}
 	}
@@ -607,6 +702,9 @@ func (c *invariantChecker) checkLeaderCompleteness(views []nodeSnapshot) {
 	sort.Slice(terms, func(i, j int) bool { return terms[i] < terms[j] })
 	byID := make(map[raft.NodeID]nodeSnapshot, len(views))
 	for _, v := range views {
+		if !v.usable {
+			continue
+		}
 		byID[v.cn.id] = v
 	}
 
@@ -650,10 +748,13 @@ func (c *invariantChecker) finish() {
 	c.sweep()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.t.Helper()
+	if c.skipped > 0 {
+		c.t.Logf("%d node view(s) skipped as torn reads of a store being written to", c.skipped)
+	}
 	if len(c.violations) == 0 {
 		return
 	}
-	c.t.Helper()
 	c.t.Logf("%d safety violation(s) recorded:", len(c.violations))
 	for _, v := range c.violations {
 		c.t.Logf("  %s", v)

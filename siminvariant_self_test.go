@@ -13,7 +13,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/brunoga/raft/v2"
 	"github.com/brunoga/raft/v2/internal/simnet"
@@ -264,5 +266,154 @@ func TestInvariantChecker_DetectsConflictingCommits(t *testing.T) {
 
 	if !r.reported("State Machine Safety") {
 		t.Errorf("two leaders committing different entries at index 2 were not reported; got: %s", r.joined())
+	}
+}
+
+// ---- Torn reads of a store that is being written to -------------------------
+//
+// The checker reads the durable log directly, in three calls that are not one
+// atomic read, while the node keeps writing. A soak run turned that into 41
+// reported Leader Completeness violations against a node that had lost
+// nothing: an AppendEntries replacing a conflicting suffix truncated the log
+// between the checker's LastIndex and GetLogEntries calls, the store rejected
+// the now-overlong range, and the failed read was taken to mean an empty log.
+
+// flakyReads is a store whose entry reads fail for the first n calls, which is
+// what a range invalidated by a concurrent truncation looks like from here.
+type flakyReads struct {
+	raft.Storage
+	remaining int
+}
+
+func (f *flakyReads) GetLogEntries(ctx context.Context, lo, hi raft.Index) ([]raft.LogEntry, error) {
+	if f.remaining > 0 {
+		f.remaining--
+		return nil, fmt.Errorf("%w: range [%d,%d) not within the log", raft.ErrNotFound, lo, hi)
+	}
+	return f.Storage.GetLogEntries(ctx, lo, hi)
+}
+
+func TestReadLog_RetriesAFailedRead(t *testing.T) {
+	inner := memstore.New()
+	log := []raft.LogEntry{entry(1, 1, encodePut("k", "a")), entry(2, 2, encodePut("k", "b"))}
+	if err := inner.AppendLogEntries(context.Background(), log); err != nil {
+		t.Fatalf("AppendLogEntries: %v", err)
+	}
+	store := simnet.NewFaultStore(&flakyReads{Storage: inner, remaining: 2})
+
+	entries, _, ok := readLog(store)
+	if !ok {
+		t.Fatal("readLog gave up on a read that fails twice and then succeeds")
+	}
+	if len(entries) != len(log) {
+		t.Errorf("readLog returned %d entries, want %d", len(entries), len(log))
+	}
+}
+
+func TestReadLog_ReportsAnUnreadableLog(t *testing.T) {
+	inner := memstore.New()
+	if err := inner.AppendLogEntries(context.Background(), []raft.LogEntry{entry(1, 1, nil)}); err != nil {
+		t.Fatalf("AppendLogEntries: %v", err)
+	}
+	store := simnet.NewFaultStore(&flakyReads{Storage: inner, remaining: 1000})
+
+	entries, _, ok := readLog(store)
+	if ok {
+		t.Errorf("readLog reported success for a log it never managed to read, returning %d entries", len(entries))
+	}
+}
+
+func TestInvariantChecker_IgnoresAnUnreadableLog(t *testing.T) {
+	r := &recorder{}
+	c := newInvariantChecker(r, nil)
+
+	committedLog := []raft.LogEntry{
+		entry(1, 1, encodePut("k", "a")),
+		entry(2, 2, encodePut("k", "b")),
+	}
+	c.addNode("n1", seedStore(t, committedLog...))
+
+	// n2 holds the same log, but every read of it fails. That is not evidence
+	// that n2 is missing anything.
+	inner := memstore.New()
+	if err := inner.AppendLogEntries(context.Background(), committedLog); err != nil {
+		t.Fatalf("AppendLogEntries: %v", err)
+	}
+	c.addNode("n2", simnet.NewFaultStore(&flakyReads{Storage: inner, remaining: 1000}))
+
+	c.recordCommitted("n1", 3, committedLog, 2)
+	c.metrics().StateChange("n2", raft.Candidate, raft.Leader, 5)
+
+	c.sweep()
+
+	if c.violated() {
+		t.Errorf("a log the checker could not read was reported as a violation: %s", r.joined())
+	}
+}
+
+func TestDescribesApplied_RejectsALogBehindTheAppliedIndex(t *testing.T) {
+	committedLog := []raft.LogEntry{
+		entry(1, 1, encodePut("k", "a")),
+		entry(2, 2, encodePut("k", "b")),
+	}
+	// The store has been truncated to nothing and the replacement entries have
+	// not landed yet -- the window between the two writes an AppendEntries
+	// carrying a conflicting suffix queues.
+	mid := nodeSnapshot{log: nil, snapAt: 0, applied: 2}
+	if describesApplied(mid) {
+		t.Error("a log holding nothing was accepted as describing 2 applied entries")
+	}
+	// The same store once the entries are back.
+	whole := nodeSnapshot{log: committedLog, snapAt: 0, applied: 2}
+	if !describesApplied(whole) {
+		t.Error("a log holding both applied entries was rejected")
+	}
+	// A log compacted into a snapshot describes what it no longer holds.
+	compacted := nodeSnapshot{log: nil, snapAt: 2, applied: 2}
+	if !describesApplied(compacted) {
+		t.Error("a log compacted past the applied index was rejected")
+	}
+}
+
+func TestInvariantChecker_AllowsACommitIndexReadRacingTheHook(t *testing.T) {
+	// The sweep and the node's own CommitAdvanced hook write the same
+	// monotonicity baseline. A sweep that reads the commit index and is then
+	// overtaken by the hook holds a stale value, and reporting that value as a
+	// commit index going backwards is a lie: setCommitIndex only ever moves
+	// forward. The two paths have to be ordered against each other, so this
+	// runs them against each other on a real node and fails on the report.
+	cfg := defaultSimConfig(0x5eed)
+	cfg.nodes = 1
+	c := newSimCluster(t, &cfg)
+	if c.waitLeader(5*time.Second) < 0 {
+		t.Fatalf("no leader after startup\n%s", c.diagnostics())
+	}
+	cn := c.ck.nodeList()[0]
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				c.ck.readVolatile(cn)
+			}
+		}
+	}()
+
+	for i := range 200 {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		c.put(ctx, "k", fmt.Sprintf("v%d", i))
+		cancel()
+	}
+	close(done)
+	wg.Wait()
+
+	if c.ck.violated() {
+		t.Error("a commit-index read racing the commit hook was reported as a violation")
 	}
 }
