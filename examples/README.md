@@ -1,6 +1,19 @@
 # Examples
 
-Nine fully-worked services are provided, each targeting a different deployment pattern. Every one ships with a `cluster.sh` script that starts a local 3-node cluster. A ninth example, `raftctl`, is an operator tool rather than a service.
+Nine fully-worked services are provided, each targeting a different deployment pattern. A tenth example, `raftctl`, is an operator tool rather than a service.
+
+## Running any of them
+
+Every service ships with a `cluster.sh` that starts a local 3-node cluster, and every one of them behaves the same way:
+
+```bash
+./cluster.sh          # start it, print how to exercise it, stay up until Ctrl-C
+./cluster.sh --demo   # start it, walk through what it demonstrates, then stop
+```
+
+`--demo` is the one to reach for first. It runs the same commands the default mode prints, explaining before each what it is about to show and why that matters, and it exits non-zero if any step fails — so it doubles as an end-to-end check that the example still works. The two modes read from one list, which is what keeps a printed command from outliving the endpoint it calls.
+
+If a node dies at startup, the script says which one and shows the end of its log rather than waiting out a timeout and reporting an empty table.
 
 ---
 

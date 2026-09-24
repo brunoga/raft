@@ -10,6 +10,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$SCRIPT_DIR/ratelimiter"
 DATA_ROOT="/tmp/ratelimiter"
 
+# shellcheck source=../internal/clusterlib.sh
+. "$REPO_ROOT/examples/internal/clusterlib.sh"
+
+cluster_parse_args "$@"
+
 echo "==> Building ratelimiter..."
 (cd "$REPO_ROOT" && go build -o "$BINARY" ./examples/ratelimiter)
 
@@ -17,45 +22,28 @@ echo "==> Cleaning data dirs under $DATA_ROOT..."
 rm -rf "$DATA_ROOT"
 mkdir -p "$DATA_ROOT"/{n1,n2,n3}
 
-PIDS=()
 cleanup() {
     echo ""
     echo "==> Stopping nodes..."
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    wait 2>/dev/null || true
+    cluster_stop
     echo "==> Removing $DATA_ROOT..."
     rm -rf "$DATA_ROOT"
     echo "Done."
 }
 trap cleanup INT TERM
 
-# Wait for a Raft leader to be elected, then print the member table.
-wait_and_show_status() {
-    local seed="http://localhost:8001"
-    local timeout=30
+# Ready when the seed lists three members and one of them leads.
+cluster_ready() {
+    local body
+    body=$(curl -sf "http://localhost:8001/members" 2>/dev/null) || return 1
+    [[ "$(printf '%s' "$body" | count_occurrences '"leader":')" -ge 3 ]] &&
+        printf '%s' "$body" | grep -q '"leader":true'
+}
 
-    printf "==> Waiting for cluster (up to %ds)..." "$timeout"
-    local deadline=$((SECONDS + timeout))
-    while [[ $SECONDS -lt $deadline ]]; do
-        local body
-        body=$(curl -sf "$seed/members" 2>/dev/null) || { sleep 0.3; continue; }
-        member_count=$(printf '%s' "$body" | grep -o '"leader":' | wc -l)
-        if [[ $member_count -ge 3 ]] && printf '%s' "$body" | grep -q '"leader":true'; then
-            printf ' done.\n'
-            break
-        fi
-        sleep 0.3
-    done
-    if [[ $SECONDS -ge $deadline ]]; then
-        printf ' timed out (check %s/n*.log).\n' "$DATA_ROOT"
-        return
-    fi
-
+show_members() {
     printf '==> Cluster members:\n'
     local body
-    body=$(curl -sf "$seed/members" 2>/dev/null)
+    body=$(curl -sf "http://localhost:8001/members" 2>/dev/null) || return 0
     if command -v jq >/dev/null 2>&1; then
         printf '%s' "$body" | jq -r '
             .members | sort_by(.id)[] |
@@ -67,45 +55,56 @@ wait_and_show_status() {
     printf '\n'
 }
 
-echo "==> Starting n1 (bootstrap)..."
-"$BINARY" -id n1 -raft 127.0.0.1:7001 -http 127.0.0.1:8001 -data "$DATA_ROOT/n1" \
+cluster_start "n1" "$BINARY" -id n1 -raft 127.0.0.1:7001 -http 127.0.0.1:8001 -data "$DATA_ROOT/n1" \
     -peers n1=127.0.0.1:7001 \
-    >"$DATA_ROOT/n1.log" 2>&1 &
-PIDS+=($!)
 
 sleep 0.5
 
-echo "==> Starting n2 (joining n1)..."
-"$BINARY" -id n2 -raft 127.0.0.1:7002 -http 127.0.0.1:8002 -data "$DATA_ROOT/n2" \
+cluster_start "n2" "$BINARY" -id n2 -raft 127.0.0.1:7002 -http 127.0.0.1:8002 -data "$DATA_ROOT/n2" \
     -join 127.0.0.1:8001 \
-    >"$DATA_ROOT/n2.log" 2>&1 &
-PIDS+=($!)
 
 sleep 0.5
 
-echo "==> Starting n3 (joining n1)..."
-"$BINARY" -id n3 -raft 127.0.0.1:7003 -http 127.0.0.1:8003 -data "$DATA_ROOT/n3" \
+cluster_start "n3" "$BINARY" -id n3 -raft 127.0.0.1:7003 -http 127.0.0.1:8003 -data "$DATA_ROOT/n3" \
     -join 127.0.0.1:8001 \
-    >"$DATA_ROOT/n3.log" 2>&1 &
-PIDS+=($!)
 
-wait_and_show_status
+cluster_wait_ready "the cluster to elect a leader" 30 cluster_ready || cluster_give_up
+show_members
 
 echo "Endpoints:"
 echo "  n1  http://localhost:8001"
 echo "  n2  http://localhost:8002"
 echo "  n3  http://localhost:8003"
 echo ""
-echo "Quick smoke-test:"
-echo "  # Create a quota"
-echo "  curl -X POST http://localhost:8001/quotas/premium-user -H 'Content-Type: application/json' -d '{\"max_tokens\":100,\"current_tokens\":100,\"refill_rate\":1}'"
-echo "  # Take 5 tokens (follows 307 redirect to leader)"
-echo "  curl -L -X POST http://localhost:8001/quotas/premium-user/mutate -H 'Content-Type: application/json' -d \"{\\\"name\\\":\\\"take\\\",\\\"args\\\":{\\\"requested\\\":5,\\\"now\\\":\$(date +%s)}}\""
-echo "  # Check quota status"
-echo "  curl http://localhost:8002/quotas/premium-user"
-echo ""
-echo "Logs: $DATA_ROOT/n{1,2,3}.log"
-echo "Press Ctrl-C to stop."
-echo ""
+cluster_demo_intro 'A distributed token bucket. The interesting part is not the counting but
+the clock: refill depends on time, and a state machine may not read one --
+every replica applies the same entry and must reach the same number.
 
-wait
+The timestamp therefore travels inside the request, fixed before the entry is
+proposed.'
+
+cluster_smoke 'Create a quota with 100 tokens' \
+    'curl -sS -L -X POST http://localhost:8001/quotas/premium-user -H '\''Content-Type: application/json'\'' -d '\''{"max_tokens":100,"current_tokens":100,"refill_rate":1}'\'' -w '\'' HTTP %{http_code}\n'\''' \
+    'A bucket that holds 100 tokens and refills at one per second.'
+
+cluster_smoke 'Take five tokens' \
+    'curl -sS -L -X POST http://localhost:8001/quotas/premium-user/mutate -H '\''Content-Type: application/json'\'' -d "{\"name\":\"take\",\"args\":{\"requested\":5,\"now\":$(date +%s)}}"' \
+    'The `now` is supplied by the caller, not read inside the state machine.
+That is what lets every replica compute the same refill: the mutation is a
+pure function of the entry, clock reading included.'
+
+cluster_smoke 'Read the quota from another node' \
+    'curl -sS http://localhost:8002/quotas/premium-user' \
+    '95 tokens, on a node that did not serve the request. Every replica ran
+the same mutation and got the same answer.'
+
+cluster_smoke 'Ask for more than the bucket holds' \
+    'curl -sS -L -X POST http://localhost:8001/quotas/premium-user/mutate -H '\''Content-Type: application/json'\'' -d "{\"name\":\"take\",\"args\":{\"requested\":1000,\"now\":$(date +%s)}}"' \
+    'Refused by the mutation itself, so the refusal is agreed by the cluster
+rather than decided by whichever node was asked.'
+
+cluster_smoke 'Confirm nothing was taken' \
+    'curl -sS http://localhost:8002/quotas/premium-user' \
+    'Still 95. A refused take leaves the bucket alone.'
+
+cluster_footer

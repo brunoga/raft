@@ -4,6 +4,37 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## Unreleased
+
+### Fixed
+
+- **`examples/tenants/cluster.sh` exited instead of starting a cluster.** The
+  readiness loop counted leaders with `grep -o ... | wc -l`, and grep exits 1
+  when it matches nothing. Under `set -o pipefail` that becomes the status of
+  the assignment, which `set -e` treats as fatal -- so the loop killed the
+  script on its first pass, before a single dot, because at that point no
+  group had elected anything yet. The same shape was latent in four other
+  scripts, which survived only because the string they happened to grep for
+  is always present.
+
+### Changed
+
+- **The example `cluster.sh` scripts all behave the same way now**, from one
+  shared `examples/internal/clusterlib.sh` rather than nine copies that had
+  drifted. Each waits for readiness, shows the cluster, prints how to
+  exercise it, and stays up until Ctrl-C. A node that dies at startup is
+  reported by name with the end of its log, rather than waiting out a
+  timeout and printing a table of zeroes.
+
+- **`./cluster.sh --demo`** runs what the example demonstrates instead of
+  printing it: each step says what it is about to show and why that matters,
+  then runs it and shows the output. It exits non-zero if any step fails, so
+  it doubles as an end-to-end check.
+
+  Both modes read from one list of steps. Printed commands and executed ones
+  cannot drift apart, which is how a command in a README outlives the
+  endpoint it calls.
+
 ## v2.1.1
 
 Three fixes, no API change. Two came out of the nightly soak, which repeats
