@@ -299,6 +299,30 @@ type options struct {
 	closeTimeout        time.Duration
 	peerAuth            PeerAuthorizer
 	strictValidation    bool
+	listener            net.Listener
+}
+
+// WithListener serves on ln instead of binding the address given to [Listen].
+//
+// The address is still used: it is what this transport advertises and what
+// peers dial, so it must be a name the dial options can reach. A listener on
+// a Unix socket, or one inherited from a supervisor, works that way.
+//
+// Tests are the other reason. A goroutine parked in Accept on a real socket
+// is not durably blocked, so a single idle listener stops the clock inside a
+// testing/synctest bubble and the test hangs rather than fails. Paired with a
+// dialer passed through [WithDialOptions], an in-process listener keeps the
+// whole transport off the operating system.
+//
+// Peer addresses still go through gRPC's name resolution, which defaults to
+// DNS. An address that is not something DNS can answer for -- an in-process
+// name like "n2:7000", say -- has to be given to [GRPCTransport.AddPeer] as
+// "passthrough:///n2:7000", so gRPC hands it to the dialer as written instead
+// of asking about a host called "n2".
+//
+// The listener belongs to this transport once passed: Close closes it.
+func WithListener(ln net.Listener) Option {
+	return func(o *options) { o.listener = ln }
 }
 
 // WithServerOptions appends extra gRPC server options (e.g. TLS credentials).
@@ -582,9 +606,13 @@ func Listen(addr string, opts ...Option) (*GRPCTransport, error) {
 	}
 	defaultDialOpts = append(defaultDialOpts, o.dialOpts...)
 
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("grpctransport.Listen: %w", err)
+	ln := o.listener
+	if ln == nil {
+		bound, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("grpctransport.Listen: %w", err)
+		}
+		ln = bound
 	}
 
 	hbWin := o.heartbeatWindow
