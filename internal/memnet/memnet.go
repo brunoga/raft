@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"sync"
 )
 
@@ -102,3 +103,79 @@ type addr string
 
 func (a addr) Network() string { return "memnet" }
 func (a addr) String() string  { return string(a) }
+
+// Network is a set of listeners addressed by name, and the dialer that
+// reaches them.
+//
+// A cluster test needs more than one server, and the client then has to be
+// told which in-process listener an address belongs to, because "n2:8080" is
+// not somewhere the operating system can take it. Network is that lookup,
+// with the http.Client that uses it.
+//
+// The zero value is not usable; call NewNetwork.
+type Network struct {
+	mu  sync.Mutex
+	lns map[string]*Listener
+}
+
+// NewNetwork returns an empty Network.
+func NewNetwork() *Network {
+	return &Network{lns: make(map[string]*Listener)}
+}
+
+// Listen adds a listener under name and returns it. Listening twice on the
+// same name replaces the first, which is what restarting a node looks like.
+func (n *Network) Listen(name string) *Listener {
+	ln := Listen(name)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.lns[name] = ln
+	return ln
+}
+
+// Has reports whether anything is listening on addr.
+//
+// It exists for callers that have to choose between this network and the
+// operating system for each address, which is what a test package holding
+// both in-memory and real nodes has to do. Deciding by asking is better than
+// deciding by falling back: a dialer that quietly reaches the real network
+// when it does not recognise an address is how a test comes to believe it is
+// in memory when it is not.
+func (n *Network) Has(addr string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	_, ok := n.lns[addr]
+	return ok
+}
+
+// ErrNoListener is returned when nothing is listening on the address dialled.
+// It stands in for connection-refused, and says which address so a test that
+// mistypes one is told rather than left to time out.
+type ErrNoListener struct{ Addr string }
+
+func (e *ErrNoListener) Error() string {
+	return "memnet: nothing is listening on " + e.Addr
+}
+
+// DialContext has the shape http.Transport.DialContext wants and routes by
+// address.
+func (n *Network) DialContext(ctx context.Context, _, addr string) (net.Conn, error) {
+	n.mu.Lock()
+	ln, ok := n.lns[addr]
+	n.mu.Unlock()
+	if !ok {
+		return nil, &ErrNoListener{Addr: addr}
+	}
+	return ln.Dial(ctx)
+}
+
+// DialTarget has the shape grpc.WithContextDialer wants and routes by target.
+func (n *Network) DialTarget(ctx context.Context, target string) (net.Conn, error) {
+	return n.DialContext(ctx, "memnet", target)
+}
+
+// HTTPClient returns a client whose connections go to this network's
+// listeners rather than to the operating system.
+func (n *Network) HTTPClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{DialContext: n.DialContext}}
+}

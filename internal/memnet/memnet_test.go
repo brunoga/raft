@@ -159,3 +159,47 @@ func TestHTTPServerInBubble(t *testing.T) {
 }
 
 var _ net.Listener = (*memnet.Listener)(nil)
+
+func TestNetworkRoutesByAddress(t *testing.T) {
+	nw := memnet.NewNetwork()
+	for _, name := range []string{"n1:8080", "n2:8080"} {
+		ln := nw.Listen(name)
+		who := name
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, who)
+		})}
+		go func() { _ = srv.Serve(ln) }()
+		t.Cleanup(func() {
+			_ = srv.Close()
+			_ = ln.Close()
+		})
+	}
+
+	client := nw.HTTPClient()
+	for _, name := range []string{"n1:8080", "n2:8080"} {
+		resp, err := client.Get("http://" + name + "/")
+		if err != nil {
+			t.Fatalf("Get %s: %v", name, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if string(body) != name {
+			t.Errorf("%s answered %q, want %q", name, body, name)
+		}
+	}
+}
+
+func TestNetworkUnknownAddress(t *testing.T) {
+	n := memnet.NewNetwork()
+	_, err := n.DialContext(context.Background(), "tcp", "nobody:9999")
+	var missing *memnet.ErrNoListener
+	if !errors.As(err, &missing) {
+		t.Fatalf("Dial to an address with no listener returned %v, want ErrNoListener", err)
+	}
+	if missing.Addr != "nobody:9999" {
+		t.Errorf("ErrNoListener names %q, want %q", missing.Addr, "nobody:9999")
+	}
+}

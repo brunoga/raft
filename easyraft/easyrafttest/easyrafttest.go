@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -96,6 +97,10 @@ type Cluster struct {
 	opts    Options
 	started bool
 	stopped []bool
+
+	// bubbled records whether this cluster was built inside a synctest
+	// bubble, which decides what "wait for the cluster to settle" can mean.
+	bubbled bool
 }
 
 // NewCluster builds an n-node cluster, starts it, and waits for a leader.
@@ -123,6 +128,7 @@ func New(t *testing.T, n int, opts ...Options) *Cluster {
 		net:     memtransport.NewNetwork(),
 		peers:   make(map[raft.NodeID]string, n),
 		stopped: make([]bool, n),
+		bubbled: inBubble(),
 	}
 	if len(opts) == 1 {
 		c.opts = opts[0]
@@ -403,6 +409,39 @@ func (c *Cluster) Context() context.Context {
 	return ctx
 }
 
+// inBubble reports whether the caller is running inside a synctest bubble.
+//
+// synctest.Wait panics outside one, and that panic is the only way to ask.
+// Calling Wait to find out is not a trick played on the runtime: waiting is
+// what the caller wants anyway, so inside a bubble the question and the
+// answer are the same operation.
+func inBubble() (yes bool) {
+	defer func() { yes = recover() == nil }()
+	synctest.Wait()
+	return
+}
+
+// settle lets the cluster finish reacting to whatever the test just did, then
+// lets a unit of time pass.
+//
+// Inside a synctest bubble the first half is exact: Wait returns only once
+// every other goroutine in the bubble is durably blocked, so every apply and
+// every replication round the last call set in motion has finished. Outside
+// one there is no such signal and a short sleep is the best available.
+//
+// Time advances either way, because wait below bounds itself with a deadline
+// and a deadline that never arrives is a hang. In a bubble that advance is of
+// the fake clock, so it costs nothing and no amount of load can shorten it --
+// which is the point. These clusters elect leaders and replicate, and a
+// budget the machine can spend on the test's behalf is how such a test comes
+// to fail on a busy CI runner and nowhere else.
+func (c *Cluster) settle() {
+	if c.bubbled {
+		synctest.Wait()
+	}
+	time.Sleep(time.Millisecond)
+}
+
 // wait polls until done reports true, or fails the test naming what it was
 // waiting for.
 func (c *Cluster) wait(what string, done func() bool) {
@@ -412,7 +451,7 @@ func (c *Cluster) wait(what string, done func() bool) {
 		if done() {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		c.settle()
 	}
 	c.t.Fatalf("easyrafttest: timed out after %v waiting for %s; %s",
 		c.opts.Timeout, what, c.describe())
