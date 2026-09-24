@@ -159,6 +159,7 @@ func TestProposeOnce_RetryAfterSnapshotRestoreIsStillDeduplicated(t *testing.T) 
 	store := memstore.New()
 	tune := func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 4
+		cfg.TrailingLogs = 3
 		cfg.MaxClientTableSize = 16
 	}
 

@@ -124,7 +124,7 @@ func TestRecoverCluster_RestoresAvailabilityAfterQuorumLoss(t *testing.T) {
 		// its operator passes to New, which is the case
 		// TestInspectStorage_FlagsMembershipItCannotKnow covers.
 		nodes[i] = recoveryNode(t, net, stores[i], &recoverySM{}, id, peersExcept(ids, id),
-			func(cfg *raft.Config) { cfg.SnapshotThreshold = 2 })
+			func(cfg *raft.Config) { cfg.SnapshotThreshold, cfg.TrailingLogs = 2, 1 })
 	}
 
 	tickAll := func() {

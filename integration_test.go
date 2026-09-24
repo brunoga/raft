@@ -293,6 +293,7 @@ func TestSnapshot_AutomaticTrigger(t *testing.T) {
 	// Low threshold so we trigger snapshots quickly.
 	c := newClusterWith(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 3
+		cfg.TrailingLogs = 2
 	})
 	c.WaitLeader(electionTimeout)
 
@@ -320,6 +321,7 @@ func TestSnapshot_AutomaticTrigger(t *testing.T) {
 func TestSnapshot_LaggingFollowerReceivesSnapshot(t *testing.T) {
 	c := newClusterWith(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 3
+		cfg.TrailingLogs = 2
 	})
 	leaderIdx := c.WaitLeader(electionTimeout)
 

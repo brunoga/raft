@@ -201,6 +201,7 @@ func TestSnapshotMetrics_ReportTheirRealSize(t *testing.T) {
 	m := &recordingMetrics{}
 	node := metricsNode(t, m, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 4
+		cfg.TrailingLogs = 3
 	})
 
 	for range 10 {
@@ -237,6 +238,7 @@ func TestStorageMetrics_ReportsDurableWrites(t *testing.T) {
 	m := &recordingMetrics{}
 	node := metricsNode(t, m, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 4
+		cfg.TrailingLogs = 3
 	})
 
 	for range 8 {
