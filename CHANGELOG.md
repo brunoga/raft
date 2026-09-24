@@ -8,6 +8,26 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ### Fixed
 
+- **Two flaky lease-read tests.** `TestReadIndexLease_ExpiryFromSendTime`
+  failed about five times in a hundred, and the nightly soak's own fix for it
+  had not gone far enough. It simulates a round-trip by advancing a manual
+  clock when a read barrier reaches a follower, and it took "the first barrier
+  to arrive" to be the round it was timing -- but the round that waits for the
+  no-op sends a request to every follower, and one of those can still be in
+  flight when the timed round begins. The clock was then advanced by a
+  straggler, before the timed barrier was sent rather than after, leaving the
+  lease anchored 100ms later than the test believed and still valid when the
+  assertion expected it expired. Barrier generations are monotonic and travel
+  on every request, so the round is now identified by its generation. 150
+  clean runs, from five failures in sixty.
+
+  `TestReadIndexLease_FollowerForwarding` assumed leadership would not move
+  between electing a leader and asking a follower to forward to it. On a busy
+  machine it does, and the forward is answered `ErrNotLeader` by a node that
+  has since stepped down -- which is not a failure of forwarding. It now
+  re-reads the leader on each attempt. CI caught this one; four hundred local
+  runs did not.
+
 - **`examples/tenants/cluster.sh` exited instead of starting a cluster.** The
   readiness loop counted leaders with `grep -o ... | wc -l`, and grep exits 1
   when it matches nothing. Under `set -o pipefail` that becomes the status of

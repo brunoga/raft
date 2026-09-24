@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -304,17 +305,38 @@ func TestReadIndexLease_FollowerForwarding(t *testing.T) {
 		t.Fatalf("leader ReadIndex (nop wait): %v", err)
 	}
 
-	follower := c.nodes[(leaderIdx+1)%3]
-	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
-	defer cancel()
+	// Leadership can move between electing one and asking a follower, which
+	// is not a failure of forwarding: the follower forwards to the node it
+	// last heard from, and that node answers ErrNotLeader if it has since
+	// stepped down. A busy machine loses that race occasionally -- CI did,
+	// once, where four hundred local runs did not.
+	//
+	// So the leader is re-read on each attempt rather than assumed to be the
+	// one elected earlier. What is being tested is that a follower forwards
+	// and gets a usable index, and that is still exactly what has to happen.
+	deadline := time.Now().Add(electionTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		leaderIdx = c.WaitLeader(electionTimeout)
+		follower := c.nodes[(leaderIdx+1)%3]
 
-	idx, err := follower.ReadIndexLease(ctx)
-	if err != nil {
-		t.Fatalf("ReadIndexLease on follower: %v", err)
+		ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+		idx, err := follower.ReadIndexLease(ctx)
+		cancel()
+
+		if err == nil {
+			if idx == 0 {
+				t.Fatal("ReadIndexLease returned 0")
+			}
+			return
+		}
+		lastErr = err
+		if !errors.Is(err, raft.ErrNotLeader) {
+			t.Fatalf("ReadIndexLease on follower: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if idx == 0 {
-		t.Fatal("ReadIndexLease returned 0")
-	}
+	t.Fatalf("ReadIndexLease on follower never succeeded: %v", lastErr)
 }
 
 // TestReadIndexLease_FastPathAfterReadIndex verifies that after a successful
@@ -434,6 +456,11 @@ type barrierDelay struct {
 	rtt  time.Duration
 	once sync.Once
 	seen chan struct{}
+	// firstGen is the generation of the first barrier round this handler
+	// sees, which is the one that waits for the no-op. The round being timed
+	// is the next one, and telling them apart by generation is what makes
+	// this deterministic -- see HandleAppendEntries.
+	firstGen atomic.Uint64
 }
 
 // barrierDelayHandler wraps one follower. Every follower shares the same
@@ -445,7 +472,26 @@ type barrierDelayHandler struct {
 }
 
 func (h *barrierDelayHandler) HandleAppendEntries(ctx context.Context, req *raft.AppendEntriesRequest) (*raft.AppendEntriesResponse, error) {
+	// The round-trip is added to the round being timed, identified by its
+	// generation rather than by being the first barrier to arrive.
+	//
+	// "First to arrive" is not the same thing. The round that waits for the
+	// no-op sends a request to every follower, and one of those can still be
+	// in flight when the timed round begins -- so the clock would be advanced
+	// by a straggler, before the timed barrier is sent rather than after,
+	// leaving the lease anchored 100ms later than the test believes. The
+	// assertion then finds a lease that is still valid. It cost a few
+	// failures in every hundred runs, in three different disguises.
+	//
+	// Generations are monotonic and every request carries the one that
+	// produced it, so the first generation seen is the no-op round and
+	// anything after it is the round under test, whenever it happens to
+	// arrive.
 	if req.ReadBarrier != 0 {
+		if h.delay.firstGen.CompareAndSwap(0, req.ReadBarrier) ||
+			req.ReadBarrier == h.delay.firstGen.Load() {
+			return h.Handler.HandleAppendEntries(ctx, req)
+		}
 		h.delay.once.Do(func() {
 			h.delay.clk.Advance(h.delay.rtt)
 			close(h.delay.seen)
@@ -476,6 +522,18 @@ func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
 	leaderIdx := c.WaitLeader(electionTimeout)
 	leader := c.nodes[leaderIdx]
 
+	// The followers add the round-trip themselves, to the round after the one
+	// that waits for the no-op. They are wrapped before that wait so the
+	// handler sees its generation and can tell the two apart; see
+	// barrierDelayHandler.
+	delay := &barrierDelay{clk: clk, rtt: rtt, seen: make(chan struct{})}
+	for i, id := range c.ids {
+		if i == leaderIdx {
+			continue
+		}
+		c.net.Register(id, &barrierDelayHandler{Handler: c.nodes[i].Handler(), delay: delay})
+	}
+
 	// Wait for the no-op to commit before measuring anything. Until it does, a
 	// ReadIndex is queued rather than barriered, and the barrier that
 	// eventually carries it is not the one this test is timing.
@@ -497,17 +555,6 @@ func TestReadIndexLease_ExpiryFromSendTime(t *testing.T) {
 		t.Fatalf("ReadIndex (nop wait): %v", err)
 	}
 	nopCancel()
-
-	// From here the followers add the round-trip themselves, on the first
-	// barrier they see. T0 is whatever the clock reads when that barrier is
-	// sent; the ACKs then arrive at T0+rtt.
-	delay := &barrierDelay{clk: clk, rtt: rtt, seen: make(chan struct{})}
-	for i, id := range c.ids {
-		if i == leaderIdx {
-			continue
-		}
-		c.net.Register(id, &barrierDelayHandler{Handler: c.nodes[i].Handler(), delay: delay})
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
 	defer cancel()
