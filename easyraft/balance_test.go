@@ -421,21 +421,28 @@ func TestLeaderBalancing_StatusEndpointReportsEveryGroup(t *testing.T) {
 	}
 	destIndex := (fromHost + 1) % len(c.managers)
 
-	fromProvider := raft.NewHTTPNodeProvider("http://"+c.httpAddrs[fromHost]+"/__balance", nil)
-	if err := fromProvider.TransferGroupLeadership(ctx, moved, c.ids[destIndex]); err != nil {
-		t.Fatalf("TransferGroupLeadership of group %d from %s over HTTP: %v",
-			moved, c.ids[fromHost], err)
-	}
-	deadline := time.Now().Add(30 * time.Second)
+	// A transfer is a request, not a guarantee: the target has to be caught
+	// up enough to win the election it is being asked to call, and on a busy
+	// machine it may not be in time. The engine returns once the request is
+	// accepted, so one call and a long wait is asserting something Raft does
+	// not promise -- and it failed that way in CI.
+	//
+	// So this does what the balance controller does: ask again, from
+	// whichever host leads the group now, until it lands.
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		for _, status := range c.managers[destIndex].StatusAll(ctx) {
-			if status.GroupID == moved && status.State == raft.Leader {
-				return
-			}
+		if c.leaderOf(ctx, moved) == destIndex {
+			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		if host := c.leaderOf(ctx, moved); host >= 0 {
+			provider := raft.NewHTTPNodeProvider("http://"+c.httpAddrs[host]+"/__balance", nil)
+			lastErr = provider.TransferGroupLeadership(ctx, moved, c.ids[destIndex])
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	t.Errorf("group %d did not move from %s to %s", moved, c.ids[fromHost], c.ids[destIndex])
+	t.Errorf("group %d never moved to %s (last transfer attempt: %v)",
+		moved, c.ids[destIndex], lastErr)
 }
 
 // TestManager_GroupZeroIsRefused pins the trap this guard exists for. A

@@ -70,7 +70,8 @@ func TestLease_KeyOutlivesNothing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	lease, err := er.GrantLease(ctx, 300*time.Millisecond)
+	const keyLeaseTTL = 2 * time.Second
+	lease, err := er.GrantLease(ctx, keyLeaseTTL)
 	if err != nil {
 		t.Fatalf("GrantLease: %v", err)
 	}
@@ -87,16 +88,30 @@ func TestLease_KeyOutlivesNothing(t *testing.T) {
 		t.Errorf("LeaseOf returned %d, want %d", got, lease)
 	}
 
-	// Renewing keeps it alive well past its own TTL.
-	renewUntil := time.Now().Add(time.Second)
+	// Renewing keeps it alive well past its own TTL. The widest gap between
+	// renewals is measured, because a gap longer than the lease means this
+	// process was descheduled and the key expiring says nothing about
+	// renewal -- see the note in TestLease_HTTP.
+	var longestGap time.Duration
+	lastRenew := time.Now()
+	renewUntil := time.Now().Add(3 * time.Second)
 	for time.Now().Before(renewUntil) {
 		if _, err := er.KeepAlive(ctx, lease); err != nil {
 			t.Fatalf("KeepAlive: %v", err)
 		}
-		time.Sleep(50 * time.Millisecond)
+		if gap := time.Since(lastRenew); gap > longestGap {
+			longestGap = gap
+		}
+		lastRenew = time.Now()
+		time.Sleep(200 * time.Millisecond)
 	}
 	if _, err := er.ReadStale("instance-1"); err != nil {
-		t.Fatalf("the key went while it was still being renewed: %v", err)
+		if longestGap >= keyLeaseTTL {
+			t.Skipf("renewals were %v apart at worst, longer than the %v lease: this machine stalled",
+				longestGap, keyLeaseTTL)
+		}
+		t.Fatalf("the key went while it was still being renewed "+
+			"(worst gap %v, lease %v): %v", longestGap, keyLeaseTTL, err)
 	}
 
 	// Stop renewing and it goes.
@@ -120,7 +135,8 @@ func TestLease_KeepAliveLoopHoldsItAndReleasesIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	lease, err := er.GrantLease(ctx, 400*time.Millisecond)
+	const loopLeaseTTL = 2 * time.Second
+	lease, err := er.GrantLease(ctx, loopLeaseTTL)
 	if err != nil {
 		t.Fatalf("GrantLease: %v", err)
 	}
@@ -132,9 +148,17 @@ func TestLease_KeepAliveLoopHoldsItAndReleasesIt(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- er.KeepAliveLoop(loopCtx, lease) }()
 
-	// Well past the TTL, still there.
-	time.Sleep(1200 * time.Millisecond)
+	// Well past the TTL, still there. The sleep is measured: if it overran by
+	// more than the lease, the loop was starved along with it and the key
+	// expiring says nothing about the loop.
+	holdFor := 3 * time.Second
+	start := time.Now()
+	time.Sleep(holdFor)
 	if _, err := er.ReadStale("held"); err != nil {
+		if slept := time.Since(start); slept >= holdFor+loopLeaseTTL {
+			t.Skipf("a %v sleep took %v: this machine stalled for longer than the %v lease",
+				holdFor, slept, loopLeaseTTL)
+		}
 		t.Fatalf("the key went while the keep-alive loop was running: %v", err)
 	}
 
@@ -195,7 +219,12 @@ func TestLease_HTTP(t *testing.T) {
 	er, httpAddr := startLeaseNode(t)
 	base := "http://" + httpAddr
 
-	grantStatus, grantBody, _ := doRequest(t, http.MethodPost, base+"/__leases", `{"ttl_seconds":0.3}`, nil)
+	// Two seconds, not the fraction this once used. The assertion below is
+	// that renewal keeps the key alive, and a TTL of 300ms renewed every 50ms
+	// only survives if the machine never stalls for 300ms -- which a shared
+	// CI runner does. The test still proves the same thing: the hold below
+	// outlasts the TTL, so nothing but renewal can explain the key surviving.
+	grantStatus, grantBody, _ := doRequest(t, http.MethodPost, base+"/__leases", `{"ttl_seconds":2}`, nil)
 	if grantStatus != http.StatusCreated {
 		t.Fatalf("grant: %d %s", grantStatus, grantBody)
 	}
@@ -226,16 +255,34 @@ func TestLease_HTTP(t *testing.T) {
 	}
 
 	// Renewing over HTTP holds it past its TTL.
-	renewUntil := time.Now().Add(time.Second)
+	//
+	// The longest gap between renewals is measured as we go. If this process
+	// was descheduled for longer than the lease, the key expiring says
+	// nothing about whether renewal works, and failing on it would be
+	// reporting the machine rather than the code.
+	const httpLeaseTTL = 2 * time.Second
+	var longestGap time.Duration
+	lastRenew := time.Now()
+	renewUntil := time.Now().Add(3 * time.Second)
 	for time.Now().Before(renewUntil) {
 		if status, body, _ := doRequest(t, http.MethodPost,
 			base+"/__leases/"+strconv.FormatUint(granted.ID, 10)+"/keepalive", "", nil); status != http.StatusOK {
 			t.Fatalf("keepalive: %d %s", status, body)
 		}
-		time.Sleep(50 * time.Millisecond)
+		if gap := time.Since(lastRenew); gap > longestGap {
+			longestGap = gap
+		}
+		lastRenew = time.Now()
+		time.Sleep(200 * time.Millisecond)
 	}
 	if _, err := er.ReadStale("web-1"); err != nil {
-		t.Fatalf("the key went while it was being renewed over HTTP: %v", err)
+		if longestGap >= httpLeaseTTL {
+			t.Skipf("renewals were %v apart at worst, longer than the %v lease: "+
+				"this machine stalled, and the key expiring says nothing about renewal",
+				longestGap, httpLeaseTTL)
+		}
+		t.Fatalf("the key went while it was being renewed over HTTP "+
+			"(worst gap between renewals %v, lease %v): %v", longestGap, httpLeaseTTL, err)
 	}
 
 	waitGone(t, er, "web-1")
