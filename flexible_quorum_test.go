@@ -148,7 +148,7 @@ func TestFlexibleQuorum_CommitOnTwo(t *testing.T) {
 // that the value is reported everywhere.
 func TestFlexibleQuorum_BackToMajority(t *testing.T) {
 	c := newCluster(t, 3)
-	leader := c.nodes[c.WaitLeader(electionTimeout)]
+	c.WaitLeader(electionTimeout)
 
 	// Ticked throughout, because a configuration change has to be replicated
 	// to commit and a cluster nobody ticks replicates only what a proposal
@@ -157,43 +157,67 @@ func TestFlexibleQuorum_BackToMajority(t *testing.T) {
 	stopTicking := tickWhile(c.nodes...)
 	defer stopTicking()
 
+	// Leadership is not a thing to hold on to across a cut. Under a commit
+	// quorum of three, a single follower out of contact is also one short of
+	// the set check-quorum needs, so the leader steps down and the term
+	// churns until the cluster settles. Resolving the leader once and calling
+	// it is a bet that it is still the leader when the call lands, and that
+	// bet lost about three times in forty runs. So resolve it again on every
+	// attempt and retry for as long as it is still moving.
+	//
 	// A context per call rather than one for the test: a single budget spent
 	// across an election, a write that is meant to time out, and a wait for
 	// the cluster to agree is a budget that runs out on a loaded machine,
 	// and the failure then lands on whichever call was last.
-	setQuorum := func(node *raft.Node, quorum int) error {
+	setQuorum := func(quorum int) error {
 		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
-		defer cancel()
-		return node.SetCommitQuorum(ctx, quorum)
+		deadline := time.Now().Add(3 * electionTimeout)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), electionTimeout)
+			err := c.Leader(electionTimeout).SetCommitQuorum(ctx, quorum)
+			cancel()
+			settling := errors.Is(err, raft.ErrNotLeader) ||
+				errors.Is(err, context.DeadlineExceeded)
+			if !settling || time.Now().After(deadline) {
+				return err
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 
-	if err := setQuorum(leader, 3); err != nil {
+	// cutFollower disconnects a node that is not the leader and returns which,
+	// so that healing reconnects the node that was actually cut. Recomputing
+	// the index afterwards reconnects whoever trails the leader by then, which
+	// is a different node once leadership has moved -- and leadership moving
+	// is the whole point of the cut.
+	cutFollower := func() int {
+		t.Helper()
+		idx := (c.WaitLeader(electionTimeout) + 1) % 3
+		c.Disconnect(idx)
+		return idx
+	}
+
+	if err := setQuorum(3); err != nil {
 		t.Fatalf("SetCommitQuorum(3): %v", err)
 	}
 	waitCommitQuorum(t, c, 3)
-	c.Disconnect((c.LeaderIndex() + 1) % 3)
+
+	cut := cutFollower()
 	if _, err := c.Propose(300*time.Millisecond, []byte("k=stalls")); err == nil {
 		t.Fatal("a write committed on two of three under a commit quorum of three")
 	}
-	c.Reconnect((c.LeaderIndex() + 1) % 3)
+	c.Reconnect(cut)
 
-	// Under a commit quorum of three, one follower out of contact is also
-	// one short of the set check-quorum needs, so the leader may have
-	// stepped down during the cut. Find whoever leads now.
-	leader = c.Leader(electionTimeout)
-	if leader == nil {
-		t.Fatal("no leader after healing")
-	}
-	if err := setQuorum(leader, 0); err != nil {
+	if err := setQuorum(0); err != nil {
 		t.Fatalf("SetCommitQuorum(0): %v", err)
 	}
 	waitCommitQuorum(t, c, 0)
-	c.Disconnect((c.LeaderIndex() + 1) % 3)
+
+	cut = cutFollower()
 	if _, err := c.Propose(electionTimeout, []byte("k=majority")); err != nil {
 		t.Fatalf("a write did not commit on a majority after restoring it: %v", err)
 	}
-	c.Reconnect((c.LeaderIndex() + 1) % 3)
+	c.Reconnect(cut)
 }
 
 // TestFlexibleQuorum_Refusals pins the argument checks.
