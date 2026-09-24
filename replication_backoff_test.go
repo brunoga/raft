@@ -86,6 +86,11 @@ func newBackoffCluster(t *testing.T, n int, snapshotThreshold uint64) *backoffCl
 		cfg.Transport = tr
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = snapshotThreshold
+		if snapshotThreshold > 0 {
+			// The engine caps trailing at SnapshotThreshold-1 so that compaction
+			// reclaims something; say so here rather than make it warn.
+			cfg.TrailingLogs = snapshotThreshold - 1
+		}
 
 		node, err := raft.New(&cfg)
 		if err != nil {

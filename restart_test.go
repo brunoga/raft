@@ -287,6 +287,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	cfg.Transport = tr
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 5 // snapshot every 5 applied entries
+	cfg.TrailingLogs = 4
 
 	n, err := raft.New(&cfg)
 	if err != nil {
@@ -348,6 +349,7 @@ func TestRestart_SnapshotRestoredOnRestart(t *testing.T) {
 	cfg2.Transport = tr2
 	cfg2.TickInterval = 0
 	cfg2.SnapshotThreshold = 5
+	cfg2.TrailingLogs = 4
 
 	n2, err := raft.New(&cfg2)
 	if err != nil {
@@ -600,6 +602,7 @@ func TestProposeOnce_ExactlyOnceAfterSnapshotRestore(t *testing.T) {
 	cfg.Transport = tr
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 4
+	cfg.TrailingLogs = 3
 
 	n, err := raft.New(&cfg)
 	if err != nil {
@@ -755,6 +758,7 @@ func TestInstallSnapshot_Chunked(t *testing.T) {
 		cfg.Transport = transports[i]
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 5
+		cfg.TrailingLogs = 4
 		cfg.SnapshotChunkSize = 64 // forces ~3-4 chunks for a 10-entry kvSM snapshot (~100-200 bytes)
 		tuneForManualTicks(&cfg)
 

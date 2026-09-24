@@ -94,6 +94,7 @@ func snapshotPayload(t *testing.T) []byte {
 	cfg.Transport = memtransport.NewNetwork().NewTransport("src")
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = 1
+	cfg.TrailingLogs = 0
 	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)

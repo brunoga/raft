@@ -261,6 +261,7 @@ func TestProposeOnce_LRUEviction(t *testing.T) {
 func TestProposeOnce_DedupSurvivesSnapshot(t *testing.T) {
 	c := newClusterWith(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 2 // very aggressive — snapshot after every 2 entries
+		cfg.TrailingLogs = 1
 	})
 	leaderIdx := c.WaitLeader(electionTimeout)
 	leader := c.nodes[leaderIdx]

@@ -40,6 +40,11 @@ func restartableNode(t *testing.T, store raft.Storage, net *memtransport.Network
 	cfg.Transport = net.NewTransport(id)
 	cfg.TickInterval = 0
 	cfg.SnapshotThreshold = snapshotThreshold
+	if snapshotThreshold > 0 {
+		// The engine caps trailing at SnapshotThreshold-1 so that compaction
+		// reclaims something; say so here rather than make it warn.
+		cfg.TrailingLogs = snapshotThreshold - 1
+	}
 	tuneForManualTicks(&cfg)
 
 	node, err := raft.New(&cfg)

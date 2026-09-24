@@ -626,6 +626,7 @@ func TestManager_SnapshotThrottling(t *testing.T) {
 		cfg.Transport = net.NewTransport(cfg.ID)
 		cfg.TickInterval = 0
 		cfg.SnapshotThreshold = 1 // Snapshot after every apply
+		cfg.TrailingLogs = 0
 		cfg.SnapshotSemaphore = sem
 
 		n, _ := raft.New(&cfg)

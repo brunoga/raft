@@ -479,6 +479,7 @@ func TestHTTP_SnapshotPreservesData(t *testing.T) {
 			cfg.Transport = network.NewTransport(nodeID)
 			cfg.TickInterval = 0
 			cfg.SnapshotThreshold = 2 // trigger snapshots aggressively
+			cfg.TrailingLogs = 1
 
 			node, err := raft.New(&cfg)
 			if err != nil {

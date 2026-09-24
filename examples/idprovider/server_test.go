@@ -711,6 +711,7 @@ func TestHTTP_SnapshotPreservesDomains(t *testing.T) {
 	// Use SnapshotThreshold=2 to trigger snapshots aggressively.
 	c := newIDPCluster(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 2
+		cfg.TrailingLogs = 1
 	})
 	base := c.LeaderURL()
 
@@ -741,6 +742,7 @@ func TestHTTP_SnapshotPreservesDomains(t *testing.T) {
 func TestHTTP_SnapshotPreservesMultipleDomains(t *testing.T) {
 	c := newIDPCluster(t, 3, func(cfg *raft.Config) {
 		cfg.SnapshotThreshold = 3
+		cfg.TrailingLogs = 2
 	})
 	base := c.LeaderURL()
 
