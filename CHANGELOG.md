@@ -4,7 +4,15 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
-## Unreleased
+## v2.1.2
+
+Examples and tests only. No library code changed, so a `v2.1.1` deployment
+upgrades by changing the version and nothing else.
+
+The example cluster scripts had drifted into nine variations on one idea, and
+one of them did not work at all. They now share a single library, and every
+one of them can walk through what its example demonstrates rather than
+printing commands nobody ran.
 
 ### Fixed
 
