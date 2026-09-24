@@ -113,12 +113,12 @@ cluster_smoke 'Look at the leases holding them' \
 goes, its keys go with it.'
 
 cluster_smoke 'Stop api-1 politely' \
-    'kill "${CLUSTER_PIDS[3]}"; sleep 2; curl -sS http://localhost:8003/services/api' \
+    "kill ${CLUSTER_PIDS[3]}; sleep 2; curl -sS http://localhost:8003/services/api" \
     'Gone immediately. A clean shutdown revokes the lease on the way out, so
 the entry is removed at once rather than waiting to be noticed.'
 
 cluster_smoke 'Kill api-2 outright' \
-    'kill -9 "${CLUSTER_PIDS[4]}"; curl -sS http://localhost:8003/services/api' \
+    "kill -9 ${CLUSTER_PIDS[4]}; curl -sS http://localhost:8003/services/api" \
     'Still listed. SIGKILL runs no code, so nothing revoked anything -- this
 is the crash case, and the registry cannot yet tell the difference between a
 dead process and a slow one.'

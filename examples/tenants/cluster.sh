@@ -107,29 +107,29 @@ queue behind that tenant'\''s log, not behind everybody'\''s.
 Nine groups are running across three nodes, with leader balancing on.'
 
 cluster_smoke 'Which group holds a tenant' \
-    '"$CTL" --tenant acme --groups "$NUM_GROUPS" where' \
+    "$CTL --tenant acme --groups $NUM_GROUPS where" \
     'No cluster round-trip at all: the mapping is a pure function of the name,
 so a client can work out where a tenant lives without asking anyone. That is
 also why the cluster and its clients cannot drift apart.'
 
 cluster_smoke 'Write into one tenant' \
-    '"$CTL" --tenant acme --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" put greeting hello && echo "written"' \
+    "$CTL --tenant acme --groups $NUM_GROUPS --endpoints $ENDPOINTS put greeting hello && echo written" \
     'The client is pointed at that tenant'\''s Raft group, and from there behaves
 exactly as it would against a single-group store -- including finding the
 leader of that group and following it when balancing moves it.'
 
 cluster_smoke 'Read it back' \
-    '"$CTL" --tenant acme --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" get greeting' \
+    "$CTL --tenant acme --groups $NUM_GROUPS --endpoints $ENDPOINTS get greeting" \
     'The value, from whichever node currently leads that group.'
 
 cluster_smoke 'Write the same key in a different tenant' \
-    '"$CTL" --tenant globex --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" put greeting "different tenant" && "$CTL" --tenant globex --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" get greeting' \
+    "$CTL --tenant globex --groups $NUM_GROUPS --endpoints $ENDPOINTS put greeting elsewhere && $CTL --tenant globex --groups $NUM_GROUPS --endpoints $ENDPOINTS get greeting" \
     'The same key name, a different value, because it is a different Raft
 group. Tenants are isolated by construction rather than by a prefix somebody
 has to remember to apply.'
 
 cluster_smoke 'List each tenant separately' \
-    'echo "acme:"; "$CTL" --tenant acme --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" list; echo "globex:"; "$CTL" --tenant globex --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" list' \
+    "echo acme:; $CTL --tenant acme --groups $NUM_GROUPS --endpoints $ENDPOINTS list; echo globex:; $CTL --tenant globex --groups $NUM_GROUPS --endpoints $ENDPOINTS list" \
     'Neither listing contains the other'\''s data.'
 
 cluster_smoke 'Count leaders per host' \
