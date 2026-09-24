@@ -3,6 +3,7 @@ package easyraft
 import (
 	"crypto/tls"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -125,6 +126,10 @@ type config struct {
 	// Transport replaces the gRPC transport this store would otherwise
 	// build. Set via [WithTransport].
 	Transport raft.Transport
+
+	// HTTPListener replaces the TCP listener this store would otherwise
+	// bind for its HTTP API. Set via [WithHTTPListener].
+	HTTPListener net.Listener
 
 	// MaxProposalBytes caps the size of a single command. Set via
 	// [WithMaxProposalBytes].
@@ -665,6 +670,26 @@ func WithMaxProposalBytes(n int) Option {
 // network works.
 func WithTransport(tr raft.Transport) Option {
 	return func(c *config) { c.Transport = tr }
+}
+
+// WithHTTPListener serves the HTTP API on ln instead of binding
+// [WithHTTPAddr] as a TCP listener.
+//
+// The address the store reports is then ln.Addr(), so a listener on a Unix
+// socket, on one inherited from a supervisor, or on something that is not a
+// socket at all works without the store having to know which.
+//
+// Tests are the other reason. A goroutine parked in Accept on a real socket
+// is not durably blocked, so a single idle listener stops the clock inside a
+// testing/synctest bubble and the test hangs instead of failing. An
+// in-process listener is made of channel operations, which are durable, and
+// a store built on one can run in a bubble.
+//
+// Giving both this and [WithHTTPMux] is an error: the mux says the caller is
+// serving the routes themselves, and then there is no listener for this
+// store to use.
+func WithHTTPListener(ln net.Listener) Option {
+	return func(c *config) { c.HTTPListener = ln }
 }
 
 // WithKeyLeaseSweepInterval sets how often the leader looks for key leases

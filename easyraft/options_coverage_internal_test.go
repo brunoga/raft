@@ -11,6 +11,7 @@ import (
 
 	"github.com/brunoga/raft/v2"
 	"github.com/brunoga/raft/v2/discovery"
+	"github.com/brunoga/raft/v2/internal/memnet"
 	"github.com/brunoga/raft/v2/transport/memtransport"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -59,6 +60,7 @@ func TestOptions_CoverEveryConfigField(t *testing.T) {
 		WithLeaderBalancing(map[raft.HostID]string{"n1": "127.0.0.1:8001"},
 			time.Second, raft.WithGroupCooldown(time.Minute)),
 		WithTransport(memtransport.NewNetwork().NewTransport("n1")),
+		WithHTTPListener(memnet.Listen("n1:8000")),
 		WithProposalQueue(512, raft.ProposalOverflowReject),
 		WithOnRemoved(func() {}),
 		WithHTTPTLS(&tls.Config{MinVersion: tls.VersionTLS13}),

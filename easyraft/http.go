@@ -197,7 +197,14 @@ func (s *Store) registerRoutes(mux *http.ServeMux) {
 // construction time rather than disappearing into a background goroutine.
 // It does nothing when the caller supplied their own mux or no address.
 func (s *Store) initHTTP() error {
-	if s.cfg.HTTPMux != nil || s.cfg.HTTPAddr == "" {
+	if s.cfg.HTTPMux != nil {
+		return nil
+	}
+	if s.cfg.HTTPListener != nil {
+		s.httpListener = s.cfg.HTTPListener
+		return nil
+	}
+	if s.cfg.HTTPAddr == "" {
 		return nil
 	}
 	ln, err := net.Listen("tcp", s.cfg.HTTPAddr)
@@ -1346,9 +1353,13 @@ func (m *Manager) serveHTTP() error {
 		return nil
 	}
 
-	ln, err := net.Listen("tcp", m.cfg.HTTPAddr)
-	if err != nil {
-		return fmt.Errorf("easyraft: listen http %s: %w", m.cfg.HTTPAddr, err)
+	ln := m.cfg.HTTPListener
+	if ln == nil {
+		bound, err := net.Listen("tcp", m.cfg.HTTPAddr)
+		if err != nil {
+			return fmt.Errorf("easyraft: listen http %s: %w", m.cfg.HTTPAddr, err)
+		}
+		ln = bound
 	}
 
 	server := &http.Server{
