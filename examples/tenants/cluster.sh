@@ -11,25 +11,29 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 # -bin suffixes because this example has directories named `tenants` and
 # `tenantctl` beside this script. `go build -o <existing dir>` does not fail:
 # it writes the binary *inside* that directory and reports success, so the
-# script then tried to execute a directory and every node died before it
-# started. Nothing said so -- the failure surfaced only as an election that
-# never happened.
+# script then tried to execute a directory.
 BINARY="$SCRIPT_DIR/tenants-bin"
 CTL="$SCRIPT_DIR/tenantctl-bin"
 DATA_ROOT="/tmp/tenants"
+
 # NUM_GROUPS, not GROUPS: bash's GROUPS is a special array holding the
 # current user's group IDs, and an assignment to it is silently ignored. The
 # script then passed --groups "$GROUPS", which expands to the user's primary
-# group ID -- 1000 on a typical Linux box. Every node started a thousand Raft
-# groups and the wait loop sat there needing a thousand leaders, which is
-# what "stuck waiting for every group to elect a leader" looked like.
+# group ID -- 1000 on a typical Linux box.
 NUM_GROUPS=9
 PEERS="n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003"
 BALANCE="n1=127.0.0.1:8001,n2=127.0.0.1:8002,n3=127.0.0.1:8003"
 TENANTS="acme,globex,initech,umbrella,hooli"
+ENDPOINTS="127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003"
+
+# shellcheck source=../internal/clusterlib.sh
+. "$REPO_ROOT/examples/internal/clusterlib.sh"
+
+cluster_parse_args "$@"
 
 echo "==> Building tenants and tenantctl..."
 (cd "$REPO_ROOT" && go build -o "$BINARY" ./examples/tenants)
@@ -39,91 +43,100 @@ echo "==> Cleaning data dirs under $DATA_ROOT..."
 rm -rf "$DATA_ROOT"
 mkdir -p "$DATA_ROOT"/{n1,n2,n3}
 
-PIDS=()
 cleanup() {
     echo ""
     echo "==> Stopping nodes..."
-    for pid in "${PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    wait 2>/dev/null || true
+    cluster_stop
     echo "==> Removing $DATA_ROOT..."
     rm -rf "$DATA_ROOT"
     echo "Done."
 }
 trap cleanup INT TERM
 
+# Ready when every group has a leader somewhere.
+leaders_total() {
+    local n total=0
+    for n in 1 2 3; do
+        local body
+        body=$(curl -sf "http://127.0.0.1:800$n/__balance/status" 2>/dev/null) || continue
+        total=$((total + $(printf '%s' "$body" | count_occurrences '"state":"Leader"')))
+    done
+    printf '%s' "$total"
+}
+all_groups_led() {
+    [[ "$(leaders_total)" -ge "$NUM_GROUPS" ]]
+}
+
 for n in 1 2 3; do
-    echo "==> Starting n$n..."
-    "$BINARY" --id "n$n" \
+    cluster_start "n$n" "$BINARY" --id "n$n" \
         --raft-addr "127.0.0.1:700$n" --http-addr "127.0.0.1:800$n" \
         --data-dir "$DATA_ROOT/n$n" --groups "$NUM_GROUPS" \
         --peers "$PEERS" --balance-peers "$BALANCE" --balance-every 5s \
-        --tenants "$TENANTS" \
-        >"$DATA_ROOT/n$n.log" 2>&1 &
-    PIDS+=($!)
+        --tenants "$TENANTS"
 done
 
-printf "==> Waiting for every group to elect a leader"
-deadline=$((SECONDS + 60))
-elected=0
-while [[ $SECONDS -lt $deadline ]]; do
-    # A node that died takes its groups with it, and waiting out the timeout
-    # to discover that wastes a minute and says nothing. Check first.
-    for i in "${!PIDS[@]}"; do
-        if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
-            printf '\n'
-            echo "==> Node n$((i + 1)) exited. Its log says:"
-            sed 's/^/    /' "$DATA_ROOT/n$((i + 1)).log" | tail -20
-            exit 1
-        fi
-    done
-
-    led=0
-    for n in 1 2 3; do
-        body=$(curl -sf "http://127.0.0.1:800$n/__balance/status" 2>/dev/null) || continue
-        led=$((led + $(printf '%s' "$body" | grep -o '"state":"Leader"' | wc -l)))
-    done
-    if [[ $led -ge $NUM_GROUPS ]]; then
-        printf ' done.\n'
-        elected=1
-        break
-    fi
-    printf '.'
-    sleep 0.5
-done
-if [[ $elected -eq 0 ]]; then
-    printf '\n'
-    echo "==> Only $led of $NUM_GROUPS groups have a leader after 60s. Check $DATA_ROOT/n*.log."
-    exit 1
-fi
-echo ""
+cluster_wait_ready "$NUM_GROUPS groups to elect leaders" 60 all_groups_led || cluster_give_up
 
 echo "==> Leaders per host:"
 for n in 1 2 3; do
-    body=$(curl -sf "http://127.0.0.1:800$n/__balance/status" 2>/dev/null || echo '[]')
-    count=$(printf '%s' "$body" | grep -o '"state":"Leader"' | wc -l)
+    body=$(curl -sf "http://127.0.0.1:800$n/__balance/status" 2>/dev/null) || body=""
+    count=$(printf '%s' "$body" | count_occurrences '"state":"Leader"')
     printf '  n%s  %s of %s groups\n' "$n" "$count" "$NUM_GROUPS"
 done
 
 echo ""
 echo "==> Where each tenant lives:"
-curl -sf "http://127.0.0.1:8001/tenants" || true
-echo ""
+if command -v jq >/dev/null 2>&1; then
+    curl -sf "http://127.0.0.1:8001/tenants" | jq -r '
+        .tenants[] | "  \(.tenant)\tgroup \(.group)\tleader \(.leader)"' || true
+else
+    curl -sf "http://127.0.0.1:8001/tenants" || true
+    echo ""
+fi
 
 echo ""
-echo "Try it:"
-echo "  $CTL --tenant acme --groups $NUM_GROUPS --endpoints 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003 put greeting hello"
-echo "  $CTL --tenant acme --groups $NUM_GROUPS --endpoints 127.0.0.1:8001,127.0.0.1:8002,127.0.0.1:8003 get greeting"
-echo "  $CTL --tenant acme --groups $NUM_GROUPS where"
+echo "Endpoints:"
+echo "  n1  http://localhost:8001"
+echo "  n2  http://localhost:8002"
+echo "  n3  http://localhost:8003"
 echo ""
-echo "Watch balancing do its job. Kill a node and restart it; its groups"
-echo "re-elect elsewhere, and the controllers hand some back:"
-echo "  kill ${PIDS[0]}"
-echo "  curl -s 127.0.0.1:8002/__balance/status | grep -o '\"state\":\"Leader\"' | wc -l"
-echo ""
-echo "Logs: $DATA_ROOT/n{1,2,3}.log"
-echo "Press Ctrl-C to stop."
-echo ""
+cluster_demo_intro 'A multi-tenant store where every tenant is its own Raft group, many
+groups to a node. Tenants are isolated by construction: one tenant'\''s writes
+queue behind that tenant'\''s log, not behind everybody'\''s.
 
-wait
+Nine groups are running across three nodes, with leader balancing on.'
+
+cluster_smoke 'Which group holds a tenant' \
+    '"$CTL" --tenant acme --groups "$NUM_GROUPS" where' \
+    'No cluster round-trip at all: the mapping is a pure function of the name,
+so a client can work out where a tenant lives without asking anyone. That is
+also why the cluster and its clients cannot drift apart.'
+
+cluster_smoke 'Write into one tenant' \
+    '"$CTL" --tenant acme --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" put greeting hello && echo "written"' \
+    'The client is pointed at that tenant'\''s Raft group, and from there behaves
+exactly as it would against a single-group store -- including finding the
+leader of that group and following it when balancing moves it.'
+
+cluster_smoke 'Read it back' \
+    '"$CTL" --tenant acme --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" get greeting' \
+    'The value, from whichever node currently leads that group.'
+
+cluster_smoke 'Write the same key in a different tenant' \
+    '"$CTL" --tenant globex --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" put greeting "different tenant" && "$CTL" --tenant globex --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" get greeting' \
+    'The same key name, a different value, because it is a different Raft
+group. Tenants are isolated by construction rather than by a prefix somebody
+has to remember to apply.'
+
+cluster_smoke 'List each tenant separately' \
+    'echo "acme:"; "$CTL" --tenant acme --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" list; echo "globex:"; "$CTL" --tenant globex --groups "$NUM_GROUPS" --endpoints "$ENDPOINTS" list' \
+    'Neither listing contains the other'\''s data.'
+
+cluster_smoke 'Count leaders per host' \
+    'for n in 1 2 3; do printf "n$n: "; curl -sS "http://127.0.0.1:800$n/__balance/status" | grep -o '\''"state":"Leader"'\'' | wc -l; done' \
+    'Leadership is spread rather than concentrated. Groups elect
+independently, so without the balance controller a host that stayed up while
+others restarted would end up leading most of them -- doing all the
+replication, all the linearizable reads and all the writes.'
+
+cluster_footer
