@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -223,30 +224,32 @@ func entriesAt(term Term, from Index, count int) []LogEntry {
 // contract at once: the entries count for everything the node decides now, and
 // for nothing it promises about its own survival.
 func TestRaftLog_AnAppendIsInTheLogBeforeItIsOnDisk(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	store.hold()
-	rl.append(entriesAt(1, 1, 3))
+		store.hold()
+		rl.append(entriesAt(1, 1, 3))
 
-	if got := rl.lastLogIndex(); got != 3 {
-		t.Errorf("lastLogIndex = %d, want 3: the entries are in the log immediately", got)
-	}
-	if got := rl.lastLogTerm(); got != 1 {
-		t.Errorf("lastLogTerm = %d, want 1", got)
-	}
-	if rl.isUpToDate(2, 1) {
-		t.Error("a candidate whose log ends at index 2 was judged up to date against a log ending at 3")
-	}
-	if got := rl.stableIndex(); got != 0 {
-		t.Errorf("stableIndex = %d, want 0: nothing has been written yet", got)
-	}
+		if got := rl.lastLogIndex(); got != 3 {
+			t.Errorf("lastLogIndex = %d, want 3: the entries are in the log immediately", got)
+		}
+		if got := rl.lastLogTerm(); got != 1 {
+			t.Errorf("lastLogTerm = %d, want 1", got)
+		}
+		if rl.isUpToDate(2, 1) {
+			t.Error("a candidate whose log ends at index 2 was judged up to date against a log ending at 3")
+		}
+		if got := rl.stableIndex(); got != 0 {
+			t.Errorf("stableIndex = %d, want 0: nothing has been written yet", got)
+		}
 
-	store.release()
-	settle(t, rl, w)
+		store.release()
+		settle(t, rl, w)
 
-	if got := rl.stableIndex(); got != 3 {
-		t.Errorf("stableIndex = %d after the write completed, want 3", got)
-	}
+		if got := rl.stableIndex(); got != 3 {
+			t.Errorf("stableIndex = %d after the write completed, want 3", got)
+		}
+	})
 }
 
 // TestRaftLog_ReplacedEntriesAreNotStableBecauseTheOldOnesWere is the case the
@@ -259,54 +262,56 @@ func TestRaftLog_AnAppendIsInTheLogBeforeItIsOnDisk(t *testing.T) {
 // and reporting them as stable would have the follower acknowledge, and the
 // apply loop read, entries belonging to a history it has already discarded.
 func TestRaftLog_ReplacedEntriesAreNotStableBecauseTheOldOnesWere(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	store.hold()
-	rl.append(entriesAt(1, 1, 8)) // from the first leader
+		store.hold()
+		rl.append(entriesAt(1, 1, 8)) // from the first leader
 
-	// The second leader replaces everything from index 5.
-	if err := rl.truncateSuffix(context.Background(), 5); err != nil {
-		t.Fatalf("truncateSuffix: %v", err)
-	}
-	rl.append(entriesAt(2, 5, 2))
+		// The second leader replaces everything from index 5.
+		if err := rl.truncateSuffix(context.Background(), 5); err != nil {
+			t.Fatalf("truncateSuffix: %v", err)
+		}
+		rl.append(entriesAt(2, 5, 2))
 
-	if got := rl.lastLogIndex(); got != 6 {
-		t.Fatalf("lastLogIndex = %d, want 6", got)
-	}
+		if got := rl.lastLogIndex(); got != 6 {
+			t.Fatalf("lastLogIndex = %d, want 6", got)
+		}
 
-	// Let only the first append through: storage now holds 1..8, where 5..8
-	// are the discarded entries, and neither the truncation nor its
-	// replacement has run.
-	store.allow(t, 1)
-	first := awaitWrite(t, rl, w)
+		// Let only the first append through: storage now holds 1..8, where 5..8
+		// are the discarded entries, and neither the truncation nor its
+		// replacement has run.
+		store.allow(t, 1)
+		first := awaitWrite(t, rl, w)
 
-	if got := store.indices(); len(got) != 8 {
-		t.Fatalf("storage holds %v; the test needs only the first append to have run", got)
-	}
-	if first.durableAfter != 8 {
-		t.Fatalf("the first write reported durableAfter = %d, want 8", first.durableAfter)
-	}
-	if got := rl.stableIndex(); got > 4 {
-		t.Errorf("stableIndex = %d while indices 5 to 8 on disk still hold the discarded entries; want at most 4", got)
-	}
+		if got := store.indices(); len(got) != 8 {
+			t.Fatalf("storage holds %v; the test needs only the first append to have run", got)
+		}
+		if first.durableAfter != 8 {
+			t.Fatalf("the first write reported durableAfter = %d, want 8", first.durableAfter)
+		}
+		if got := rl.stableIndex(); got > 4 {
+			t.Errorf("stableIndex = %d while indices 5 to 8 on disk still hold the discarded entries; want at most 4", got)
+		}
 
-	store.release()
-	settle(t, rl, w)
+		store.release()
+		settle(t, rl, w)
 
-	if got := rl.stableIndex(); got != 6 {
-		t.Errorf("stableIndex = %d once every write landed, want 6", got)
-	}
-	if got := store.indices(); !slices.Equal(got, []Index{1, 2, 3, 4, 5, 6}) {
-		t.Errorf("storage holds %v, want 1..6", got)
-	}
-	// And the entries at the replaced indices are the second leader's.
-	term, err := rl.termAt(5)
-	if err != nil {
-		t.Fatalf("termAt(5): %v", err)
-	}
-	if term != 2 {
-		t.Errorf("term at index 5 = %d, want 2", term)
-	}
+		if got := rl.stableIndex(); got != 6 {
+			t.Errorf("stableIndex = %d once every write landed, want 6", got)
+		}
+		if got := store.indices(); !slices.Equal(got, []Index{1, 2, 3, 4, 5, 6}) {
+			t.Errorf("storage holds %v, want 1..6", got)
+		}
+		// And the entries at the replaced indices are the second leader's.
+		term, err := rl.termAt(5)
+		if err != nil {
+			t.Fatalf("termAt(5): %v", err)
+		}
+		if term != 2 {
+			t.Errorf("term at index 5 = %d, want 2", term)
+		}
+	})
 }
 
 // TestRaftLog_ReadsSeeEntriesThatAreOnlyInMemory pins that an entry is
@@ -315,66 +320,70 @@ func TestRaftLog_ReplacedEntriesAreNotStableBecauseTheOldOnesWere(t *testing.T) 
 // read path that went to storage would send nothing and the cluster would
 // advance only as fast as the leader's disk.
 func TestRaftLog_ReadsSeeEntriesThatAreOnlyInMemory(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	store.hold()
-	defer store.release()
-	rl.append(entriesAt(4, 1, 5))
+		store.hold()
+		defer store.release()
+		rl.append(entriesAt(4, 1, 5))
 
-	got, err := rl.entries(context.Background(), 2, 5)
-	if err != nil {
-		t.Fatalf("entries: %v", err)
-	}
-	if len(got) != 3 || got[0].Index != 2 || got[2].Index != 4 {
-		t.Fatalf("entries(2,5) returned %d entries starting at %v, want 2..4", len(got), got)
-	}
-	for _, e := range got {
-		if e.Term != 4 {
-			t.Errorf("entry %d has term %d, want 4", e.Index, e.Term)
+		got, err := rl.entries(context.Background(), 2, 5)
+		if err != nil {
+			t.Fatalf("entries: %v", err)
 		}
-	}
+		if len(got) != 3 || got[0].Index != 2 || got[2].Index != 4 {
+			t.Fatalf("entries(2,5) returned %d entries starting at %v, want 2..4", len(got), got)
+		}
+		for _, e := range got {
+			if e.Term != 4 {
+				t.Errorf("entry %d has term %d, want 4", e.Index, e.Term)
+			}
+		}
 
-	term, err := rl.termAt(3)
-	if err != nil {
-		t.Fatalf("termAt(3): %v", err)
-	}
-	if term != 4 {
-		t.Errorf("termAt(3) = %d, want 4", term)
-	}
+		term, err := rl.termAt(3)
+		if err != nil {
+			t.Fatalf("termAt(3): %v", err)
+		}
+		if term != 4 {
+			t.Errorf("termAt(3) = %d, want 4", term)
+		}
 
-	store.release()
-	settle(t, rl, w)
+		store.release()
+		settle(t, rl, w)
+	})
 }
 
 // TestRaftLog_ReadsSpanBothHalvesOfTheLog covers a range that starts on disk
 // and ends in memory, which is the shape of every read a leader does while it
 // is being written to.
 func TestRaftLog_ReadsSpanBothHalvesOfTheLog(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	rl.append(entriesAt(1, 1, 4))
-	settle(t, rl, w)
+		rl.append(entriesAt(1, 1, 4))
+		settle(t, rl, w)
 
-	store.hold()
-	defer store.release()
-	rl.append(entriesAt(2, 5, 4))
+		store.hold()
+		defer store.release()
+		rl.append(entriesAt(2, 5, 4))
 
-	got, err := rl.entries(context.Background(), 3, 7)
-	if err != nil {
-		t.Fatalf("entries: %v", err)
-	}
-	want := []Index{3, 4, 5, 6}
-	if len(got) != len(want) {
-		t.Fatalf("entries(3,7) returned %v, want indices %v", got, want)
-	}
-	for i := range want {
-		if got[i].Index != want[i] {
-			t.Fatalf("entries(3,7) returned index %d at position %d, want %d", got[i].Index, i, want[i])
+		got, err := rl.entries(context.Background(), 3, 7)
+		if err != nil {
+			t.Fatalf("entries: %v", err)
 		}
-	}
-	if got[1].Term != 1 || got[2].Term != 2 {
-		t.Errorf("the boundary entries have terms %d and %d, want 1 and 2", got[1].Term, got[2].Term)
-	}
+		want := []Index{3, 4, 5, 6}
+		if len(got) != len(want) {
+			t.Fatalf("entries(3,7) returned %v, want indices %v", got, want)
+		}
+		for i := range want {
+			if got[i].Index != want[i] {
+				t.Fatalf("entries(3,7) returned index %d at position %d, want %d", got[i].Index, i, want[i])
+			}
+		}
+		if got[1].Term != 1 || got[2].Term != 2 {
+			t.Errorf("the boundary entries have terms %d and %d, want 1 and 2", got[1].Term, got[2].Term)
+		}
+	})
 }
 
 // TestRaftLog_ReadsRefuseIndicesTheLogHasDiscarded pins the guard that makes
@@ -385,35 +394,37 @@ func TestRaftLog_ReadsSpanBothHalvesOfTheLog(t *testing.T) {
 // has rather than by what storage will hand over, so those entries cannot come
 // back through a read in the meantime.
 func TestRaftLog_ReadsRefuseIndicesTheLogHasDiscarded(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	rl.append(entriesAt(1, 1, 6))
-	settle(t, rl, w)
+		rl.append(entriesAt(1, 1, 6))
+		settle(t, rl, w)
 
-	store.hold()
-	defer store.release()
+		store.hold()
+		defer store.release()
 
-	if err := rl.truncateSuffix(context.Background(), 4); err != nil {
-		t.Fatalf("truncateSuffix: %v", err)
-	}
+		if err := rl.truncateSuffix(context.Background(), 4); err != nil {
+			t.Fatalf("truncateSuffix: %v", err)
+		}
 
-	// Storage has not been touched yet.
-	if got := store.indices(); len(got) != 6 {
-		t.Fatalf("storage holds %v; the test needs the truncation to still be pending", got)
-	}
+		// Storage has not been touched yet.
+		if got := store.indices(); len(got) != 6 {
+			t.Fatalf("storage holds %v; the test needs the truncation to still be pending", got)
+		}
 
-	if _, err := rl.termAt(5); err == nil {
-		t.Error("termAt returned a discarded entry that storage had not removed yet")
-	}
-	if got, err := rl.entries(context.Background(), 4, 7); err == nil && len(got) != 0 {
-		t.Errorf("entries returned %d discarded entries that storage had not removed yet", len(got))
-	}
-	if rl.canDescribe(5) {
-		t.Error("canDescribe said it could describe a discarded entry")
-	}
-	if got := rl.lastLogIndex(); got != 3 {
-		t.Errorf("lastLogIndex = %d, want 3", got)
-	}
+		if _, err := rl.termAt(5); err == nil {
+			t.Error("termAt returned a discarded entry that storage had not removed yet")
+		}
+		if got, err := rl.entries(context.Background(), 4, 7); err == nil && len(got) != 0 {
+			t.Errorf("entries returned %d discarded entries that storage had not removed yet", len(got))
+		}
+		if rl.canDescribe(5) {
+			t.Error("canDescribe said it could describe a discarded entry")
+		}
+		if got := rl.lastLogIndex(); got != 3 {
+			t.Errorf("lastLogIndex = %d, want 3", got)
+		}
+	})
 }
 
 // TestRaftLog_UnstableSizeTracksWhatIsHeldInMemory pins the number a leader
@@ -421,60 +432,64 @@ func TestRaftLog_ReadsRefuseIndicesTheLogHasDiscarded(t *testing.T) {
 // node could take; understating it would let the backlog grow without limit,
 // which is the failure the limit exists to prevent.
 func TestRaftLog_UnstableSizeTracksWhatIsHeldInMemory(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	if got := rl.unstableSize(); got != 0 {
-		t.Fatalf("unstableSize on a fresh log = %d, want 0", got)
-	}
+		if got := rl.unstableSize(); got != 0 {
+			t.Fatalf("unstableSize on a fresh log = %d, want 0", got)
+		}
 
-	store.hold()
-	rl.append(entriesAt(1, 1, 4)) // 4 entries of 3 bytes each
-	if got := rl.unstableSize(); got != 12 {
-		t.Errorf("unstableSize = %d after appending 4 commands of 3 bytes, want 12", got)
-	}
+		store.hold()
+		rl.append(entriesAt(1, 1, 4)) // 4 entries of 3 bytes each
+		if got := rl.unstableSize(); got != 12 {
+			t.Errorf("unstableSize = %d after appending 4 commands of 3 bytes, want 12", got)
+		}
 
-	if err := rl.truncateSuffix(context.Background(), 3); err != nil {
-		t.Fatalf("truncateSuffix: %v", err)
-	}
-	if got := rl.unstableSize(); got != 6 {
-		t.Errorf("unstableSize = %d after discarding 2 of the 4, want 6", got)
-	}
+		if err := rl.truncateSuffix(context.Background(), 3); err != nil {
+			t.Fatalf("truncateSuffix: %v", err)
+		}
+		if got := rl.unstableSize(); got != 6 {
+			t.Errorf("unstableSize = %d after discarding 2 of the 4, want 6", got)
+		}
 
-	store.release()
-	settle(t, rl, w)
+		store.release()
+		settle(t, rl, w)
 
-	if got := rl.unstableSize(); got != 0 {
-		t.Errorf("unstableSize = %d once every write landed, want 0", got)
-	}
+		if got := rl.unstableSize(); got != 0 {
+			t.Errorf("unstableSize = %d once every write landed, want 0", got)
+		}
+	})
 }
 
 // TestRaftLog_CompactionReleasesEntriesFromBothHalves pins that reclaiming a
 // prefix reclaims it in memory too, so a node that compacts while writes are
 // outstanding does not keep the compacted entries alive.
 func TestRaftLog_CompactionReleasesEntriesFromBothHalves(t *testing.T) {
-	rl, store, w := newTestLog(t)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := newTestLog(t)
 
-	store.hold()
-	rl.append(entriesAt(1, 1, 6))
+		store.hold()
+		rl.append(entriesAt(1, 1, 6))
 
-	rl.truncatePrefix(4)
-	if got := rl.unstableSize(); got != 9 {
-		t.Errorf("unstableSize = %d after compacting away 3 of 6 entries, want 9", got)
-	}
-	if rl.first != 4 {
-		t.Errorf("first = %d after compaction, want 4", rl.first)
-	}
-	if rl.canDescribe(2) {
-		t.Error("canDescribe said it could describe a compacted entry")
-	}
+		rl.truncatePrefix(4)
+		if got := rl.unstableSize(); got != 9 {
+			t.Errorf("unstableSize = %d after compacting away 3 of 6 entries, want 9", got)
+		}
+		if rl.first != 4 {
+			t.Errorf("first = %d after compaction, want 4", rl.first)
+		}
+		if rl.canDescribe(2) {
+			t.Error("canDescribe said it could describe a compacted entry")
+		}
 
-	store.release()
-	settle(t, rl, w)
+		store.release()
+		settle(t, rl, w)
 
-	if got := store.indices(); !slices.Equal(got, []Index{4, 5, 6}) {
-		t.Errorf("storage holds %v, want 4..6", got)
-	}
-	if got := rl.stableIndex(); got != 6 {
-		t.Errorf("stableIndex = %d, want 6", got)
-	}
+		if got := store.indices(); !slices.Equal(got, []Index{4, 5, 6}) {
+			t.Errorf("storage holds %v, want 4..6", got)
+		}
+		if got := rl.stableIndex(); got != 6 {
+			t.Errorf("stableIndex = %d, want 6", got)
+		}
+	})
 }

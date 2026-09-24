@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -42,6 +43,10 @@ func watchNode(t *testing.T, id raft.NodeID, net *memtransport.Network, peers []
 	}
 	net.Register(id, node.Handler())
 	node.Start()
+	// Registered here rather than left to each caller: inside a synctest
+	// bubble a node still running when the test ends is a failure, not an
+	// unnoticed leak.
+	t.Cleanup(node.Stop)
 	return node
 }
 
@@ -71,54 +76,73 @@ func awaitChange(t *testing.T, ch <-chan raft.LeadershipChange, want func(raft.L
 // leadership change from no change at all, so work carries on running on a node
 // that is no longer entitled to do it.
 func TestLeadershipChanges_ReportsGainingAndLosingLeadership(t *testing.T) {
-	net := memtransport.NewNetwork()
-	node := watchNode(t, "n1", net, nil)
-	t.Cleanup(node.Stop)
+	synctest.Test(t, func(t *testing.T) {
+		net := memtransport.NewNetwork()
+		node := watchNode(t, "n1", net, nil)
+		t.Cleanup(node.Stop)
 
-	changes, stop := node.LeadershipChanges()
-	defer stop()
+		changes, stop := node.LeadershipChanges()
+		defer stop()
 
-	// The first value is the status at subscription time, so a subscriber does
-	// not have to wait for a change to learn where it stands.
-	select {
-	case initial := <-changes:
-		if initial.IsLeader {
-			t.Fatalf("node reported itself leader before any election: %+v", initial)
+		// The first value is the status at subscription time, so a subscriber does
+		// not have to wait for a change to learn where it stands.
+		select {
+		case initial := <-changes:
+			if initial.IsLeader {
+				t.Fatalf("node reported itself leader before any election: %+v", initial)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("no initial status delivered on subscribe")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("no initial status delivered on subscribe")
-	}
 
-	go func() {
-		deadline := time.Now().Add(3 * time.Second)
-		for node.State() != raft.Leader && time.Now().Before(deadline) {
-			node.Tick()
-			time.Sleep(time.Millisecond)
+		// Stopped and waited for when the test body returns. Signalling alone
+		// is not enough: the bubble checks for stray goroutines the moment the
+		// body returns, and this one would still be in its sleep. It outlives
+		// the wait below whenever the node becomes leader before its own
+		// deadline, which is the normal case.
+		stopTicking := make(chan struct{})
+		tickerDone := make(chan struct{})
+		defer func() {
+			close(stopTicking)
+			<-tickerDone
+		}()
+		go func() {
+			defer close(tickerDone)
+			deadline := time.Now().Add(3 * time.Second)
+			for node.State() != raft.Leader && time.Now().Before(deadline) {
+				select {
+				case <-stopTicking:
+					return
+				default:
+				}
+				node.Tick()
+				time.Sleep(time.Millisecond)
+			}
+		}()
+
+		became := awaitChange(t, changes, func(c raft.LeadershipChange) bool { return c.IsLeader },
+			"this node to report itself leader")
+		if became.Leader != "n1" {
+			t.Errorf("leader reported as %q while claiming leadership, want n1", became.Leader)
 		}
-	}()
+		if became.Term == 0 {
+			t.Error("leadership reported at term 0")
+		}
 
-	became := awaitChange(t, changes, func(c raft.LeadershipChange) bool { return c.IsLeader },
-		"this node to report itself leader")
-	if became.Leader != "n1" {
-		t.Errorf("leader reported as %q while claiming leadership, want n1", became.Leader)
-	}
-	if became.Term == 0 {
-		t.Error("leadership reported at term 0")
-	}
+		// A higher term from elsewhere deposes it.
+		if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+			Term:     became.Term + 5,
+			LeaderID: "n2",
+		}); err != nil {
+			t.Fatalf("HandleAppendEntries: %v", err)
+		}
 
-	// A higher term from elsewhere deposes it.
-	if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-		Term:     became.Term + 5,
-		LeaderID: "n2",
-	}); err != nil {
-		t.Fatalf("HandleAppendEntries: %v", err)
-	}
-
-	lost := awaitChange(t, changes, func(c raft.LeadershipChange) bool { return !c.IsLeader },
-		"this node to report that it is no longer leader")
-	if lost.Leader != "n2" {
-		t.Errorf("leader reported as %q after stepping down, want n2", lost.Leader)
-	}
+		lost := awaitChange(t, changes, func(c raft.LeadershipChange) bool { return !c.IsLeader },
+			"this node to report that it is no longer leader")
+		if lost.Leader != "n2" {
+			t.Errorf("leader reported as %q after stepping down, want n2", lost.Leader)
+		}
+	})
 }
 
 // TestLeadershipChanges_SlowSubscriberSeesCurrentStatus asserts the coalescing
@@ -126,90 +150,96 @@ func TestLeadershipChanges_ReportsGainingAndLosingLeadership(t *testing.T) {
 // it comes back. Acting on an out-of-date leadership status is the failure this
 // signal exists to prevent.
 func TestLeadershipChanges_SlowSubscriberSeesCurrentStatus(t *testing.T) {
-	net := memtransport.NewNetwork()
-	node := watchNode(t, "n1", net, nil)
-	t.Cleanup(node.Stop)
+	synctest.Test(t, func(t *testing.T) {
+		net := memtransport.NewNetwork()
+		node := watchNode(t, "n1", net, nil)
+		t.Cleanup(node.Stop)
 
-	changes, stop := node.LeadershipChanges()
-	defer stop()
+		changes, stop := node.LeadershipChanges()
+		defer stop()
 
-	// Never read while the node churns through several transitions.
-	deadline := time.Now().Add(3 * time.Second)
-	for node.State() != raft.Leader && time.Now().Before(deadline) {
-		node.Tick()
-		time.Sleep(time.Millisecond)
-	}
-	if node.State() != raft.Leader {
-		t.Fatal("node never became leader")
-	}
-	for range 5 {
-		if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-			Term:     node.Term() + 1,
-			LeaderID: "n2",
-		}); err != nil {
-			t.Fatalf("HandleAppendEntries: %v", err)
+		// Never read while the node churns through several transitions.
+		deadline := time.Now().Add(3 * time.Second)
+		for node.State() != raft.Leader && time.Now().Before(deadline) {
+			node.Tick()
+			time.Sleep(time.Millisecond)
 		}
-	}
-
-	// Whatever is waiting must describe where the node actually is now.
-	select {
-	case change := <-changes:
-		if change.IsLeader {
-			t.Errorf("subscriber was handed a stale status claiming leadership: %+v", change)
+		if node.State() != raft.Leader {
+			t.Fatal("node never became leader")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no status available to a subscriber that fell behind")
-	}
+		for range 5 {
+			if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+				Term:     node.Term() + 1,
+				LeaderID: "n2",
+			}); err != nil {
+				t.Fatalf("HandleAppendEntries: %v", err)
+			}
+		}
+
+		// Whatever is waiting must describe where the node actually is now.
+		select {
+		case change := <-changes:
+			if change.IsLeader {
+				t.Errorf("subscriber was handed a stale status claiming leadership: %+v", change)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no status available to a subscriber that fell behind")
+		}
+	})
 }
 
 // TestLeadershipChanges_ChannelClosesWhenTheNodeStops asserts that a consumer
 // ranging over the channel is released when the node shuts down, rather than
 // blocking for ever.
 func TestLeadershipChanges_ChannelClosesWhenTheNodeStops(t *testing.T) {
-	net := memtransport.NewNetwork()
-	node := watchNode(t, "n1", net, nil)
+	synctest.Test(t, func(t *testing.T) {
+		net := memtransport.NewNetwork()
+		node := watchNode(t, "n1", net, nil)
 
-	changes, stop := node.LeadershipChanges()
-	defer stop()
+		changes, stop := node.LeadershipChanges()
+		defer stop()
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for range changes { //nolint:revive // draining until close is the point
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for range changes { //nolint:revive // draining until close is the point
+			}
+		}()
+
+		node.Stop()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("subscription channel was not closed when the node stopped")
 		}
-	}()
-
-	node.Stop()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("subscription channel was not closed when the node stopped")
-	}
+	})
 }
 
 // TestLeadershipChanges_StopEndsTheSubscription asserts that unsubscribing
 // releases the subscription and does not panic when called twice.
 func TestLeadershipChanges_StopEndsTheSubscription(t *testing.T) {
-	net := memtransport.NewNetwork()
-	node := watchNode(t, "n1", net, nil)
-	t.Cleanup(node.Stop)
+	synctest.Test(t, func(t *testing.T) {
+		net := memtransport.NewNetwork()
+		node := watchNode(t, "n1", net, nil)
+		t.Cleanup(node.Stop)
 
-	changes, stop := node.LeadershipChanges()
-	stop()
-	stop() // must be safe
+		changes, stop := node.LeadershipChanges()
+		stop()
+		stop() // must be safe
 
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case _, ok := <-changes:
-			if !ok {
-				return // closed, as expected
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case _, ok := <-changes:
+				if !ok {
+					return // closed, as expected
+				}
+			case <-deadline:
+				t.Fatal("channel was not closed after the subscription was stopped")
 			}
-		case <-deadline:
-			t.Fatal("channel was not closed after the subscription was stopped")
 		}
-	}
+	})
 }
 
 // TestLeadershipChanges_NeverReportsAHalfAppliedTransition asserts that every
@@ -221,54 +251,56 @@ func TestLeadershipChanges_StopEndsTheSubscription(t *testing.T) {
 // and a caller that redirects clients to the reported leader would send them
 // nowhere.
 func TestLeadershipChanges_NeverReportsAHalfAppliedTransition(t *testing.T) {
-	net := memtransport.NewNetwork()
-	node := watchNode(t, "n1", net, nil)
-	t.Cleanup(node.Stop)
+	synctest.Test(t, func(t *testing.T) {
+		net := memtransport.NewNetwork()
+		node := watchNode(t, "n1", net, nil)
+		t.Cleanup(node.Stop)
 
-	changes, stop := node.LeadershipChanges()
-	defer stop()
+		changes, stop := node.LeadershipChanges()
+		defer stop()
 
-	inspected := make(chan struct{})
-	go func() {
-		defer close(inspected)
-		for change := range changes {
-			if change.IsLeader && change.Leader != "n1" {
-				t.Errorf("status claims leadership but records the leader as %q: %+v",
-					change.Leader, change)
+		inspected := make(chan struct{})
+		go func() {
+			defer close(inspected)
+			for change := range changes {
+				if change.IsLeader && change.Leader != "n1" {
+					t.Errorf("status claims leadership but records the leader as %q: %+v",
+						change.Leader, change)
+				}
+				if !change.IsLeader && change.Leader == "n1" {
+					t.Errorf("status records this node as leader but does not claim leadership: %+v",
+						change)
+				}
 			}
-			if !change.IsLeader && change.Leader == "n1" {
-				t.Errorf("status records this node as leader but does not claim leadership: %+v",
-					change)
-			}
-		}
-	}()
+		}()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatal("node never became leader")
-		}
-		node.Tick()
-		time.Sleep(time.Millisecond)
-	}
-	// Churn through several terms so the transition is observed repeatedly.
-	for range 5 {
-		if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-			Term:     node.Term() + 1,
-			LeaderID: "n2",
-		}); err != nil {
-			t.Fatalf("HandleAppendEntries: %v", err)
-		}
-		deadline = time.Now().Add(3 * time.Second)
+		deadline := time.Now().Add(3 * time.Second)
 		for node.State() != raft.Leader {
 			if time.Now().After(deadline) {
-				t.Fatal("node never regained leadership")
+				t.Fatal("node never became leader")
 			}
 			node.Tick()
 			time.Sleep(time.Millisecond)
 		}
-	}
+		// Churn through several terms so the transition is observed repeatedly.
+		for range 5 {
+			if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+				Term:     node.Term() + 1,
+				LeaderID: "n2",
+			}); err != nil {
+				t.Fatalf("HandleAppendEntries: %v", err)
+			}
+			deadline = time.Now().Add(3 * time.Second)
+			for node.State() != raft.Leader {
+				if time.Now().After(deadline) {
+					t.Fatal("node never regained leadership")
+				}
+				node.Tick()
+				time.Sleep(time.Millisecond)
+			}
+		}
 
-	stop()
-	<-inspected
+		stop()
+		<-inspected
+	})
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -71,75 +72,79 @@ func seededStore(t *testing.T, n int) raft.Storage {
 
 // TestDurableStateMachine_IsNotReplayedOverWhatItAlreadyHas is the point.
 func TestDurableStateMachine_IsNotReplayedOverWhatItAlreadyHas(t *testing.T) {
-	sm := &durableSM{at: 3}
+	synctest.Test(t, func(t *testing.T) {
+		sm := &durableSM{at: 3}
 
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Storage = seededStore(t, 5)
-	cfg.StateMachine = sm
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Storage = seededStore(t, 5)
+		cfg.StateMachine = sm
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	// A single voter commits its whole log as soon as it leads.
-	stop := tickWhile(node)
-	defer stop()
-	deadline := time.Now().Add(5 * time.Second)
-	for node.LastApplied() < 5 {
-		if time.Now().After(deadline) {
-			t.Fatalf("the node never applied past %d", node.LastApplied())
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	for _, idx := range sm.appliedIndices() {
-		if idx <= 3 {
-			t.Errorf("entry %d was applied again although the state machine already had it", idx)
+		// A single voter commits its whole log as soon as it leads.
+		stop := tickWhile(node)
+		defer stop()
+		deadline := time.Now().Add(5 * time.Second)
+		for node.LastApplied() < 5 {
+			if time.Now().After(deadline) {
+				t.Fatalf("the node never applied past %d", node.LastApplied())
+			}
+			time.Sleep(time.Millisecond)
 		}
-	}
+
+		for _, idx := range sm.appliedIndices() {
+			if idx <= 3 {
+				t.Errorf("entry %d was applied again although the state machine already had it", idx)
+			}
+		}
+	})
 }
 
 // TestDurableStateMachine_WithoutTheInterfaceEverythingIsReplayed pins that
 // the interface is what changes the behaviour, not the seeded log.
 func TestDurableStateMachine_WithoutTheInterfaceEverythingIsReplayed(t *testing.T) {
-	sm := &replayCountingSM{}
+	synctest.Test(t, func(t *testing.T) {
+		sm := &replayCountingSM{}
 
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Storage = seededStore(t, 5)
-	cfg.StateMachine = sm
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Storage = seededStore(t, 5)
+		cfg.StateMachine = sm
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	stop := tickWhile(node)
-	defer stop()
-	deadline := time.Now().Add(5 * time.Second)
-	for node.LastApplied() < 5 {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never applied the seeded log")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	saw := sm.appliedIndices()
-	for want := raft.Index(1); want <= 5; want++ {
-		found := false
-		for _, got := range saw {
-			if got == want {
-				found = true
+		stop := tickWhile(node)
+		defer stop()
+		deadline := time.Now().Add(5 * time.Second)
+		for node.LastApplied() < 5 {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never applied the seeded log")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		saw := sm.appliedIndices()
+		for want := raft.Index(1); want <= 5; want++ {
+			found := false
+			for _, got := range saw {
+				if got == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("entry %d was not applied; a state machine with no durable state needs all of them", want)
 			}
 		}
-		if !found {
-			t.Errorf("entry %d was not applied; a state machine with no durable state needs all of them", want)
-		}
-	}
+	})
 }
 
 // replayCountingSM records applies and does not implement DurableStateMachine.
@@ -170,17 +175,19 @@ func (s *replayCountingSM) appliedIndices() []raft.Index {
 // the log caught up. Refusing to start is the only honest answer, and it names
 // both numbers so the operator can see which storage is the odd one out.
 func TestDurableStateMachine_AheadOfTheLogIsRefused(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Storage = seededStore(t, 5)
-	cfg.StateMachine = &durableSM{at: 9}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Storage = seededStore(t, 5)
+		cfg.StateMachine = &durableSM{at: 9}
 
-	_, err := raft.New(&cfg)
-	if err == nil {
-		t.Fatal("a state machine ahead of the log was accepted")
-	}
-	if !strings.Contains(err.Error(), "ahead of this node's log") {
-		t.Errorf("New returned %v, want it to say the state machine is ahead of the log", err)
-	}
+		_, err := raft.New(&cfg)
+		if err == nil {
+			t.Fatal("a state machine ahead of the log was accepted")
+		}
+		if !strings.Contains(err.Error(), "ahead of this node's log") {
+			t.Errorf("New returned %v, want it to say the state machine is ahead of the log", err)
+		}
+	})
 }
 
 // TestDurableStateMachine_AFailedQueryStopsConstruction pins that the engine
@@ -188,15 +195,17 @@ func TestDurableStateMachine_AheadOfTheLogIsRefused(t *testing.T) {
 // storage is in an unknown state, and starting anyway means choosing between
 // replaying what it already had and skipping what it did not.
 func TestDurableStateMachine_AFailedQueryStopsConstruction(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Storage = seededStore(t, 3)
-	cfg.StateMachine = &durableSM{err: errors.New("disk unreadable")}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Storage = seededStore(t, 3)
+		cfg.StateMachine = &durableSM{err: errors.New("disk unreadable")}
 
-	_, err := raft.New(&cfg)
-	if err == nil {
-		t.Fatal("a state machine that could not report its applied index was accepted")
-	}
-	if !strings.Contains(err.Error(), "disk unreadable") {
-		t.Errorf("New returned %v, want it to carry the state machine's error", err)
-	}
+		_, err := raft.New(&cfg)
+		if err == nil {
+			t.Fatal("a state machine that could not report its applied index was accepted")
+		}
+		if !strings.Contains(err.Error(), "disk unreadable") {
+			t.Errorf("New returned %v, want it to carry the state machine's error", err)
+		}
+	})
 }

@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 )
 
 // countingLogStorage records how many times the commit path reads an entry
@@ -36,101 +37,114 @@ func (c *countingLogStorage) GetLogEntries(ctx context.Context, lo, hi Index) ([
 // below can never be committed by replica count, so there is nothing to test
 // there.
 func TestMaybeAdvanceCommit_DoesNotReadTheLogFromStorage(t *testing.T) {
-	store := &countingLogStorage{}
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingLogStorage{}
 
-	cfg := DefaultConfig()
-	cfg.ID = "self"
-	// Four peers, so a quorum needs three of five and nothing this test does
-	// can commit: the scan runs its full length every time.
-	cfg.Peers = []PeerConfig{
-		{ID: "a", Voter: true}, {ID: "b", Voter: true},
-		{ID: "c", Voter: true}, {ID: "d", Voter: true},
-	}
-	cfg.Storage = store
-	cfg.StateMachine = &stubStateMachine{}
-	cfg.Transport = &stubTransport{}
-	cfg.TickInterval = 0
+		cfg := DefaultConfig()
+		cfg.ID = "self"
+		// Four peers, so a quorum needs three of five and nothing this test does
+		// can commit: the scan runs its full length every time.
+		cfg.Peers = []PeerConfig{
+			{ID: "a", Voter: true}, {ID: "b", Voter: true},
+			{ID: "c", Voter: true}, {ID: "d", Voter: true},
+		}
+		cfg.Storage = store
+		cfg.StateMachine = &stubStateMachine{}
+		cfg.Transport = &stubTransport{}
+		cfg.TickInterval = 0
 
-	node, err := New(&cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+		node, err := New(&cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		// Stopped even though it was never started. The storage writer's
+		// goroutine starts on the first write rather than in Start, so a node
+		// driven by hand like this one still has something running behind it.
+		// Outside a synctest bubble that goroutine outlived the test unnoticed;
+		// inside one it is a failure, which is how this came to light.
+		defer node.Stop()
 
-	// Stand the node up as leader by hand: the event loop is never started, so
-	// the test owns all of this state.
-	const backlog = 500
-	entries := make([]LogEntry, 0, backlog)
-	for i := range backlog {
-		entries = append(entries, LogEntry{Index: Index(i + 1), Term: 7, Command: []byte("x")})
-	}
-	node.log.append(entries)
-	node.flushWrites(t)
-	node.currentTerm = 7
-	node.setState(Leader)
-	node.termStartIndex = 1
-	node.nextIndex = make(map[NodeID]Index)
-	node.matchIndex = make(map[NodeID]Index)
-	node.inflight = make(map[NodeID]int)
-	node.snapshotInflight = make(map[NodeID]bool)
+		// Stand the node up as leader by hand: the event loop is never started, so
+		// the test owns all of this state.
+		const backlog = 500
+		entries := make([]LogEntry, 0, backlog)
+		for i := range backlog {
+			entries = append(entries, LogEntry{Index: Index(i + 1), Term: 7, Command: []byte("x")})
+		}
+		node.log.append(entries)
+		node.flushWrites(t)
+		node.currentTerm = 7
+		node.setState(Leader)
+		node.termStartIndex = 1
+		node.nextIndex = make(map[NodeID]Index)
+		node.matchIndex = make(map[NodeID]Index)
+		node.inflight = make(map[NodeID]int)
+		node.snapshotInflight = make(map[NodeID]bool)
 
-	store.reads = 0
-	for range 20 {
-		node.maybeAdvanceCommit()
-	}
+		store.reads = 0
+		for range 20 {
+			node.maybeAdvanceCommit()
+		}
 
-	if store.reads != 0 {
-		t.Errorf("advancing the commit index read the log %d times over 20 attempts "+
-			"across %d entries; it should read none", store.reads, backlog)
-	}
-	if node.commitIndex != 0 {
-		t.Errorf("commitIndex = %d with only one of five members holding the entries, want 0",
-			node.commitIndex)
-	}
+		if store.reads != 0 {
+			t.Errorf("advancing the commit index read the log %d times over 20 attempts "+
+				"across %d entries; it should read none", store.reads, backlog)
+		}
+		if node.commitIndex != 0 {
+			t.Errorf("commitIndex = %d with only one of five members holding the entries, want 0",
+				node.commitIndex)
+		}
+	})
 }
 
 // TestMaybeAdvanceCommit_StillCommitsOnQuorum is the guard on the other side:
 // bounding the scan must not stop it finding the highest committable index.
 func TestMaybeAdvanceCommit_StillCommitsOnQuorum(t *testing.T) {
-	store := &countingLogStorage{}
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingLogStorage{}
 
-	cfg := DefaultConfig()
-	cfg.ID = "self"
-	cfg.Peers = []PeerConfig{{ID: "a", Voter: true}, {ID: "b", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = &stubStateMachine{}
-	cfg.Transport = &stubTransport{}
-	cfg.TickInterval = 0
+		cfg := DefaultConfig()
+		cfg.ID = "self"
+		cfg.Peers = []PeerConfig{{ID: "a", Voter: true}, {ID: "b", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = &stubStateMachine{}
+		cfg.Transport = &stubTransport{}
+		cfg.TickInterval = 0
 
-	node, err := New(&cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+		node, err := New(&cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		// Stopped though never started: the storage writer's goroutine
+		// starts on the first write, not in Start.
+		defer node.Stop()
 
-	// Entries 1 and 2 are from an earlier term; 3 to 6 are this leader's.
-	entries := []LogEntry{
-		{Index: 1, Term: 6, Command: []byte("old")},
-		{Index: 2, Term: 6, Command: []byte("old")},
-		{Index: 3, Term: 7, Command: nil},
-		{Index: 4, Term: 7, Command: []byte("x")},
-		{Index: 5, Term: 7, Command: []byte("x")},
-		{Index: 6, Term: 7, Command: []byte("x")},
-	}
-	node.log.append(entries)
-	node.flushWrites(t)
-	node.currentTerm = 7
-	node.setState(Leader)
-	node.termStartIndex = 3
-	node.nextIndex = map[NodeID]Index{"a": 7, "b": 7}
-	node.matchIndex = map[NodeID]Index{"a": 5, "b": 2}
-	node.inflight = make(map[NodeID]int)
-	node.snapshotInflight = make(map[NodeID]bool)
+		// Entries 1 and 2 are from an earlier term; 3 to 6 are this leader's.
+		entries := []LogEntry{
+			{Index: 1, Term: 6, Command: []byte("old")},
+			{Index: 2, Term: 6, Command: []byte("old")},
+			{Index: 3, Term: 7, Command: nil},
+			{Index: 4, Term: 7, Command: []byte("x")},
+			{Index: 5, Term: 7, Command: []byte("x")},
+			{Index: 6, Term: 7, Command: []byte("x")},
+		}
+		node.log.append(entries)
+		node.flushWrites(t)
+		node.currentTerm = 7
+		node.setState(Leader)
+		node.termStartIndex = 3
+		node.nextIndex = map[NodeID]Index{"a": 7, "b": 7}
+		node.matchIndex = map[NodeID]Index{"a": 5, "b": 2}
+		node.inflight = make(map[NodeID]int)
+		node.snapshotInflight = make(map[NodeID]bool)
 
-	node.maybeAdvanceCommit()
+		node.maybeAdvanceCommit()
 
-	// Self and a hold index 5; b does not. Two of three is a majority.
-	if node.commitIndex != 5 {
-		t.Errorf("commitIndex = %d, want 5", node.commitIndex)
-	}
+		// Self and a hold index 5; b does not. Two of three is a majority.
+		if node.commitIndex != 5 {
+			t.Errorf("commitIndex = %d, want 5", node.commitIndex)
+		}
+	})
 }
 
 // TestMaybeAdvanceCommit_WillNotCommitAnEarlierTermByCount pins the safety
@@ -138,41 +152,46 @@ func TestMaybeAdvanceCommit_StillCommitsOnQuorum(t *testing.T) {
 // on replica count alone, however widely it is replicated (Raft 5.4.2, the
 // Figure 8 case).
 func TestMaybeAdvanceCommit_WillNotCommitAnEarlierTermByCount(t *testing.T) {
-	store := &countingLogStorage{}
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingLogStorage{}
 
-	cfg := DefaultConfig()
-	cfg.ID = "self"
-	cfg.Peers = []PeerConfig{{ID: "a", Voter: true}, {ID: "b", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = &stubStateMachine{}
-	cfg.Transport = &stubTransport{}
-	cfg.TickInterval = 0
+		cfg := DefaultConfig()
+		cfg.ID = "self"
+		cfg.Peers = []PeerConfig{{ID: "a", Voter: true}, {ID: "b", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = &stubStateMachine{}
+		cfg.Transport = &stubTransport{}
+		cfg.TickInterval = 0
 
-	node, err := New(&cfg)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+		node, err := New(&cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		// Stopped though never started: the storage writer's goroutine
+		// starts on the first write, not in Start.
+		defer node.Stop()
 
-	entries := []LogEntry{
-		{Index: 1, Term: 6, Command: []byte("old")},
-		{Index: 2, Term: 6, Command: []byte("old")},
-		{Index: 3, Term: 7, Command: nil}, // this leader's no-op
-	}
-	node.log.append(entries)
-	node.flushWrites(t)
-	node.currentTerm = 7
-	node.setState(Leader)
-	node.termStartIndex = 3
-	node.nextIndex = map[NodeID]Index{"a": 3, "b": 3}
-	// Both peers hold the old entries; neither holds the no-op yet.
-	node.matchIndex = map[NodeID]Index{"a": 2, "b": 2}
-	node.inflight = make(map[NodeID]int)
-	node.snapshotInflight = make(map[NodeID]bool)
+		entries := []LogEntry{
+			{Index: 1, Term: 6, Command: []byte("old")},
+			{Index: 2, Term: 6, Command: []byte("old")},
+			{Index: 3, Term: 7, Command: nil}, // this leader's no-op
+		}
+		node.log.append(entries)
+		node.flushWrites(t)
+		node.currentTerm = 7
+		node.setState(Leader)
+		node.termStartIndex = 3
+		node.nextIndex = map[NodeID]Index{"a": 3, "b": 3}
+		// Both peers hold the old entries; neither holds the no-op yet.
+		node.matchIndex = map[NodeID]Index{"a": 2, "b": 2}
+		node.inflight = make(map[NodeID]int)
+		node.snapshotInflight = make(map[NodeID]bool)
 
-	node.maybeAdvanceCommit()
+		node.maybeAdvanceCommit()
 
-	if node.commitIndex != 0 {
-		t.Errorf("commitIndex = %d: an entry from an earlier term was committed on "+
-			"replica count alone", node.commitIndex)
-	}
+		if node.commitIndex != 0 {
+			t.Errorf("commitIndex = %d: an entry from an earlier term was committed on "+
+				"replica count alone", node.commitIndex)
+		}
+	})
 }

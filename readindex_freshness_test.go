@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -152,8 +153,10 @@ func (barrierSM) Restore(_ context.Context, _ raft.SnapshotMeta, r io.Reader) er
 // tickForever drives the cluster until the returned stop function is called.
 func (c *readIndexCluster) tickForever() func() {
 	done := make(chan struct{})
+	exited := make(chan struct{})
 	var once sync.Once
 	go func() {
+		defer close(exited)
 		for {
 			select {
 			case <-done:
@@ -166,7 +169,14 @@ func (c *readIndexCluster) tickForever() func() {
 			time.Sleep(time.Millisecond)
 		}
 	}()
-	return func() { once.Do(func() { close(done) }) }
+	// The returned function waits for the goroutine to go, rather than only
+	// asking it to. Inside a synctest bubble a goroutine still running when
+	// the test ends is a failure, and closing the channel alone leaves this
+	// one in its sleep.
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
 }
 
 func (c *readIndexCluster) leaderIndex() int {
@@ -189,124 +199,128 @@ func (c *readIndexCluster) leaderIndex() int {
 // then returns a commit index from a leader that had already been replaced.
 // Confirming it requires a fresh round.
 func TestReadIndex_RequestIsConfirmedByARoundThatStartedAfterIt(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-	c := newReadIndexCluster(t, 3)
-	stopTicking := c.tickForever()
-	defer stopTicking()
+		c := newReadIndexCluster(t, 3)
+		stopTicking := c.tickForever()
+		defer stopTicking()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for c.leaderIndex() < 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("no leader elected")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	li := c.leaderIndex()
-	leader := c.nodes[li]
-	gate := c.gates[li]
-
-	// A committed entry in this term, so reads are served rather than queued
-	// behind the leader's initial no-op.
-	if _, err := leader.Propose(ctx, []byte("entry")); err != nil {
-		t.Fatalf("propose: %v", err)
-	}
-
-	gate.hold()
-
-	// First read: starts a barrier round, which the gate holds in flight.
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := leader.ReadIndex(ctx)
-		firstDone <- err
-	}()
-
-	deadline = time.Now().Add(5 * time.Second)
-	for !gate.sawAnyRound() {
-		if time.Now().After(deadline) {
-			t.Fatal("leader never sent a read barrier")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	roundsAtFirstRead := gate.roundsSeen()
-
-	// Second read, arriving while the first round is still outstanding. Its
-	// answer must not come from that round.
-	secondDone := make(chan error, 1)
-	go func() {
-		_, err := leader.ReadIndex(ctx)
-		secondDone <- err
-	}()
-	time.Sleep(50 * time.Millisecond) // give it time to reach the event loop
-
-	gate.release()
-
-	for _, ch := range []chan error{firstDone, secondDone} {
-		select {
-		case err := <-ch:
-			if err != nil {
-				t.Fatalf("ReadIndex: %v", err)
+		deadline := time.Now().Add(5 * time.Second)
+		for c.leaderIndex() < 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("no leader elected")
 			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("ReadIndex never returned")
+			time.Sleep(time.Millisecond)
 		}
-	}
+		li := c.leaderIndex()
+		leader := c.nodes[li]
+		gate := c.gates[li]
 
-	if got := gate.roundsSeen(); got <= roundsAtFirstRead {
-		t.Errorf("both reads were answered by %d barrier round(s); the second read "+
-			"arrived after the first round was already in flight and needed a round of its own",
-			got)
-	}
+		// A committed entry in this term, so reads are served rather than queued
+		// behind the leader's initial no-op.
+		if _, err := leader.Propose(ctx, []byte("entry")); err != nil {
+			t.Fatalf("propose: %v", err)
+		}
+
+		gate.hold()
+
+		// First read: starts a barrier round, which the gate holds in flight.
+		firstDone := make(chan error, 1)
+		go func() {
+			_, err := leader.ReadIndex(ctx)
+			firstDone <- err
+		}()
+
+		deadline = time.Now().Add(5 * time.Second)
+		for !gate.sawAnyRound() {
+			if time.Now().After(deadline) {
+				t.Fatal("leader never sent a read barrier")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		roundsAtFirstRead := gate.roundsSeen()
+
+		// Second read, arriving while the first round is still outstanding. Its
+		// answer must not come from that round.
+		secondDone := make(chan error, 1)
+		go func() {
+			_, err := leader.ReadIndex(ctx)
+			secondDone <- err
+		}()
+		time.Sleep(50 * time.Millisecond) // give it time to reach the event loop
+
+		gate.release()
+
+		for _, ch := range []chan error{firstDone, secondDone} {
+			select {
+			case err := <-ch:
+				if err != nil {
+					t.Fatalf("ReadIndex: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("ReadIndex never returned")
+			}
+		}
+
+		if got := gate.roundsSeen(); got <= roundsAtFirstRead {
+			t.Errorf("both reads were answered by %d barrier round(s); the second read "+
+				"arrived after the first round was already in flight and needed a round of its own",
+				got)
+		}
+	})
 }
 
 // TestReadIndex_ConcurrentReadsStillShareARound asserts the batching that makes
 // ReadIndex cheap is intact: reads that arrive together are answered by one
 // confirmation round, not one round each.
 func TestReadIndex_ConcurrentReadsStillShareARound(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-	c := newReadIndexCluster(t, 3)
-	stopTicking := c.tickForever()
-	defer stopTicking()
+		c := newReadIndexCluster(t, 3)
+		stopTicking := c.tickForever()
+		defer stopTicking()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for c.leaderIndex() < 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("no leader elected")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	li := c.leaderIndex()
-	leader := c.nodes[li]
-	gate := c.gates[li]
-
-	if _, err := leader.Propose(ctx, []byte("entry")); err != nil {
-		t.Fatalf("propose: %v", err)
-	}
-
-	const readers = 16
-	var wg sync.WaitGroup
-	errs := make(chan error, readers)
-	before := gate.roundsSeen()
-	for range readers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := leader.ReadIndex(ctx); err != nil {
-				errs <- err
+		deadline := time.Now().Add(5 * time.Second)
+		for c.leaderIndex() < 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("no leader elected")
 			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatalf("ReadIndex: %v", err)
-	}
+			time.Sleep(time.Millisecond)
+		}
+		li := c.leaderIndex()
+		leader := c.nodes[li]
+		gate := c.gates[li]
 
-	if rounds := gate.roundsSeen() - before; rounds > readers {
-		t.Errorf("%d concurrent reads cost %d barrier rounds; batching is not working",
-			readers, rounds)
-	}
+		if _, err := leader.Propose(ctx, []byte("entry")); err != nil {
+			t.Fatalf("propose: %v", err)
+		}
+
+		const readers = 16
+		var wg sync.WaitGroup
+		errs := make(chan error, readers)
+		before := gate.roundsSeen()
+		for range readers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := leader.ReadIndex(ctx); err != nil {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("ReadIndex: %v", err)
+		}
+
+		if rounds := gate.roundsSeen() - before; rounds > readers {
+			t.Errorf("%d concurrent reads cost %d barrier rounds; batching is not working",
+				readers, rounds)
+		}
+	})
 }

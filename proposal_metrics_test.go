@@ -5,6 +5,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -122,6 +123,10 @@ func metricsNode(t *testing.T, m raft.Metrics, tune func(*raft.Config)) *raft.No
 // operator watches, and it is not derivable from the commit index: it covers
 // the queue at the event loop, the durable append, the replication round-trip
 // and the state machine, which are exactly the parts that get slow.
+// Deliberately not run inside a synctest bubble. It asserts that each
+// proposal was reported with a duration above zero, and a bubble's clock only
+// moves when every goroutine is blocked, so work that completes without
+// anyone waiting takes exactly no time and every duration is zero.
 func TestProposalMetrics_ReportsEveryProposal(t *testing.T) {
 	ctx := context.Background()
 	m := &recordingMetrics{}
@@ -156,38 +161,40 @@ func TestProposalMetrics_ReportsEveryProposal(t *testing.T) {
 // TestProposalMetrics_ReportsFailures asserts that a rejected proposal is
 // reported too, so that a rising failure rate is visible.
 func TestProposalMetrics_ReportsFailures(t *testing.T) {
-	ctx := context.Background()
-	m := &recordingMetrics{}
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		m := &recordingMetrics{}
 
-	// A follower with peers: it never wins an election, so every proposal is
-	// refused.
-	cfg := raft.DefaultConfig()
-	cfg.ID = "n1"
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.Storage = memstore.New()
-	cfg.StateMachine = metricsSM{}
-	cfg.Transport = memtransport.NewNetwork().NewTransport("n1")
-	cfg.TickInterval = 0
-	cfg.Metrics = m
+		// A follower with peers: it never wins an election, so every proposal is
+		// refused.
+		cfg := raft.DefaultConfig()
+		cfg.ID = "n1"
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = metricsSM{}
+		cfg.Transport = memtransport.NewNetwork().NewTransport("n1")
+		cfg.TickInterval = 0
+		cfg.Metrics = m
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
+		}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	if _, err := node.Propose(ctx, []byte("x")); err == nil {
-		t.Fatal("a follower accepted a proposal")
-	}
+		if _, err := node.Propose(ctx, []byte("x")); err == nil {
+			t.Fatal("a follower accepted a proposal")
+		}
 
-	_, outcomes, _ := m.snapshot()
-	if len(outcomes) == 0 {
-		t.Fatal("a refused proposal was not reported at all")
-	}
-	if outcomes[0] {
-		t.Error("a refused proposal was reported as successful")
-	}
+		_, outcomes, _ := m.snapshot()
+		if len(outcomes) == 0 {
+			t.Fatal("a refused proposal was not reported at all")
+		}
+		if outcomes[0] {
+			t.Error("a refused proposal was reported as successful")
+		}
+	})
 }
 
 // TestSnapshotMetrics_ReportTheirRealSize asserts that the size handed to
@@ -197,33 +204,35 @@ func TestProposalMetrics_ReportsFailures(t *testing.T) {
 // and reporting a constant zero makes the metric worse than absent: it reads
 // like a measurement.
 func TestSnapshotMetrics_ReportTheirRealSize(t *testing.T) {
-	ctx := context.Background()
-	m := &recordingMetrics{}
-	node := metricsNode(t, m, func(cfg *raft.Config) {
-		cfg.SnapshotThreshold = 4
-		cfg.TrailingLogs = 3
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		m := &recordingMetrics{}
+		node := metricsNode(t, m, func(cfg *raft.Config) {
+			cfg.SnapshotThreshold = 4
+			cfg.TrailingLogs = 3
+		})
+
+		for range 10 {
+			if _, err := node.Propose(ctx, []byte("x")); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for node.SnapshotIndex() == 0 && time.Now().Before(deadline) {
+			node.Tick()
+			time.Sleep(time.Millisecond)
+		}
+
+		_, _, sizes := m.snapshot()
+		if len(sizes) == 0 {
+			t.Fatal("no snapshot was reported")
+		}
+		for i, size := range sizes {
+			if size < 4096 {
+				t.Errorf("snapshot %d reported %d bytes; the state machine alone writes 4096", i, size)
+			}
+		}
 	})
-
-	for range 10 {
-		if _, err := node.Propose(ctx, []byte("x")); err != nil {
-			t.Fatalf("propose: %v", err)
-		}
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for node.SnapshotIndex() == 0 && time.Now().Before(deadline) {
-		node.Tick()
-		time.Sleep(time.Millisecond)
-	}
-
-	_, _, sizes := m.snapshot()
-	if len(sizes) == 0 {
-		t.Fatal("no snapshot was reported")
-	}
-	for i, size := range sizes {
-		if size < 4096 {
-			t.Errorf("snapshot %d reported %d bytes; the state machine alone writes 4096", i, size)
-		}
-	}
 }
 
 // TestStorageMetrics_ReportsDurableWrites asserts that the writes the event
@@ -234,28 +243,30 @@ func TestSnapshotMetrics_ReportTheirRealSize(t *testing.T) {
 // this, a node whose disk has degraded looks identical to one on a slow
 // network.
 func TestStorageMetrics_ReportsDurableWrites(t *testing.T) {
-	ctx := context.Background()
-	m := &recordingMetrics{}
-	node := metricsNode(t, m, func(cfg *raft.Config) {
-		cfg.SnapshotThreshold = 4
-		cfg.TrailingLogs = 3
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		m := &recordingMetrics{}
+		node := metricsNode(t, m, func(cfg *raft.Config) {
+			cfg.SnapshotThreshold = 4
+			cfg.TrailingLogs = 3
+		})
+
+		for range 8 {
+			if _, err := node.Propose(ctx, []byte("x")); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for node.SnapshotIndex() == 0 && time.Now().Before(deadline) {
+			node.Tick()
+			time.Sleep(time.Millisecond)
+		}
+
+		writes := m.storageWrites()
+		for _, op := range []string{"hardstate", "append", "snapshot"} {
+			if writes[op] == 0 {
+				t.Errorf("no %q write was reported; observed %v", op, writes)
+			}
+		}
 	})
-
-	for range 8 {
-		if _, err := node.Propose(ctx, []byte("x")); err != nil {
-			t.Fatalf("propose: %v", err)
-		}
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for node.SnapshotIndex() == 0 && time.Now().Before(deadline) {
-		node.Tick()
-		time.Sleep(time.Millisecond)
-	}
-
-	writes := m.storageWrites()
-	for _, op := range []string{"hardstate", "append", "snapshot"} {
-		if writes[op] == 0 {
-			t.Errorf("no %q write was reported; observed %v", op, writes)
-		}
-	}
 }

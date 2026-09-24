@@ -25,6 +25,11 @@ import (
 // any build that does it.
 //
 // Run with -race; without it this test passes whether or not the bug is there.
+// Deliberately not run inside a synctest bubble. The reader below spins on
+// Members with nothing to block on, which is the whole point -- it is what
+// makes the race detector see the two goroutines meet. A bubble advances its
+// clock only once every goroutine is durably blocked, so a spinning one stops
+// it for good and this test would hang rather than run.
 func TestMembers_ConcurrentWithConfigChange(t *testing.T) {
 	ctx := context.Background()
 	net := memtransport.NewNetwork()

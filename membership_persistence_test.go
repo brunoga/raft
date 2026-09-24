@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -90,45 +91,47 @@ func hasMember(members []raft.PeerConfig, id raft.NodeID) bool {
 // cluster uses the new ones, which is how a cluster ends up with two leaders
 // that each believe they have a majority.
 func TestMembership_SurvivesRestartAfterCompaction(t *testing.T) {
-	ctx := context.Background()
-	store := memstore.New()
-	net := memtransport.NewNetwork()
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := memstore.New()
+		net := memtransport.NewNetwork()
 
-	// Bootstrap a single-node cluster and add a non-voting member. A non-voter
-	// keeps this node the only voter, so it stays leader throughout and the
-	// test does not depend on elections.
-	node := restartableNode(t, store, net, "n1", nil, 2)
-	if !tickUntil(node, 3*time.Second, func() bool { return node.State() == raft.Leader }) {
-		t.Fatal("node never became leader")
-	}
-	if err := node.AddServer(ctx, raft.PeerConfig{ID: "n2", Voter: false}); err != nil {
-		t.Fatalf("AddServer: %v", err)
-	}
-	if !hasMember(node.Members(), "n2") {
-		t.Fatalf("member not added before restart: %v", node.Members())
-	}
-
-	// Commit enough entries that the config change is compacted into a
-	// snapshot and is no longer present in the log.
-	for range 6 {
-		if _, err := node.Propose(ctx, []byte("entry")); err != nil {
-			t.Fatalf("propose: %v", err)
+		// Bootstrap a single-node cluster and add a non-voting member. A non-voter
+		// keeps this node the only voter, so it stays leader throughout and the
+		// test does not depend on elections.
+		node := restartableNode(t, store, net, "n1", nil, 2)
+		if !tickUntil(node, 3*time.Second, func() bool { return node.State() == raft.Leader }) {
+			t.Fatal("node never became leader")
 		}
-	}
-	if !tickUntil(node, 3*time.Second, func() bool { return node.SnapshotIndex() > 0 }) {
-		t.Fatal("node never took a snapshot")
-	}
-	node.Stop()
+		if err := node.AddServer(ctx, raft.PeerConfig{ID: "n2", Voter: false}); err != nil {
+			t.Fatalf("AddServer: %v", err)
+		}
+		if !hasMember(node.Members(), "n2") {
+			t.Fatalf("member not added before restart: %v", node.Members())
+		}
 
-	// Restart with the peer list the operator originally bootstrapped with.
-	// The membership must come from durable state, not from this argument.
-	restarted := restartableNode(t, store, net, "n1", nil, 2)
-	t.Cleanup(restarted.Stop)
+		// Commit enough entries that the config change is compacted into a
+		// snapshot and is no longer present in the log.
+		for range 6 {
+			if _, err := node.Propose(ctx, []byte("entry")); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
+		}
+		if !tickUntil(node, 3*time.Second, func() bool { return node.SnapshotIndex() > 0 }) {
+			t.Fatal("node never took a snapshot")
+		}
+		node.Stop()
 
-	if !hasMember(restarted.Members(), "n2") {
-		t.Errorf("committed membership lost across restart: members = %v, want n2 present",
-			restarted.Members())
-	}
+		// Restart with the peer list the operator originally bootstrapped with.
+		// The membership must come from durable state, not from this argument.
+		restarted := restartableNode(t, store, net, "n1", nil, 2)
+		t.Cleanup(restarted.Stop)
+
+		if !hasMember(restarted.Members(), "n2") {
+			t.Errorf("committed membership lost across restart: members = %v, want n2 present",
+				restarted.Members())
+		}
+	})
 }
 
 // TestMembership_SurvivesRestartFromLog is the same guarantee for a change that
@@ -136,25 +139,27 @@ func TestMembership_SurvivesRestartAfterCompaction(t *testing.T) {
 // immediately after New, before any entry is re-applied, because the node can
 // be asked to vote before its apply loop has caught up.
 func TestMembership_SurvivesRestartFromLog(t *testing.T) {
-	ctx := context.Background()
-	store := memstore.New()
-	net := memtransport.NewNetwork()
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := memstore.New()
+		net := memtransport.NewNetwork()
 
-	node := restartableNode(t, store, net, "n1", nil, 0) // no compaction
-	if !tickUntil(node, 3*time.Second, func() bool { return node.State() == raft.Leader }) {
-		t.Fatal("node never became leader")
-	}
-	if err := node.AddServer(ctx, raft.PeerConfig{ID: "n2", Voter: false}); err != nil {
-		t.Fatalf("AddServer: %v", err)
-	}
-	node.Stop()
+		node := restartableNode(t, store, net, "n1", nil, 0) // no compaction
+		if !tickUntil(node, 3*time.Second, func() bool { return node.State() == raft.Leader }) {
+			t.Fatal("node never became leader")
+		}
+		if err := node.AddServer(ctx, raft.PeerConfig{ID: "n2", Voter: false}); err != nil {
+			t.Fatalf("AddServer: %v", err)
+		}
+		node.Stop()
 
-	restarted := restartableNode(t, store, net, "n1", nil, 0)
-	t.Cleanup(restarted.Stop)
+		restarted := restartableNode(t, store, net, "n1", nil, 0)
+		t.Cleanup(restarted.Stop)
 
-	// Checked before any tick: no election, no replay, nothing applied yet.
-	if !hasMember(restarted.Members(), "n2") {
-		t.Errorf("membership from the log not in effect after restart: members = %v, want n2 present",
-			restarted.Members())
-	}
+		// Checked before any tick: no election, no replay, nothing applied yet.
+		if !hasMember(restarted.Members(), "n2") {
+			t.Errorf("membership from the log not in effect after restart: members = %v, want n2 present",
+				restarted.Members())
+		}
+	})
 }

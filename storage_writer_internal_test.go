@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 )
 
 // recordingBatchStore records the durable operations issued against it.
@@ -54,31 +55,33 @@ func (s *batchSeamStore) SaveState(_ context.Context, hs *HardState, entries []L
 // can write them as one record and pay one fsync where it used to pay two, and
 // this is where the engine decides to give it the chance.
 func TestStorageWriter_BatchesATermWithTheEntriesThatFollowIt(t *testing.T) {
-	store := &batchSeamStore{}
-	w := newStorageWriter(store)
+	synctest.Test(t, func(t *testing.T) {
+		store := &batchSeamStore{}
+		w := newStorageWriter(store)
 
-	// Fill the queue without letting the writer run, so what it sees is fixed.
-	w.queue = []writeOp{
-		{seq: 1, kind: writeHardState, hs: HardState{CurrentTerm: 4}},
-		{seq: 2, kind: writeAppend, entries: entriesAt(4, 1, 2)},
-		{seq: 3, kind: writeAppend, entries: entriesAt(4, 3, 1)},
-	}
+		// Fill the queue without letting the writer run, so what it sees is fixed.
+		w.queue = []writeOp{
+			{seq: 1, kind: writeHardState, hs: HardState{CurrentTerm: 4}},
+			{seq: 2, kind: writeAppend, entries: entriesAt(4, 1, 2)},
+			{seq: 3, kind: writeAppend, entries: entriesAt(4, 3, 1)},
+		}
 
-	batch, stop := w.take()
-	if stop {
-		t.Fatal("take reported the writer should stop")
-	}
-	if len(batch) != 3 {
-		t.Fatalf("take returned %d operations, want all 3 together", len(batch))
-	}
-	if err := w.run(batch); err != nil {
-		t.Fatalf("run: %v", err)
-	}
+		batch, stop := w.take()
+		if stop {
+			t.Fatal("take reported the writer should stop")
+		}
+		if len(batch) != 3 {
+			t.Fatalf("take returned %d operations, want all 3 together", len(batch))
+		}
+		if err := w.run(batch); err != nil {
+			t.Fatalf("run: %v", err)
+		}
 
-	got := store.operations()
-	if len(got) != 1 || got[0] != "savestate(term=4,1..3)" {
-		t.Errorf("storage saw %v, want one savestate carrying the term and entries 1..3", got)
-	}
+		got := store.operations()
+		if len(got) != 1 || got[0] != "savestate(term=4,1..3)" {
+			t.Errorf("storage saw %v, want one savestate carrying the term and entries 1..3", got)
+		}
+	})
 }
 
 // TestStorageWriter_WithoutTheSeamTheTermGoesAlone pins that a store which does
@@ -86,31 +89,33 @@ func TestStorageWriter_BatchesATermWithTheEntriesThatFollowIt(t *testing.T) {
 // own, so a log recovered after a crash never holds entries from a term the
 // node does not believe it reached.
 func TestStorageWriter_WithoutTheSeamTheTermGoesAlone(t *testing.T) {
-	store := &recordingBatchStore{}
-	w := newStorageWriter(store)
+	synctest.Test(t, func(t *testing.T) {
+		store := &recordingBatchStore{}
+		w := newStorageWriter(store)
 
-	w.queue = []writeOp{
-		{seq: 1, kind: writeHardState, hs: HardState{CurrentTerm: 4}},
-		{seq: 2, kind: writeAppend, entries: entriesAt(4, 1, 2)},
-	}
+		w.queue = []writeOp{
+			{seq: 1, kind: writeHardState, hs: HardState{CurrentTerm: 4}},
+			{seq: 2, kind: writeAppend, entries: entriesAt(4, 1, 2)},
+		}
 
-	first, _ := w.take()
-	if len(first) != 1 || first[0].kind != writeHardState {
-		t.Fatalf("take returned %d operations starting with kind %v, want the hard state alone",
-			len(first), first[0].kind)
-	}
-	if err := w.run(first); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	second, _ := w.take()
-	if err := w.run(second); err != nil {
-		t.Fatalf("run: %v", err)
-	}
+		first, _ := w.take()
+		if len(first) != 1 || first[0].kind != writeHardState {
+			t.Fatalf("take returned %d operations starting with kind %v, want the hard state alone",
+				len(first), first[0].kind)
+		}
+		if err := w.run(first); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		second, _ := w.take()
+		if err := w.run(second); err != nil {
+			t.Fatalf("run: %v", err)
+		}
 
-	got := store.operations()
-	if len(got) != 2 || got[0] != "hardstate(term=4)" || got[1] != "append(1..2)" {
-		t.Errorf("storage saw %v, want [hardstate(term=4) append(1..2)]", got)
-	}
+		got := store.operations()
+		if len(got) != 2 || got[0] != "hardstate(term=4)" || got[1] != "append(1..2)" {
+			t.Errorf("storage saw %v, want [hardstate(term=4) append(1..2)]", got)
+		}
+	})
 }
 
 // TestStorageWriter_ATermWithNoEntriesIsNotBatched pins that the seam is used
@@ -118,22 +123,24 @@ func TestStorageWriter_WithoutTheSeamTheTermGoesAlone(t *testing.T) {
 // wrapping it would mean a store implementing BatchWriter never saw a plain
 // hard-state write at all.
 func TestStorageWriter_ATermWithNoEntriesIsNotBatched(t *testing.T) {
-	store := &batchSeamStore{}
-	w := newStorageWriter(store)
+	synctest.Test(t, func(t *testing.T) {
+		store := &batchSeamStore{}
+		w := newStorageWriter(store)
 
-	w.queue = []writeOp{
-		{seq: 1, kind: writeHardState, hs: HardState{CurrentTerm: 7}},
-		{seq: 2, kind: writeTruncateSuffix, index: 3},
-	}
+		w.queue = []writeOp{
+			{seq: 1, kind: writeHardState, hs: HardState{CurrentTerm: 7}},
+			{seq: 2, kind: writeTruncateSuffix, index: 3},
+		}
 
-	batch, _ := w.take()
-	if len(batch) != 1 || batch[0].kind != writeHardState {
-		t.Fatalf("take returned %d operations, want the hard state alone", len(batch))
-	}
-	if err := w.run(batch); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if got := store.operations(); len(got) != 1 || got[0] != "hardstate(term=7)" {
-		t.Errorf("storage saw %v, want a plain hardstate write", got)
-	}
+		batch, _ := w.take()
+		if len(batch) != 1 || batch[0].kind != writeHardState {
+			t.Fatalf("take returned %d operations, want the hard state alone", len(batch))
+		}
+		if err := w.run(batch); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if got := store.operations(); len(got) != 1 || got[0] != "hardstate(term=7)" {
+			t.Errorf("storage saw %v, want a plain hardstate write", got)
+		}
+	})
 }

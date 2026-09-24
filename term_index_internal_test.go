@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 )
 
 // These tests are about one number: how many times the event loop reads the
@@ -125,22 +126,24 @@ func termLog(t *testing.T, lengths ...int) (*raftLog, *countingStore, *storageWr
 // TestTermIndex_LookingUpATermReadsNothing is the property the whole structure
 // exists for.
 func TestTermIndex_LookingUpATermReadsNothing(t *testing.T) {
-	rl, store, _ := termLog(t, 200, 200, 200)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, _ := termLog(t, 200, 200, 200)
 
-	for i := Index(1); i <= 600; i++ {
-		got, err := rl.termAt(i)
-		if err != nil {
-			t.Fatalf("termAt(%d): %v", i, err)
+		for i := Index(1); i <= 600; i++ {
+			got, err := rl.termAt(i)
+			if err != nil {
+				t.Fatalf("termAt(%d): %v", i, err)
+			}
+			want := Term((i-1)/200 + 1)
+			if got != want {
+				t.Fatalf("termAt(%d) = %d, want %d", i, got, want)
+			}
 		}
-		want := Term((i-1)/200 + 1)
-		if got != want {
-			t.Fatalf("termAt(%d) = %d, want %d", i, got, want)
-		}
-	}
 
-	if n := store.readCount(); n != 0 {
-		t.Errorf("looking up 600 terms made %d storage reads, want 0", n)
-	}
+		if n := store.readCount(); n != 0 {
+			t.Errorf("looking up 600 terms made %d storage reads, want 0", n)
+		}
+	})
 }
 
 // TestTermIndex_AConflictHintCostsNoReads covers the follower's side of a log
@@ -151,21 +154,23 @@ func TestTermIndex_LookingUpATermReadsNothing(t *testing.T) {
 // the cost was the length of a term -- and the trigger is ordinary divergence
 // after an election, which is when a cluster is already busy recovering.
 func TestTermIndex_AConflictHintCostsNoReads(t *testing.T) {
-	rl, store, _ := termLog(t, 500, 500)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, _ := termLog(t, 500, 500)
 
-	// An index deep inside the second term. Its run begins at 501.
-	if got := rl.termRunStart(900); got != 501 {
-		t.Errorf("termRunStart(900) = %d, want 501", got)
-	}
-	if got := rl.termRunStart(300); got != 1 {
-		t.Errorf("termRunStart(300) = %d, want 1", got)
-	}
-	if got := rl.termRunStart(1001); got != 0 {
-		t.Errorf("termRunStart past the end of the log = %d, want 0", got)
-	}
-	if n := store.readCount(); n != 0 {
-		t.Errorf("building conflict hints made %d storage reads, want 0", n)
-	}
+		// An index deep inside the second term. Its run begins at 501.
+		if got := rl.termRunStart(900); got != 501 {
+			t.Errorf("termRunStart(900) = %d, want 501", got)
+		}
+		if got := rl.termRunStart(300); got != 1 {
+			t.Errorf("termRunStart(300) = %d, want 1", got)
+		}
+		if got := rl.termRunStart(1001); got != 0 {
+			t.Errorf("termRunStart past the end of the log = %d, want 0", got)
+		}
+		if n := store.readCount(); n != 0 {
+			t.Errorf("building conflict hints made %d storage reads, want 0", n)
+		}
+	})
 }
 
 // TestTermIndex_InterpretingAConflictHintCostsNoReads covers the leader's side.
@@ -175,30 +180,32 @@ func TestTermIndex_AConflictHintCostsNoReads(t *testing.T) {
 // its log reading each entry, so the cost was how far the follower had fallen
 // behind.
 func TestTermIndex_InterpretingAConflictHintCostsNoReads(t *testing.T) {
-	rl, store, _ := termLog(t, 100, 100, 100)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, _ := termLog(t, 100, 100, 100)
 
-	cases := []struct {
-		term  Term
-		want  Index
-		found bool
-	}{
-		{term: 1, want: 100, found: true},
-		{term: 2, want: 200, found: true},
-		{term: 3, want: 300, found: true},
-		{term: 4, found: false},
-	}
-	for _, c := range cases {
-		got, ok := rl.lastIndexOfTerm(c.term)
-		if ok != c.found {
-			t.Fatalf("lastIndexOfTerm(%d) found = %v, want %v", c.term, ok, c.found)
+		cases := []struct {
+			term  Term
+			want  Index
+			found bool
+		}{
+			{term: 1, want: 100, found: true},
+			{term: 2, want: 200, found: true},
+			{term: 3, want: 300, found: true},
+			{term: 4, found: false},
 		}
-		if ok && got != c.want {
-			t.Errorf("lastIndexOfTerm(%d) = %d, want %d", c.term, got, c.want)
+		for _, c := range cases {
+			got, ok := rl.lastIndexOfTerm(c.term)
+			if ok != c.found {
+				t.Fatalf("lastIndexOfTerm(%d) found = %v, want %v", c.term, ok, c.found)
+			}
+			if ok && got != c.want {
+				t.Errorf("lastIndexOfTerm(%d) = %d, want %d", c.term, got, c.want)
+			}
 		}
-	}
-	if n := store.readCount(); n != 0 {
-		t.Errorf("interpreting conflict hints made %d storage reads, want 0", n)
-	}
+		if n := store.readCount(); n != 0 {
+			t.Errorf("interpreting conflict hints made %d storage reads, want 0", n)
+		}
+	})
 }
 
 // TestTermIndex_FollowsTruncationAndCompaction pins that the index stays a
@@ -206,118 +213,126 @@ func TestTermIndex_InterpretingAConflictHintCostsNoReads(t *testing.T) {
 // that drifted would be worse than no index at all: it answers the questions
 // that decide where two logs diverge.
 func TestTermIndex_FollowsTruncationAndCompaction(t *testing.T) {
-	rl, _, w := termLog(t, 3, 3, 3) // 1..3 term 1, 4..6 term 2, 7..9 term 3
+	synctest.Test(t, func(t *testing.T) {
+		rl, _, w := termLog(t, 3, 3, 3) // 1..3 term 1, 4..6 term 2, 7..9 term 3
 
-	// A new leader in term 5 overwrites from index 5.
-	if err := rl.truncateSuffix(context.Background(), 5); err != nil {
-		t.Fatalf("truncateSuffix: %v", err)
-	}
-	if got, err := rl.termAt(4); err != nil || got != 2 {
-		t.Fatalf("termAt(4) = %d, %v; want 2, nil", got, err)
-	}
-	if _, err := rl.termAt(5); err == nil {
-		t.Error("termAt returned a term for an index the log no longer holds")
-	}
-	if _, ok := rl.lastIndexOfTerm(3); ok {
-		t.Error("the index still reports a term whose entries were all truncated")
-	}
+		// A new leader in term 5 overwrites from index 5.
+		if err := rl.truncateSuffix(context.Background(), 5); err != nil {
+			t.Fatalf("truncateSuffix: %v", err)
+		}
+		if got, err := rl.termAt(4); err != nil || got != 2 {
+			t.Fatalf("termAt(4) = %d, %v; want 2, nil", got, err)
+		}
+		if _, err := rl.termAt(5); err == nil {
+			t.Error("termAt returned a term for an index the log no longer holds")
+		}
+		if _, ok := rl.lastIndexOfTerm(3); ok {
+			t.Error("the index still reports a term whose entries were all truncated")
+		}
 
-	rl.append([]LogEntry{
-		{Index: 5, Term: 5, Command: []byte("c")},
-		{Index: 6, Term: 5, Command: []byte("c")},
+		rl.append([]LogEntry{
+			{Index: 5, Term: 5, Command: []byte("c")},
+			{Index: 6, Term: 5, Command: []byte("c")},
+		})
+		if got, ok := rl.lastIndexOfTerm(5); !ok || got != 6 {
+			t.Errorf("lastIndexOfTerm(5) = %d, %v; want 6, true", got, ok)
+		}
+		if got := rl.termRunStart(6); got != 5 {
+			t.Errorf("termRunStart(6) = %d, want 5", got)
+		}
+
+		// Compaction reclaims the first term and part of the second.
+		rl.truncatePrefix(5)
+		if _, err := rl.termAt(4); err == nil {
+			t.Error("termAt returned a term for a compacted index")
+		}
+		if got, err := rl.termAt(5); err != nil || got != 5 {
+			t.Fatalf("termAt(5) after compaction = %d, %v; want 5, nil", got, err)
+		}
+		if got, ok := rl.lastIndexOfTerm(1); ok {
+			t.Errorf("lastIndexOfTerm(1) = %d after its entries were compacted away, want not found", got)
+		}
+		settle(t, rl, w)
 	})
-	if got, ok := rl.lastIndexOfTerm(5); !ok || got != 6 {
-		t.Errorf("lastIndexOfTerm(5) = %d, %v; want 6, true", got, ok)
-	}
-	if got := rl.termRunStart(6); got != 5 {
-		t.Errorf("termRunStart(6) = %d, want 5", got)
-	}
-
-	// Compaction reclaims the first term and part of the second.
-	rl.truncatePrefix(5)
-	if _, err := rl.termAt(4); err == nil {
-		t.Error("termAt returned a term for a compacted index")
-	}
-	if got, err := rl.termAt(5); err != nil || got != 5 {
-		t.Fatalf("termAt(5) after compaction = %d, %v; want 5, nil", got, err)
-	}
-	if got, ok := rl.lastIndexOfTerm(1); ok {
-		t.Errorf("lastIndexOfTerm(1) = %d after its entries were compacted away, want not found", got)
-	}
-	settle(t, rl, w)
 }
 
 // TestTermIndex_SurvivesARestart pins that a node rebuilds the index from what
 // is on disk. It is built once while the node is being constructed, which is
 // what lets every later lookup be free.
 func TestTermIndex_SurvivesARestart(t *testing.T) {
-	rl, store, w := termLog(t, 2, 3, 4)
-	settle(t, rl, w)
+	synctest.Test(t, func(t *testing.T) {
+		rl, store, w := termLog(t, 2, 3, 4)
+		settle(t, rl, w)
 
-	reopened, err := newRaftLog(store, newStorageWriter(store))
-	if err != nil {
-		t.Fatalf("newRaftLog on reopen: %v", err)
-	}
-
-	store.resetReads()
-	for i := Index(1); i <= 9; i++ {
-		want, _ := rl.termAt(i)
-		got, err := reopened.termAt(i)
+		reopened, err := newRaftLog(store, newStorageWriter(store))
 		if err != nil {
-			t.Fatalf("termAt(%d) after reopen: %v", i, err)
+			t.Fatalf("newRaftLog on reopen: %v", err)
 		}
-		if got != want {
-			t.Errorf("termAt(%d) after reopen = %d, want %d", i, got, want)
+
+		store.resetReads()
+		for i := Index(1); i <= 9; i++ {
+			want, _ := rl.termAt(i)
+			got, err := reopened.termAt(i)
+			if err != nil {
+				t.Fatalf("termAt(%d) after reopen: %v", i, err)
+			}
+			if got != want {
+				t.Errorf("termAt(%d) after reopen = %d, want %d", i, got, want)
+			}
 		}
-	}
-	if got := reopened.lastLogTerm(); got != 3 {
-		t.Errorf("lastLogTerm after reopen = %d, want 3", got)
-	}
-	if n := store.readCount(); n != 0 {
-		t.Errorf("a reopened log made %d storage reads answering term lookups, want 0", n)
-	}
+		if got := reopened.lastLogTerm(); got != 3 {
+			t.Errorf("lastLogTerm after reopen = %d, want 3", got)
+		}
+		if n := store.readCount(); n != 0 {
+			t.Errorf("a reopened log made %d storage reads answering term lookups, want 0", n)
+		}
+	})
 }
 
 // TestTermIndex_StaysSmallHoweverLongTheLogGets pins the reason this is
 // affordable. One run per leadership epoch, not one per entry: a log that
 // never changes leader costs the same as a log with one entry.
 func TestTermIndex_StaysSmallHoweverLongTheLogGets(t *testing.T) {
-	rl, _, _ := termLog(t, 10_000)
+	synctest.Test(t, func(t *testing.T) {
+		rl, _, _ := termLog(t, 10_000)
 
-	if got := len(rl.runs); got != 1 {
-		t.Errorf("a log of 10,000 entries in one term needs %d runs, want 1", got)
-	}
-	if got, err := rl.termAt(9_999); err != nil || got != 1 {
-		t.Fatalf("termAt(9999) = %d, %v; want 1, nil", got, err)
-	}
+		if got := len(rl.runs); got != 1 {
+			t.Errorf("a log of 10,000 entries in one term needs %d runs, want 1", got)
+		}
+		if got, err := rl.termAt(9_999); err != nil || got != 1 {
+			t.Fatalf("termAt(9999) = %d, %v; want 1, nil", got, err)
+		}
+	})
 }
 
 // TestTermIndex_AgreesWithTheEntriesThemselves is the safety net: the index is
 // a claim about what the log holds, and the log itself is the authority.
 func TestTermIndex_AgreesWithTheEntriesThemselves(t *testing.T) {
-	rl, _, w := termLog(t, 7, 1, 4, 1, 9)
-	settle(t, rl, w)
+	synctest.Test(t, func(t *testing.T) {
+		rl, _, w := termLog(t, 7, 1, 4, 1, 9)
+		settle(t, rl, w)
 
-	got, err := rl.entries(context.Background(), rl.first, rl.last+1)
-	if err != nil {
-		t.Fatalf("entries: %v", err)
-	}
-	if len(got) != 22 {
-		t.Fatalf("read %d entries, want 22", len(got))
-	}
-	for _, e := range got {
-		indexed, err := rl.termAt(e.Index)
+		got, err := rl.entries(context.Background(), rl.first, rl.last+1)
 		if err != nil {
-			t.Fatalf("termAt(%d): %v", e.Index, err)
+			t.Fatalf("entries: %v", err)
 		}
-		if indexed != e.Term {
-			t.Fatalf("the index says entry %d is in term %d; the entry says %d",
-				e.Index, indexed, e.Term)
+		if len(got) != 22 {
+			t.Fatalf("read %d entries, want 22", len(got))
 		}
-	}
-	if fmt.Sprint(len(rl.runs)) != "5" {
-		t.Errorf("runs = %d, want 5", len(rl.runs))
-	}
+		for _, e := range got {
+			indexed, err := rl.termAt(e.Index)
+			if err != nil {
+				t.Fatalf("termAt(%d): %v", e.Index, err)
+			}
+			if indexed != e.Term {
+				t.Fatalf("the index says entry %d is in term %d; the entry says %d",
+					e.Index, indexed, e.Term)
+			}
+		}
+		if fmt.Sprint(len(rl.runs)) != "5" {
+			t.Errorf("runs = %d, want 5", len(rl.runs))
+		}
+	})
 }
 
 // TestTermIndex_DescribesTheSnapshotBoundary covers the one index a log can
@@ -330,22 +345,24 @@ func TestTermIndex_AgreesWithTheEntriesThemselves(t *testing.T) {
 // follower that needs almost none of it -- the outcome its own guard against
 // hint-less rejections was written to avoid.
 func TestTermIndex_DescribesTheSnapshotBoundary(t *testing.T) {
-	rl, _, _ := termLog(t, 2)
-	rl.snapMeta = SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 3}
+	synctest.Test(t, func(t *testing.T) {
+		rl, _, _ := termLog(t, 2)
+		rl.snapMeta = SnapshotMeta{LastIncludedIndex: 10, LastIncludedTerm: 3}
 
-	// Compact everything away: the log now holds nothing but the boundary.
-	rl.truncatePrefix(11)
-	if rl.first != 0 {
-		t.Fatalf("first = %d after compacting the whole log, want 0", rl.first)
-	}
+		// Compact everything away: the log now holds nothing but the boundary.
+		rl.truncatePrefix(11)
+		if rl.first != 0 {
+			t.Fatalf("first = %d after compacting the whole log, want 0", rl.first)
+		}
 
-	if got, err := rl.termAt(10); err != nil || got != 3 {
-		t.Fatalf("termAt(10) = %d, %v; want 3, nil", got, err)
-	}
-	if got, ok := rl.lastIndexOfTerm(3); !ok || got != 10 {
-		t.Errorf("lastIndexOfTerm(3) = %d, %v; want 10, true: the boundary is in that term", got, ok)
-	}
-	if _, ok := rl.lastIndexOfTerm(9); ok {
-		t.Error("lastIndexOfTerm reported a term the node has never held")
-	}
+		if got, err := rl.termAt(10); err != nil || got != 3 {
+			t.Fatalf("termAt(10) = %d, %v; want 3, nil", got, err)
+		}
+		if got, ok := rl.lastIndexOfTerm(3); !ok || got != 10 {
+			t.Errorf("lastIndexOfTerm(3) = %d, %v; want 10, true: the boundary is in that term", got, ok)
+		}
+		if _, ok := rl.lastIndexOfTerm(9); ok {
+			t.Error("lastIndexOfTerm reported a term the node has never held")
+		}
+	})
 }

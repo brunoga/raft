@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -111,16 +112,18 @@ func followerTakingANewTerm(t *testing.T, store raft.Storage) *raft.Node {
 // recovered after a crash never holds entries from a term the node does not
 // believe it reached.
 func TestBatchWrite_AStoreWithoutTheSeamIsUnchanged(t *testing.T) {
-	store := &batchStore{Storage: memstore.New()}
-	followerTakingANewTerm(t, store)
+	synctest.Test(t, func(t *testing.T) {
+		store := &batchStore{Storage: memstore.New()}
+		followerTakingANewTerm(t, store)
 
-	ops := store.operations()
-	if len(ops) != 2 {
-		t.Fatalf("storage was called %d times: %v; want two, the term then the entries", len(ops), ops)
-	}
-	if ops[0] != "hardstate(term=4)" || ops[1] != "append(1..3)" {
-		t.Errorf("storage saw %v, want [hardstate(term=4) append(1..3)]", ops)
-	}
+		ops := store.operations()
+		if len(ops) != 2 {
+			t.Fatalf("storage was called %d times: %v; want two, the term then the entries", len(ops), ops)
+		}
+		if ops[0] != "hardstate(term=4)" || ops[1] != "append(1..3)" {
+			t.Errorf("storage saw %v, want [hardstate(term=4) append(1..3)]", ops)
+		}
+	})
 }
 
 // TestBatchWrite_AStoreWithTheSeamSeesTheSameWork pins the other half: batching
@@ -132,39 +135,41 @@ func TestBatchWrite_AStoreWithoutTheSeamIsUnchanged(t *testing.T) {
 // batching itself is tested directly in storage_writer_internal_test.go, where
 // the queue can be held still.
 func TestBatchWrite_AStoreWithTheSeamSeesTheSameWork(t *testing.T) {
-	store := &batchingStore{batchStore{Storage: memstore.New()}}
-	node := followerTakingANewTerm(t, store)
+	synctest.Test(t, func(t *testing.T) {
+		store := &batchingStore{batchStore{Storage: memstore.New()}}
+		node := followerTakingANewTerm(t, store)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for node.Term() != 4 {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never reached term 4")
+		deadline := time.Now().Add(5 * time.Second)
+		for node.Term() != 4 {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never reached term 4")
+			}
+			time.Sleep(time.Millisecond)
 		}
-		time.Sleep(time.Millisecond)
-	}
 
-	last, err := store.LastIndex()
-	if err != nil {
-		t.Fatalf("LastIndex: %v", err)
-	}
-	for last < 3 {
-		if time.Now().After(deadline) {
-			t.Fatalf("the store holds up to index %d, want 3", last)
-		}
-		time.Sleep(time.Millisecond)
-		if last, err = store.LastIndex(); err != nil {
+		last, err := store.LastIndex()
+		if err != nil {
 			t.Fatalf("LastIndex: %v", err)
 		}
-	}
+		for last < 3 {
+			if time.Now().After(deadline) {
+				t.Fatalf("the store holds up to index %d, want 3", last)
+			}
+			time.Sleep(time.Millisecond)
+			if last, err = store.LastIndex(); err != nil {
+				t.Fatalf("LastIndex: %v", err)
+			}
+		}
 
-	hs, err := store.LoadHardState(context.Background())
-	if err != nil {
-		t.Fatalf("LoadHardState: %v", err)
-	}
-	if hs.CurrentTerm != 4 {
-		t.Errorf("the store holds term %d, want 4", hs.CurrentTerm)
-	}
-	if ops := store.operations(); len(ops) == 0 {
-		t.Error("the store was never written to")
-	}
+		hs, err := store.LoadHardState(context.Background())
+		if err != nil {
+			t.Fatalf("LoadHardState: %v", err)
+		}
+		if hs.CurrentTerm != 4 {
+			t.Errorf("the store holds term %d, want 4", hs.CurrentTerm)
+		}
+		if ops := store.operations(); len(ops) == 0 {
+			t.Error("the store was never written to")
+		}
+	})
 }
