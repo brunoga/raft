@@ -439,7 +439,11 @@ func TestClient_Leases(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	lease, grantErr := c.GrantLease(ctx, 400*time.Millisecond)
+	// Two seconds rather than a fraction of one. What is asserted below is
+	// that the keep-alive loop holds the registration past its TTL, and a
+	// 400ms lease only survives a machine that never stalls for 400ms.
+	const leaseTTL = 2 * time.Second
+	lease, grantErr := c.GrantLease(ctx, leaseTTL)
 	if grantErr != nil {
 		t.Fatalf("GrantLease: %v", grantErr)
 	}
@@ -462,9 +466,29 @@ func TestClient_Leases(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.KeepAliveLoop(loopCtx, lease) }()
 
-	time.Sleep(1200 * time.Millisecond)
+	// Held for longer than the lease, so nothing but the loop can explain the
+	// registration surviving. The lease's own deadline is read first: if it
+	// has moved forward, renewals are landing, and if the key has gone
+	// anyway that is a real failure rather than a stalled machine.
+	held := 3 * time.Second
+	start := time.Now()
+	time.Sleep(held)
+	slept := time.Since(start)
+
 	if _, err := services.ReadStale(ctx, "web-1"); err != nil {
+		if slept >= held+leaseTTL {
+			t.Skipf("a %v sleep took %v: this machine stalled for longer than the %v lease, "+
+				"so the registration expiring says nothing about the keep-alive loop",
+				held, slept, leaseTTL)
+		}
 		t.Fatalf("the registration went while the keep-alive loop was running: %v", err)
+	}
+	renewed, renewErr := c.Lease(ctx, lease)
+	if renewErr != nil {
+		t.Fatalf("Lease after renewals: %v", renewErr)
+	}
+	if !renewed.ExpiresAt.After(info.ExpiresAt) {
+		t.Errorf("the lease deadline did not move: %v then %v", info.ExpiresAt, renewed.ExpiresAt)
 	}
 
 	stopLoop()

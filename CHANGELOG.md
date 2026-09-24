@@ -4,6 +4,36 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
+## Unreleased
+
+### Fixed
+
+- **Four tests that failed together on a slow CI runner**, none of them a
+  library defect and three of them mine.
+
+  Two lease tests held a registration alive with renewals and then asserted
+  the key had survived, using a TTL of a few hundred milliseconds. That only
+  holds on a machine that never stalls for that long, and a shared runner
+  does. Both now use a two-second lease, and both measure whether the
+  machine actually stalled -- if renewals really were further apart than the
+  lease, the key expiring says nothing about renewal, and the test says so
+  instead of failing. The client one also asserts the lease deadline moved,
+  which tests renewal directly rather than by inference.
+
+  A leader-balancing test asked for a leadership transfer once and waited
+  thirty seconds for it to land. A transfer is a request: the target has to
+  be caught up enough to win the election it is asked to call, and on a busy
+  machine it may not be in time. It now retries from whichever host leads the
+  group, which is what the balance controller itself does.
+
+  `TestRecover_RefusesWithoutConfirm` asserted that a node's storage held
+  three members after a refused recovery. Membership is recoverable from a
+  snapshot and, for a cluster started from a static peer list, from nowhere
+  else -- so a follower that lagged far enough not to snapshot has no members
+  on disk and never did. Blaming the tool for that is wrong; the test now
+  reads the state before the refusal and checks it is unchanged, which is
+  what it meant all along.
+
 ## v2.1.2
 
 Examples and tests only. No library code changed, so a `v2.1.1` deployment

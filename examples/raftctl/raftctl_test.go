@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -338,6 +339,21 @@ func TestRecover_BringsBackACluster(t *testing.T) {
 func TestRecover_RefusesWithoutConfirm(t *testing.T) {
 	dirs, ids := startCluster(t, true)
 
+	// What this asserts is that the refusal changed nothing, so the state is
+	// read first and compared against itself afterwards.
+	//
+	// It used to assert three members outright, which holds only if this node
+	// happened to write a snapshot before shutdown: a cluster started from a
+	// static peer list has no configuration entries in its log, so membership
+	// is recoverable from a snapshot and nowhere else. A follower that lagged
+	// far enough not to snapshot has no members on disk and never did, and
+	// reporting that as "a refused recovery changed the membership" blames
+	// the tool for something it did not touch. CI found exactly that.
+	before, ierr := inspect(dirs[0])
+	if ierr != nil {
+		t.Fatalf("inspect before: %v", ierr)
+	}
+
 	err := run([]string{"recover", "--data-dir", dirs[0], "--id", string(ids[0])})
 	if err == nil {
 		t.Fatal("recover rewrote durable state without --confirm")
@@ -346,13 +362,20 @@ func TestRecover_RefusesWithoutConfirm(t *testing.T) {
 		t.Errorf("error = %v, want it to name the flag", err)
 	}
 
-	// Nothing was written: the term is untouched.
-	info, ierr := inspect(dirs[0])
+	after, ierr := inspect(dirs[0])
 	if ierr != nil {
-		t.Fatalf("inspect: %v", ierr)
+		t.Fatalf("inspect after: %v", ierr)
 	}
-	if len(info.Members) != 3 {
-		t.Errorf("a refused recovery changed the membership: %v", info.Members)
+	if !reflect.DeepEqual(before.Members, after.Members) {
+		t.Errorf("a refused recovery changed the membership: %v became %v",
+			before.Members, after.Members)
+	}
+	if before.Term != after.Term {
+		t.Errorf("a refused recovery changed the term: %d became %d", before.Term, after.Term)
+	}
+	if before.LastIndex != after.LastIndex {
+		t.Errorf("a refused recovery changed the log: last index %d became %d",
+			before.LastIndex, after.LastIndex)
 	}
 }
 
