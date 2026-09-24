@@ -155,6 +155,19 @@ cluster_demo_intro() {
 # cluster_smoke DESC CMD [NOTE] — register a step. NOTE is prose explaining
 # what the step shows; it is printed in --demo and left out of the copyable
 # list, where the command and its title are the whole point.
+#
+# Quoting CMD decides what the reader sees, and the rule is which side of the
+# script a name lives on:
+#
+#   "..."  for this script's own plumbing -- a binary path, a group count, an
+#          endpoint list. Double quotes expand it here, so both the printed
+#          command and the demonstration show something that can be pasted
+#          into a shell that has never heard of $CTL.
+#
+#   '...'  for anything the command itself creates: a loop variable, or a
+#          value an earlier step assigned, such as the ETag configsvc reads
+#          and then writes back. There the variable *is* the thing to copy,
+#          and expanding it here would print an empty string.
 cluster_smoke() {
     CLUSTER_SMOKE_DESCS+=("$1")
     CLUSTER_SMOKE_CMDS+=("$2")
