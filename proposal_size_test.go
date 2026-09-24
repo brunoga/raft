@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -92,69 +93,77 @@ func leaderWithLimit(t *testing.T, limit int, tune func(*raft.Config)) *raft.Nod
 // — from nothing more than application data being too big. Refusing it at the
 // door turns a silent, permanent stall into an error the caller can act on.
 func TestPropose_RejectsACommandTooLargeToReplicate(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	const limit = 64 * 1024
-	node := leaderWithLimit(t, limit, nil)
+		const limit = 64 * 1024
+		node := leaderWithLimit(t, limit, nil)
 
-	_, err := node.Propose(ctx, make([]byte, limit*2))
-	if !errors.Is(err, raft.ErrProposalTooLarge) {
-		t.Fatalf("Propose of an unreplicable command returned %v, want ErrProposalTooLarge", err)
-	}
+		_, err := node.Propose(ctx, make([]byte, limit*2))
+		if !errors.Is(err, raft.ErrProposalTooLarge) {
+			t.Fatalf("Propose of an unreplicable command returned %v, want ErrProposalTooLarge", err)
+		}
 
-	// The log must be untouched: a rejected proposal is not a log entry.
-	before := node.LastApplied()
-	if _, err := node.Propose(ctx, []byte("small")); err != nil {
-		t.Fatalf("a later small proposal failed, so the group is stalled: %v", err)
-	}
-	if got := node.LastApplied(); got != before+1 {
-		t.Errorf("applied index moved by %d, want 1: the rejected command reached the log", got-before)
-	}
+		// The log must be untouched: a rejected proposal is not a log entry.
+		before := node.LastApplied()
+		if _, err := node.Propose(ctx, []byte("small")); err != nil {
+			t.Fatalf("a later small proposal failed, so the group is stalled: %v", err)
+		}
+		if got := node.LastApplied(); got != before+1 {
+			t.Errorf("applied index moved by %d, want 1: the rejected command reached the log", got-before)
+		}
+	})
 }
 
 // TestPropose_AcceptsACommandThatFits is the companion guard: the limit must
 // not reject commands the transport can carry.
 func TestPropose_AcceptsACommandThatFits(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	const limit = 64 * 1024
-	node := leaderWithLimit(t, limit, nil)
+		const limit = 64 * 1024
+		node := leaderWithLimit(t, limit, nil)
 
-	if _, err := node.Propose(ctx, make([]byte, limit/2)); err != nil {
-		t.Errorf("Propose of a command well inside the transport limit: %v", err)
-	}
+		if _, err := node.Propose(ctx, make([]byte, limit/2)); err != nil {
+			t.Errorf("Propose of a command well inside the transport limit: %v", err)
+		}
+	})
 }
 
 // TestPropose_ConfiguredLimitOverridesTheTransport asserts that an explicit
 // limit is honoured, for transports that cannot report one.
 func TestPropose_ConfiguredLimitOverridesTheTransport(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	node := leaderWithLimit(t, 1<<20, func(cfg *raft.Config) {
-		cfg.MaxProposalBytes = 4096
+		node := leaderWithLimit(t, 1<<20, func(cfg *raft.Config) {
+			cfg.MaxProposalBytes = 4096
+		})
+
+		if _, err := node.Propose(ctx, make([]byte, 8192)); !errors.Is(err, raft.ErrProposalTooLarge) {
+			t.Errorf("Propose past the configured limit returned %v, want ErrProposalTooLarge", err)
+		}
+		if _, err := node.Propose(ctx, make([]byte, 1024)); err != nil {
+			t.Errorf("Propose inside the configured limit: %v", err)
+		}
 	})
-
-	if _, err := node.Propose(ctx, make([]byte, 8192)); !errors.Is(err, raft.ErrProposalTooLarge) {
-		t.Errorf("Propose past the configured limit returned %v, want ErrProposalTooLarge", err)
-	}
-	if _, err := node.Propose(ctx, make([]byte, 1024)); err != nil {
-		t.Errorf("Propose inside the configured limit: %v", err)
-	}
 }
 
 // TestProposeOnce_RejectsACommandTooLargeToReplicate covers the exactly-once
 // entry point, whose dedup header makes the entry larger than the command.
 func TestProposeOnce_RejectsACommandTooLargeToReplicate(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	const limit = 64 * 1024
-	node := leaderWithLimit(t, limit, nil)
+		const limit = 64 * 1024
+		node := leaderWithLimit(t, limit, nil)
 
-	if _, err := node.ProposeOnce(ctx, "client", 1, make([]byte, limit*2)); !errors.Is(err, raft.ErrProposalTooLarge) {
-		t.Errorf("ProposeOnce of an unreplicable command returned %v, want ErrProposalTooLarge", err)
-	}
+		if _, err := node.ProposeOnce(ctx, "client", 1, make([]byte, limit*2)); !errors.Is(err, raft.ErrProposalTooLarge) {
+			t.Errorf("ProposeOnce of an unreplicable command returned %v, want ErrProposalTooLarge", err)
+		}
+	})
 }

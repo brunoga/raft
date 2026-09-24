@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -109,31 +110,41 @@ func TestReconnect_RestartedPeerIsReachedQuickly(t *testing.T) {
 // configured. The test keeps a link idle across that former 30 s boundary and
 // then checks it still carries traffic.
 func TestReconnect_ConnectionSurvivesBeyondThirtySeconds(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping: the test must idle past the former 30s connection age")
-	}
+	// Idling past thirty seconds used to mean waiting thirty-five of them,
+	// behind a testing.Short guard that skipped it. In a bubble the clock is
+	// fake and advances only when every goroutine is blocked, so the idle
+	// period costs nothing and the test always runs. gRPC is unchanged
+	// underneath -- the same HTTP/2, the same keepalive timers, which see the
+	// thirty-five seconds pass exactly as they would have -- and only the
+	// connection beneath it is a pipe rather than a socket.
+	//
+	// The other tests in this file keep their sockets: they turn on a server
+	// being closed and rebound at the same address, and what that does to a
+	// connection is the thing under test.
+	synctest.Test(t, func(t *testing.T) {
+		cli, srv := pairedMemTransports(t)
+		srv.Register("srv", newRecordingHandler())
 
-	cli, srv := pairedTransports(t)
-	srv.Register("srv", newRecordingHandler())
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
+		req := &raft.AppendEntriesRequest{Term: 1, LeaderID: "leader",
+			Entries: []raft.LogEntry{{Index: 1, Term: 1}}}
 
-	req := &raft.AppendEntriesRequest{Term: 1, LeaderID: "leader",
-		Entries: []raft.LogEntry{{Index: 1, Term: 1}}}
+		if _, err := cli.AppendEntries(ctx, "srv", req); err != nil {
+			t.Fatalf("initial AppendEntries: %v", err)
+		}
 
-	if _, err := cli.AppendEntries(ctx, "srv", req); err != nil {
-		t.Fatalf("initial AppendEntries: %v", err)
-	}
+		// Idle well past the boundary at which the connection used to be
+		// recycled.
+		time.Sleep(35 * time.Second)
 
-	// Idle well past the boundary at which the connection used to be recycled.
-	time.Sleep(35 * time.Second)
-
-	sendCtx, sendCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer sendCancel()
-	if _, err := cli.AppendEntries(sendCtx, "srv", req); err != nil {
-		t.Fatalf("AppendEntries after an idle period: %v", err)
-	}
+		sendCtx, sendCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer sendCancel()
+		if _, err := cli.AppendEntries(sendCtx, "srv", req); err != nil {
+			t.Fatalf("AppendEntries after an idle period: %v", err)
+		}
+	})
 }
 
 // TestReconnect_BackoffIsConfigured verifies that the transport governs its own

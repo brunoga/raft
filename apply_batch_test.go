@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -108,109 +109,113 @@ func leaderWithSM(t *testing.T, sm raft.StateMachine) *raft.Node {
 // them durable together, the commit index jumps over all of them at once, and
 // the apply loop is handed the run that the interface exists for.
 func TestApplyBatch_EntriesArriveTogether(t *testing.T) {
-	sm := &batchSM{}
-	store := newGateStore()
+	synctest.Test(t, func(t *testing.T) {
+		sm := &batchSM{}
+		store := newGateStore()
 
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Storage = store
-	cfg.StateMachine = sm
-	tuneForManualTicks(&cfg)
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Storage = store
+		cfg.StateMachine = sm
+		tuneForManualTicks(&cfg)
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	stopTicking := tickWhile(node)
-	t.Cleanup(stopTicking)
-	deadline := time.Now().Add(10 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never became leader")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	release := store.hold(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	const proposals = 64
-	var wg sync.WaitGroup
-	submitted := make(chan struct{}, proposals)
-	for i := range proposals {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			submitted <- struct{}{}
-			_, _ = node.Propose(ctx, fmt.Appendf(nil, "cmd%02d", i))
-		}(i)
-	}
-
-	// Every goroutine has reached its Propose call, and at least one proposal
-	// has already been appended and had its write taken up by the writer,
-	// which is now blocked. Nothing can drain while the disk is held, so the
-	// rest queue behind it rather than racing ahead.
-	for range proposals {
-		select {
-		case <-submitted:
-		case <-time.After(10 * time.Second):
-			t.Fatal("not every proposal was submitted")
+		stopTicking := tickWhile(node)
+		t.Cleanup(stopTicking)
+		deadline := time.Now().Add(10 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never became leader")
+			}
+			time.Sleep(time.Millisecond)
 		}
-	}
-	store.awaitHeld(t)
 
-	release()
-	wg.Wait()
+		release := store.hold(t)
 
-	biggest := 0
-	for _, b := range sm.snapshotBatches() {
-		if len(b) > biggest {
-			biggest = len(b)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		const proposals = 64
+		var wg sync.WaitGroup
+		submitted := make(chan struct{}, proposals)
+		for i := range proposals {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				submitted <- struct{}{}
+				_, _ = node.Propose(ctx, fmt.Appendf(nil, "cmd%02d", i))
+			}(i)
 		}
-	}
-	if biggest < 2 {
-		t.Errorf("the largest batch the state machine saw held %d entries; %d entries "+
-			"committed at once should have been handed over together", biggest, proposals)
-	}
-	t.Logf("largest batch: %d of %d entries", biggest, proposals)
+
+		// Every goroutine has reached its Propose call, and at least one proposal
+		// has already been appended and had its write taken up by the writer,
+		// which is now blocked. Nothing can drain while the disk is held, so the
+		// rest queue behind it rather than racing ahead.
+		for range proposals {
+			select {
+			case <-submitted:
+			case <-time.After(10 * time.Second):
+				t.Fatal("not every proposal was submitted")
+			}
+		}
+		store.awaitHeld(t)
+
+		release()
+		wg.Wait()
+
+		biggest := 0
+		for _, b := range sm.snapshotBatches() {
+			if len(b) > biggest {
+				biggest = len(b)
+			}
+		}
+		if biggest < 2 {
+			t.Errorf("the largest batch the state machine saw held %d entries; %d entries "+
+				"committed at once should have been handed over together", biggest, proposals)
+		}
+		t.Logf("largest batch: %d of %d entries", biggest, proposals)
+	})
 }
 
 // TestApplyBatch_ResultsGoBackToTheRightProposer is the property that a batch
 // must not disturb. Each caller waits on its own command and must get its own
 // answer, not the answer to somebody else's.
 func TestApplyBatch_ResultsGoBackToTheRightProposer(t *testing.T) {
-	sm := &batchSM{}
-	node := leaderWithSM(t, sm)
+	synctest.Test(t, func(t *testing.T) {
+		sm := &batchSM{}
+		node := leaderWithSM(t, sm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-	var wg sync.WaitGroup
-	bad := make(chan string, 64)
-	for i := range 64 {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			cmd := fmt.Sprintf("cmd%02d", i)
-			got, err := node.Propose(ctx, []byte(cmd))
-			if err != nil {
-				bad <- fmt.Sprintf("%s: %v", cmd, err)
-				return
-			}
-			if string(got) != "ok:"+cmd {
-				bad <- fmt.Sprintf("%s got %q", cmd, got)
-			}
-		}(i)
-	}
-	wg.Wait()
-	close(bad)
-	for msg := range bad {
-		t.Errorf("a proposal got the wrong answer: %s", msg)
-	}
+		var wg sync.WaitGroup
+		bad := make(chan string, 64)
+		for i := range 64 {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				cmd := fmt.Sprintf("cmd%02d", i)
+				got, err := node.Propose(ctx, []byte(cmd))
+				if err != nil {
+					bad <- fmt.Sprintf("%s: %v", cmd, err)
+					return
+				}
+				if string(got) != "ok:"+cmd {
+					bad <- fmt.Sprintf("%s got %q", cmd, got)
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(bad)
+		for msg := range bad {
+			t.Errorf("a proposal got the wrong answer: %s", msg)
+		}
+	})
 }
 
 // TestApplyBatch_ARejectedCommandDoesNotFailItsNeighbours pins the difference
@@ -221,81 +226,85 @@ func TestApplyBatch_ResultsGoBackToTheRightProposer(t *testing.T) {
 // as a batch failure would let one bad command undo the work of the entries
 // around it.
 func TestApplyBatch_ARejectedCommandDoesNotFailItsNeighbours(t *testing.T) {
-	sm := &batchSM{reject: "poison"}
-	node := leaderWithSM(t, sm)
+	synctest.Test(t, func(t *testing.T) {
+		sm := &batchSM{reject: "poison"}
+		node := leaderWithSM(t, sm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 
-	var wg sync.WaitGroup
-	results := make(chan error, 3)
-	for _, cmd := range []string{"before", "poison", "after"} {
-		wg.Add(1)
-		go func(cmd string) {
-			defer wg.Done()
-			_, err := node.Propose(ctx, []byte(cmd))
-			if cmd == "poison" {
-				results <- err
-				return
+		var wg sync.WaitGroup
+		results := make(chan error, 3)
+		for _, cmd := range []string{"before", "poison", "after"} {
+			wg.Add(1)
+			go func(cmd string) {
+				defer wg.Done()
+				_, err := node.Propose(ctx, []byte(cmd))
+				if cmd == "poison" {
+					results <- err
+					return
+				}
+				if err != nil {
+					results <- fmt.Errorf("%s was refused: %w", cmd, err)
+					return
+				}
+				results <- nil
+			}(cmd)
+		}
+		wg.Wait()
+		close(results)
+
+		sawRejection := false
+		for err := range results {
+			if err == nil {
+				continue
 			}
-			if err != nil {
-				results <- fmt.Errorf("%s was refused: %w", cmd, err)
-				return
+			if err.Error() == "rejected: poison" {
+				sawRejection = true
+				continue
 			}
-			results <- nil
-		}(cmd)
-	}
-	wg.Wait()
-	close(results)
-
-	sawRejection := false
-	for err := range results {
-		if err == nil {
-			continue
+			t.Errorf("unexpected outcome: %v", err)
 		}
-		if err.Error() == "rejected: poison" {
-			sawRejection = true
-			continue
+		if !sawRejection {
+			t.Error("the rejected command's proposer was not told")
 		}
-		t.Errorf("unexpected outcome: %v", err)
-	}
-	if !sawRejection {
-		t.Error("the rejected command's proposer was not told")
-	}
 
-	applied := sm.appliedCommands()
-	for _, want := range []string{"before", "after"} {
-		found := false
-		for _, got := range applied {
-			if got == want {
-				found = true
+		applied := sm.appliedCommands()
+		for _, want := range []string{"before", "after"} {
+			found := false
+			for _, got := range applied {
+				if got == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("%q was not applied; a rejected neighbour took it down with it", want)
 			}
 		}
-		if !found {
-			t.Errorf("%q was not applied; a rejected neighbour took it down with it", want)
-		}
-	}
+	})
 }
 
 // TestApplyBatch_AStateMachineWithoutItIsUnchanged pins that the interface is
 // optional: a state machine that does not implement it sees exactly the calls
 // it saw before, one entry at a time.
 func TestApplyBatch_AStateMachineWithoutItIsUnchanged(t *testing.T) {
-	sm := &countingSM{}
-	node := leaderWithSM(t, sm)
+	synctest.Test(t, func(t *testing.T) {
+		sm := &countingSM{}
+		node := leaderWithSM(t, sm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	for i := range 8 {
-		if _, err := node.Propose(ctx, fmt.Appendf(nil, "cmd%d", i)); err != nil {
-			t.Fatalf("propose %d: %v", i, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		for i := range 8 {
+			if _, err := node.Propose(ctx, fmt.Appendf(nil, "cmd%d", i)); err != nil {
+				t.Fatalf("propose %d: %v", i, err)
+			}
 		}
-	}
 
-	// One call per entry, plus the no-op the leader appends on election.
-	if got := sm.calls(); got < 8 {
-		t.Errorf("Apply was called %d times for 8 proposals, want at least 8", got)
-	}
+		// One call per entry, plus the no-op the leader appends on election.
+		if got := sm.calls(); got < 8 {
+			t.Errorf("Apply was called %d times for 8 proposals, want at least 8", got)
+		}
+	})
 }
 
 // countingSM counts Apply calls and does not implement BatchApplier.

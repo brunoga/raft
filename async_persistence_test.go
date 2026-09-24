@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -272,43 +273,45 @@ func appendFrom(term raft.Term, from raft.Index, count int, commit raft.Index) *
 // healthy apart from one pending write. Here the write is held open for as
 // long as the test likes, and the node has to keep answering anyway.
 func TestAsyncPersistence_TheEventLoopKeepsRunningWhileAWriteIsOutstanding(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.hold(t)
-	defer release()
+		release := store.hold(t)
+		defer release()
 
-	// Give the node entries to write. The acknowledgement will not come back
-	// until the write does, so this cannot be waited on here.
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
-	}()
-	store.awaitHeld(t)
+		// Give the node entries to write. The acknowledgement will not come back
+		// until the write does, so this cannot be waited on here.
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+		}()
+		store.awaitHeld(t)
 
-	// With the write still outstanding, the loop must answer as usual. A vote
-	// request is the sharpest test available: it is what a follower sends when
-	// it has decided the leader is gone, and answering it is what stops a
-	// healthy cluster from tearing itself apart over a slow disk.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	resp, err := node.Handler().HandleRequestVote(ctx, &raft.RequestVoteRequest{
-		Term:         1,
-		CandidateID:  "n3",
-		LastLogIndex: 0,
-		LastLogTerm:  0,
-		PreVote:      true,
+		// With the write still outstanding, the loop must answer as usual. A vote
+		// request is the sharpest test available: it is what a follower sends when
+		// it has decided the leader is gone, and answering it is what stops a
+		// healthy cluster from tearing itself apart over a slow disk.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := node.Handler().HandleRequestVote(ctx, &raft.RequestVoteRequest{
+			Term:         1,
+			CandidateID:  "n3",
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+			PreVote:      true,
+		})
+		if err != nil {
+			t.Fatalf("the node did not answer a vote request while a log write was outstanding: %v", err)
+		}
+		if resp == nil {
+			t.Fatal("nil vote response while a log write was outstanding")
+		}
+
+		// And it is still tracking time, which is what elections depend on.
+		node.Tick()
+		if node.FatalError() != nil {
+			t.Fatalf("node failed while a write was merely slow: %v", node.FatalError())
+		}
 	})
-	if err != nil {
-		t.Fatalf("the node did not answer a vote request while a log write was outstanding: %v", err)
-	}
-	if resp == nil {
-		t.Fatal("nil vote response while a log write was outstanding")
-	}
-
-	// And it is still tracking time, which is what elections depend on.
-	node.Tick()
-	if node.FatalError() != nil {
-		t.Fatalf("node failed while a write was merely slow: %v", node.FatalError())
-	}
 }
 
 // TestAsyncPersistence_AFollowerAcknowledgesOnlyAfterTheEntriesAreOnDisk is the
@@ -322,48 +325,50 @@ func TestAsyncPersistence_TheEventLoopKeepsRunningWhileAWriteIsOutstanding(t *te
 // by retrying; a node that acknowledged first and crashed second would have
 // told the cluster something that is no longer true.
 func TestAsyncPersistence_AFollowerAcknowledgesOnlyAfterTheEntriesAreOnDisk(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.hold(t)
+		release := store.hold(t)
 
-	type ack struct {
-		resp *raft.AppendEntriesResponse
-		err  error
-	}
-	acked := make(chan ack, 1)
-	go func() {
-		resp, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
-		acked <- ack{resp, err}
-	}()
-	store.awaitHeld(t)
-
-	select {
-	case got := <-acked:
-		t.Fatalf("follower acknowledged entries before they were written: %+v (err %v)", got.resp, got.err)
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	if ops := store.logOperations(); len(ops) != 0 {
-		t.Fatalf("storage recorded %v before the write was released", ops)
-	}
-
-	release()
-
-	select {
-	case got := <-acked:
-		if got.err != nil {
-			t.Fatalf("acknowledgement returned an error: %v", got.err)
+		type ack struct {
+			resp *raft.AppendEntriesResponse
+			err  error
 		}
-		if !got.resp.Success {
-			t.Fatalf("acknowledgement was not successful: %+v", got.resp)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no acknowledgement after the write was released")
-	}
+		acked := make(chan ack, 1)
+		go func() {
+			resp, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+			acked <- ack{resp, err}
+		}()
+		store.awaitHeld(t)
 
-	if ops := store.logOperations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "append(1..3)") {
-		t.Fatalf("storage operations = %v, want the append to have happened before the acknowledgement", ops)
-	}
+		select {
+		case got := <-acked:
+			t.Fatalf("follower acknowledged entries before they were written: %+v (err %v)", got.resp, got.err)
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		if ops := store.logOperations(); len(ops) != 0 {
+			t.Fatalf("storage recorded %v before the write was released", ops)
+		}
+
+		release()
+
+		select {
+		case got := <-acked:
+			if got.err != nil {
+				t.Fatalf("acknowledgement returned an error: %v", got.err)
+			}
+			if !got.resp.Success {
+				t.Fatalf("acknowledgement was not successful: %+v", got.resp)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no acknowledgement after the write was released")
+		}
+
+		if ops := store.logOperations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "append(1..3)") {
+			t.Fatalf("storage operations = %v, want the append to have happened before the acknowledgement", ops)
+		}
+	})
 }
 
 // TestAsyncPersistence_NothingIsAppliedBeforeItIsOnDisk covers the quietest way
@@ -377,39 +382,41 @@ func TestAsyncPersistence_AFollowerAcknowledgesOnlyAfterTheEntriesAreOnDisk(t *t
 // result would be a state machine that skipped a committed entry, which no
 // later replication repairs.
 func TestAsyncPersistence_NothingIsAppliedBeforeItIsOnDisk(t *testing.T) {
-	applied := make(chan raft.Index, 16)
-	node, store := newGatedFollower(t, func(cfg *raft.Config) {
-		cfg.StateMachine = &indexReportingSM{applied: applied}
-	})
+	synctest.Test(t, func(t *testing.T) {
+		applied := make(chan raft.Index, 16)
+		node, store := newGatedFollower(t, func(cfg *raft.Config) {
+			cfg.StateMachine = &indexReportingSM{applied: applied}
+		})
 
-	release := store.hold(t)
+		release := store.hold(t)
 
-	// LeaderCommit covers every entry in the request, so the follower's commit
-	// index moves to 3 immediately while the entries are still only in memory.
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 3))
-	}()
-	store.awaitHeld(t)
+		// LeaderCommit covers every entry in the request, so the follower's commit
+		// index moves to 3 immediately while the entries are still only in memory.
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 3))
+		}()
+		store.awaitHeld(t)
 
-	select {
-	case idx := <-applied:
-		t.Fatalf("entry %d was applied before it was on disk", idx)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	release()
-
-	deadline := time.After(5 * time.Second)
-	for want := raft.Index(1); want <= 3; want++ {
 		select {
-		case got := <-applied:
-			if got != want {
-				t.Fatalf("applied index %d, want %d", got, want)
-			}
-		case <-deadline:
-			t.Fatalf("entry %d was never applied after the write was released", want)
+		case idx := <-applied:
+			t.Fatalf("entry %d was applied before it was on disk", idx)
+		case <-time.After(200 * time.Millisecond):
 		}
-	}
+
+		release()
+
+		deadline := time.After(5 * time.Second)
+		for want := raft.Index(1); want <= 3; want++ {
+			select {
+			case got := <-applied:
+				if got != want {
+					t.Fatalf("applied index %d, want %d", got, want)
+				}
+			case <-deadline:
+				t.Fatalf("entry %d was never applied after the write was released", want)
+			}
+		}
+	})
 }
 
 // TestAsyncPersistence_ALeaderDoesNotCommitOnItsOwnUnwrittenLog holds the
@@ -422,66 +429,68 @@ func TestAsyncPersistence_NothingIsAppliedBeforeItIsOnDisk(t *testing.T) {
 // machine died before the write landed. In a single-node cluster the leader is
 // the entire quorum, which makes the rule visible on its own.
 func TestAsyncPersistence_ALeaderDoesNotCommitOnItsOwnUnwrittenLog(t *testing.T) {
-	store := newGateStore()
-	cfg := raft.DefaultConfig()
-	cfg.ID = "solo"
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = memtransport.NewNetwork().NewTransport("solo")
-	cfg.TickInterval = 0
+	synctest.Test(t, func(t *testing.T) {
+		store := newGateStore()
+		cfg := raft.DefaultConfig()
+		cfg.ID = "solo"
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = memtransport.NewNetwork().NewTransport("solo")
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	// Registered before the gate below, so cleanup releases the gate first:
-	// a stop cannot complete while a write it accepted is still held.
-	t.Cleanup(node.Stop)
-
-	// Elect it, with writes flowing: the leadership no-op has to be written
-	// before anything can commit at all.
-	stop := tickWhile(node)
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			stop()
-			t.Fatal("the node never became leader")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	stop()
+		node.Start()
+		// Registered before the gate below, so cleanup releases the gate first:
+		// a stop cannot complete while a write it accepted is still held.
+		t.Cleanup(node.Stop)
 
-	before := node.CommitIndex()
-	release := store.hold(t)
-
-	proposed := make(chan error, 1)
-	go func() {
-		_, perr := node.Propose(context.Background(), []byte("v"))
-		proposed <- perr
-	}()
-	store.awaitHeld(t)
-
-	// The entry is in the leader's log and it is the only replica there is,
-	// yet it must not be committed while the write is outstanding.
-	time.Sleep(200 * time.Millisecond)
-	if got := node.CommitIndex(); got != before {
-		t.Fatalf("commit index moved from %d to %d while the leader's own write was outstanding", before, got)
-	}
-
-	release()
-
-	select {
-	case perr := <-proposed:
-		if perr != nil {
-			t.Fatalf("Propose: %v", perr)
+		// Elect it, with writes flowing: the leadership no-op has to be written
+		// before anything can commit at all.
+		stop := tickWhile(node)
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				stop()
+				t.Fatal("the node never became leader")
+			}
+			time.Sleep(time.Millisecond)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the proposal never completed after the write was released")
-	}
-	if got := node.CommitIndex(); got <= before {
-		t.Fatalf("commit index = %d after the write landed, want more than %d", got, before)
-	}
+		stop()
+
+		before := node.CommitIndex()
+		release := store.hold(t)
+
+		proposed := make(chan error, 1)
+		go func() {
+			_, perr := node.Propose(context.Background(), []byte("v"))
+			proposed <- perr
+		}()
+		store.awaitHeld(t)
+
+		// The entry is in the leader's log and it is the only replica there is,
+		// yet it must not be committed while the write is outstanding.
+		time.Sleep(200 * time.Millisecond)
+		if got := node.CommitIndex(); got != before {
+			t.Fatalf("commit index moved from %d to %d while the leader's own write was outstanding", before, got)
+		}
+
+		release()
+
+		select {
+		case perr := <-proposed:
+			if perr != nil {
+				t.Fatalf("Propose: %v", perr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the proposal never completed after the write was released")
+		}
+		if got := node.CommitIndex(); got <= before {
+			t.Fatalf("commit index = %d after the write landed, want more than %d", got, before)
+		}
+	})
 }
 
 // TestAsyncPersistence_AConflictingSuffixIsRemovedBeforeItIsReplaced is the
@@ -495,35 +504,37 @@ func TestAsyncPersistence_ALeaderDoesNotCommitOnItsOwnUnwrittenLog(t *testing.T)
 // leader's log while believing it had acknowledged it. Queueing them is only
 // safe because one goroutine drains that queue in order.
 func TestAsyncPersistence_AConflictingSuffixIsRemovedBeforeItIsReplaced(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	// Three entries from the leader of term 1.
-	if _, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0)); err != nil {
-		t.Fatalf("first append: %v", err)
-	}
+		// Three entries from the leader of term 1.
+		if _, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0)); err != nil {
+			t.Fatalf("first append: %v", err)
+		}
 
-	// A leader of term 2 overwrites from index 2. Its PrevLogIndex of 1 still
-	// matches, so the follower truncates and appends in one exchange.
-	conflicting := appendFrom(2, 2, 2, 0)
-	conflicting.PrevLogTerm = 1
-	resp, err := node.Handler().HandleAppendEntries(context.Background(), conflicting)
-	if err != nil {
-		t.Fatalf("conflicting append: %v", err)
-	}
-	if !resp.Success {
-		t.Fatalf("conflicting append was rejected: %+v", resp)
-	}
+		// A leader of term 2 overwrites from index 2. Its PrevLogIndex of 1 still
+		// matches, so the follower truncates and appends in one exchange.
+		conflicting := appendFrom(2, 2, 2, 0)
+		conflicting.PrevLogTerm = 1
+		resp, err := node.Handler().HandleAppendEntries(context.Background(), conflicting)
+		if err != nil {
+			t.Fatalf("conflicting append: %v", err)
+		}
+		if !resp.Success {
+			t.Fatalf("conflicting append was rejected: %+v", resp)
+		}
 
-	want := []string{"append(1..3)", "truncate_suffix(2)", "append(2..3)"}
-	got := store.logOperations()
-	if len(got) != len(want) {
-		t.Fatalf("storage operations = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
+		want := []string{"append(1..3)", "truncate_suffix(2)", "append(2..3)"}
+		got := store.logOperations()
+		if len(got) != len(want) {
 			t.Fatalf("storage operations = %v, want %v", got, want)
 		}
-	}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("storage operations = %v, want %v", got, want)
+			}
+		}
+	})
 }
 
 // TestAsyncPersistence_ProposalsAreRefusedWhenTheBacklogIsFull covers what
@@ -536,74 +547,76 @@ func TestAsyncPersistence_AConflictingSuffixIsRemovedBeforeItIsReplaced(t *testi
 // with it. Refusing the proposal keeps the node alive and hands the decision
 // to the caller.
 func TestAsyncPersistence_ProposalsAreRefusedWhenTheBacklogIsFull(t *testing.T) {
-	store := newGateStore()
-	cfg := raft.DefaultConfig()
-	cfg.ID = "solo"
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = memtransport.NewNetwork().NewTransport("solo")
-	cfg.TickInterval = 0
-	cfg.MaxUnstableLogBytes = 4 << 10 // 4 KiB
+	synctest.Test(t, func(t *testing.T) {
+		store := newGateStore()
+		cfg := raft.DefaultConfig()
+		cfg.ID = "solo"
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = memtransport.NewNetwork().NewTransport("solo")
+		cfg.TickInterval = 0
+		cfg.MaxUnstableLogBytes = 4 << 10 // 4 KiB
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	// Registered before the gate below, so cleanup releases the gate first:
-	// a stop cannot complete while a write it accepted is still held.
-	t.Cleanup(node.Stop)
-
-	stop := tickWhile(node)
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			stop()
-			t.Fatal("the node never became leader")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	stop()
+		node.Start()
+		// Registered before the gate below, so cleanup releases the gate first:
+		// a stop cannot complete while a write it accepted is still held.
+		t.Cleanup(node.Stop)
 
-	release := store.hold(t)
-	defer release()
-
-	const (
-		proposals = 32
-		cmdSize   = 1 << 10 // 1 KiB, so a handful of these fills the budget
-	)
-	cmd := make([]byte, cmdSize)
-	results := make(chan error, proposals)
-	for range proposals {
-		go func() {
-			_, perr := node.Propose(context.Background(), cmd)
-			results <- perr
-		}()
-	}
-
-	// The proposals that fit are appended and then wait for a commit that
-	// cannot happen while the write is held, so they do not come back at all.
-	// The ones that do not fit are refused straight away, which is the whole
-	// point: the node answers rather than absorbing.
-	var refused, other int
-	giveUp := time.After(10 * time.Second)
-	for refused == 0 {
-		select {
-		case perr := <-results:
-			switch {
-			case errors.Is(perr, raft.ErrWriteBacklogFull):
-				refused++
-			default:
-				other++
+		stop := tickWhile(node)
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				stop()
+				t.Fatal("the node never became leader")
 			}
-		case <-giveUp:
-			t.Fatalf("no proposal was refused with ErrWriteBacklogFull: %d KiB offered against a %d KiB budget, %d other results",
-				proposals*cmdSize>>10, cfg.MaxUnstableLogBytes>>10, other)
+			time.Sleep(time.Millisecond)
 		}
-	}
-	if other > 0 {
-		t.Errorf("%d proposals came back for a reason other than the backlog being full", other)
-	}
+		stop()
+
+		release := store.hold(t)
+		defer release()
+
+		const (
+			proposals = 32
+			cmdSize   = 1 << 10 // 1 KiB, so a handful of these fills the budget
+		)
+		cmd := make([]byte, cmdSize)
+		results := make(chan error, proposals)
+		for range proposals {
+			go func() {
+				_, perr := node.Propose(context.Background(), cmd)
+				results <- perr
+			}()
+		}
+
+		// The proposals that fit are appended and then wait for a commit that
+		// cannot happen while the write is held, so they do not come back at all.
+		// The ones that do not fit are refused straight away, which is the whole
+		// point: the node answers rather than absorbing.
+		var refused, other int
+		giveUp := time.After(10 * time.Second)
+		for refused == 0 {
+			select {
+			case perr := <-results:
+				switch {
+				case errors.Is(perr, raft.ErrWriteBacklogFull):
+					refused++
+				default:
+					other++
+				}
+			case <-giveUp:
+				t.Fatalf("no proposal was refused with ErrWriteBacklogFull: %d KiB offered against a %d KiB budget, %d other results",
+					proposals*cmdSize>>10, cfg.MaxUnstableLogBytes>>10, other)
+			}
+		}
+		if other > 0 {
+			t.Errorf("%d proposals came back for a reason other than the backlog being full", other)
+		}
+	})
 }
 
 // TestAsyncPersistence_AGracefulStopWritesWhatItAccepted pins that shutting a
@@ -614,40 +627,42 @@ func TestAsyncPersistence_ProposalsAreRefusedWhenTheBacklogIsFull(t *testing.T) 
 // every orderly restart threw away the tail of the log and fetched it again
 // from the leader.
 func TestAsyncPersistence_AGracefulStopWritesWhatItAccepted(t *testing.T) {
-	store := newGateStore()
-	cfg := raft.DefaultConfig()
-	cfg.ID = "n1"
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = memtransport.NewNetwork().NewTransport("n1")
-	cfg.TickInterval = 0
+	synctest.Test(t, func(t *testing.T) {
+		store := newGateStore()
+		cfg := raft.DefaultConfig()
+		cfg.ID = "n1"
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = memtransport.NewNetwork().NewTransport("n1")
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
+		}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	release := store.hold(t)
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
-	}()
-	store.awaitHeld(t)
+		release := store.hold(t)
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+		}()
+		store.awaitHeld(t)
 
-	// Release and stop: the entries were accepted, so stopping must not lose
-	// them.
-	release()
-	node.Stop()
+		// Release and stop: the entries were accepted, so stopping must not lose
+		// them.
+		release()
+		node.Stop()
 
-	last, err := store.LastIndex()
-	if err != nil {
-		t.Fatalf("LastIndex: %v", err)
-	}
-	if last != 3 {
-		t.Errorf("after a graceful stop the store holds up to index %d, want 3", last)
-	}
+		last, err := store.LastIndex()
+		if err != nil {
+			t.Fatalf("LastIndex: %v", err)
+		}
+		if last != 3 {
+			t.Errorf("after a graceful stop the store holds up to index %d, want 3", last)
+		}
+	})
 }
 
 // indexReportingSM reports the index of every entry it applies, as it applies
@@ -730,71 +745,73 @@ func (t *echoTransport) Close() error                           { return nil }
 // the leader still needs its own entry on disk, it just no longer spends the
 // round trip waiting for it.
 func TestAsyncPersistence_ALeaderReplicatesWhileItsOwnWriteIsStillOutstanding(t *testing.T) {
-	transport := &echoTransport{sent: make(chan raft.Index, 32)}
-	store := newGateStore()
+	synctest.Test(t, func(t *testing.T) {
+		transport := &echoTransport{sent: make(chan raft.Index, 32)}
+		store := newGateStore()
 
-	cfg := raft.DefaultConfig()
-	cfg.ID = "leader"
-	cfg.Peers = []raft.PeerConfig{{ID: "follower", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = transport
-	cfg.TickInterval = 0
+		cfg := raft.DefaultConfig()
+		cfg.ID = "leader"
+		cfg.Peers = []raft.PeerConfig{{ID: "follower", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = transport
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	stop := tickWhile(node)
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			stop()
-			t.Fatal("the node never became leader")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	stop()
-	// Drain whatever replication the election itself produced.
-	for len(transport.sent) > 0 {
-		<-transport.sent
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	release := store.hold(t)
-	before := node.CommitIndex()
-
-	go func() {
-		_, _ = node.Propose(context.Background(), []byte("v"))
-	}()
-	store.awaitHeld(t)
-
-	// The entry is on its way to the follower even though this leader has not
-	// written it.
-	select {
-	case idx := <-transport.sent:
-		if idx <= before {
-			t.Fatalf("the leader replicated up to index %d, want something past %d", idx, before)
+		stop := tickWhile(node)
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				stop()
+				t.Fatal("the node never became leader")
+			}
+			time.Sleep(time.Millisecond)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the leader waited for its own write before replicating")
-	}
-
-	// And it still has not committed, because its own copy is not on disk.
-	if got := node.CommitIndex(); got != before {
-		t.Fatalf("commit index moved to %d before the leader's own write landed", got)
-	}
-
-	release()
-	deadline = time.Now().Add(5 * time.Second)
-	for node.CommitIndex() == before {
-		if time.Now().After(deadline) {
-			t.Fatal("the entry never committed after the write landed")
+		stop()
+		// Drain whatever replication the election itself produced.
+		for len(transport.sent) > 0 {
+			<-transport.sent
 		}
-		time.Sleep(time.Millisecond)
-	}
+
+		release := store.hold(t)
+		before := node.CommitIndex()
+
+		go func() {
+			_, _ = node.Propose(context.Background(), []byte("v"))
+		}()
+		store.awaitHeld(t)
+
+		// The entry is on its way to the follower even though this leader has not
+		// written it.
+		select {
+		case idx := <-transport.sent:
+			if idx <= before {
+				t.Fatalf("the leader replicated up to index %d, want something past %d", idx, before)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("the leader waited for its own write before replicating")
+		}
+
+		// And it still has not committed, because its own copy is not on disk.
+		if got := node.CommitIndex(); got != before {
+			t.Fatalf("commit index moved to %d before the leader's own write landed", got)
+		}
+
+		release()
+		deadline = time.Now().Add(5 * time.Second)
+		for node.CommitIndex() == before {
+			if time.Now().After(deadline) {
+				t.Fatal("the entry never committed after the write landed")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
 }
 
 // snapGateStore holds SaveSnapshot open, so a test can watch what a node says
@@ -872,72 +889,74 @@ func (s *snapGateStore) awaitHeld(t *testing.T) {
 // voter, and a cluster that promotes one which has not has given itself a
 // voter that cannot vote.
 func TestAsyncPersistence_ASnapshotIsAcknowledgedOnlyAfterItIsWritten(t *testing.T) {
-	payload := snapshotPayload(t)
-	store := newSnapGateStore()
+	synctest.Test(t, func(t *testing.T) {
+		payload := snapshotPayload(t)
+		store := newSnapGateStore()
 
-	cfg := raft.DefaultConfig()
-	cfg.ID = "f1"
-	cfg.Peers = []raft.PeerConfig{{ID: "l1", Voter: true}, {ID: "f2", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = &echoSM{}
-	cfg.Transport = memtransport.NewNetwork().NewTransport("f1")
-	cfg.TickInterval = 0
+		cfg := raft.DefaultConfig()
+		cfg.ID = "f1"
+		cfg.Peers = []raft.PeerConfig{{ID: "l1", Voter: true}, {ID: "f2", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = &echoSM{}
+		cfg.Transport = memtransport.NewNetwork().NewTransport("f1")
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	release := store.hold(t)
-
-	type ack struct {
-		resp *raft.InstallSnapshotResponse
-		err  error
-	}
-	acked := make(chan ack, 1)
-	go func() {
-		resp, ackErr := node.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
-			Term:              3,
-			LeaderID:          "l1",
-			LastIncludedIndex: 3,
-			LastIncludedTerm:  3,
-			Offset:            0,
-			Data:              payload,
-			Done:              true,
-		})
-		acked <- ack{resp, ackErr}
-	}()
-	store.awaitHeld(t)
-
-	select {
-	case got := <-acked:
-		t.Fatalf("the snapshot was acknowledged before it was written: %+v (err %v)", got.resp, got.err)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	release()
-
-	select {
-	case got := <-acked:
-		if got.err != nil {
-			t.Fatalf("snapshot acknowledgement returned an error: %v", got.err)
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		if got.resp == nil {
-			t.Fatal("nil snapshot response")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no snapshot acknowledgement after the write was released")
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for node.SnapshotIndex() < 3 {
-		if time.Now().After(deadline) {
-			t.Fatal("the snapshot was never installed after it was written")
+		release := store.hold(t)
+
+		type ack struct {
+			resp *raft.InstallSnapshotResponse
+			err  error
 		}
-		time.Sleep(time.Millisecond)
-	}
+		acked := make(chan ack, 1)
+		go func() {
+			resp, ackErr := node.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
+				Term:              3,
+				LeaderID:          "l1",
+				LastIncludedIndex: 3,
+				LastIncludedTerm:  3,
+				Offset:            0,
+				Data:              payload,
+				Done:              true,
+			})
+			acked <- ack{resp, ackErr}
+		}()
+		store.awaitHeld(t)
+
+		select {
+		case got := <-acked:
+			t.Fatalf("the snapshot was acknowledged before it was written: %+v (err %v)", got.resp, got.err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		release()
+
+		select {
+		case got := <-acked:
+			if got.err != nil {
+				t.Fatalf("snapshot acknowledgement returned an error: %v", got.err)
+			}
+			if got.resp == nil {
+				t.Fatal("nil snapshot response")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no snapshot acknowledgement after the write was released")
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		for node.SnapshotIndex() < 3 {
+			if time.Now().After(deadline) {
+				t.Fatal("the snapshot was never installed after it was written")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
 }
 
 // TestAsyncPersistence_AFollowerRefusesEntriesItCannotBuffer is the follower's
@@ -952,68 +971,70 @@ func TestAsyncPersistence_ASnapshotIsAcknowledgedOnlyAfterItIsWritten(t *testing
 // a statement about this node's log and would send the leader hunting
 // backwards through it for a disagreement that does not exist.
 func TestAsyncPersistence_AFollowerRefusesEntriesItCannotBuffer(t *testing.T) {
-	node, store := newGatedFollower(t, func(cfg *raft.Config) {
-		cfg.MaxUnstableLogBytes = 1 << 10 // 1 KiB, so one batch overshoots it
-	})
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, func(cfg *raft.Config) {
+			cfg.MaxUnstableLogBytes = 1 << 10 // 1 KiB, so one batch overshoots it
+		})
 
-	release := store.hold(t)
-	defer release()
+		release := store.hold(t)
+		defer release()
 
-	cmd := make([]byte, 1<<10) // 1 KiB per entry
-	batch := func(from raft.Index) *raft.AppendEntriesRequest {
-		entries := make([]raft.LogEntry, 0, 4)
-		for i := range 4 {
-			entries = append(entries, raft.LogEntry{Index: from + raft.Index(i), Term: 1, Command: cmd})
+		cmd := make([]byte, 1<<10) // 1 KiB per entry
+		batch := func(from raft.Index) *raft.AppendEntriesRequest {
+			entries := make([]raft.LogEntry, 0, 4)
+			for i := range 4 {
+				entries = append(entries, raft.LogEntry{Index: from + raft.Index(i), Term: 1, Command: cmd})
+			}
+			req := &raft.AppendEntriesRequest{
+				Term:         1,
+				LeaderID:     "n2",
+				PrevLogIndex: from - 1,
+				PrevLogTerm:  1,
+				Entries:      entries,
+			}
+			if from == 1 {
+				req.PrevLogTerm = 0
+			}
+			return req
 		}
-		req := &raft.AppendEntriesRequest{
-			Term:         1,
-			LeaderID:     "n2",
-			PrevLogIndex: from - 1,
-			PrevLogTerm:  1,
-			Entries:      entries,
-		}
-		if from == 1 {
-			req.PrevLogTerm = 0
-		}
-		return req
-	}
 
-	// The first batch is taken: a node with nothing outstanding always accepts,
-	// whatever the size, so that an entry larger than the budget is never
-	// refused for ever. Its acknowledgement waits for the write, which is held,
-	// so this call does not return.
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), batch(1))
-	}()
-	store.awaitHeld(t)
+		// The first batch is taken: a node with nothing outstanding always accepts,
+		// whatever the size, so that an entry larger than the budget is never
+		// refused for ever. Its acknowledgement waits for the write, which is held,
+		// so this call does not return.
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), batch(1))
+		}()
+		store.awaitHeld(t)
 
-	// The second finds four kilobytes already waiting against a one-kilobyte
-	// budget and is refused outright, rather than queued or rejected.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	resp, err := node.Handler().HandleAppendEntries(ctx, batch(5))
-	if !errors.Is(err, raft.ErrWriteBacklogFull) {
-		t.Fatalf("second batch returned (%+v, %v); want raft.ErrWriteBacklogFull", resp, err)
-	}
-	if node.FatalError() != nil {
-		t.Errorf("refusing entries stopped the node: %v", node.FatalError())
-	}
-
-	// Once the backlog clears the follower takes entries again.
-	release()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+		// The second finds four kilobytes already waiting against a one-kilobyte
+		// budget and is refused outright, rather than queued or rejected.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 		resp, err := node.Handler().HandleAppendEntries(ctx, batch(5))
-		cancel()
-		if err == nil && resp != nil && resp.Success {
-			return
+		if !errors.Is(err, raft.ErrWriteBacklogFull) {
+			t.Fatalf("second batch returned (%+v, %v); want raft.ErrWriteBacklogFull", resp, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the follower never took entries again after its backlog drained: (%+v, %v)", resp, err)
+		if node.FatalError() != nil {
+			t.Errorf("refusing entries stopped the node: %v", node.FatalError())
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+
+		// Once the backlog clears the follower takes entries again.
+		release()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			resp, err := node.Handler().HandleAppendEntries(ctx, batch(5))
+			cancel()
+			if err == nil && resp != nil && resp.Success {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the follower never took entries again after its backlog drained: (%+v, %v)", resp, err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
 }
 
 // TestAsyncPersistence_ARetransmittedRangeIsNotAcknowledgedEarly closes the
@@ -1031,47 +1052,49 @@ func TestAsyncPersistence_AFollowerRefusesEntriesItCannotBuffer(t *testing.T) {
 // this node holds. It is wrong about what this node would still hold after a
 // crash, and that is the only thing the answer is for.
 func TestAsyncPersistence_ARetransmittedRangeIsNotAcknowledgedEarly(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.hold(t)
+		release := store.hold(t)
 
-	first := make(chan *raft.AppendEntriesResponse, 1)
-	go func() {
-		resp, _ := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
-		first <- resp
-	}()
-	store.awaitHeld(t)
+		first := make(chan *raft.AppendEntriesResponse, 1)
+		go func() {
+			resp, _ := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+			first <- resp
+		}()
+		store.awaitHeld(t)
 
-	// The same range again, while the first delivery's write is still held.
-	second := make(chan *raft.AppendEntriesResponse, 1)
-	go func() {
-		resp, _ := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
-		second <- resp
-	}()
+		// The same range again, while the first delivery's write is still held.
+		second := make(chan *raft.AppendEntriesResponse, 1)
+		go func() {
+			resp, _ := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+			second <- resp
+		}()
 
-	select {
-	case got := <-second:
-		t.Fatalf("the retransmission was acknowledged with nothing written: %+v; storage has %v",
-			got, store.logOperations())
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	release()
-
-	for _, ch := range []chan *raft.AppendEntriesResponse{first, second} {
 		select {
-		case got := <-ch:
-			if got == nil || !got.Success {
-				t.Fatalf("acknowledgement after the write landed = %+v, want success", got)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("no acknowledgement after the write was released")
+		case got := <-second:
+			t.Fatalf("the retransmission was acknowledged with nothing written: %+v; storage has %v",
+				got, store.logOperations())
+		case <-time.After(200 * time.Millisecond):
 		}
-	}
 
-	if ops := store.logOperations(); len(ops) != 1 || ops[0] != "append(1..3)" {
-		t.Errorf("storage operations = %v, want a single append of 1..3", ops)
-	}
+		release()
+
+		for _, ch := range []chan *raft.AppendEntriesResponse{first, second} {
+			select {
+			case got := <-ch:
+				if got == nil || !got.Success {
+					t.Fatalf("acknowledgement after the write landed = %+v, want success", got)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("no acknowledgement after the write was released")
+			}
+		}
+
+		if ops := store.logOperations(); len(ops) != 1 || ops[0] != "append(1..3)" {
+			t.Errorf("storage operations = %v, want a single append of 1..3", ops)
+		}
+	})
 }
 
 // TestAsyncPersistence_AHeartbeatIsNotGatedOnTheFollowersDisk is the limit on
@@ -1085,33 +1108,35 @@ func TestAsyncPersistence_ARetransmittedRangeIsNotAcknowledgedEarly(t *testing.T
 // rare shape. A follower that cannot answer a heartbeat is one its leader
 // stands down for, which is the failure this whole design exists to prevent.
 func TestAsyncPersistence_AHeartbeatIsNotGatedOnTheFollowersDisk(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.hold(t)
-	defer release()
+		release := store.hold(t)
+		defer release()
 
-	// Entries 1..3 go into the log and their write is held open.
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
-	}()
-	store.awaitHeld(t)
+		// Entries 1..3 go into the log and their write is held open.
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 3, 0))
+		}()
+		store.awaitHeld(t)
 
-	// A heartbeat naming the last of those entries must still be answered,
-	// even though that entry is not on disk.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	resp, err := node.Handler().HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
-		Term:         1,
-		LeaderID:     "n2",
-		PrevLogIndex: 3,
-		PrevLogTerm:  1,
+		// A heartbeat naming the last of those entries must still be answered,
+		// even though that entry is not on disk.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := node.Handler().HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
+			Term:         1,
+			LeaderID:     "n2",
+			PrevLogIndex: 3,
+			PrevLogTerm:  1,
+		})
+		if err != nil {
+			t.Fatalf("a heartbeat was not answered while a log write was outstanding: %v", err)
+		}
+		if resp == nil || !resp.Success {
+			t.Fatalf("heartbeat response = %+v, want success", resp)
+		}
 	})
-	if err != nil {
-		t.Fatalf("a heartbeat was not answered while a log write was outstanding: %v", err)
-	}
-	if resp == nil || !resp.Success {
-		t.Fatalf("heartbeat response = %+v, want success", resp)
-	}
 }
 
 // TestAsyncPersistence_ACommitIndexMayOutrunTheDisk pins the transient state
@@ -1130,80 +1155,82 @@ func TestAsyncPersistence_AHeartbeatIsNotGatedOnTheFollowersDisk(t *testing.T) {
 // the commit index is not persisted, so a crash here brings the node back with
 // no commit index at all and the leader brings it up to date again.
 func TestAsyncPersistence_ACommitIndexMayOutrunTheDisk(t *testing.T) {
-	applied := make(chan raft.Index, 16)
-	node, store := newGatedFollower(t, func(cfg *raft.Config) {
-		cfg.StateMachine = &indexReportingSM{applied: applied}
+	synctest.Test(t, func(t *testing.T) {
+		applied := make(chan raft.Index, 16)
+		node, store := newGatedFollower(t, func(cfg *raft.Config) {
+			cfg.StateMachine = &indexReportingSM{applied: applied}
+		})
+
+		// Entries 1 and 2 in term 1, written and applied.
+		if _, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 2, 1)); err != nil {
+			t.Fatalf("first append: %v", err)
+		}
+		select {
+		case idx := <-applied:
+			if idx != 1 {
+				t.Fatalf("applied index %d, want 1", idx)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("entry 1 was never applied")
+		}
+
+		// A leader in term 2 replaces index 2 and says it is committed. Its write
+		// is held, so the disk keeps the term-1 entry there.
+		release := store.hold(t)
+
+		replace := &raft.AppendEntriesRequest{
+			Term:         2,
+			LeaderID:     "n2",
+			PrevLogIndex: 1,
+			PrevLogTerm:  1,
+			Entries:      []raft.LogEntry{{Index: 2, Term: 2, Command: []byte("replacement")}},
+			LeaderCommit: 2,
+		}
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), replace)
+		}()
+		store.awaitHeld(t)
+
+		// The commit index has moved past what the disk holds. That is the state
+		// the durable log alone cannot explain.
+		deadline := time.Now().Add(5 * time.Second)
+		for node.CommitIndex() < 2 {
+			if time.Now().After(deadline) {
+				t.Fatal("the commit index never reached 2")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		got, err := store.GetLogEntry(context.Background(), 2)
+		if err != nil {
+			t.Fatalf("read index 2 from the store: %v", err)
+		}
+		if got.Term != 1 {
+			t.Fatalf("the store holds term %d at index 2; the test needs the replacement to still be pending", got.Term)
+		}
+
+		// Nothing is applied there while that is true.
+		select {
+		case idx := <-applied:
+			t.Fatalf("index %d was applied while the disk still held the entry it replaced", idx)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		release()
+
+		select {
+		case idx := <-applied:
+			if idx != 2 {
+				t.Fatalf("applied index %d, want 2", idx)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("index 2 was never applied after the write landed")
+		}
+		final, err := store.GetLogEntry(context.Background(), 2)
+		if err != nil {
+			t.Fatalf("re-read index 2: %v", err)
+		}
+		if final.Term != 2 {
+			t.Errorf("the store holds term %d at index 2 after the write landed, want 2", final.Term)
+		}
 	})
-
-	// Entries 1 and 2 in term 1, written and applied.
-	if _, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(1, 1, 2, 1)); err != nil {
-		t.Fatalf("first append: %v", err)
-	}
-	select {
-	case idx := <-applied:
-		if idx != 1 {
-			t.Fatalf("applied index %d, want 1", idx)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("entry 1 was never applied")
-	}
-
-	// A leader in term 2 replaces index 2 and says it is committed. Its write
-	// is held, so the disk keeps the term-1 entry there.
-	release := store.hold(t)
-
-	replace := &raft.AppendEntriesRequest{
-		Term:         2,
-		LeaderID:     "n2",
-		PrevLogIndex: 1,
-		PrevLogTerm:  1,
-		Entries:      []raft.LogEntry{{Index: 2, Term: 2, Command: []byte("replacement")}},
-		LeaderCommit: 2,
-	}
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), replace)
-	}()
-	store.awaitHeld(t)
-
-	// The commit index has moved past what the disk holds. That is the state
-	// the durable log alone cannot explain.
-	deadline := time.Now().Add(5 * time.Second)
-	for node.CommitIndex() < 2 {
-		if time.Now().After(deadline) {
-			t.Fatal("the commit index never reached 2")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	got, err := store.GetLogEntry(context.Background(), 2)
-	if err != nil {
-		t.Fatalf("read index 2 from the store: %v", err)
-	}
-	if got.Term != 1 {
-		t.Fatalf("the store holds term %d at index 2; the test needs the replacement to still be pending", got.Term)
-	}
-
-	// Nothing is applied there while that is true.
-	select {
-	case idx := <-applied:
-		t.Fatalf("index %d was applied while the disk still held the entry it replaced", idx)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	release()
-
-	select {
-	case idx := <-applied:
-		if idx != 2 {
-			t.Fatalf("applied index %d, want 2", idx)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("index 2 was never applied after the write landed")
-	}
-	final, err := store.GetLogEntry(context.Background(), 2)
-	if err != nil {
-		t.Fatalf("re-read index 2: %v", err)
-	}
-	if final.Term != 2 {
-		t.Errorf("the store holds term %d at index 2 after the write landed, want 2", final.Term)
-	}
 }

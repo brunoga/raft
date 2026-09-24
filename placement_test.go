@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -22,24 +23,26 @@ import (
 // nothing at all. Nothing about it looks broken. Refusing at construction is
 // the only point at which the mistake is cheap.
 func TestPlacement_RefusesAClusterThatCouldNeverSatisfyIt(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.MinCommitZones = 2
-	cfg.Zones = map[raft.NodeID]raft.ZoneID{
-		"n1": "eu-west-1a", "n2": "eu-west-1a", "n3": "eu-west-1a",
-	}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.MinCommitZones = 2
+		cfg.Zones = map[raft.NodeID]raft.ZoneID{
+			"n1": "eu-west-1a", "n2": "eu-west-1a", "n3": "eu-west-1a",
+		}
 
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("a cluster whose voters are all in one zone was accepted with MinCommitZones 2")
-	} else if !strings.Contains(err.Error(), "span") {
-		t.Errorf("Validate returned %v, want it to say how many zones the voters span", err)
-	}
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("a cluster whose voters are all in one zone was accepted with MinCommitZones 2")
+		} else if !strings.Contains(err.Error(), "span") {
+			t.Errorf("Validate returned %v, want it to say how many zones the voters span", err)
+		}
 
-	// Spreading them makes it satisfiable.
-	cfg.Zones["n3"] = "eu-west-1b"
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("a cluster spanning two zones was refused: %v", err)
-	}
+		// Spreading them makes it satisfiable.
+		cfg.Zones["n3"] = "eu-west-1b"
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("a cluster spanning two zones was refused: %v", err)
+		}
+	})
 }
 
 // TestPlacement_AnUnplacedNodeIsNotEvidence pins the conservative reading of a
@@ -50,14 +53,16 @@ func TestPlacement_RefusesAClusterThatCouldNeverSatisfyIt(t *testing.T) {
 // requirement exists to prevent. A node nobody placed cannot be evidence that
 // a write survived the loss of a zone.
 func TestPlacement_AnUnplacedNodeIsNotEvidence(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}}
-	cfg.MinCommitZones = 2
-	cfg.Zones = map[raft.NodeID]raft.ZoneID{"n1": "a"} // n2 unplaced
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}}
+		cfg.MinCommitZones = 2
+		cfg.Zones = map[raft.NodeID]raft.ZoneID{"n1": "a"} // n2 unplaced
 
-	if err := cfg.Validate(); err == nil {
-		t.Error("an unplaced voter was counted as a second zone")
-	}
+		if err := cfg.Validate(); err == nil {
+			t.Error("an unplaced voter was counted as a second zone")
+		}
+	})
 }
 
 // TestPlacement_DoesNotCommitUntilTheWriteHasLeftTheZone is the property, and
@@ -69,34 +74,36 @@ func TestPlacement_AnUnplacedNodeIsNotEvidence(t *testing.T) {
 // zone a, and losing that zone loses it. With the requirement the entry must
 // reach zone b first, and zone b is not answering.
 func TestPlacement_DoesNotCommitUntilTheWriteHasLeftTheZone(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	cfg.MinCommitZones = 2
-	cfg.Zones = map[raft.NodeID]raft.ZoneID{"n1": "a", "n2": "a", "n3": "b"}
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.Transport = &selectiveTransport{silent: "n3"}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		cfg.MinCommitZones = 2
+		cfg.Zones = map[raft.NodeID]raft.ZoneID{"n1": "a", "n2": "a", "n3": "b"}
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.Transport = &selectiveTransport{silent: "n3"}
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	stop := tickWhile(node)
-	defer stop()
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never became leader")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-	if _, err := node.Propose(ctx, []byte("x")); err == nil {
-		t.Fatal("a write was acknowledged by a quorum that sat entirely in one zone")
-	}
+		stop := tickWhile(node)
+		defer stop()
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never became leader")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		if _, err := node.Propose(ctx, []byte("x")); err == nil {
+			t.Fatal("a write was acknowledged by a quorum that sat entirely in one zone")
+		}
+	})
 }
 
 // selectiveTransport answers for every peer except one, which is silent.
@@ -122,60 +129,64 @@ func (t *selectiveTransport) AppendEntries(ctx context.Context, to raft.NodeID, 
 // TestPlacement_CommitsOnceTheWriteReachesASecondZone is the other half: the
 // requirement must not be a permanent stall when the cluster is healthy.
 func TestPlacement_CommitsOnceTheWriteReachesASecondZone(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	cfg.MinCommitZones = 2
-	cfg.Zones = map[raft.NodeID]raft.ZoneID{"n1": "a", "n2": "a", "n3": "b"}
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.Transport = &echoTransport{sent: make(chan raft.Index, 64)}
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		cfg.MinCommitZones = 2
+		cfg.Zones = map[raft.NodeID]raft.ZoneID{"n1": "a", "n2": "a", "n3": "b"}
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.Transport = &echoTransport{sent: make(chan raft.Index, 64)}
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	stop := tickWhile(node)
-	defer stop()
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never became leader")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := node.Propose(ctx, []byte("x")); err != nil {
-		t.Errorf("a write acknowledged by a second zone was not committed: %v", err)
-	}
+		stop := tickWhile(node)
+		defer stop()
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never became leader")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := node.Propose(ctx, []byte("x")); err != nil {
+			t.Errorf("a write acknowledged by a second zone was not committed: %v", err)
+		}
+	})
 }
 
 // TestPlacement_UnsetIsAPlainMajority pins that nothing changes for a cluster
 // that has not asked for this.
 func TestPlacement_UnsetIsAPlainMajority(t *testing.T) {
-	cfg := safeBaseConfig(t, "n1")
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	stop := tickWhile(node)
-	defer stop()
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never became leader")
+	synctest.Test(t, func(t *testing.T) {
+		cfg := safeBaseConfig(t, "n1")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := node.Propose(ctx, []byte("x")); err != nil {
-		t.Errorf("a single-voter cluster with no zones configured did not commit: %v", err)
-	}
+		stop := tickWhile(node)
+		defer stop()
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never became leader")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := node.Propose(ctx, []byte("x")); err != nil {
+			t.Errorf("a single-voter cluster with no zones configured did not commit: %v", err)
+		}
+	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -40,46 +41,48 @@ import (
 // healthy cluster, and it can only do that if a cluster whose disks are busy
 // can still work out who should stand.
 func TestAsyncHardState_APreVoteIsAnsweredWhileAVoteIsStillBeingWritten(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.holdHardState(t)
-	defer release()
+		release := store.holdHardState(t)
+		defer release()
 
-	// A vote request at a higher term forces a hard-state write, which the
-	// store now holds open.
-	go func() {
-		_, _ = node.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
-			Term:        5,
-			CandidateID: "n2",
+		// A vote request at a higher term forces a hard-state write, which the
+		// store now holds open.
+		go func() {
+			_, _ = node.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+				Term:        5,
+				CandidateID: "n2",
+			})
+		}()
+		store.awaitHeld(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := node.Handler().HandleRequestVote(ctx, &raft.RequestVoteRequest{
+			Term:        6,
+			CandidateID: "n3",
+			PreVote:     true,
 		})
-	}()
-	store.awaitHeld(t)
+		if err != nil {
+			t.Fatalf("a pre-vote was not answered while a vote was being written: %v", err)
+		}
+		if resp == nil {
+			t.Fatal("nil pre-vote response while a vote was being written")
+		}
+		if ops := store.operations(); len(ops) != 0 {
+			t.Errorf("storage recorded %v; a pre-vote must change nothing and the held vote must not have landed", ops)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	resp, err := node.Handler().HandleRequestVote(ctx, &raft.RequestVoteRequest{
-		Term:        6,
-		CandidateID: "n3",
-		PreVote:     true,
+		// And the node is still tracking time, which is what elections depend on.
+		node.Tick()
+		if err := node.FatalError(); err != nil {
+			t.Fatalf("node failed while a write was merely slow: %v", err)
+		}
+		if got := node.Term(); got != 5 {
+			t.Errorf("Term() = %d while the write was outstanding, want 5: the term takes effect immediately", got)
+		}
 	})
-	if err != nil {
-		t.Fatalf("a pre-vote was not answered while a vote was being written: %v", err)
-	}
-	if resp == nil {
-		t.Fatal("nil pre-vote response while a vote was being written")
-	}
-	if ops := store.operations(); len(ops) != 0 {
-		t.Errorf("storage recorded %v; a pre-vote must change nothing and the held vote must not have landed", ops)
-	}
-
-	// And the node is still tracking time, which is what elections depend on.
-	node.Tick()
-	if err := node.FatalError(); err != nil {
-		t.Fatalf("node failed while a write was merely slow: %v", err)
-	}
-	if got := node.Term(); got != 5 {
-		t.Errorf("Term() = %d while the write was outstanding, want 5: the term takes effect immediately", got)
-	}
 }
 
 // TestAsyncHardState_AVoteIsNotGrantedUntilItIsOnDisk is the safety property.
@@ -90,48 +93,50 @@ func TestAsyncHardState_APreVoteIsAnsweredWhileAVoteIsStillBeingWritten(t *testi
 // no longer remembers, and the candidate it promised may already have counted
 // it towards a majority.
 func TestAsyncHardState_AVoteIsNotGrantedUntilItIsOnDisk(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.holdHardState(t)
+		release := store.holdHardState(t)
 
-	type vote struct {
-		resp *raft.RequestVoteResponse
-		err  error
-	}
-	answered := make(chan vote, 1)
-	go func() {
-		resp, err := node.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
-			Term:        5,
-			CandidateID: "n2",
-		})
-		answered <- vote{resp, err}
-	}()
-	store.awaitHeld(t)
-
-	select {
-	case got := <-answered:
-		t.Fatalf("the vote was answered before it was written: %+v (err %v)", got.resp, got.err)
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	release()
-
-	select {
-	case got := <-answered:
-		if got.err != nil {
-			t.Fatalf("vote response returned an error: %v", got.err)
+		type vote struct {
+			resp *raft.RequestVoteResponse
+			err  error
 		}
-		if !got.resp.VoteGranted {
-			t.Fatalf("the vote was not granted: %+v", got.resp)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no vote response after the write was released")
-	}
+		answered := make(chan vote, 1)
+		go func() {
+			resp, err := node.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+				Term:        5,
+				CandidateID: "n2",
+			})
+			answered <- vote{resp, err}
+		}()
+		store.awaitHeld(t)
 
-	ops := store.operations()
-	if len(ops) == 0 || !strings.HasPrefix(ops[0], "hardstate(term=5,vote=n2)") {
-		t.Fatalf("storage operations = %v, want the vote written before it was granted", ops)
-	}
+		select {
+		case got := <-answered:
+			t.Fatalf("the vote was answered before it was written: %+v (err %v)", got.resp, got.err)
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		release()
+
+		select {
+		case got := <-answered:
+			if got.err != nil {
+				t.Fatalf("vote response returned an error: %v", got.err)
+			}
+			if !got.resp.VoteGranted {
+				t.Fatalf("the vote was not granted: %+v", got.resp)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no vote response after the write was released")
+		}
+
+		ops := store.operations()
+		if len(ops) == 0 || !strings.HasPrefix(ops[0], "hardstate(term=5,vote=n2)") {
+			t.Fatalf("storage operations = %v, want the vote written before it was granted", ops)
+		}
+	})
 }
 
 // TestAsyncHardState_ACandidateWaitsForItsOwnVoteBeforeSolicitingOthers covers
@@ -142,52 +147,54 @@ func TestAsyncHardState_AVoteIsNotGrantedUntilItIsOnDisk(t *testing.T) {
 // else in that same term -- so the request has to wait for the write just as a
 // granted vote does.
 func TestAsyncHardState_ACandidateWaitsForItsOwnVoteBeforeSolicitingOthers(t *testing.T) {
-	transport := &countingVoteTransport{realVotes: make(chan raft.Term, 8)}
-	store := newGateStore()
+	synctest.Test(t, func(t *testing.T) {
+		transport := &countingVoteTransport{realVotes: make(chan raft.Term, 8)}
+		store := newGateStore()
 
-	cfg := raft.DefaultConfig()
-	cfg.ID = "n1"
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = transport
-	cfg.TickInterval = 0
+		cfg := raft.DefaultConfig()
+		cfg.ID = "n1"
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = transport
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
+		}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	release := store.holdHardState(t)
+		release := store.holdHardState(t)
 
-	// Tick past the election timeout. The pre-vote round needs no write and
-	// will be granted, which takes the node into a real election.
-	stop := tickWhile(node)
-	store.awaitHeld(t)
+		// Tick past the election timeout. The pre-vote round needs no write and
+		// will be granted, which takes the node into a real election.
+		stop := tickWhile(node)
+		store.awaitHeld(t)
 
-	// Pre-votes may have gone out; a real vote request must not have.
-	select {
-	case term := <-transport.realVotes:
+		// Pre-votes may have gone out; a real vote request must not have.
+		select {
+		case term := <-transport.realVotes:
+			stop()
+			t.Fatalf("the node solicited votes for term %d before its own vote was written", term)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		release()
+
+		select {
+		case <-transport.realVotes:
+		case <-time.After(5 * time.Second):
+			stop()
+			t.Fatal("the node never solicited votes after its own vote was written")
+		}
 		stop()
-		t.Fatalf("the node solicited votes for term %d before its own vote was written", term)
-	case <-time.After(200 * time.Millisecond):
-	}
 
-	release()
-
-	select {
-	case <-transport.realVotes:
-	case <-time.After(5 * time.Second):
-		stop()
-		t.Fatal("the node never solicited votes after its own vote was written")
-	}
-	stop()
-
-	if ops := store.operations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "hardstate(term=1,vote=n1)") {
-		t.Errorf("storage operations = %v, want the self-vote written first", ops)
-	}
+		if ops := store.operations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "hardstate(term=1,vote=n1)") {
+			t.Errorf("storage operations = %v, want the self-vote written first", ops)
+		}
+	})
 }
 
 // TestAsyncHardState_AnAcknowledgementWaitsForTheTermThatMadeIt covers the case
@@ -198,39 +205,41 @@ func TestAsyncHardState_ACandidateWaitsForItsOwnVoteBeforeSolicitingOthers(t *te
 // acknowledgement says so: a leader counts it, and a node that forgot the term
 // after a crash could go on to vote for a different candidate in it.
 func TestAsyncHardState_AnAcknowledgementWaitsForTheTermThatMadeIt(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	release := store.holdHardState(t)
+		release := store.holdHardState(t)
 
-	acked := make(chan *raft.AppendEntriesResponse, 1)
-	go func() {
-		resp, _ := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-			Term:     7,
-			LeaderID: "n2",
-		})
-		acked <- resp
-	}()
-	store.awaitHeld(t)
+		acked := make(chan *raft.AppendEntriesResponse, 1)
+		go func() {
+			resp, _ := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+				Term:     7,
+				LeaderID: "n2",
+			})
+			acked <- resp
+		}()
+		store.awaitHeld(t)
 
-	select {
-	case got := <-acked:
-		t.Fatalf("a heartbeat was acknowledged at term 7 before that term was written: %+v", got)
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	release()
-
-	select {
-	case got := <-acked:
-		if got == nil || !got.Success {
-			t.Fatalf("heartbeat acknowledgement = %+v, want success", got)
+		select {
+		case got := <-acked:
+			t.Fatalf("a heartbeat was acknowledged at term 7 before that term was written: %+v", got)
+		case <-time.After(150 * time.Millisecond):
 		}
-		if got.Term != 7 {
-			t.Errorf("acknowledgement carried term %d, want 7", got.Term)
+
+		release()
+
+		select {
+		case got := <-acked:
+			if got == nil || !got.Success {
+				t.Fatalf("heartbeat acknowledgement = %+v, want success", got)
+			}
+			if got.Term != 7 {
+				t.Errorf("acknowledgement carried term %d, want 7", got.Term)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no acknowledgement after the write was released")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no acknowledgement after the write was released")
-	}
+	})
 }
 
 // TestAsyncHardState_TermsReachStorageBeforeTheEntriesWrittenInThem pins the
@@ -241,26 +250,28 @@ func TestAsyncHardState_AnAcknowledgementWaitsForTheTermThatMadeIt(t *testing.T)
 // through one queue in the order they were issued, and the term is always
 // issued first, so that cannot happen.
 func TestAsyncHardState_TermsReachStorageBeforeTheEntriesWrittenInThem(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	resp, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(3, 1, 2, 0))
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	if !resp.Success {
-		t.Fatalf("append was rejected: %+v", resp)
-	}
+		resp, err := node.Handler().HandleAppendEntries(context.Background(), appendFrom(3, 1, 2, 0))
+		if err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		if !resp.Success {
+			t.Fatalf("append was rejected: %+v", resp)
+		}
 
-	ops := store.operations()
-	if len(ops) < 2 {
-		t.Fatalf("storage operations = %v, want a hard-state write and an append", ops)
-	}
-	if !strings.HasPrefix(ops[0], "hardstate(term=3") {
-		t.Errorf("storage operations = %v, want the term written first", ops)
-	}
-	if ops[1] != "append(1..2)" {
-		t.Errorf("storage operations = %v, want the entries written after the term", ops)
-	}
+		ops := store.operations()
+		if len(ops) < 2 {
+			t.Fatalf("storage operations = %v, want a hard-state write and an append", ops)
+		}
+		if !strings.HasPrefix(ops[0], "hardstate(term=3") {
+			t.Errorf("storage operations = %v, want the term written first", ops)
+		}
+		if ops[1] != "append(1..2)" {
+			t.Errorf("storage operations = %v, want the entries written after the term", ops)
+		}
+	})
 }
 
 // countingVoteTransport reports the terms it was asked to solicit real votes
@@ -313,46 +324,48 @@ func (t *countingVoteTransport) Close() error                           { return
 // index and term is a Log Matching violation, and no later replication repairs
 // it — the conflict detection that would catch it works by comparing terms.
 func TestAsyncHardState_ASingleVoterDoesNotLeadInATermItHasNotWritten(t *testing.T) {
-	store := newGateStore()
+	synctest.Test(t, func(t *testing.T) {
+		store := newGateStore()
 
-	cfg := raft.DefaultConfig()
-	cfg.ID = "solo"
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = &echoTransport{sent: make(chan raft.Index, 8)}
-	cfg.TickInterval = 0
+		cfg := raft.DefaultConfig()
+		cfg.ID = "solo"
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = &echoTransport{sent: make(chan raft.Index, 8)}
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	release := store.holdHardState(t)
-
-	stop := tickWhile(node)
-	defer stop()
-	store.awaitHeld(t)
-
-	time.Sleep(200 * time.Millisecond)
-	if got := node.State(); got == raft.Leader {
-		t.Fatal("the node started leading in a term it had not written")
-	}
-
-	release()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for node.State() != raft.Leader {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never became leader after its term was written")
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	if ops := store.operations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "hardstate(term=1,vote=solo)") {
-		t.Errorf("storage operations = %v, want the term and self-vote written first", ops)
-	}
+		release := store.holdHardState(t)
+
+		stop := tickWhile(node)
+		defer stop()
+		store.awaitHeld(t)
+
+		time.Sleep(200 * time.Millisecond)
+		if got := node.State(); got == raft.Leader {
+			t.Fatal("the node started leading in a term it had not written")
+		}
+
+		release()
+
+		deadline := time.Now().Add(5 * time.Second)
+		for node.State() != raft.Leader {
+			if time.Now().After(deadline) {
+				t.Fatal("the node never became leader after its term was written")
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		if ops := store.operations(); len(ops) == 0 || !strings.HasPrefix(ops[0], "hardstate(term=1,vote=solo)") {
+			t.Errorf("storage operations = %v, want the term and self-vote written first", ops)
+		}
+	})
 }
 
 // TestAsyncHardState_ASettledTermCostsNothing pins that the gate is not
@@ -365,35 +378,37 @@ func TestAsyncHardState_ASingleVoterDoesNotLeadInATermItHasNotWritten(t *testing
 // than better: this is the case that happens millions of times for each one
 // the gate exists for.
 func TestAsyncHardState_ASettledTermCostsNothing(t *testing.T) {
-	node, store := newGatedFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newGatedFollower(t, nil)
 
-	// Adopt term 4 and let the write land.
-	if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-		Term:     4,
-		LeaderID: "n2",
-	}); err != nil {
-		t.Fatalf("first heartbeat: %v", err)
-	}
-
-	// Now hold every kind of write open. A heartbeat in the same term needs
-	// none of them.
-	store.hold(t)
-	store.holdHardState(t)
-
-	for i := range 5 {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		resp, err := node.Handler().HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
+		// Adopt term 4 and let the write land.
+		if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
 			Term:     4,
 			LeaderID: "n2",
-		})
-		cancel()
-		if err != nil {
-			t.Fatalf("heartbeat %d was not answered with every storage write held: %v", i, err)
+		}); err != nil {
+			t.Fatalf("first heartbeat: %v", err)
 		}
-		if !resp.Success {
-			t.Fatalf("heartbeat %d was rejected: %+v", i, resp)
+
+		// Now hold every kind of write open. A heartbeat in the same term needs
+		// none of them.
+		store.hold(t)
+		store.holdHardState(t)
+
+		for i := range 5 {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			resp, err := node.Handler().HandleAppendEntries(ctx, &raft.AppendEntriesRequest{
+				Term:     4,
+				LeaderID: "n2",
+			})
+			cancel()
+			if err != nil {
+				t.Fatalf("heartbeat %d was not answered with every storage write held: %v", i, err)
+			}
+			if !resp.Success {
+				t.Fatalf("heartbeat %d was rejected: %+v", i, resp)
+			}
 		}
-	}
+	})
 }
 
 // TestAsyncHardState_AForwardedReadCarriesOnlyADurableTerm closes the one
@@ -406,70 +421,72 @@ func TestAsyncHardState_ASettledTermCostsNothing(t *testing.T) {
 // crash would make a healthy leader abandon its own for one that never
 // existed, so what goes out is the term on disk rather than the term in use.
 func TestAsyncHardState_AForwardedReadCarriesOnlyADurableTerm(t *testing.T) {
-	seen := make(chan raft.Term, 8)
-	store := newGateStore()
+	synctest.Test(t, func(t *testing.T) {
+		seen := make(chan raft.Term, 8)
+		store := newGateStore()
 
-	cfg := raft.DefaultConfig()
-	cfg.ID = "n1"
-	cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
-	cfg.Storage = store
-	cfg.StateMachine = idleSM{}
-	cfg.Transport = &readIndexSpyTransport{seen: seen}
-	cfg.TickInterval = 0
+		cfg := raft.DefaultConfig()
+		cfg.ID = "n1"
+		cfg.Peers = []raft.PeerConfig{{ID: "n2", Voter: true}, {ID: "n3", Voter: true}}
+		cfg.Storage = store
+		cfg.StateMachine = idleSM{}
+		cfg.Transport = &readIndexSpyTransport{seen: seen}
+		cfg.TickInterval = 0
 
-	node, err := raft.New(&cfg)
-	if err != nil {
-		t.Fatalf("raft.New: %v", err)
-	}
-	node.Start()
-	t.Cleanup(node.Stop)
-
-	// Adopt term 2 from a leader and let the write land, so the node has a
-	// durable term and a known leader to forward to.
-	if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-		Term:     2,
-		LeaderID: "n2",
-	}); err != nil {
-		t.Fatalf("first heartbeat: %v", err)
-	}
-
-	// Now move to term 7 with the hard-state write held open.
-	release := store.holdHardState(t)
-	go func() {
-		_, _ = node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-			Term:     7,
-			LeaderID: "n2",
-		})
-	}()
-	store.awaitHeld(t)
-
-	// The write reaching the gate does not mean the term is visible yet.
-	// saveTerm queues the write before it publishes the term, so the writer
-	// goroutine can already be blocked at the gate while the event loop has
-	// not yet stored the new term in the mirror Term() reads. That ordering is
-	// the conservative one -- the write is on its way before anything
-	// announces the term -- so waiting is what the test has to do about it.
-	// Asserting the instant awaitHeld returns fails about one run in three
-	// hundred on a loaded machine.
-	if !awaitTerm(node, 7, 5*time.Second) {
-		t.Fatalf("Term() = %d, want 7: the term takes effect once the event loop "+
-			"has processed the request", node.Term())
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	_, _ = node.ReadIndex(ctx)
-	cancel()
-
-	select {
-	case got := <-seen:
-		if got != 2 {
-			t.Errorf("the forwarded read carried term %d, which is not on disk; want the durable term 2", got)
+		node, err := raft.New(&cfg)
+		if err != nil {
+			t.Fatalf("raft.New: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no read was forwarded to the leader")
-	}
+		node.Start()
+		t.Cleanup(node.Stop)
 
-	release()
+		// Adopt term 2 from a leader and let the write land, so the node has a
+		// durable term and a known leader to forward to.
+		if _, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+			Term:     2,
+			LeaderID: "n2",
+		}); err != nil {
+			t.Fatalf("first heartbeat: %v", err)
+		}
+
+		// Now move to term 7 with the hard-state write held open.
+		release := store.holdHardState(t)
+		go func() {
+			_, _ = node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+				Term:     7,
+				LeaderID: "n2",
+			})
+		}()
+		store.awaitHeld(t)
+
+		// The write reaching the gate does not mean the term is visible yet.
+		// saveTerm queues the write before it publishes the term, so the writer
+		// goroutine can already be blocked at the gate while the event loop has
+		// not yet stored the new term in the mirror Term() reads. That ordering is
+		// the conservative one -- the write is on its way before anything
+		// announces the term -- so waiting is what the test has to do about it.
+		// Asserting the instant awaitHeld returns fails about one run in three
+		// hundred on a loaded machine.
+		if !awaitTerm(node, 7, 5*time.Second) {
+			t.Fatalf("Term() = %d, want 7: the term takes effect once the event loop "+
+				"has processed the request", node.Term())
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = node.ReadIndex(ctx)
+		cancel()
+
+		select {
+		case got := <-seen:
+			if got != 2 {
+				t.Errorf("the forwarded read carried term %d, which is not on disk; want the durable term 2", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no read was forwarded to the leader")
+		}
+
+		release()
+	})
 }
 
 // readIndexSpyTransport reports the term on each forwarded read.

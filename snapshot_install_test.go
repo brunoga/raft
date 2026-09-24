@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -174,30 +175,32 @@ func awaitLastIndexAtMost(t *testing.T, store raft.Storage, want raft.Index, tim
 // that starts with the leader's state and continues with somebody else's, and
 // the follower will happily serve and replicate it.
 func TestInstallSnapshot_DiscardsLogThatDivergesFromTheSnapshot(t *testing.T) {
-	payload := snapshotPayload(t)
+	synctest.Test(t, func(t *testing.T) {
+		payload := snapshotPayload(t)
 
-	// The follower's entries 1-5 are from term 2. The leader's snapshot covers
-	// through index 3 at term 3, so the follower's index-3 entry is from a
-	// different history, and so is everything after it.
-	node, store := snapshotFollower(t, []raft.LogEntry{
-		{Index: 1, Term: 2, Command: []byte("a")},
-		{Index: 2, Term: 2, Command: []byte("b")},
-		{Index: 3, Term: 2, Command: []byte("diverged")},
-		{Index: 4, Term: 2, Command: []byte("diverged")},
-		{Index: 5, Term: 2, Command: []byte("diverged")},
+		// The follower's entries 1-5 are from term 2. The leader's snapshot covers
+		// through index 3 at term 3, so the follower's index-3 entry is from a
+		// different history, and so is everything after it.
+		node, store := snapshotFollower(t, []raft.LogEntry{
+			{Index: 1, Term: 2, Command: []byte("a")},
+			{Index: 2, Term: 2, Command: []byte("b")},
+			{Index: 3, Term: 2, Command: []byte("diverged")},
+			{Index: 4, Term: 2, Command: []byte("diverged")},
+			{Index: 5, Term: 2, Command: []byte("diverged")},
+		})
+
+		sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 3}, payload)
+
+		deadline := time.Now().Add(3 * time.Second)
+		for node.LastApplied() < 3 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+
+		if got := awaitLastIndexAtMost(t, store, 3, 3*time.Second); got > 3 {
+			t.Errorf("log still ends at index %d after installing a snapshot through index 3 "+
+				"that disagrees with it; entries from the abandoned history were kept", got)
+		}
 	})
-
-	sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 3}, payload)
-
-	deadline := time.Now().Add(3 * time.Second)
-	for node.LastApplied() < 3 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-
-	if got := awaitLastIndexAtMost(t, store, 3, 3*time.Second); got > 3 {
-		t.Errorf("log still ends at index %d after installing a snapshot through index 3 "+
-			"that disagrees with it; entries from the abandoned history were kept", got)
-	}
 }
 
 // TestInstallSnapshot_KeepsLogThatAgreesWithTheSnapshot is the companion case:
@@ -205,45 +208,49 @@ func TestInstallSnapshot_DiscardsLogThatDivergesFromTheSnapshot(t *testing.T) {
 // are part of the same history and must be kept, so the follower does not have
 // to be sent them again.
 func TestInstallSnapshot_KeepsLogThatAgreesWithTheSnapshot(t *testing.T) {
-	payload := snapshotPayload(t)
+	synctest.Test(t, func(t *testing.T) {
+		payload := snapshotPayload(t)
 
-	node, store := snapshotFollower(t, []raft.LogEntry{
-		{Index: 1, Term: 2, Command: []byte("a")},
-		{Index: 2, Term: 2, Command: []byte("b")},
-		{Index: 3, Term: 3, Command: []byte("agrees")},
-		{Index: 4, Term: 3, Command: []byte("keep-me")},
-		{Index: 5, Term: 3, Command: []byte("keep-me")},
+		node, store := snapshotFollower(t, []raft.LogEntry{
+			{Index: 1, Term: 2, Command: []byte("a")},
+			{Index: 2, Term: 2, Command: []byte("b")},
+			{Index: 3, Term: 3, Command: []byte("agrees")},
+			{Index: 4, Term: 3, Command: []byte("keep-me")},
+			{Index: 5, Term: 3, Command: []byte("keep-me")},
+		})
+
+		sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 3}, payload)
+
+		deadline := time.Now().Add(3 * time.Second)
+		for node.LastApplied() < 3 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+
+		if got := lastIndexOf(t, store); got != 5 {
+			t.Errorf("log ends at index %d after installing a snapshot through index 3 that "+
+				"agrees with it; entries 4 and 5 should have been kept", got)
+		}
 	})
-
-	sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 3}, payload)
-
-	deadline := time.Now().Add(3 * time.Second)
-	for node.LastApplied() < 3 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-
-	if got := lastIndexOf(t, store); got != 5 {
-		t.Errorf("log ends at index %d after installing a snapshot through index 3 that "+
-			"agrees with it; entries 4 and 5 should have been kept", got)
-	}
 }
 
 // TestInstallSnapshot_ReportsTheInstalledSnapshotIndex asserts that a node
 // reports the compaction boundary it actually has. A follower brought up to
 // date by a snapshot answers SnapshotIndex with what it installed, not zero.
 func TestInstallSnapshot_ReportsTheInstalledSnapshotIndex(t *testing.T) {
-	payload := snapshotPayload(t)
-	node, _ := snapshotFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		payload := snapshotPayload(t)
+		node, _ := snapshotFollower(t, nil)
 
-	sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 7, LastIncludedTerm: 3}, payload)
+		sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 7, LastIncludedTerm: 3}, payload)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for node.LastApplied() < 7 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := node.SnapshotIndex(); got != 7 {
-		t.Errorf("SnapshotIndex() = %d after installing a snapshot through index 7, want 7", got)
-	}
+		deadline := time.Now().Add(3 * time.Second)
+		for node.LastApplied() < 7 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := node.SnapshotIndex(); got != 7 {
+			t.Errorf("SnapshotIndex() = %d after installing a snapshot through index 7, want 7", got)
+		}
+	})
 }
 
 // TestInstallSnapshot_ReportsTheLeaderThatSentIt asserts that an
@@ -251,35 +258,37 @@ func TestInstallSnapshot_ReportsTheInstalledSnapshotIndex(t *testing.T) {
 // way an AppendEntries does. A client redirected by this follower needs the
 // right address.
 func TestInstallSnapshot_ReportsTheLeaderThatSentIt(t *testing.T) {
-	payload := snapshotPayload(t)
-	node, _ := snapshotFollower(t, nil)
+	synctest.Test(t, func(t *testing.T) {
+		payload := snapshotPayload(t)
+		node, _ := snapshotFollower(t, nil)
 
-	sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 7, LastIncludedTerm: 3}, payload)
+		sendSnapshot(t, node, raft.SnapshotMeta{LastIncludedIndex: 7, LastIncludedTerm: 3}, payload)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for node.Leader() == "" && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := node.Leader(); got != "l1" {
-		t.Fatalf("Leader() = %q after an InstallSnapshot from l1, want %q", got, "l1")
-	}
+		deadline := time.Now().Add(3 * time.Second)
+		for node.Leader() == "" && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := node.Leader(); got != "l1" {
+			t.Fatalf("Leader() = %q after an InstallSnapshot from l1, want %q", got, "l1")
+		}
 
-	// A second request in the same term, from a different leader. The term did
-	// not change, so nothing else updates the node's view of who leads; the
-	// snapshot handler has to.
-	if _, err := node.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
-		Term:              3,
-		LeaderID:          "l2",
-		LastIncludedIndex: 2, // already covered, so the install itself is a no-op
-		LastIncludedTerm:  3,
-		Offset:            0,
-		Data:              payload,
-		Done:              true,
-	}); err != nil {
-		t.Fatalf("second HandleInstallSnapshot: %v", err)
-	}
-	if got := node.Leader(); got != "l2" {
-		t.Errorf("Leader() = %q after an InstallSnapshot from l2 in the same term, want %q",
-			got, "l2")
-	}
+		// A second request in the same term, from a different leader. The term did
+		// not change, so nothing else updates the node's view of who leads; the
+		// snapshot handler has to.
+		if _, err := node.Handler().HandleInstallSnapshot(context.Background(), &raft.InstallSnapshotRequest{
+			Term:              3,
+			LeaderID:          "l2",
+			LastIncludedIndex: 2, // already covered, so the install itself is a no-op
+			LastIncludedTerm:  3,
+			Offset:            0,
+			Data:              payload,
+			Done:              true,
+		}); err != nil {
+			t.Fatalf("second HandleInstallSnapshot: %v", err)
+		}
+		if got := node.Leader(); got != "l2" {
+			t.Errorf("Leader() = %q after an InstallSnapshot from l2 in the same term, want %q",
+				got, "l2")
+		}
+	})
 }

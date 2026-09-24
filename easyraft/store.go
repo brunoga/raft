@@ -537,6 +537,9 @@ func NewStore(opts ...Option) (*Store, error) {
 	if err := resolveTLSFiles(&c); err != nil {
 		return nil, err
 	}
+	if err := validateListener(&c); err != nil {
+		return nil, err
+	}
 	if err := validateSecurity(&c, true); err != nil {
 		return nil, err
 	}
@@ -661,6 +664,15 @@ func resolveTLSFiles(c *config) error {
 	return nil
 }
 
+// validateListener rejects the one combination that cannot mean anything.
+func validateListener(c *config) error {
+	if c.HTTPListener != nil && c.HTTPMux != nil {
+		return fmt.Errorf("easyraft: WithHTTPListener and WithHTTPMux are mutually exclusive; " +
+			"a caller-supplied mux is served by the caller, so this store has no use for a listener")
+	}
+	return nil
+}
+
 func validateSecurity(c *config, servesHTTP bool) error {
 	// A transport the caller built is the caller's to secure; this check is
 	// about the listener this store would otherwise have opened itself.
@@ -668,7 +680,7 @@ func validateSecurity(c *config, servesHTTP bool) error {
 		return fmt.Errorf("easyraft: the Raft transport has no TLS configuration; pass WithTLS, " +
 			"or WithInsecureTransportAcknowledged to run in plaintext on a trusted network")
 	}
-	if servesHTTP && (c.HTTPAddr != "" || c.HTTPMux != nil) &&
+	if servesHTTP && (c.HTTPAddr != "" || c.HTTPMux != nil || c.HTTPListener != nil) &&
 		c.HTTPAuth == nil && !c.AcknowledgeInsecureHTTP {
 		return fmt.Errorf("easyraft: the HTTP API has no authorization hook; pass WithHTTPAuth or " +
 			"WithBearerTokenAuth, or WithInsecureHTTPAcknowledged if the listener is only " +

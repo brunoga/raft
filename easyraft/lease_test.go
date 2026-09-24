@@ -9,28 +9,43 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
 	"github.com/brunoga/raft/v2/easyraft"
+	"github.com/brunoga/raft/v2/internal/memnet"
+	"github.com/brunoga/raft/v2/transport/memtransport"
 )
 
 // startLeaseNode brings up a one-node cluster that sweeps expired leases
 // often, so a test can watch a key go without waiting a second for it.
+//
+// Everything is in memory: the Raft traffic over memtransport, the HTTP over
+// a memnet listener. That is what lets these tests run inside a synctest
+// bubble, where a 2s lease is exact rather than a race against the scheduler.
+// A goroutine parked in Accept on a real socket is not durably blocked, so
+// one real listener would stop the bubble's clock for good.
 func startLeaseNode(t *testing.T) (er *easyraft.EasyRaft[Counter], httpAddr string) {
 	t.Helper()
-	raftAddr, httpAddr := freePort(t), freePort(t)
 
-	er, err := easyraft.New[Counter](
+	httpAddr = "n1:8080"
+
+	// One node, so the network has nobody else on it; the transport exists
+	// only because a store must have one.
+	opts := []easyraft.Option{
 		easyraft.WithID("n1"),
-		easyraft.WithRaftAddr(raftAddr),
-		easyraft.WithHTTPAddr(httpAddr),
 		easyraft.WithDataDir(filepath.Join(t.TempDir(), "n1")),
-		easyraft.WithPeers(map[raft.NodeID]string{"n1": raftAddr}),
-		easyraft.WithKeyLeaseSweepInterval(50*time.Millisecond),
+		easyraft.WithKeyLeaseSweepInterval(50 * time.Millisecond),
+		easyraft.WithTransport(memtransport.NewNetwork().NewTransport("n1")),
+		easyraft.WithHTTPAddr(httpAddr),
+		easyraft.WithHTTPListener(testNet.Listen(httpAddr)),
+		easyraft.WithPeers(map[raft.NodeID]string{"n1": "n1"}),
 		easyraft.WithInsecureTransportAcknowledged(),
 		easyraft.WithInsecureHTTPAcknowledged(),
-	)
+	}
+
+	er, err := easyraft.New[Counter](opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,271 +81,305 @@ func waitGone(t *testing.T, er *easyraft.EasyRaft[Counter], key string) {
 // registered under a lease disappears once nothing renews it, with no other
 // process having to notice that its owner died.
 func TestLease_KeyOutlivesNothing(t *testing.T) {
-	er, _ := startLeaseNode(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		er, _ := startLeaseNode(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
 
-	const keyLeaseTTL = 2 * time.Second
-	lease, err := er.GrantLease(ctx, keyLeaseTTL)
-	if err != nil {
-		t.Fatalf("GrantLease: %v", err)
-	}
-	if lease == 0 {
-		t.Fatal("GrantLease returned lease 0")
-	}
-	if err := er.UpsertWithLease(ctx, "instance-1", Counter{Value: 1}, lease); err != nil {
-		t.Fatalf("UpsertWithLease: %v", err)
-	}
-	if err := er.Create(ctx, "permanent", Counter{Value: 2}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if got := er.LeaseOf("instance-1"); got != lease {
-		t.Errorf("LeaseOf returned %d, want %d", got, lease)
-	}
+		const keyLeaseTTL = 2 * time.Second
+		lease, err := er.GrantLease(ctx, keyLeaseTTL)
+		if err != nil {
+			t.Fatalf("GrantLease: %v", err)
+		}
+		if lease == 0 {
+			t.Fatal("GrantLease returned lease 0")
+		}
+		if err := er.UpsertWithLease(ctx, "instance-1", Counter{Value: 1}, lease); err != nil {
+			t.Fatalf("UpsertWithLease: %v", err)
+		}
+		if err := er.Create(ctx, "permanent", Counter{Value: 2}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if got := er.LeaseOf("instance-1"); got != lease {
+			t.Errorf("LeaseOf returned %d, want %d", got, lease)
+		}
 
-	// Renewing keeps it alive well past its own TTL. The widest gap between
-	// renewals is measured, because a gap longer than the lease means this
-	// process was descheduled and the key expiring says nothing about
-	// renewal -- see the note in TestLease_HTTP.
-	var longestGap time.Duration
-	lastRenew := time.Now()
-	renewUntil := time.Now().Add(3 * time.Second)
-	for time.Now().Before(renewUntil) {
-		if _, err := er.KeepAlive(ctx, lease); err != nil {
-			t.Fatalf("KeepAlive: %v", err)
+		// Renewing keeps it alive well past its own TTL. The widest gap between
+		// renewals is measured, because a gap longer than the lease means this
+		// process was descheduled and the key expiring says nothing about
+		// renewal -- see the note in TestLease_HTTP.
+		var longestGap time.Duration
+		lastRenew := time.Now()
+		renewUntil := time.Now().Add(3 * time.Second)
+		for time.Now().Before(renewUntil) {
+			if _, err := er.KeepAlive(ctx, lease); err != nil {
+				t.Fatalf("KeepAlive: %v", err)
+			}
+			if gap := time.Since(lastRenew); gap > longestGap {
+				longestGap = gap
+			}
+			lastRenew = time.Now()
+			time.Sleep(200 * time.Millisecond)
 		}
-		if gap := time.Since(lastRenew); gap > longestGap {
-			longestGap = gap
-		}
-		lastRenew = time.Now()
-		time.Sleep(200 * time.Millisecond)
-	}
-	if _, err := er.ReadStale("instance-1"); err != nil {
+		// No stall escape hatch: the clock is fake, so a gap wider than the
+		// lease is a bug in the code under test and never the machine.
 		if longestGap >= keyLeaseTTL {
-			t.Skipf("renewals were %v apart at worst, longer than the %v lease: this machine stalled",
-				longestGap, keyLeaseTTL)
+			t.Fatalf("renewals were %v apart at worst, wider than the %v lease", longestGap, keyLeaseTTL)
 		}
-		t.Fatalf("the key went while it was still being renewed "+
-			"(worst gap %v, lease %v): %v", longestGap, keyLeaseTTL, err)
-	}
+		if _, err := er.ReadStale("instance-1"); err != nil {
+			t.Fatalf("the key went while it was still being renewed "+
+				"(worst gap %v, lease %v): %v", longestGap, keyLeaseTTL, err)
+		}
 
-	// Stop renewing and it goes.
-	waitGone(t, er, "instance-1")
-	if _, err := er.ReadStale("permanent"); err != nil {
-		t.Errorf("a key with no lease was removed: %v", err)
-	}
-	if _, err := er.Lease(lease); !errors.Is(err, easyraft.ErrLeaseNotFound) {
-		t.Errorf("the expired lease is still there: %v", err)
-	}
-	if err := er.UpsertWithLease(ctx, "late", Counter{}, lease); !errors.Is(err, easyraft.ErrLeaseNotFound) {
-		t.Errorf("writing under an expired lease: %v, want ErrLeaseNotFound", err)
-	}
+		// Stop renewing and it goes.
+		waitGone(t, er, "instance-1")
+		if _, err := er.ReadStale("permanent"); err != nil {
+			t.Errorf("a key with no lease was removed: %v", err)
+		}
+		if _, err := er.Lease(lease); !errors.Is(err, easyraft.ErrLeaseNotFound) {
+			t.Errorf("the expired lease is still there: %v", err)
+		}
+		if err := er.UpsertWithLease(ctx, "late", Counter{}, lease); !errors.Is(err, easyraft.ErrLeaseNotFound) {
+			t.Errorf("writing under an expired lease: %v, want ErrLeaseNotFound", err)
+		}
+	})
 }
 
 // TestLease_KeepAliveLoopHoldsItAndReleasesIt covers the helper a service
 // actually uses: one goroutine, and the registration lives exactly as long as
 // the context it was given.
 func TestLease_KeepAliveLoopHoldsItAndReleasesIt(t *testing.T) {
-	er, _ := startLeaseNode(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		er, _ := startLeaseNode(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
 
-	const loopLeaseTTL = 2 * time.Second
-	lease, err := er.GrantLease(ctx, loopLeaseTTL)
-	if err != nil {
-		t.Fatalf("GrantLease: %v", err)
-	}
-	if err := er.UpsertWithLease(ctx, "held", Counter{Value: 1}, lease); err != nil {
-		t.Fatalf("UpsertWithLease: %v", err)
-	}
-
-	loopCtx, stopLoop := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() { done <- er.KeepAliveLoop(loopCtx, lease) }()
-
-	// Well past the TTL, still there. The sleep is measured: if it overran by
-	// more than the lease, the loop was starved along with it and the key
-	// expiring says nothing about the loop.
-	holdFor := 3 * time.Second
-	start := time.Now()
-	time.Sleep(holdFor)
-	if _, err := er.ReadStale("held"); err != nil {
-		if slept := time.Since(start); slept >= holdFor+loopLeaseTTL {
-			t.Skipf("a %v sleep took %v: this machine stalled for longer than the %v lease",
-				holdFor, slept, loopLeaseTTL)
+		const loopLeaseTTL = 2 * time.Second
+		lease, err := er.GrantLease(ctx, loopLeaseTTL)
+		if err != nil {
+			t.Fatalf("GrantLease: %v", err)
 		}
-		t.Fatalf("the key went while the keep-alive loop was running: %v", err)
-	}
-
-	stopLoop()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("KeepAliveLoop returned %v, want context.Canceled", err)
+		if err := er.UpsertWithLease(ctx, "held", Counter{Value: 1}, lease); err != nil {
+			t.Fatalf("UpsertWithLease: %v", err)
 		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("KeepAliveLoop did not return after its context was cancelled")
-	}
-	waitGone(t, er, "held")
 
-	// A loop for a lease that does not exist says so rather than spinning.
-	if err := er.KeepAliveLoop(ctx, lease); !errors.Is(err, easyraft.ErrLeaseNotFound) {
-		t.Errorf("KeepAliveLoop on a dead lease: %v, want ErrLeaseNotFound", err)
-	}
+		loopCtx, stopLoop := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- er.KeepAliveLoop(loopCtx, lease) }()
+
+		// Well past the TTL, still there. The sleep used to be measured and the
+		// test skipped itself when the machine had overrun it: a starved loop
+		// losing the key says nothing about the loop. In a bubble the clock is
+		// fake and advances only when every goroutine is blocked, so the sleep
+		// is exact and there is nothing to excuse.
+		holdFor := 3 * time.Second
+		start := time.Now()
+		time.Sleep(holdFor)
+		if slept := time.Since(start); slept != holdFor {
+			t.Fatalf("a %v sleep took %v of fake time", holdFor, slept)
+		}
+		if _, err := er.ReadStale("held"); err != nil {
+			t.Fatalf("the key went while the keep-alive loop was running: %v", err)
+		}
+
+		stopLoop()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("KeepAliveLoop returned %v, want context.Canceled", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("KeepAliveLoop did not return after its context was cancelled")
+		}
+		waitGone(t, er, "held")
+
+		// A loop for a lease that does not exist says so rather than spinning.
+		if err := er.KeepAliveLoop(ctx, lease); !errors.Is(err, easyraft.ErrLeaseNotFound) {
+			t.Errorf("KeepAliveLoop on a dead lease: %v, want ErrLeaseNotFound", err)
+		}
+	})
 }
 
 // TestLease_RevokeIsImmediate covers giving a registration up on purpose,
 // which a process should do on a clean shutdown rather than leaving a stale
 // entry for a whole TTL.
 func TestLease_RevokeIsImmediate(t *testing.T) {
-	er, _ := startLeaseNode(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		er, _ := startLeaseNode(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
 
-	lease, err := er.GrantLease(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("GrantLease: %v", err)
-	}
-	if err := er.UpsertWithLease(ctx, "leaving", Counter{Value: 1}, lease); err != nil {
-		t.Fatalf("UpsertWithLease: %v", err)
-	}
-	if err := er.RevokeLease(ctx, lease); err != nil {
-		t.Fatalf("RevokeLease: %v", err)
-	}
-	if _, err := er.ReadStale("leaving"); !errors.Is(err, easyraft.ErrKeyNotFound) {
-		t.Errorf("the key survived an explicit revocation: %v", err)
-	}
-	// Revoking again succeeds: the outcome asked for is the outcome.
-	if err := er.RevokeLease(ctx, lease); err != nil {
-		t.Errorf("revoking twice: %v", err)
-	}
+		lease, err := er.GrantLease(ctx, time.Hour)
+		if err != nil {
+			t.Fatalf("GrantLease: %v", err)
+		}
+		if err := er.UpsertWithLease(ctx, "leaving", Counter{Value: 1}, lease); err != nil {
+			t.Fatalf("UpsertWithLease: %v", err)
+		}
+		if err := er.RevokeLease(ctx, lease); err != nil {
+			t.Fatalf("RevokeLease: %v", err)
+		}
+		if _, err := er.ReadStale("leaving"); !errors.Is(err, easyraft.ErrKeyNotFound) {
+			t.Errorf("the key survived an explicit revocation: %v", err)
+		}
+		// Revoking again succeeds: the outcome asked for is the outcome.
+		if err := er.RevokeLease(ctx, lease); err != nil {
+			t.Errorf("revoking twice: %v", err)
+		}
 
-	// A TTL that is not positive is refused before anything is proposed.
-	if _, err := er.GrantLease(ctx, 0); err == nil {
-		t.Error("GrantLease(0) succeeded")
-	}
-	if _, err := er.GrantLease(ctx, -time.Second); err == nil {
-		t.Error("GrantLease(-1s) succeeded")
-	}
+		// A TTL that is not positive is refused before anything is proposed.
+		if _, err := er.GrantLease(ctx, 0); err == nil {
+			t.Error("GrantLease(0) succeeded")
+		}
+		if _, err := er.GrantLease(ctx, -time.Second); err == nil {
+			t.Error("GrantLease(-1s) succeeded")
+		}
+	})
 }
 
 // TestLease_HTTP covers the same contract for a client that is not in Go.
 func TestLease_HTTP(t *testing.T) {
-	er, httpAddr := startLeaseNode(t)
-	base := "http://" + httpAddr
+	synctest.Test(t, func(t *testing.T) {
+		er, httpAddr := startLeaseNode(t)
+		base := "http://" + httpAddr
 
-	// Two seconds, not the fraction this once used. The assertion below is
-	// that renewal keeps the key alive, and a TTL of 300ms renewed every 50ms
-	// only survives if the machine never stalls for 300ms -- which a shared
-	// CI runner does. The test still proves the same thing: the hold below
-	// outlasts the TTL, so nothing but renewal can explain the key surviving.
-	grantStatus, grantBody, _ := doRequest(t, http.MethodPost, base+"/__leases", `{"ttl_seconds":2}`, nil)
-	if grantStatus != http.StatusCreated {
-		t.Fatalf("grant: %d %s", grantStatus, grantBody)
-	}
-	var granted struct {
-		ID         uint64  `json:"id"`
-		TTLSeconds float64 `json:"ttl_seconds"`
-	}
-	if err := json.Unmarshal([]byte(grantBody), &granted); err != nil {
-		t.Fatalf("decode grant: %v", err)
-	}
-	if granted.ID == 0 {
-		t.Fatalf("grant returned id 0: %s", grantBody)
-	}
-
-	leaseParam := "?lease=" + strconv.FormatUint(granted.ID, 10)
-	if status, body, _ := doRequest(t, http.MethodPatch,
-		base+"/default/web-1"+leaseParam, `{"value":1}`, nil); status != http.StatusNoContent {
-		t.Fatalf("leased upsert: %d %s", status, body)
-	}
-	if status, body, _ := doRequest(t, http.MethodGet,
-		base+"/__leases/"+strconv.FormatUint(granted.ID, 10), "", nil); status != http.StatusOK {
-		t.Fatalf("read lease: %d %s", status, body)
-	} else if !strings.Contains(body, "web-1") {
-		t.Errorf("the lease does not list its key: %s", body)
-	}
-	if status, body, _ := doRequest(t, http.MethodGet, base+"/__leases", "", nil); status != http.StatusOK {
-		t.Fatalf("list leases: %d %s", status, body)
-	}
-
-	// Renewing over HTTP holds it past its TTL.
-	//
-	// The longest gap between renewals is measured as we go. If this process
-	// was descheduled for longer than the lease, the key expiring says
-	// nothing about whether renewal works, and failing on it would be
-	// reporting the machine rather than the code.
-	const httpLeaseTTL = 2 * time.Second
-	var longestGap time.Duration
-	lastRenew := time.Now()
-	renewUntil := time.Now().Add(3 * time.Second)
-	for time.Now().Before(renewUntil) {
-		if status, body, _ := doRequest(t, http.MethodPost,
-			base+"/__leases/"+strconv.FormatUint(granted.ID, 10)+"/keepalive", "", nil); status != http.StatusOK {
-			t.Fatalf("keepalive: %d %s", status, body)
+		// Two seconds, not the fraction this once used. The assertion below is
+		// that renewal keeps the key alive, and a TTL of 300ms renewed every 50ms
+		// only survives if the machine never stalls for 300ms -- which a shared
+		// CI runner does. The test still proves the same thing: the hold below
+		// outlasts the TTL, so nothing but renewal can explain the key surviving.
+		grantStatus, grantBody, _ := doRequest(t, http.MethodPost, base+"/__leases", `{"ttl_seconds":2}`, nil)
+		if grantStatus != http.StatusCreated {
+			t.Fatalf("grant: %d %s", grantStatus, grantBody)
 		}
-		if gap := time.Since(lastRenew); gap > longestGap {
-			longestGap = gap
+		var granted struct {
+			ID         uint64  `json:"id"`
+			TTLSeconds float64 `json:"ttl_seconds"`
 		}
-		lastRenew = time.Now()
-		time.Sleep(200 * time.Millisecond)
-	}
-	if _, err := er.ReadStale("web-1"); err != nil {
+		if err := json.Unmarshal([]byte(grantBody), &granted); err != nil {
+			t.Fatalf("decode grant: %v", err)
+		}
+		if granted.ID == 0 {
+			t.Fatalf("grant returned id 0: %s", grantBody)
+		}
+
+		leaseParam := "?lease=" + strconv.FormatUint(granted.ID, 10)
+		if status, body, _ := doRequest(t, http.MethodPatch,
+			base+"/default/web-1"+leaseParam, `{"value":1}`, nil); status != http.StatusNoContent {
+			t.Fatalf("leased upsert: %d %s", status, body)
+		}
+		if status, body, _ := doRequest(t, http.MethodGet,
+			base+"/__leases/"+strconv.FormatUint(granted.ID, 10), "", nil); status != http.StatusOK {
+			t.Fatalf("read lease: %d %s", status, body)
+		} else if !strings.Contains(body, "web-1") {
+			t.Errorf("the lease does not list its key: %s", body)
+		}
+		if status, body, _ := doRequest(t, http.MethodGet, base+"/__leases", "", nil); status != http.StatusOK {
+			t.Fatalf("list leases: %d %s", status, body)
+		}
+
+		// Renewing over HTTP holds it past its TTL.
+		//
+		// The longest gap between renewals is measured as we go. If this process
+		// was descheduled for longer than the lease, the key expiring says
+		// nothing about whether renewal works, and failing on it would be
+		// reporting the machine rather than the code.
+		const httpLeaseTTL = 2 * time.Second
+		var longestGap time.Duration
+		lastRenew := time.Now()
+		renewUntil := time.Now().Add(3 * time.Second)
+		for time.Now().Before(renewUntil) {
+			if status, body, _ := doRequest(t, http.MethodPost,
+				base+"/__leases/"+strconv.FormatUint(granted.ID, 10)+"/keepalive", "", nil); status != http.StatusOK {
+				t.Fatalf("keepalive: %d %s", status, body)
+			}
+			if gap := time.Since(lastRenew); gap > longestGap {
+				longestGap = gap
+			}
+			lastRenew = time.Now()
+			time.Sleep(200 * time.Millisecond)
+		}
+		// No stall escape hatch: the clock is fake, so a renewal gap wider than
+		// the lease is a bug in the code under test and never the machine.
 		if longestGap >= httpLeaseTTL {
-			t.Skipf("renewals were %v apart at worst, longer than the %v lease: "+
-				"this machine stalled, and the key expiring says nothing about renewal",
+			t.Fatalf("renewals were %v apart at worst, wider than the %v lease",
 				longestGap, httpLeaseTTL)
 		}
-		t.Fatalf("the key went while it was being renewed over HTTP "+
-			"(worst gap between renewals %v, lease %v): %v", longestGap, httpLeaseTTL, err)
-	}
-
-	waitGone(t, er, "web-1")
-
-	// The lease is gone, and so are the endpoints that name it.
-	if status, _, _ := doRequest(t, http.MethodGet,
-		base+"/__leases/"+strconv.FormatUint(granted.ID, 10), "", nil); status != http.StatusNotFound {
-		t.Errorf("reading an expired lease answered %d, want 404", status)
-	}
-	if status, _, _ := doRequest(t, http.MethodPost,
-		base+"/__leases/"+strconv.FormatUint(granted.ID, 10)+"/keepalive", "", nil); status != http.StatusNotFound {
-		t.Errorf("renewing an expired lease answered %d, want 404", status)
-	}
-	if status, _, _ := doRequest(t, http.MethodPatch,
-		base+"/default/late"+leaseParam, `{"value":1}`, nil); status != http.StatusNotFound {
-		t.Errorf("writing under an expired lease answered %d, want 404", status)
-	}
-
-	// Malformed input is refused rather than treated as "no lease".
-	for _, bad := range []struct{ method, path, body string }{
-		{http.MethodPost, "/__leases", `{"ttl_seconds":0}`},
-		{http.MethodPost, "/__leases", `{"ttl_seconds":-5}`},
-		{http.MethodPatch, "/default/x?lease=nope", `{"value":1}`},
-		{http.MethodPatch, "/default/x?lease=0", `{"value":1}`},
-		{http.MethodGet, "/__leases/notanumber", ""},
-	} {
-		if status, body, _ := doRequest(t, bad.method, base+bad.path, bad.body, nil); status != http.StatusBadRequest {
-			t.Errorf("%s %s answered %d %s, want 400", bad.method, bad.path, status, body)
+		if _, err := er.ReadStale("web-1"); err != nil {
+			t.Fatalf("the key went while it was being renewed over HTTP "+
+				"(worst gap between renewals %v, lease %v): %v", longestGap, httpLeaseTTL, err)
 		}
-	}
 
-	// An explicit revocation over HTTP.
-	grantStatus, grantBody, _ = doRequest(t, http.MethodPost, base+"/__leases", `{"ttl_seconds":3600}`, nil)
-	if grantStatus != http.StatusCreated {
-		t.Fatalf("second grant: %d %s", grantStatus, grantBody)
-	}
-	if err := json.Unmarshal([]byte(grantBody), &granted); err != nil {
-		t.Fatal(err)
-	}
-	if status, body, _ := doRequest(t, http.MethodPatch,
-		base+"/default/web-2?lease="+strconv.FormatUint(granted.ID, 10), `{"value":2}`, nil); status != http.StatusNoContent {
-		t.Fatalf("second leased upsert: %d %s", status, body)
-	}
-	if status, body, _ := doRequest(t, http.MethodDelete,
-		base+"/__leases/"+strconv.FormatUint(granted.ID, 10), "", nil); status != http.StatusNoContent {
-		t.Fatalf("revoke: %d %s", status, body)
-	}
-	if _, err := er.ReadStale("web-2"); !errors.Is(err, easyraft.ErrKeyNotFound) {
-		t.Errorf("the key survived revocation over HTTP: %v", err)
-	}
+		waitGone(t, er, "web-1")
+
+		// The lease is gone, and so are the endpoints that name it.
+		if status, _, _ := doRequest(t, http.MethodGet,
+			base+"/__leases/"+strconv.FormatUint(granted.ID, 10), "", nil); status != http.StatusNotFound {
+			t.Errorf("reading an expired lease answered %d, want 404", status)
+		}
+		if status, _, _ := doRequest(t, http.MethodPost,
+			base+"/__leases/"+strconv.FormatUint(granted.ID, 10)+"/keepalive", "", nil); status != http.StatusNotFound {
+			t.Errorf("renewing an expired lease answered %d, want 404", status)
+		}
+		if status, _, _ := doRequest(t, http.MethodPatch,
+			base+"/default/late"+leaseParam, `{"value":1}`, nil); status != http.StatusNotFound {
+			t.Errorf("writing under an expired lease answered %d, want 404", status)
+		}
+
+		// Malformed input is refused rather than treated as "no lease".
+		for _, bad := range []struct{ method, path, body string }{
+			{http.MethodPost, "/__leases", `{"ttl_seconds":0}`},
+			{http.MethodPost, "/__leases", `{"ttl_seconds":-5}`},
+			{http.MethodPatch, "/default/x?lease=nope", `{"value":1}`},
+			{http.MethodPatch, "/default/x?lease=0", `{"value":1}`},
+			{http.MethodGet, "/__leases/notanumber", ""},
+		} {
+			if status, body, _ := doRequest(t, bad.method, base+bad.path, bad.body, nil); status != http.StatusBadRequest {
+				t.Errorf("%s %s answered %d %s, want 400", bad.method, bad.path, status, body)
+			}
+		}
+
+		// An explicit revocation over HTTP.
+		grantStatus, grantBody, _ = doRequest(t, http.MethodPost, base+"/__leases", `{"ttl_seconds":3600}`, nil)
+		if grantStatus != http.StatusCreated {
+			t.Fatalf("second grant: %d %s", grantStatus, grantBody)
+		}
+		if err := json.Unmarshal([]byte(grantBody), &granted); err != nil {
+			t.Fatal(err)
+		}
+		if status, body, _ := doRequest(t, http.MethodPatch,
+			base+"/default/web-2?lease="+strconv.FormatUint(granted.ID, 10), `{"value":2}`, nil); status != http.StatusNoContent {
+			t.Fatalf("second leased upsert: %d %s", status, body)
+		}
+		if status, body, _ := doRequest(t, http.MethodDelete,
+			base+"/__leases/"+strconv.FormatUint(granted.ID, 10), "", nil); status != http.StatusNoContent {
+			t.Fatalf("revoke: %d %s", status, body)
+		}
+		if _, err := er.ReadStale("web-2"); !errors.Is(err, easyraft.ErrKeyNotFound) {
+			t.Errorf("the key survived revocation over HTTP: %v", err)
+		}
+	})
+}
+
+// TestLease_ListenerAndMuxConflict pins the one combination that cannot mean
+// anything: a caller-supplied mux is served by the caller, so a listener has
+// nowhere to go.
+func TestLease_ListenerAndMuxConflict(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		_, err := easyraft.New[Counter](
+			easyraft.WithID("n1"),
+			easyraft.WithDataDir(t.TempDir()),
+			easyraft.WithTransport(memtransport.NewNetwork().NewTransport("n1")),
+			easyraft.WithHTTPListener(memnet.Listen("n1:8000")),
+			easyraft.WithHTTPMux(http.NewServeMux()),
+			easyraft.WithInsecureTransportAcknowledged(),
+			easyraft.WithInsecureHTTPAcknowledged(),
+		)
+		if err == nil {
+			t.Fatal("WithHTTPListener together with WithHTTPMux was accepted")
+		}
+		if !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Errorf("error was %q, want it to say the two are mutually exclusive", err)
+		}
+	})
 }

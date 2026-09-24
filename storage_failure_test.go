@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -102,73 +103,79 @@ func waitFatal(t *testing.T, node *raft.Node) error {
 // with it the loss of committed entries. There is nothing useful such a node
 // can do, so it stops.
 func TestStorage_HardStateFailureStopsTheNode(t *testing.T) {
-	node, store := newFaultyNode(t)
-	store.failHardState.Store(true)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newFaultyNode(t)
+		store.failHardState.Store(true)
 
-	// A higher-term vote request forces the node to persist a new term.
-	_, _ = node.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
-		Term:         5,
-		CandidateID:  "n2",
-		LastLogIndex: 0,
-		LastLogTerm:  0,
+		// A higher-term vote request forces the node to persist a new term.
+		_, _ = node.Handler().HandleRequestVote(context.Background(), &raft.RequestVoteRequest{
+			Term:         5,
+			CandidateID:  "n2",
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+
+		fatal := waitFatal(t, node)
+		if fatal == nil {
+			t.Fatal("node kept running after it failed to persist its term and vote")
+		}
+		if !errors.Is(fatal, errDiskFailure) {
+			t.Errorf("FatalError() = %v, want it to wrap %v", fatal, errDiskFailure)
+		}
+		if !errors.Is(fatal, raft.ErrNodeFailed) {
+			t.Errorf("FatalError() = %v, want it to match raft.ErrNodeFailed", fatal)
+		}
+
+		// Every subsequent operation reports the failure rather than pretending to
+		// work or reporting a plain shutdown.
+		if _, err := node.Propose(context.Background(), []byte("x")); !errors.Is(err, raft.ErrNodeFailed) {
+			t.Errorf("Propose after failure returned %v, want raft.ErrNodeFailed", err)
+		}
 	})
-
-	fatal := waitFatal(t, node)
-	if fatal == nil {
-		t.Fatal("node kept running after it failed to persist its term and vote")
-	}
-	if !errors.Is(fatal, errDiskFailure) {
-		t.Errorf("FatalError() = %v, want it to wrap %v", fatal, errDiskFailure)
-	}
-	if !errors.Is(fatal, raft.ErrNodeFailed) {
-		t.Errorf("FatalError() = %v, want it to match raft.ErrNodeFailed", fatal)
-	}
-
-	// Every subsequent operation reports the failure rather than pretending to
-	// work or reporting a plain shutdown.
-	if _, err := node.Propose(context.Background(), []byte("x")); !errors.Is(err, raft.ErrNodeFailed) {
-		t.Errorf("Propose after failure returned %v, want raft.ErrNodeFailed", err)
-	}
 }
 
 // TestStorage_AppendFailureStopsTheNode asserts the same for the log itself: a
 // follower that acknowledges entries it did not durably store lets the leader
 // count it towards a commit quorum for entries that can vanish.
 func TestStorage_AppendFailureStopsTheNode(t *testing.T) {
-	node, store := newFaultyNode(t)
-	store.failAppend.Store(true)
+	synctest.Test(t, func(t *testing.T) {
+		node, store := newFaultyNode(t)
+		store.failAppend.Store(true)
 
-	resp, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-		Term:         1,
-		LeaderID:     "n2",
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      []raft.LogEntry{{Index: 1, Term: 1, Command: []byte("x")}},
+		resp, err := node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+			Term:         1,
+			LeaderID:     "n2",
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Entries:      []raft.LogEntry{{Index: 1, Term: 1, Command: []byte("x")}},
+		})
+		if err == nil && resp != nil && resp.Success {
+			t.Fatal("follower acknowledged entries it could not store")
+		}
+
+		if fatal := waitFatal(t, node); fatal == nil {
+			t.Error("node kept running after it failed to store log entries")
+		}
 	})
-	if err == nil && resp != nil && resp.Success {
-		t.Fatal("follower acknowledged entries it could not store")
-	}
-
-	if fatal := waitFatal(t, node); fatal == nil {
-		t.Error("node kept running after it failed to store log entries")
-	}
 }
 
 // TestStorage_HealthyNodeReportsNoFatalError guards against the failure path
 // firing during ordinary operation.
 func TestStorage_HealthyNodeReportsNoFatalError(t *testing.T) {
-	node, _ := newFaultyNode(t)
+	synctest.Test(t, func(t *testing.T) {
+		node, _ := newFaultyNode(t)
 
-	_, _ = node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
-		Term:         1,
-		LeaderID:     "n2",
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      []raft.LogEntry{{Index: 1, Term: 1, Command: []byte("x")}},
+		_, _ = node.Handler().HandleAppendEntries(context.Background(), &raft.AppendEntriesRequest{
+			Term:         1,
+			LeaderID:     "n2",
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Entries:      []raft.LogEntry{{Index: 1, Term: 1, Command: []byte("x")}},
+		})
+		time.Sleep(50 * time.Millisecond)
+
+		if err := node.FatalError(); err != nil {
+			t.Errorf("healthy node reported a fatal error: %v", err)
+		}
 	})
-	time.Sleep(50 * time.Millisecond)
-
-	if err := node.FatalError(); err != nil {
-		t.Errorf("healthy node reported a fatal error: %v", err)
-	}
 }

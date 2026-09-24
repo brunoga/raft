@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -129,33 +130,35 @@ func twoNodeWithRecorder(t *testing.T, tune func(*raft.Config)) (*raft.Node, *si
 // it re-sends the same rejected batch forever and that follower never catches
 // up again.
 func TestAppendEntries_PayloadIsBoundedByBytes(t *testing.T) {
-	ctx := context.Background()
-	const budget = 64 * 1024
-	const entrySize = 8 * 1024
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const budget = 64 * 1024
+		const entrySize = 8 * 1024
 
-	leader, rec, tick := twoNodeWithRecorder(t, func(cfg *raft.Config) {
-		cfg.MaxBytesPerRPC = budget
-		cfg.MaxLogEntriesPerRPC = 64 // would otherwise allow 64 * 8 KiB
-	})
+		leader, rec, tick := twoNodeWithRecorder(t, func(cfg *raft.Config) {
+			cfg.MaxBytesPerRPC = budget
+			cfg.MaxLogEntriesPerRPC = 64 // would otherwise allow 64 * 8 KiB
+		})
 
-	for i := range 40 {
-		// A fresh slice per proposal: Propose retains the command it is given.
-		payload := make([]byte, entrySize)
-		payload[0] = byte(i)
-		if _, err := leader.Propose(ctx, payload); err != nil {
-			t.Fatalf("propose: %v", err)
+		for i := range 40 {
+			// A fresh slice per proposal: Propose retains the command it is given.
+			payload := make([]byte, entrySize)
+			payload[0] = byte(i)
+			if _, err := leader.Propose(ctx, payload); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
 		}
-	}
-	tick()
+		tick()
 
-	size, entries := rec.largest()
-	if size == 0 {
-		t.Fatal("no AppendEntries carrying entries was observed")
-	}
-	if size > budget {
-		t.Errorf("largest AppendEntries carried %d bytes in %d entries, over the %d byte budget",
-			size, entries, budget)
-	}
+		size, entries := rec.largest()
+		if size == 0 {
+			t.Fatal("no AppendEntries carrying entries was observed")
+		}
+		if size > budget {
+			t.Errorf("largest AppendEntries carried %d bytes in %d entries, over the %d byte budget",
+				size, entries, budget)
+		}
+	})
 }
 
 // TestAppendEntries_SingleOversizedEntryIsStillSent asserts that an entry
@@ -163,47 +166,51 @@ func TestAppendEntries_PayloadIsBoundedByBytes(t *testing.T) {
 // all. Refusing to send it would stall replication permanently, which is worse
 // than one oversized message the transport may still accept.
 func TestAppendEntries_SingleOversizedEntryIsStillSent(t *testing.T) {
-	ctx := context.Background()
-	const budget = 4 * 1024
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const budget = 4 * 1024
 
-	leader, rec, tick := twoNodeWithRecorder(t, func(cfg *raft.Config) {
-		cfg.MaxBytesPerRPC = budget
+		leader, rec, tick := twoNodeWithRecorder(t, func(cfg *raft.Config) {
+			cfg.MaxBytesPerRPC = budget
+		})
+
+		big := make([]byte, 32*1024)
+		if _, err := leader.Propose(ctx, big); err != nil {
+			t.Fatalf("propose: %v", err)
+		}
+		tick()
+
+		size, entries := rec.largest()
+		if size == 0 {
+			t.Fatal("an entry larger than the budget was never sent")
+		}
+		if entries != 1 {
+			t.Errorf("oversized entry was sent alongside %d others; it should travel alone", entries-1)
+		}
 	})
-
-	big := make([]byte, 32*1024)
-	if _, err := leader.Propose(ctx, big); err != nil {
-		t.Fatalf("propose: %v", err)
-	}
-	tick()
-
-	size, entries := rec.largest()
-	if size == 0 {
-		t.Fatal("an entry larger than the budget was never sent")
-	}
-	if entries != 1 {
-		t.Errorf("oversized entry was sent alongside %d others; it should travel alone", entries-1)
-	}
 }
 
 // TestAppendEntries_UnsetBudgetKeepsCountLimit asserts the count limit still
 // applies when no byte budget is configured, so existing deployments behave as
 // before.
 func TestAppendEntries_UnsetBudgetKeepsCountLimit(t *testing.T) {
-	ctx := context.Background()
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
 
-	leader, rec, tick := twoNodeWithRecorder(t, func(cfg *raft.Config) {
-		cfg.MaxBytesPerRPC = 0 // unlimited
-		cfg.MaxLogEntriesPerRPC = 4
-	})
+		leader, rec, tick := twoNodeWithRecorder(t, func(cfg *raft.Config) {
+			cfg.MaxBytesPerRPC = 0 // unlimited
+			cfg.MaxLogEntriesPerRPC = 4
+		})
 
-	for i := range 40 {
-		if _, err := leader.Propose(ctx, fmt.Appendf(nil, "entry-%d", i)); err != nil {
-			t.Fatalf("propose: %v", err)
+		for i := range 40 {
+			if _, err := leader.Propose(ctx, fmt.Appendf(nil, "entry-%d", i)); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
 		}
-	}
-	tick()
+		tick()
 
-	if _, entries := rec.largest(); entries > 4 {
-		t.Errorf("AppendEntries carried %d entries with MaxLogEntriesPerRPC set to 4", entries)
-	}
+		if _, entries := rec.largest(); entries > 4 {
+			t.Errorf("AppendEntries carried %d entries with MaxLogEntriesPerRPC set to 4", entries)
+		}
+	})
 }

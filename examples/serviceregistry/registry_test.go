@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/http"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2/easyraft"
 	"github.com/brunoga/raft/v2/easyraft/client"
 	"github.com/brunoga/raft/v2/easyraft/easyrafttest"
 	registry "github.com/brunoga/raft/v2/examples/serviceregistry/registry"
+	"github.com/brunoga/raft/v2/internal/memnet"
 )
 
 // discardLogger keeps the registry's own change log out of the test output;
@@ -24,19 +26,10 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// freePort returns an address nothing is listening on.
-func freePort(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	if closeErr := ln.Close(); closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	return addr
-}
+// httpClient reaches the in-process listeners the cluster was put on. "n1:8080"
+// is not an address the operating system can route, so http.DefaultClient
+// cannot be used here.
+var httpClient *http.Client
 
 // startRegistry brings up a three-node registry serving this example's own
 // routes, and returns the HTTP addresses.
@@ -47,9 +40,17 @@ func freePort(t *testing.T) string {
 func startRegistry(t *testing.T, ttlSweep time.Duration) (cluster *easyrafttest.Cluster, addrs []string) {
 	t.Helper()
 
+	// In memory rather than on real sockets, so these tests can run inside a
+	// synctest bubble: a goroutine parked in Accept on a real socket is not
+	// durably blocked, and one idle listener stops a bubble's clock.
+	nw := memnet.NewNetwork()
+	httpClient = nw.HTTPClient()
+
 	addrs = make([]string, 3)
+	lns := make([]net.Listener, 3)
 	for i := range addrs {
-		addrs[i] = freePort(t)
+		addrs[i] = fmt.Sprintf("n%d:8080", i+1)
+		lns[i] = nw.Listen(addrs[i])
 	}
 
 	// One mux per node, built before the cluster so the routes are registered
@@ -80,10 +81,7 @@ func startRegistry(t *testing.T, ttlSweep time.Duration) (cluster *easyrafttest.
 		muxes[i].HandleFunc("GET /services/{name}/{instance}", srv.handleGet)
 
 		httpSrv := &http.Server{Addr: addrs[i], Handler: muxes[i], ReadHeaderTimeout: 5 * time.Second}
-		ln, err := net.Listen("tcp", addrs[i])
-		if err != nil {
-			t.Fatalf("listen %s: %v", addrs[i], err)
-		}
+		ln := lns[i]
 		go func() { _ = httpSrv.Serve(ln) }()
 		t.Cleanup(func() { _ = httpSrv.Close() })
 	}
@@ -99,7 +97,7 @@ func getJSON(t *testing.T, url string, dst any) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
@@ -166,210 +164,217 @@ func waitInstances(t *testing.T, url string, want int) []registry.Instance {
 // TestRegistry_AnInstanceOutlivesNothing is the example's whole claim: an
 // entry that is there while its owner renews, and gone once it stops.
 func TestRegistry_AnInstanceOutlivesNothing(t *testing.T) {
-	_, addrs := startRegistry(t, 50*time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		_, addrs := startRegistry(t, 50*time.Millisecond)
 
-	api, err := client.New(client.WithEndpoints(addrs...))
-	if err != nil {
-		t.Fatal(err)
-	}
+		api, err := client.New(client.WithEndpoints(addrs...), client.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
 
-	// api-1 is the one under test: a short TTL, held alive by a loop. The
-	// other two have hour-long leases and are here to show that what happens
-	// to api-1 happens to api-1 alone -- an expiry that took the whole
-	// collection with it would pass a test that only watched one key.
-	const heldTTL = 2 * time.Second
-	held := registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", heldTTL)
-	loopCtx, stopLoop := context.WithCancel(ctx)
-	loopDone := make(chan error, 1)
-	go func() { loopDone <- api.KeepAliveLoop(loopCtx, held) }()
+		// api-1 is the one under test: a short TTL, held alive by a loop. The
+		// other two have hour-long leases and are here to show that what happens
+		// to api-1 happens to api-1 alone -- an expiry that took the whole
+		// collection with it would pass a test that only watched one key.
+		const heldTTL = 2 * time.Second
+		held := registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", heldTTL)
+		loopCtx, stopLoop := context.WithCancel(ctx)
+		loopDone := make(chan error, 1)
+		go func() { loopDone <- api.KeepAliveLoop(loopCtx, held) }()
 
-	registerInstance(t, api, "api", "api-2", "10.0.0.2:9000", time.Hour)
-	registerInstance(t, api, "worker", "w-1", "10.0.0.3:9000", time.Hour)
+		registerInstance(t, api, "api", "api-2", "10.0.0.2:9000", time.Hour)
+		registerInstance(t, api, "worker", "w-1", "10.0.0.3:9000", time.Hour)
 
-	// Every node answers, not just the leader: this is a local read of
-	// replicated state.
-	for _, addr := range addrs {
-		found := waitInstances(t, "http://"+addr+"/services/api", 2)
-		for _, instance := range found {
-			if instance.Service != "api" {
-				t.Errorf("%s returned an instance of %q under /services/api", addr, instance.Service)
+		// Every node answers, not just the leader: this is a local read of
+		// replicated state.
+		for _, addr := range addrs {
+			found := waitInstances(t, "http://"+addr+"/services/api", 2)
+			for _, instance := range found {
+				if instance.Service != "api" {
+					t.Errorf("%s returned an instance of %q under /services/api", addr, instance.Service)
+				}
 			}
 		}
-	}
 
-	// Longer than its own TTL later, the renewed registration is still there.
-	//
-	// The sleep is measured rather than assumed. A TTL short enough to keep
-	// this test quick is also short enough for a loaded machine to overrun by
-	// starving the keep-alive loop, and a registration expiring because this
-	// process was descheduled says nothing about whether renewal works. If
-	// the sleep itself overran by more than the lease, that is what happened,
-	// and the test reports the machine instead of failing the code.
-	held2 := 3 * time.Second
-	start := time.Now()
-	time.Sleep(held2)
-	if slept := time.Since(start); slept >= held2+heldTTL {
-		t.Skipf("a %v sleep took %v: this machine stalled for longer than the %v lease",
-			held2, slept, heldTTL)
-	}
-	waitInstances(t, "http://"+addrs[0]+"/services/api", 2)
+		// Longer than its own TTL later, the renewed registration is still there.
+		//
+		// The sleep used to be measured, and the test skipped itself when the
+		// machine had overrun it by more than the lease: a registration expiring
+		// because this process was descheduled says nothing about whether
+		// renewal works. Inside a bubble the clock is fake and advances only
+		// when every goroutine is blocked, so the sleep cannot overrun and
+		// there is nothing left to measure or excuse.
+		held2 := 3 * time.Second
+		start := time.Now()
+		time.Sleep(held2)
+		if slept := time.Since(start); slept != held2 {
+			t.Fatalf("a %v sleep took %v of fake time", held2, slept)
+		}
+		waitInstances(t, "http://"+addrs[0]+"/services/api", 2)
 
-	// Stop renewing and it goes -- and only it.
-	stopLoop()
-	select {
-	case <-loopDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("KeepAliveLoop did not return after its context was cancelled")
-	}
+		// Stop renewing and it goes -- and only it.
+		stopLoop()
+		select {
+		case <-loopDone:
+		case <-time.After(30 * time.Second):
+			t.Fatal("KeepAliveLoop did not return after its context was cancelled")
+		}
 
-	remaining := waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
-	if remaining[0].ID != "api-2" {
-		t.Errorf("the instance left behind is %q, want api-2", remaining[0].ID)
-	}
-	waitInstances(t, "http://"+addrs[0]+"/services/worker", 1)
+		remaining := waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
+		if remaining[0].ID != "api-2" {
+			t.Errorf("the instance left behind is %q, want api-2", remaining[0].ID)
+		}
+		waitInstances(t, "http://"+addrs[0]+"/services/worker", 1)
 
-	if status := getJSON(t, "http://"+addrs[0]+"/services/api/api-1", nil); status != http.StatusNotFound {
-		t.Errorf("a departed instance answers %d, want 404", status)
-	}
+		if status := getJSON(t, "http://"+addrs[0]+"/services/api/api-1", nil); status != http.StatusNotFound {
+			t.Errorf("a departed instance answers %d, want 404", status)
+		}
 
-	// The lease is gone with it, so registering under it again is refused
-	// rather than writing a key nothing would ever remove.
-	instances := client.Collection[registry.Instance](api, registry.CollectionName)
-	err = instances.UpsertWithLease(ctx, registry.Key("api", "api-1"),
-		registry.Instance{Service: "api", ID: "api-1"}, held)
-	if !errors.Is(err, easyraft.ErrLeaseNotFound) {
-		t.Errorf("registering under the expired lease: %v, want ErrLeaseNotFound", err)
-	}
+		// The lease is gone with it, so registering under it again is refused
+		// rather than writing a key nothing would ever remove.
+		instances := client.Collection[registry.Instance](api, registry.CollectionName)
+		err = instances.UpsertWithLease(ctx, registry.Key("api", "api-1"),
+			registry.Instance{Service: "api", ID: "api-1"}, held)
+		if !errors.Is(err, easyraft.ErrLeaseNotFound) {
+			t.Errorf("registering under the expired lease: %v, want ErrLeaseNotFound", err)
+		}
+	})
 }
 
 // TestRegistry_RevokeRemovesItAtOnce covers the clean-shutdown path the agent
 // takes, which should not wait out a TTL.
 func TestRegistry_RevokeRemovesItAtOnce(t *testing.T) {
-	_, addrs := startRegistry(t, 50*time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		_, addrs := startRegistry(t, 50*time.Millisecond)
 
-	api, err := client.New(client.WithEndpoints(addrs...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease := registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", time.Hour)
-	waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
+		api, err := client.New(client.WithEndpoints(addrs...), client.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease := registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", time.Hour)
+		waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := api.RevokeLease(ctx, lease); err != nil {
-		t.Fatalf("RevokeLease: %v", err)
-	}
-	waitInstances(t, "http://"+addrs[0]+"/services/api", 0)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := api.RevokeLease(ctx, lease); err != nil {
+			t.Fatalf("RevokeLease: %v", err)
+		}
+		waitInstances(t, "http://"+addrs[0]+"/services/api", 0)
+	})
 }
 
 // TestRegistry_ListsAndPages covers the two read shapes, including the cursor
 // a caller carries between pages.
 func TestRegistry_ListsAndPages(t *testing.T) {
-	_, addrs := startRegistry(t, time.Second)
+	synctest.Test(t, func(t *testing.T) {
+		_, addrs := startRegistry(t, time.Second)
 
-	api, err := client.New(client.WithEndpoints(addrs...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range 7 {
-		registerInstance(t, api, "api", fmt.Sprintf("api-%02d", i), "10.0.0.1:9000", time.Hour)
-	}
-	registerInstance(t, api, "worker", "w-1", "10.0.0.9:9000", time.Hour)
+		api, err := client.New(client.WithEndpoints(addrs...), client.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range 7 {
+			registerInstance(t, api, "api", fmt.Sprintf("api-%02d", i), "10.0.0.1:9000", time.Hour)
+		}
+		registerInstance(t, api, "worker", "w-1", "10.0.0.9:9000", time.Hour)
 
-	var all fullList
-	if status := getJSON(t, "http://"+addrs[0]+"/services", &all); status != http.StatusOK {
-		t.Fatalf("GET /services: %d", status)
-	}
-	if len(all.Instances) != 8 {
-		t.Errorf("the registry lists %d instances, want 8", len(all.Instances))
-	}
-	if all.Next != "" {
-		t.Errorf("an unpaginated list returned the cursor %q", all.Next)
-	}
+		var all fullList
+		if status := getJSON(t, "http://"+addrs[0]+"/services", &all); status != http.StatusOK {
+			t.Fatalf("GET /services: %d", status)
+		}
+		if len(all.Instances) != 8 {
+			t.Errorf("the registry lists %d instances, want 8", len(all.Instances))
+		}
+		if all.Next != "" {
+			t.Errorf("an unpaginated list returned the cursor %q", all.Next)
+		}
 
-	// Paged, following the cursor until it is empty.
-	var walked []string
-	next := ""
-	for pages := 0; ; pages++ {
-		if pages > 10 {
-			t.Fatal("the paged listing did not end")
+		// Paged, following the cursor until it is empty.
+		var walked []string
+		next := ""
+		for pages := 0; ; pages++ {
+			if pages > 10 {
+				t.Fatal("the paged listing did not end")
+			}
+			url := "http://" + addrs[0] + "/services?limit=3"
+			if next != "" {
+				url += "&after=" + next
+			}
+			var page fullList
+			if status := getJSON(t, url, &page); status != http.StatusOK {
+				t.Fatalf("GET %s: %d", url, status)
+			}
+			if len(page.Instances) > 3 {
+				t.Fatalf("a page held %d instances under limit=3", len(page.Instances))
+			}
+			for _, instance := range page.Instances {
+				walked = append(walked, registry.Key(instance.Service, instance.ID))
+			}
+			if page.Next == "" {
+				break
+			}
+			next = page.Next
 		}
-		url := "http://" + addrs[0] + "/services?limit=3"
-		if next != "" {
-			url += "&after=" + next
+		if len(walked) != 8 {
+			t.Errorf("paging walked %d instances, want 8: %v", len(walked), walked)
 		}
-		var page fullList
-		if status := getJSON(t, url, &page); status != http.StatusOK {
-			t.Fatalf("GET %s: %d", url, status)
-		}
-		if len(page.Instances) > 3 {
-			t.Fatalf("a page held %d instances under limit=3", len(page.Instances))
-		}
-		for _, instance := range page.Instances {
-			walked = append(walked, registry.Key(instance.Service, instance.ID))
-		}
-		if page.Next == "" {
-			break
-		}
-		next = page.Next
-	}
-	if len(walked) != 8 {
-		t.Errorf("paging walked %d instances, want 8: %v", len(walked), walked)
-	}
 
-	// A limit that is not a number is refused rather than ignored.
-	if status := getJSON(t, "http://"+addrs[0]+"/services?limit=lots", nil); status != http.StatusBadRequest {
-		t.Errorf("limit=lots answered %d, want 400", status)
-	}
+		// A limit that is not a number is refused rather than ignored.
+		if status := getJSON(t, "http://"+addrs[0]+"/services?limit=lots", nil); status != http.StatusBadRequest {
+			t.Errorf("limit=lots answered %d, want 400", status)
+		}
 
-	// And an unknown instance is a 404 rather than an empty object.
-	if status := getJSON(t, "http://"+addrs[0]+"/services/api/nobody", nil); status != http.StatusNotFound {
-		t.Errorf("an unregistered instance answers %d, want 404", status)
-	}
+		// And an unknown instance is a 404 rather than an empty object.
+		if status := getJSON(t, "http://"+addrs[0]+"/services/api/nobody", nil); status != http.StatusNotFound {
+			t.Errorf("an unregistered instance answers %d, want 404", status)
+		}
+	})
 }
 
 // TestRegistry_ReRegisteringIsTheSameCall covers an agent coming back after a
 // crash while its old entry is still inside the TTL.
 func TestRegistry_ReRegisteringIsTheSameCall(t *testing.T) {
-	_, addrs := startRegistry(t, time.Second)
+	synctest.Test(t, func(t *testing.T) {
+		_, addrs := startRegistry(t, time.Second)
 
-	api, err := client.New(client.WithEndpoints(addrs...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", time.Hour)
-	waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
+		api, err := client.New(client.WithEndpoints(addrs...), client.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatal(err)
+		}
+		registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", time.Hour)
+		waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
 
-	// Same instance, new address, new lease: an upsert, not a create, so it
-	// does not fail on the entry it left behind.
-	registerInstance(t, api, "api", "api-1", "10.0.0.99:9000", time.Hour)
-	found := waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
-	if found[0].Addr != "10.0.0.99:9000" {
-		t.Errorf("re-registering left the address at %q", found[0].Addr)
-	}
+		// Same instance, new address, new lease: an upsert, not a create, so it
+		// does not fail on the entry it left behind.
+		registerInstance(t, api, "api", "api-1", "10.0.0.99:9000", time.Hour)
+		found := waitInstances(t, "http://"+addrs[0]+"/services/api", 1)
+		if found[0].Addr != "10.0.0.99:9000" {
+			t.Errorf("re-registering left the address at %q", found[0].Addr)
+		}
 
-	// The first lease no longer holds the key, so revoking it must not take
-	// the new registration with it.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	leases, err := api.Leases(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, lease := range leases {
-		if len(lease.Keys) == 0 {
-			if err := api.RevokeLease(ctx, lease.ID); err != nil {
-				t.Fatalf("RevokeLease: %v", err)
+		// The first lease no longer holds the key, so revoking it must not take
+		// the new registration with it.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		leases, err := api.Leases(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, lease := range leases {
+			if len(lease.Keys) == 0 {
+				if err := api.RevokeLease(ctx, lease.ID); err != nil {
+					t.Fatalf("RevokeLease: %v", err)
+				}
 			}
 		}
-	}
-	if got := len(waitInstances(t, "http://"+addrs[0]+"/services/api", 1)); got != 1 {
-		t.Errorf("revoking the abandoned lease removed the live registration")
-	}
-	if _, err := api.Lease(ctx, 0); !errors.Is(err, easyraft.ErrLeaseNotFound) {
-		t.Errorf("Lease(0): %v, want ErrLeaseNotFound", err)
-	}
+		if got := len(waitInstances(t, "http://"+addrs[0]+"/services/api", 1)); got != 1 {
+			t.Errorf("revoking the abandoned lease removed the live registration")
+		}
+		if _, err := api.Lease(ctx, 0); !errors.Is(err, easyraft.ErrLeaseNotFound) {
+			t.Errorf("Lease(0): %v, want ErrLeaseNotFound", err)
+		}
+	})
 }

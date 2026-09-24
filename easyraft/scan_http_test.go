@@ -91,7 +91,7 @@ func TestScan_ThroughTheAPIAndHTTP(t *testing.T) {
 		if reqErr != nil {
 			t.Fatal(reqErr)
 		}
-		resp, doErr := http.DefaultClient.Do(req)
+		resp, doErr := requestClient(req.URL.String()).Do(req)
 		if doErr != nil {
 			t.Fatal(doErr)
 		}

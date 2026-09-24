@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -175,75 +176,77 @@ func (c *backoffCluster) rejoin(i int) {
 // a full snapshot instead: a routine leader change turns into a full state
 // transfer to every follower that happened to be briefly behind.
 func TestReplication_NewLeaderResumesFromConflictHint(t *testing.T) {
-	ctx := context.Background()
-	const backlog = 30
-	// Snapshots are disabled so that compaction cannot interfere: this test is
-	// about where replication resumes, not about snapshot transfer.
-	c := newBackoffCluster(t, 3, 0)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		const backlog = 30
+		// Snapshots are disabled so that compaction cannot interfere: this test is
+		// about where replication resumes, not about snapshot transfer.
+		c := newBackoffCluster(t, 3, 0)
 
-	if !c.tickUntil(3*time.Second, func() bool { return c.leaderIndex() >= 0 }) {
-		t.Fatal("no leader elected")
-	}
-	li := c.leaderIndex()
-	leader := c.nodes[li]
-	follower := (li + 1) % 3
-	successor := (li + 2) % 3
-
-	// Build a backlog so that "resume from the start" is clearly distinguishable
-	// from "resume from the hint".
-	for i := range backlog {
-		if _, err := leader.Propose(ctx, fmt.Appendf(nil, "entry-%d", i)); err != nil {
-			t.Fatalf("propose: %v", err)
+		if !c.tickUntil(3*time.Second, func() bool { return c.leaderIndex() >= 0 }) {
+			t.Fatal("no leader elected")
 		}
-	}
-	target := leader.LastApplied()
-	if !c.tickUntil(5*time.Second, func() bool {
-		return c.nodes[follower].LastApplied() >= target && c.nodes[successor].LastApplied() >= target
-	}) {
-		t.Fatalf("cluster never converged: %d/%d/%d",
-			c.nodes[0].LastApplied(), c.nodes[1].LastApplied(), c.nodes[2].LastApplied())
-	}
+		li := c.leaderIndex()
+		leader := c.nodes[li]
+		follower := (li + 1) % 3
+		successor := (li + 2) % 3
 
-	// Isolate a follower, commit two more entries, then hand leadership over so
-	// the new leader starts with an optimistic nextIndex for everyone.
-	c.isolate(follower)
-	for i := range 2 {
-		if _, err := leader.Propose(ctx, fmt.Appendf(nil, "late-%d", i)); err != nil {
-			t.Fatalf("propose while partitioned: %v", err)
+		// Build a backlog so that "resume from the start" is clearly distinguishable
+		// from "resume from the hint".
+		for i := range backlog {
+			if _, err := leader.Propose(ctx, fmt.Appendf(nil, "entry-%d", i)); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
 		}
-	}
-	if err := leader.TransferLeadership(ctx, c.ids[successor]); err != nil {
-		t.Fatalf("transfer leadership: %v", err)
-	}
-	newLeader := c.nodes[successor]
-	if !c.tickUntil(3*time.Second, func() bool { return newLeader.State() == raft.Leader }) {
-		t.Fatal("successor never became leader")
-	}
+		target := leader.LastApplied()
+		if !c.tickUntil(5*time.Second, func() bool {
+			return c.nodes[follower].LastApplied() >= target && c.nodes[successor].LastApplied() >= target
+		}) {
+			t.Fatalf("cluster never converged: %d/%d/%d",
+				c.nodes[0].LastApplied(), c.nodes[1].LastApplied(), c.nodes[2].LastApplied())
+		}
 
-	gap := newLeader.LastApplied() - c.nodes[follower].LastApplied()
-	if gap == 0 || gap > 5 {
-		t.Fatalf("follower is %d entries behind; the test intends a small, non-zero gap", gap)
-	}
+		// Isolate a follower, commit two more entries, then hand leadership over so
+		// the new leader starts with an optimistic nextIndex for everyone.
+		c.isolate(follower)
+		for i := range 2 {
+			if _, err := leader.Propose(ctx, fmt.Appendf(nil, "late-%d", i)); err != nil {
+				t.Fatalf("propose while partitioned: %v", err)
+			}
+		}
+		if err := leader.TransferLeadership(ctx, c.ids[successor]); err != nil {
+			t.Fatalf("transfer leadership: %v", err)
+		}
+		newLeader := c.nodes[successor]
+		if !c.tickUntil(3*time.Second, func() bool { return newLeader.State() == raft.Leader }) {
+			t.Fatal("successor never became leader")
+		}
 
-	before := c.transports[successor].entriesSent.Load()
-	c.rejoin(follower)
+		gap := newLeader.LastApplied() - c.nodes[follower].LastApplied()
+		if gap == 0 || gap > 5 {
+			t.Fatalf("follower is %d entries behind; the test intends a small, non-zero gap", gap)
+		}
 
-	if !c.tickUntil(5*time.Second, func() bool {
-		return c.nodes[follower].LastApplied() >= newLeader.LastApplied()
-	}) {
-		t.Fatalf("follower never caught up: follower=%d leader=%d",
-			c.nodes[follower].LastApplied(), newLeader.LastApplied())
-	}
-	c.tick(5)
+		before := c.transports[successor].entriesSent.Load()
+		c.rejoin(follower)
 
-	// Catching up a follower that is a handful of entries behind must cost a
-	// handful of entries, not the whole log.
-	sent := c.transports[successor].entriesSent.Load() - before
-	if sent >= backlog {
-		t.Errorf("new leader shipped %d entries to catch up a follower %d entries behind; "+
-			"replication restarted from the beginning of the log instead of the conflict hint",
-			sent, gap)
-	}
+		if !c.tickUntil(5*time.Second, func() bool {
+			return c.nodes[follower].LastApplied() >= newLeader.LastApplied()
+		}) {
+			t.Fatalf("follower never caught up: follower=%d leader=%d",
+				c.nodes[follower].LastApplied(), newLeader.LastApplied())
+		}
+		c.tick(5)
+
+		// Catching up a follower that is a handful of entries behind must cost a
+		// handful of entries, not the whole log.
+		sent := c.transports[successor].entriesSent.Load() - before
+		if sent >= backlog {
+			t.Errorf("new leader shipped %d entries to catch up a follower %d entries behind; "+
+				"replication restarted from the beginning of the log instead of the conflict hint",
+				sent, gap)
+		}
+	})
 }
 
 // TestReplication_LaggingFollowerDoesNotTriggerSnapshot is the consequence of
@@ -251,66 +254,68 @@ func TestReplication_NewLeaderResumesFromConflictHint(t *testing.T) {
 // at or below the snapshot boundary, so the leader ships its entire state
 // machine rather than the few entries the follower is missing.
 func TestReplication_LaggingFollowerDoesNotTriggerSnapshot(t *testing.T) {
-	ctx := context.Background()
-	c := newBackoffCluster(t, 3, 4)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		c := newBackoffCluster(t, 3, 4)
 
-	if !c.tickUntil(3*time.Second, func() bool { return c.leaderIndex() >= 0 }) {
-		t.Fatal("no leader elected")
-	}
-	li := c.leaderIndex()
-	leader := c.nodes[li]
-	follower := (li + 1) % 3
-	successor := (li + 2) % 3
-
-	// Compact, then let everyone converge past the compaction boundary so that
-	// the entries the follower later misses are still in the leader's log.
-	for i := range 12 {
-		if _, err := leader.Propose(ctx, fmt.Appendf(nil, "entry-%d", i)); err != nil {
-			t.Fatalf("propose: %v", err)
+		if !c.tickUntil(3*time.Second, func() bool { return c.leaderIndex() >= 0 }) {
+			t.Fatal("no leader elected")
 		}
-	}
-	target := leader.LastApplied()
-	if !c.tickUntil(5*time.Second, func() bool {
-		return leader.SnapshotIndex() > 0 &&
-			c.nodes[follower].LastApplied() >= target &&
-			c.nodes[successor].LastApplied() >= target
-	}) {
-		t.Skipf("cluster did not reach a compacted, converged state in time (applied %d/%d/%d, snapshot %d)",
-			c.nodes[0].LastApplied(), c.nodes[1].LastApplied(), c.nodes[2].LastApplied(), leader.SnapshotIndex())
-	}
+		li := c.leaderIndex()
+		leader := c.nodes[li]
+		follower := (li + 1) % 3
+		successor := (li + 2) % 3
 
-	c.isolate(follower)
-	if _, err := leader.Propose(ctx, []byte("late")); err != nil {
-		t.Fatalf("propose while partitioned: %v", err)
-	}
-	if err := leader.TransferLeadership(ctx, c.ids[successor]); err != nil {
-		t.Fatalf("transfer leadership: %v", err)
-	}
-	newLeader := c.nodes[successor]
-	if !c.tickUntil(3*time.Second, func() bool { return newLeader.State() == raft.Leader }) {
-		t.Fatal("successor never became leader")
-	}
+		// Compact, then let everyone converge past the compaction boundary so that
+		// the entries the follower later misses are still in the leader's log.
+		for i := range 12 {
+			if _, err := leader.Propose(ctx, fmt.Appendf(nil, "entry-%d", i)); err != nil {
+				t.Fatalf("propose: %v", err)
+			}
+		}
+		target := leader.LastApplied()
+		if !c.tickUntil(5*time.Second, func() bool {
+			return leader.SnapshotIndex() > 0 &&
+				c.nodes[follower].LastApplied() >= target &&
+				c.nodes[successor].LastApplied() >= target
+		}) {
+			t.Skipf("cluster did not reach a compacted, converged state in time (applied %d/%d/%d, snapshot %d)",
+				c.nodes[0].LastApplied(), c.nodes[1].LastApplied(), c.nodes[2].LastApplied(), leader.SnapshotIndex())
+		}
 
-	// Only meaningful while every entry the follower needs is still in the
-	// leader's log.
-	firstNeeded := c.nodes[follower].LastApplied() + 1
-	if firstNeeded <= newLeader.SnapshotIndex() {
-		t.Skipf("follower needs compacted entries (needs from %d, leader compacted through %d); "+
-			"a snapshot is legitimately required here", firstNeeded, newLeader.SnapshotIndex())
-	}
+		c.isolate(follower)
+		if _, err := leader.Propose(ctx, []byte("late")); err != nil {
+			t.Fatalf("propose while partitioned: %v", err)
+		}
+		if err := leader.TransferLeadership(ctx, c.ids[successor]); err != nil {
+			t.Fatalf("transfer leadership: %v", err)
+		}
+		newLeader := c.nodes[successor]
+		if !c.tickUntil(3*time.Second, func() bool { return newLeader.State() == raft.Leader }) {
+			t.Fatal("successor never became leader")
+		}
 
-	before := c.transports[successor].installSnapshots.Load()
-	c.rejoin(follower)
-	if !c.tickUntil(5*time.Second, func() bool {
-		return c.nodes[follower].LastApplied() >= newLeader.LastApplied()
-	}) {
-		t.Fatalf("follower never caught up: follower=%d leader=%d",
-			c.nodes[follower].LastApplied(), newLeader.LastApplied())
-	}
-	c.tick(5)
+		// Only meaningful while every entry the follower needs is still in the
+		// leader's log.
+		firstNeeded := c.nodes[follower].LastApplied() + 1
+		if firstNeeded <= newLeader.SnapshotIndex() {
+			t.Skipf("follower needs compacted entries (needs from %d, leader compacted through %d); "+
+				"a snapshot is legitimately required here", firstNeeded, newLeader.SnapshotIndex())
+		}
 
-	if sent := c.transports[successor].installSnapshots.Load() - before; sent != 0 {
-		t.Errorf("leader started %d snapshot transfers for a follower whose missing entries "+
-			"were all still in the log", sent)
-	}
+		before := c.transports[successor].installSnapshots.Load()
+		c.rejoin(follower)
+		if !c.tickUntil(5*time.Second, func() bool {
+			return c.nodes[follower].LastApplied() >= newLeader.LastApplied()
+		}) {
+			t.Fatalf("follower never caught up: follower=%d leader=%d",
+				c.nodes[follower].LastApplied(), newLeader.LastApplied())
+		}
+		c.tick(5)
+
+		if sent := c.transports[successor].installSnapshots.Load() - before; sent != 0 {
+			t.Errorf("leader started %d snapshot transfers for a follower whose missing entries "+
+				"were all still in the log", sent)
+		}
+	})
 }

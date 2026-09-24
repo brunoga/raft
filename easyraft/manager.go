@@ -86,6 +86,9 @@ func NewManager(opts ...Option) (*Manager, error) {
 	if err := resolveTLSFiles(&c); err != nil {
 		return nil, err
 	}
+	if err := validateListener(&c); err != nil {
+		return nil, err
+	}
 	if err := validateSecurity(&c, true); err != nil {
 		return nil, err
 	}

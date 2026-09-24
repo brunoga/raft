@@ -5,6 +5,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/brunoga/raft/v2"
@@ -88,119 +89,127 @@ func (t *trackingTransport) Unregister(id raft.NodeID) {
 // --- Tests ------------------------------------------------------------------
 
 func TestNode_Stop_UnregistersFromTransport(t *testing.T) {
-	tr := &trackingTransport{}
-	cfg := raft.DefaultConfig()
-	cfg.ID = "n1"
-	cfg.Storage = memstore.New()
-	cfg.StateMachine = &noopSM{}
-	cfg.Transport = tr
-	cfg.TickInterval = 0
-	n, _ := raft.New(&cfg)
-	n.Start()
-	n.Stop()
-	if !tr.unregistered.Load() {
-		t.Error("Node.Stop() did not call Transport.Unregister()")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		tr := &trackingTransport{}
+		cfg := raft.DefaultConfig()
+		cfg.ID = "n1"
+		cfg.Storage = memstore.New()
+		cfg.StateMachine = &noopSM{}
+		cfg.Transport = tr
+		cfg.TickInterval = 0
+		n, _ := raft.New(&cfg)
+		n.Start()
+		n.Stop()
+		if !tr.unregistered.Load() {
+			t.Error("Node.Stop() did not call Transport.Unregister()")
+		}
+	})
 }
 
 func TestReadStale_ReturnsLastApplied(t *testing.T) {
-	// Single-node cluster: become leader, propose an entry, verify ReadStale
-	// returns the applied index with no RPC.
-	n := newTestNode(t, "n1", nil)
-	n.Start()
-	defer n.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		// Single-node cluster: become leader, propose an entry, verify ReadStale
+		// returns the applied index with no RPC.
+		n := newTestNode(t, "n1", nil)
+		n.Start()
+		defer n.Stop()
 
-	// Advance ticks to become leader.
-	for range 40 {
-		n.Tick()
-		time.Sleep(10 * time.Millisecond)
-	}
+		// Advance ticks to become leader.
+		for range 40 {
+			n.Tick()
+			time.Sleep(10 * time.Millisecond)
+		}
 
-	if n.State() != raft.Leader {
-		t.Fatal("node should be leader")
-	}
+		if n.State() != raft.Leader {
+			t.Fatal("node should be leader")
+		}
 
-	_, err := n.Propose(context.Background(), []byte("cmd1"))
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
+		_, err := n.Propose(context.Background(), []byte("cmd1"))
+		if err != nil {
+			t.Fatalf("Propose: %v", err)
+		}
 
-	if n.ReadStale() != 2 {
-		t.Errorf("ReadStale: got %d, want 2", n.ReadStale())
-	}
+		if n.ReadStale() != 2 {
+			t.Errorf("ReadStale: got %d, want 2", n.ReadStale())
+		}
+	})
 }
 
 func TestReadIndex_BlocksUntilApplied(t *testing.T) {
-	// Single-node cluster: become leader, propose an entry, verify ReadIndex
-	// returns 2. (Single-node ReadIndex resolves immediately with commitIndex).
-	n := newTestNode(t, "n1", nil)
-	n.Start()
-	defer n.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		// Single-node cluster: become leader, propose an entry, verify ReadIndex
+		// returns 2. (Single-node ReadIndex resolves immediately with commitIndex).
+		n := newTestNode(t, "n1", nil)
+		n.Start()
+		defer n.Stop()
 
-	for range 40 {
-		n.Tick()
-		time.Sleep(10 * time.Millisecond)
-	}
+		for range 40 {
+			n.Tick()
+			time.Sleep(10 * time.Millisecond)
+		}
 
-	_, _ = n.Propose(context.Background(), []byte("cmd1"))
+		_, _ = n.Propose(context.Background(), []byte("cmd1"))
 
-	idx, err := n.ReadIndex(context.Background())
-	if err != nil {
-		t.Fatalf("ReadIndex: %v", err)
-	}
-	if idx != 2 {
-		t.Errorf("ReadIndex index: got %d, want 2", idx)
-	}
+		idx, err := n.ReadIndex(context.Background())
+		if err != nil {
+			t.Fatalf("ReadIndex: %v", err)
+		}
+		if idx != 2 {
+			t.Errorf("ReadIndex index: got %d, want 2", idx)
+		}
+	})
 }
 
 func TestReadIndex_StallsOnDelayedApply(t *testing.T) {
-	// Linearizable read must wait until lastApplied >= readIndex.
-	// We use a slow state machine to verify that ReadIndex blocks until
-	// the proposed entry actually reaches SM.Apply.
-	sm := &slowSM{applyDone: make(chan struct{})}
-	n := newTestNode(t, "n1", sm)
-	n.Start()
-	defer n.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		// Linearizable read must wait until lastApplied >= readIndex.
+		// We use a slow state machine to verify that ReadIndex blocks until
+		// the proposed entry actually reaches SM.Apply.
+		sm := &slowSM{applyDone: make(chan struct{})}
+		n := newTestNode(t, "n1", sm)
+		n.Start()
+		defer n.Stop()
 
-	for range 40 {
-		n.Tick()
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	// Start proposal in background (it will block on SM.Apply).
-	propDone := make(chan struct{})
-	go func() {
-		_, _ = n.Propose(context.Background(), []byte("cmd1"))
-		close(propDone)
-	}()
-
-	// ReadIndex should also block.
-	readDone := make(chan struct{})
-	go func() {
-		idx, _ := n.ReadIndex(context.Background())
-		// It must return at least the commit index we saw earlier.
-		if idx < 1 {
-			t.Errorf("ReadIndex returned %d, want >= 1", idx)
+		for range 40 {
+			n.Tick()
+			time.Sleep(10 * time.Millisecond)
 		}
-		close(readDone)
-	}()
 
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case <-readDone:
-		t.Fatal("ReadIndex returned before entry was applied")
-	default:
-	}
+		// Start proposal in background (it will block on SM.Apply).
+		propDone := make(chan struct{})
+		go func() {
+			_, _ = n.Propose(context.Background(), []byte("cmd1"))
+			close(propDone)
+		}()
 
-	// Release the state machine.
-	close(sm.applyDone)
-	<-propDone
+		// ReadIndex should also block.
+		readDone := make(chan struct{})
+		go func() {
+			idx, _ := n.ReadIndex(context.Background())
+			// It must return at least the commit index we saw earlier.
+			if idx < 1 {
+				t.Errorf("ReadIndex returned %d, want >= 1", idx)
+			}
+			close(readDone)
+		}()
 
-	select {
-	case <-readDone:
-	case <-time.After(1 * time.Second):
-		t.Fatal("ReadIndex did not return after entry was applied")
-	}
+		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-readDone:
+			t.Fatal("ReadIndex returned before entry was applied")
+		default:
+		}
+
+		// Release the state machine.
+		close(sm.applyDone)
+		<-propDone
+
+		select {
+		case <-readDone:
+		case <-time.After(1 * time.Second):
+			t.Fatal("ReadIndex did not return after entry was applied")
+		}
+	})
 }
 
 type slowSM struct {

@@ -266,7 +266,11 @@ type Node struct {
 
 	// --- Synchronisation ----------------------------------------------------
 	startOnce sync.Once
-	stopOnce  sync.Once
+	// started records that Start actually ran, so Stop knows whether there
+	// are loops to wait for. A node that was built and then abandoned still
+	// has to be stoppable.
+	started  atomic.Bool
+	stopOnce sync.Once
 
 	// --- Vote counting (Candidate/PreCandidate only; reset on state change) -
 	// receivedVoteSet tracks which peers granted their vote in the current
@@ -913,6 +917,7 @@ func New(cfg *Config) (*Node, error) {
 // For deterministic tests set TickInterval to 0 and call Tick() manually.
 func (n *Node) Start() {
 	n.startOnce.Do(func() {
+		n.started.Store(true)
 		// Read the term before the goroutines start. Once the event loop is
 		// running it owns currentTerm, and it can change it within microseconds
 		// of starting -- an election timeout is all it takes.
@@ -944,6 +949,19 @@ func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		n.stopCancel() // unblock any in-progress StateMachine operations
 		close(n.stopCh)
+		if !n.started.Load() {
+			// Never started, so there are no loops to wait for and nothing
+			// will ever close those channels. The storage writer can still be
+			// running: its goroutine starts on the first write rather than in
+			// Start, so a node that was built, written to and then abandoned
+			// has one behind it. close handles the case where it was never
+			// started either.
+			n.writer.close()
+			n.closeWatchers()
+			n.closeObservers()
+			n.cfg.Transport.Unregister(n.cfg.ID)
+			return
+		}
 		<-n.doneCh
 		<-n.applyDoneCh
 		// Wait for any snapshot-install goroutines to exit. stopCancel() already

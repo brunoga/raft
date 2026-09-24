@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/brunoga/raft/v2"
+	"github.com/brunoga/raft/v2/internal/memnet"
 	"github.com/brunoga/raft/v2/transport/grpctransport"
 )
 
@@ -94,6 +97,42 @@ func pairedTransports(t *testing.T, opts ...grpctransport.Option) (client, serve
 	t.Cleanup(func() { _ = cli.Close() })
 
 	cli.AddPeer("srv", srv.Addr())
+	return cli, srv
+}
+
+// pairedMemTransports is pairedTransports with no sockets, so the caller can
+// run inside a synctest bubble: a goroutine parked in Accept on a real socket
+// is not durably blocked, and one idle listener stops the bubble's clock.
+//
+// gRPC itself is unchanged -- the same server, the same HTTP/2, the same
+// keepalive timers -- only the connection underneath it is a pipe.
+func pairedMemTransports(t *testing.T, opts ...grpctransport.Option) (client, server *grpctransport.GRPCTransport) {
+	t.Helper()
+	nw := memnet.NewNetwork()
+	const srvAddr, cliAddr = "srv:7000", "cli:7000"
+
+	base := []grpctransport.Option{
+		grpctransport.WithInsecure(),
+		grpctransport.WithDialOptions(grpc.WithContextDialer(nw.DialTarget)),
+	}
+
+	srv, err := grpctransport.Listen(srvAddr,
+		append(append(base, grpctransport.WithListener(nw.Listen(srvAddr))), opts...)...)
+	if err != nil {
+		t.Fatalf("Listen server: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	cli, err := grpctransport.Listen(cliAddr,
+		append(append(base, grpctransport.WithListener(nw.Listen(cliAddr))), opts...)...)
+	if err != nil {
+		t.Fatalf("Listen client: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+
+	// "passthrough" so gRPC hands the address to the dialer as written rather
+	// than asking DNS about a host called "srv".
+	cli.AddPeer("srv", "passthrough:///"+srvAddr)
 	return cli, srv
 }
 
