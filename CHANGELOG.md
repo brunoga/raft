@@ -11,7 +11,7 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 - **Four tests that failed together on a slow CI runner**, none of them a
   library defect and three of them mine.
 
-  Two lease tests held a registration alive with renewals and then asserted
+  Five lease tests held a registration alive with renewals and then asserted
   the key had survived, using a TTL of a few hundred milliseconds. That only
   holds on a machine that never stalls for that long, and a shared runner
   does. Both now use a two-second lease, and both measure whether the
@@ -19,6 +19,12 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
   lease, the key expiring says nothing about renewal, and the test says so
   instead of failing. The client one also asserts the lease deadline moved,
   which tests renewal directly rather than by inference.
+
+  That is every test of this shape in the repository, found by looking for
+  the pattern rather than by waiting for CI to hit them one at a time: a test
+  that asserts a key *survives* is the fragile one, because a stall makes it
+  fail. A test that asserts a key *expires* is safe, because a stall only
+  makes that happen sooner.
 
   A leader-balancing test asked for a leadership transfer once and waited
   thirty seconds for it to land. A transfer is a request: the target has to

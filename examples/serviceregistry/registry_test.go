@@ -180,7 +180,8 @@ func TestRegistry_AnInstanceOutlivesNothing(t *testing.T) {
 	// other two have hour-long leases and are here to show that what happens
 	// to api-1 happens to api-1 alone -- an expiry that took the whole
 	// collection with it would pass a test that only watched one key.
-	held := registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", 400*time.Millisecond)
+	const heldTTL = 2 * time.Second
+	held := registerInstance(t, api, "api", "api-1", "10.0.0.1:9000", heldTTL)
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	loopDone := make(chan error, 1)
 	go func() { loopDone <- api.KeepAliveLoop(loopCtx, held) }()
@@ -199,8 +200,21 @@ func TestRegistry_AnInstanceOutlivesNothing(t *testing.T) {
 		}
 	}
 
-	// Three times its own TTL later, the renewed registration is still there.
-	time.Sleep(1200 * time.Millisecond)
+	// Longer than its own TTL later, the renewed registration is still there.
+	//
+	// The sleep is measured rather than assumed. A TTL short enough to keep
+	// this test quick is also short enough for a loaded machine to overrun by
+	// starving the keep-alive loop, and a registration expiring because this
+	// process was descheduled says nothing about whether renewal works. If
+	// the sleep itself overran by more than the lease, that is what happened,
+	// and the test reports the machine instead of failing the code.
+	held2 := 3 * time.Second
+	start := time.Now()
+	time.Sleep(held2)
+	if slept := time.Since(start); slept >= held2+heldTTL {
+		t.Skipf("a %v sleep took %v: this machine stalled for longer than the %v lease",
+			held2, slept, heldTTL)
+	}
 	waitInstances(t, "http://"+addrs[0]+"/services/api", 2)
 
 	// Stop renewing and it goes -- and only it.
