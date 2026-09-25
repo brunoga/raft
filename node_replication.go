@@ -426,6 +426,19 @@ func (n *Node) handleAppendResult(r *appendResult) {
 			return
 		}
 
+		// A rejection of a prefix the follower has already acknowledged is
+		// stale: it was produced before the acknowledgement and delivered
+		// after, which the transport is free to do. Honouring it moved
+		// nextIndex below matchIndex, and nothing raised it again -- a
+		// success for entries the follower already had did not move
+		// nextIndex, so the pipeline re-sent the same entries with no timer
+		// between rounds, and the leader spun a core until it lost
+		// leadership. Found as a livelock under a fake clock, where a loop
+		// with no timer in it stops time altogether.
+		if r.req.PrevLogIndex < n.matchIndex[r.peer] {
+			return
+		}
+
 		// Back-track nextIndex using conflict hints.
 		if r.conflictTerm != 0 {
 			// Resume just past the last entry this leader holds in the term
@@ -445,6 +458,11 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		if n.nextIndex[r.peer] < 1 {
 			n.nextIndex[r.peer] = 1
 		}
+		// Whatever the hint said, the follower has everything up to
+		// matchIndex; nextIndex never goes below the entry after it.
+		if n.nextIndex[r.peer] <= n.matchIndex[r.peer] {
+			n.nextIndex[r.peer] = n.matchIndex[r.peer] + 1
+		}
 		// Retry immediately.
 		n.replicateToPeer(r.peer)
 		return
@@ -460,6 +478,12 @@ func (n *Node) handleAppendResult(r *appendResult) {
 		last := r.req.Entries[len(r.req.Entries)-1].Index
 		if last > n.matchIndex[r.peer] {
 			n.matchIndex[r.peer] = last
+		}
+		// nextIndex moves on every success, not only the ones that moved
+		// matchIndex: a success for entries the follower already had must
+		// still carry nextIndex past them, or the pipeline below sends them
+		// again, and again, with nothing to wait on in between.
+		if last+1 > n.nextIndex[r.peer] {
 			n.nextIndex[r.peer] = last + 1
 		}
 	}
