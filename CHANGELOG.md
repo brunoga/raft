@@ -6,39 +6,75 @@ spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
 ## Unreleased
 
+### Added
+
+- **`easyraft.WithHTTPListener`** serves the HTTP API on a listener the caller
+  built, instead of binding `WithHTTPAddr` as a TCP listener. The address the
+  store reports is then `ln.Addr()`, so a Unix socket, one inherited from a
+  supervisor, or something that is not a socket at all works without the store
+  having to know which. Passing it together with `WithHTTPMux` is refused: the
+  mux means the caller serves the routes themselves, and silently ignoring one
+  of the two is how a test ends up asserting against a server that was never
+  listening.
+
+- **`grpctransport.WithListener`** does the same for the Raft transport. Peer
+  addresses still go through gRPC's name resolution, so an address DNS cannot
+  answer for has to be given to `AddPeer` as `"passthrough:///host:port"`.
+
+  Together with the `WithTransport` option that already existed, these let a
+  whole cluster run with no sockets anywhere, which is what the test work below
+  needed.
+
 ### Fixed
 
-- **Four tests that failed together on a slow CI runner**, none of them a
-  library defect and three of them mine.
+- **A stale append rejection could livelock the leader.** A rejection of a
+  prefix the follower has already acknowledged is stale -- produced before the
+  acknowledgement and delivered after, which a transport is free to do.
+  `handleAppendResult` honoured it anyway, and the conflict-hint backtrack moved
+  `nextIndex` below `matchIndex`. Nothing then raised it again: a success for
+  entries the follower already had did not move `nextIndex`, so the pipeline
+  re-sent the same entries on every success, with no timer between rounds. The
+  leader spun a core at about ten thousand `AppendEntries` a second until it
+  lost leadership.
 
-  Five lease tests held a registration alive with renewals and then asserted
-  the key had survived, using a TTL of a few hundred milliseconds. That only
-  holds on a machine that never stalls for that long, and a shared runner
-  does. Both now use a two-second lease, and both measure whether the
-  machine actually stalled -- if renewals really were further apart than the
-  lease, the key expiring says nothing about renewal, and the test says so
-  instead of failing. The client one also asserts the lease deadline moved,
-  which tests renewal directly rather than by inference.
+  `nextIndex > matchIndex` is a Raft invariant, and it is now enforced at every
+  place that could break it: a rejection of a prefix at or before `matchIndex`
+  is ignored, a backtrack is clamped, a success always carries `nextIndex` past
+  its last entry, and a snapshot result does the same.
 
-  That is every test of this shape in the repository, found by looking for
-  the pattern rather than by waiting for CI to hit them one at a time: a test
-  that asserts a key *survives* is the fragile one, because a stall makes it
-  fail. A test that asserts a key *expires* is safe, because a stall only
-  makes that happen sooner.
+- **`Node.Stop()` hung when `Start()` had never been called.** It waited on the
+  channels the event loop and the apply loop close when they exit, and neither
+  runs until `Start`. A caller whose setup fails after `New` -- which is exactly
+  when `Stop` gets called -- waited forever.
 
-  A leader-balancing test asked for a leadership transfer once and waited
-  thirty seconds for it to land. A transfer is a request: the target has to
-  be caught up enough to win the election it is asked to call, and on a busy
-  machine it may not be in time. It now retries from whichever host leads the
-  group, which is what the balance controller itself does.
+### Changed
 
-  `TestRecover_RefusesWithoutConfirm` asserted that a node's storage held
-  three members after a refused recovery. Membership is recoverable from a
-  snapshot and, for a cluster started from a static peer list, from nowhere
-  else -- so a follower that lagged far enough not to snapshot has no members
-  on disk and never did. Blaming the tool for that is wrong; the test now
-  reads the state before the refusal and checks it is unchanged, which is
-  what it meant all along.
+- **The test suite runs on a fake clock.** Most of it now runs inside
+  `testing/synctest` bubbles, where the clock advances only when every goroutine
+  is blocked, so a loaded machine cannot shorten a timeout. The whole suite went
+  from about 121s to 85s, and individual cases by far more: one lease test went
+  from 129s to 0.02s over twenty runs.
+
+  Five tests used to skip themselves with "this machine stalled" when a sleep
+  overran the lease they were testing, because a key expiring on a descheduled
+  process says nothing about whether renewal works. All five are gone: on a fake
+  clock the sleep is exact, so the tests assert that it was, and a renewal gap
+  wider than the lease is a bug rather than an excuse. A `grpctransport` test
+  that idled past a thirty-second boundary, and was skipped under `-short`
+  because of what that cost, now always runs.
+
+  This is how the livelock above was found. A cycle with no timer in it is never
+  idle, so a fake clock stops rather than letting a deadline quietly expire.
+  Wall-clock tests had been absorbing it for as long as it had existed.
+
+- A handful of tests that failed together on a slow CI runner were repaired
+  rather than retried: lease tests whose TTL a shared runner could overrun, a
+  leader-balancing test that asked for a transfer once and waited, a recovery
+  test that asserted a member count it could not know, and a flexible-quorum
+  test that resolved the leader once and then bet on it still leading. Several
+  goroutine leaks and a `Node.Stop` that never returned came out of the same
+  work, all of them found by the bubbles failing loudly on what a real clock
+  had hidden.
 
 ## v2.1.2
 
