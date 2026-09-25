@@ -43,17 +43,5 @@ jobs:
       # Not part of the soak proper, but the same reasoning: a test that fails
       # one run in four is invisible to a suite that runs once per push, and
       # two such tests reached main before this existed.
-      #
-      # Five separate runs rather than -count=5, which repeats them inside one
-      # process. The root package's tests run inside synctest bubbles, and
-      # testing/synctest can lose a wakeup once a process has built up enough
-      # of them -- see the comment on Cluster.settle. -count=5 reproduces it;
-      # five fresh processes are the shape that does not, and they repeat the
-      # suite exactly as many times.
       - name: Repeat the fast suite to surface flakes
-        run: |
-          for i in 1 2 3 4 5; do
-            echo "::group::suite run $i"
-            go test -race -count=1 -timeout 30m ./...
-            echo "::endgroup::"
-          done
+        run: go test -race -count=5 -timeout 30m ./...

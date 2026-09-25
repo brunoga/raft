@@ -729,6 +729,11 @@ func (n *Node) handleInstallSnapshotResult(r *installSnapshotResult) {
 		n.nextIndex[r.peer] = r.meta.LastIncludedIndex + 1
 		n.matchIndex[r.peer] = r.meta.LastIncludedIndex
 	}
+	// The same invariant as for appends: a follower that has acknowledged
+	// matchIndex needs nothing before it, whatever this snapshot's index.
+	if n.nextIndex[r.peer] <= n.matchIndex[r.peer] {
+		n.nextIndex[r.peer] = n.matchIndex[r.peer] + 1
+	}
 	n.maybeAdvanceCommit()
 	// If there are new entries after the snapshot, replicate them.
 	if n.nextIndex[r.peer] <= n.log.lastLogIndex() {

@@ -123,28 +123,27 @@ func inBubble() (yes bool) {
 // In a bubble that advance is of the fake clock, so it costs nothing and a
 // loaded machine cannot shorten it.
 //
-// # A known upstream bug
+// # A hang here is a loop with no timer in it
 //
-// testing/synctest can lose a wakeup: a goroutine is left in state
-// "runnable" while every other goroutine in the bubble is durably blocked
-// and no thread is running, so the bubble's clock never advances again and
-// the test spins until its timeout. Goroutine dumps put the test itself
-// inside synctest.Wait or time.Sleep, waiting on a goroutine the runtime
-// never schedules, which is not something this package can cause or repair.
-// It reproduces on Go 1.26.0 and 1.27.1 and never on the real clock
-// (600 runs, clean).
+// A bubble's clock advances only when every goroutine in it is durably
+// blocked. Code that hands work from goroutine to goroutine without ever
+// waiting on a timer is never idle, so the clock never moves and the test
+// hangs at its timeout with a goroutine dump that shows one goroutine
+// runnable and the rest blocked. That is not a deadlock in Raft and not a
+// runtime fault: it is a livelock that a real clock would have hidden by
+// letting the test's deadline expire.
 //
-// It only appears when one process runs many bubbles. Measured on the
-// snapshot test that reproduces it most readily:
+// The first one found this way was real. A stale AppendEntries rejection
+// -- produced before the follower acknowledged an entry, delivered after --
+// moved nextIndex below matchIndex, and the pipeline then re-sent the same
+// entries on every success without a timer between rounds, at about ten
+// thousand transfers a second, until the leader lost leadership. It had
+// been mistaken for a scheduler bug because the dumps looked like one. See
+// handleAppendResult in node_replication.go and the tests in
+// stale_rejection_internal_test.go.
 //
-//	go test -count=100, one test   about 1 hang in 400
-//	the same, with the Reconnect   about 1 hang in 3000
-//	mitigation below
-//	go test -count=1, whole suite  0 hangs in 1500 runs
-//
-// The last line is the shape CI uses, which is why these tests are bubbled
-// anyway. If a run ever hangs with a dump matching that description, it is
-// this and not a deadlock in Raft.
+// So if a bubbled test hangs: read the dump for the goroutine that is
+// runnable rather than blocked, and find the cycle it is in.
 func (c *Cluster) settle() {
 	if c.bubbled {
 		synctest.Wait()
@@ -261,12 +260,8 @@ func (c *Cluster) Reconnect(i int) {
 	}
 	// Restoring a link closes the channel that parks RPCs held on the dropped
 	// link, which makes their goroutines runnable. Let them run before the
-	// caller blocks on the clock again.
-	//
-	// This is a mitigation, not a fix, for the scheduling bug described on
-	// settle below: it narrows the window by roughly seven times but does not
-	// close it. It is kept because it is free and because the soak workflow
-	// runs with -count=5, which is the shape that can hit it.
+	// caller blocks on the clock again, so the caller's next look at the
+	// cluster sees the reconnect already taken effect.
 	if c.bubbled {
 		synctest.Wait()
 	}
