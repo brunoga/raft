@@ -4,7 +4,14 @@ Notable changes, newest first. This project follows
 [semantic versioning](https://semver.org/); what a version number promises is
 spelled out in [`docs/compatibility.md`](docs/compatibility.md).
 
-## Unreleased
+## v2.2.0
+
+Two new options for supplying your own listener, two fixes worth upgrading
+for, and a test suite that now runs on a fake clock. The fixes are the reason
+to take this: a leader could livelock, and `Node.Stop` could hang.
+
+Nothing here changes an existing API, so a `v2.1.2` deployment upgrades by
+changing the version and nothing else.
 
 ### Added
 
